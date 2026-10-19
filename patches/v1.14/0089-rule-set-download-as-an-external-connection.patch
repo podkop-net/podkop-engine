@@ -1,0 +1,86 @@
+From 3531ca07254be2c9cc0e11880d2afc4cc3fcedf9 Mon Sep 17 00:00:00 2001
+From: FiyeroT <me@fiyero.xyz>
+Date: Thu, 8 Oct 2026 15:11:05 +0300
+Subject: [PATCH 089/148] rule-set: download as an external connection
+
+A urltest or selector group that switches members closes every connection
+it does not know as a routed one, whatever interrupt_exist_connections
+says. A rule-set downloaded through the group was cut and, when the set
+had been loaded before, retried only after update_interval.
+
+Mark the download context as external, as routed connections are.
+---
+ route/rule/rule_set_remote.go           |  4 ++++
+ route/rule/rule_set_remote_body_test.go | 23 +++++++++++++++++++++++
+ 2 files changed, 27 insertions(+)
+
+diff --git a/route/rule/rule_set_remote.go b/route/rule/rule_set_remote.go
+index df6a179f9..f3aea8a5b 100644
+--- a/route/rule/rule_set_remote.go
++++ b/route/rule/rule_set_remote.go
+@@ -16,6 +16,7 @@ import (
+ 	"time"
+ 
+ 	"github.com/sagernet/sing-box/adapter"
++	"github.com/sagernet/sing-box/common/interrupt"
+ 	"github.com/sagernet/sing-box/common/srs"
+ 	C "github.com/sagernet/sing-box/constant"
+ 	"github.com/sagernet/sing-box/experimental/deprecated"
+@@ -408,6 +409,9 @@ func describeRuleSetBody(response *http.Response, size int64, sample []byte) str
+ 
+ func (s *RemoteRuleSet) fetch(ctx context.Context, isStart bool) error {
+ 	s.logger.Debug("updating rule-set ", s.tag, " from URL: ", s.url)
++	// a group that switches members closes the connections it does not know as routed
++	// ones: a list half downloaded through it would wait for the next update_interval
++	ctx = interrupt.ContextWithIsExternalConnection(ctx)
+ 	ctx, cancel := context.WithCancel(ctx)
+ 	defer cancel()
+ 	if isStart {
+diff --git a/route/rule/rule_set_remote_body_test.go b/route/rule/rule_set_remote_body_test.go
+index 2312d5d68..117cce19a 100644
+--- a/route/rule/rule_set_remote_body_test.go
++++ b/route/rule/rule_set_remote_body_test.go
+@@ -3,6 +3,7 @@ package rule
+ import (
+ 	"context"
+ 	"io"
++	"net"
+ 	"net/http"
+ 	"net/http/httptest"
+ 	"strconv"
+@@ -10,6 +11,7 @@ import (
+ 	"testing"
+ 	"time"
+ 
++	"github.com/sagernet/sing-box/common/interrupt"
+ 	C "github.com/sagernet/sing-box/constant"
+ 	"github.com/sagernet/sing-box/log"
+ 
+@@ -130,3 +132,24 @@ func TestRemoteRuleSetUpdateCancelledByShutdown(t *testing.T) {
+ 	require.Zero(t, set.failures)
+ 	require.Zero(t, countPrefix(writer.take(), "ERROR"))
+ }
++
++// The download is dialed as an external connection, so that a group switching members does
++// not close it together with its own connections.
++func TestRemoteRuleSetFetchIsExternalConnection(t *testing.T) {
++	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		io.WriteString(w, testSourceSet)
++	}))
++	defer server.Close()
++	var external bool
++	set := newTestRuleSet(server.URL)
++	set.ctx = context.Background()
++	set.options.Format = C.RuleSetFormatSource
++	set.httpClient = &http.Client{Transport: &http.Transport{
++		DialContext: func(ctx context.Context, network, address string) (net.Conn, error) {
++			external = interrupt.IsExternalConnectionFromContext(ctx)
++			return (&net.Dialer{}).DialContext(ctx, network, address)
++		},
++	}}
++	require.NoError(t, set.fetch(context.Background(), false))
++	require.True(t, external)
++}
+-- 
+2.53.0
+

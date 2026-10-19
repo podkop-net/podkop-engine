@@ -1,7 +1,7 @@
 From 83d6fe360bcea79156a63a9779e39054bc051dee Mon Sep 17 00:00:00 2001
 From: FiyeroT <me@fiyero.xyz>
 Date: Thu, 8 Oct 2026 17:52:17 +0300
-Subject: [PATCH 100/126] decode-link: Shadowsocks, SOCKS, Hysteria 2, TUIC,
+Subject: [PATCH 100/140] decode-link: Shadowsocks, SOCKS, Hysteria 2, TUIC,
  VMess, HTTP, Hysteria, AnyTLS and NaiveProxy links
 
 Each in the forms its generators write:

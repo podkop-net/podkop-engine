@@ -1,0 +1,72 @@
+From 749515f28ad2234e11187eaeac966e784c33579c Mon Sep 17 00:00:00 2001
+From: FiyeroT <me@fiyero.xyz>
+Date: Fri, 9 Oct 2026 16:15:03 +0300
+Subject: [PATCH 106/148] reality: refuse a short_id longer than it can be
+
+The short id is decoded into eight bytes with hex.Decode, which writes
+past a destination shorter than what it is given, and its length was
+looked at afterwards. A short_id of 18 or more hexadecimal digits ended
+sing-box with a Go panic, at start and in "sing-box check": in an
+outbound, where a share link can ask for it, and in an inbound. It is an
+error of the configuration now ("invalid short_id").
+---
+ common/tls/reality_client.go           |  4 ++++
+ common/tls/reality_fingerprint_test.go | 13 +++++++++++++
+ common/tls/reality_server.go           |  5 +++++
+ 3 files changed, 22 insertions(+)
+
+diff --git a/common/tls/reality_client.go b/common/tls/reality_client.go
+index d2e3178dc..cde7e5805 100644
+--- a/common/tls/reality_client.go
++++ b/common/tls/reality_client.go
+@@ -108,6 +108,10 @@ func newRealityClient(ctx context.Context, logger logger.ContextLogger, serverAd
+ 		return nil, E.New("invalid public_key")
+ 	}
+ 	var shortID [8]byte
++	// hex.Decode writes past a destination shorter than its input (podkop-engine)
++	if len(options.Reality.ShortID) > 2*len(shortID) {
++		return nil, E.New("invalid short_id")
++	}
+ 	decodedLen, err := hex.Decode(shortID[:], []byte(options.Reality.ShortID))
+ 	if err != nil {
+ 		return nil, E.Cause(err, "decode short_id")
+diff --git a/common/tls/reality_fingerprint_test.go b/common/tls/reality_fingerprint_test.go
+index c448ac0fe..81878772d 100644
+--- a/common/tls/reality_fingerprint_test.go
++++ b/common/tls/reality_fingerprint_test.go
+@@ -383,3 +383,16 @@ func TestUTLSALPNHandshakeAgainAfterRelease(t *testing.T) {
+ 	})
+ 	require.True(t, conn.ConnectionState().HandshakeComplete)
+ }
++
++// A short_id longer than eight bytes is an error of the configuration, not a crash:
++// hex.Decode writes past a destination shorter than its input.
++func TestRealityShortIDTooLong(t *testing.T) {
++	logger, _ := newWarnLogger(t)
++	options := realityOptionsForTest("chrome", true)
++	options.Reality.ShortID = "0123456789abcdef01"
++	_, err := NewClient(context.Background(), logger, "192.0.2.1", options)
++	require.ErrorContains(t, err, "invalid short_id")
++	options.Reality.ShortID = "0123456789abcdef"
++	_, err = NewClient(context.Background(), logger, "192.0.2.1", options)
++	require.NoError(t, err)
++}
+diff --git a/common/tls/reality_server.go b/common/tls/reality_server.go
+index 8ad59e144..6c04cfc57 100644
+--- a/common/tls/reality_server.go
++++ b/common/tls/reality_server.go
+@@ -109,6 +109,11 @@ func NewRealityServer(ctx context.Context, logger log.ContextLogger, options opt
+ 	} else {
+ 		for i, shortIDString := range options.Reality.ShortID {
+ 			var shortID [8]byte
++			// hex.Decode writes past a destination shorter than what it is given
++			// (podkop-engine)
++			if len(shortIDString) > 2*len(shortID) {
++				return nil, E.New("invalid short_id[", i, "]: ", shortIDString)
++			}
+ 			decodedLen, err := hex.Decode(shortID[:], []byte(shortIDString))
+ 			if err != nil {
+ 				return nil, E.Cause(err, "decode short_id[", i, "]: ", shortIDString)
+-- 
+2.53.0
+

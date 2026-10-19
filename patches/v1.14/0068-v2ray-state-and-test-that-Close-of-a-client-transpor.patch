@@ -1,0 +1,242 @@
+From b79637563e4db252bdfc9a7e1475a3f9875706dc Mon Sep 17 00:00:00 2001
+From: FiyeroT <me@fiyero.xyz>
+Date: Tue, 6 Oct 2026 23:53:23 +0300
+Subject: [PATCH 068/148] v2ray: state and test that Close of a client
+ transport is a reset
+
+The outbounds call Close of their transport from InterfaceUpdated on every change of the
+network and dial through it again afterwards. Every transport has to allow that, yet the
+contract was written nowhere and no test dialed after a Close, which is how a transport
+whose Close was final went unnoticed.
+
+A comment at adapter.V2RayClientTransport states the contract. A table test builds every
+client transport of the build through NewClientTransport (ws, httpupgrade, http, grpc,
+xhttp over HTTP/1.1, HTTP/2 and HTTP/3 and with a download server, quic) over a dialer
+that fails, and checks that a dial after one Close and after two in a row still goes out
+to the server and reports the failure of the dialer, never a closed transport.
+
+With the tag with_grpc the grpc rows are skipped and the lite client is tested through
+force_lite: the client of grpc-go connects under the context of the transport and does
+not return while its server cannot be reached.
+---
+ adapter/v2ray.go                       |   8 ++
+ transport/v2ray/transport_grpc_test.go |  25 +++++
+ transport/v2ray/transport_quic_test.go |  16 +++
+ transport/v2ray/transport_test.go      | 131 +++++++++++++++++++++++++
+ 4 files changed, 180 insertions(+)
+ create mode 100644 transport/v2ray/transport_grpc_test.go
+ create mode 100644 transport/v2ray/transport_quic_test.go
+ create mode 100644 transport/v2ray/transport_test.go
+
+diff --git a/adapter/v2ray.go b/adapter/v2ray.go
+index 2dfa41026..1c4d6111c 100644
+--- a/adapter/v2ray.go
++++ b/adapter/v2ray.go
+@@ -18,6 +18,14 @@ type V2RayServerTransportHandler interface {
+ 	N.TCPConnectionHandlerEx
+ }
+ 
++// V2RayClientTransport is the client side of a V2Ray transport, owned by an
++// outbound.
++//
++// Close is a reset, not an end: it closes the connections the transport keeps
++// and leaves the transport usable. The outbounds call it from InterfaceUpdated
++// on every change of the network, before the first dial as well and any number
++// of times, and once more when they close. DialContext after a Close must open
++// a new connection and must not fail for the Close.
+ type V2RayClientTransport interface {
+ 	DialContext(ctx context.Context) (net.Conn, error)
+ 	Close() error
+diff --git a/transport/v2ray/transport_grpc_test.go b/transport/v2ray/transport_grpc_test.go
+new file mode 100644
+index 000000000..f61c1214b
+--- /dev/null
++++ b/transport/v2ray/transport_grpc_test.go
+@@ -0,0 +1,25 @@
++//go:build with_grpc
++
++package v2ray_test
++
++import (
++	C "github.com/sagernet/sing-box/constant"
++	"github.com/sagernet/sing-box/option"
++)
++
++func init() {
++	for i, c := range clientTransportCases {
++		if c.options.Type == C.V2RayTransportTypeGRPC {
++			// With this tag "grpc" is the client of grpc-go, which connects under
++			// the context of the transport and waits for the server for as long
++			// as that lives: with a dialer that only fails, its dial never
++			// returns.
++			clientTransportCases[i].skip = "the grpc-go client waits for its server"
++		}
++	}
++	forceLite := option.V2RayTransportOptions{Type: C.V2RayTransportTypeGRPC, GRPCOptions: option.V2RayGRPCOptions{ForceLite: true}}
++	clientTransportCases = append(clientTransportCases,
++		clientTransportCase{name: "grpc, lite", options: forceLite},
++		clientTransportCase{name: "grpc, lite, TLS", options: forceLite, alpn: []string{}},
++	)
++}
+diff --git a/transport/v2ray/transport_quic_test.go b/transport/v2ray/transport_quic_test.go
+new file mode 100644
+index 000000000..ac0cb113f
+--- /dev/null
++++ b/transport/v2ray/transport_quic_test.go
+@@ -0,0 +1,16 @@
++//go:build with_quic
++
++package v2ray_test
++
++import (
++	C "github.com/sagernet/sing-box/constant"
++	"github.com/sagernet/sing-box/option"
++	_ "github.com/sagernet/sing-box/transport/v2rayquic"
++)
++
++func init() {
++	clientTransportCases = append(clientTransportCases,
++		clientTransportCase{name: "quic", options: option.V2RayTransportOptions{Type: C.V2RayTransportTypeQUIC}, alpn: []string{}},
++		clientTransportCase{name: "xhttp, HTTP/3", options: option.V2RayTransportOptions{Type: C.V2RayTransportTypeXHTTP}, alpn: []string{"h3"}},
++	)
++}
+diff --git a/transport/v2ray/transport_test.go b/transport/v2ray/transport_test.go
+new file mode 100644
+index 000000000..0315416bc
+--- /dev/null
++++ b/transport/v2ray/transport_test.go
+@@ -0,0 +1,131 @@
++package v2ray_test
++
++import (
++	"context"
++	"errors"
++	"net"
++	"sync/atomic"
++	"testing"
++	"time"
++
++	"github.com/sagernet/sing-box/adapter"
++	"github.com/sagernet/sing-box/common/tls"
++	C "github.com/sagernet/sing-box/constant"
++	"github.com/sagernet/sing-box/log"
++	"github.com/sagernet/sing-box/option"
++	"github.com/sagernet/sing-box/transport/v2ray"
++	"github.com/sagernet/sing/common/json/badoption"
++	M "github.com/sagernet/sing/common/metadata"
++
++	"github.com/stretchr/testify/require"
++)
++
++var errTestDial = errors.New("test dialer: no route to host")
++
++// failingDialer counts the dials it is asked for and fails each of them.
++type failingDialer struct {
++	dials atomic.Int32
++}
++
++func (d *failingDialer) DialContext(ctx context.Context, network string, destination M.Socksaddr) (net.Conn, error) {
++	d.dials.Add(1)
++	return nil, errTestDial
++}
++
++func (d *failingDialer) ListenPacket(ctx context.Context, destination M.Socksaddr) (net.PacketConn, error) {
++	d.dials.Add(1)
++	return nil, errTestDial
++}
++
++type clientTransportCase struct {
++	name    string
++	options option.V2RayTransportOptions
++	// alpn is the ALPN of the TLS the transport runs over; nil is no TLS.
++	alpn []string
++	// skip, when set, says why the case can't be held this way.
++	skip string
++}
++
++var clientTransportCases = []clientTransportCase{
++	{name: "ws", options: option.V2RayTransportOptions{Type: C.V2RayTransportTypeWebsocket}},
++	{name: "httpupgrade", options: option.V2RayTransportOptions{Type: C.V2RayTransportTypeHTTPUpgrade}},
++	{name: "http", options: option.V2RayTransportOptions{Type: C.V2RayTransportTypeHTTP}},
++	{name: "http, TLS", options: option.V2RayTransportOptions{Type: C.V2RayTransportTypeHTTP}, alpn: []string{}},
++	{name: "grpc", options: option.V2RayTransportOptions{Type: C.V2RayTransportTypeGRPC}},
++	{name: "grpc, TLS", options: option.V2RayTransportOptions{Type: C.V2RayTransportTypeGRPC}, alpn: []string{}},
++	{name: "xhttp", options: option.V2RayTransportOptions{Type: C.V2RayTransportTypeXHTTP}},
++	{name: "xhttp, TLS", options: option.V2RayTransportOptions{Type: C.V2RayTransportTypeXHTTP}, alpn: []string{}},
++	{name: "xhttp, TLS, HTTP/1.1", options: option.V2RayTransportOptions{Type: C.V2RayTransportTypeXHTTP}, alpn: []string{"http/1.1"}},
++	{
++		name: "xhttp, TLS, download",
++		options: option.V2RayTransportOptions{Type: C.V2RayTransportTypeXHTTP, XHTTPOptions: option.V2RayXHTTPOptions{
++			Download: &option.V2RayXHTTPDownloadOptions{
++				ServerOptions:               option.ServerOptions{Server: "127.0.0.2", ServerPort: 443},
++				OutboundTLSOptionsContainer: option.OutboundTLSOptionsContainer{TLS: &option.OutboundTLSOptions{Enabled: true, Insecure: true, ServerName: "cdn.example.com"}},
++			},
++		}},
++		alpn: []string{},
++	},
++}
++
++// Close of a client transport is a reset, not an end: the outbounds call it on
++// every change of the network (InterfaceUpdated) and go on dialing through the
++// same transport. Whatever the transport keeps between dials, the dial after a
++// Close must go out to the server again.
++func TestClientTransportCloseIsReset(t *testing.T) {
++	for _, c := range clientTransportCases {
++		t.Run(c.name, func(t *testing.T) {
++			if c.skip != "" {
++				t.Skip(c.skip)
++			}
++			var tlsConfig tls.Config
++			if c.alpn != nil {
++				var err error
++				tlsConfig, err = tls.NewClient(context.Background(), log.StdLogger(), "example.com", option.OutboundTLSOptions{
++					Enabled: true, Insecure: true, ServerName: "example.com", ALPN: badoption.Listable[string](c.alpn),
++				})
++				require.NoError(t, err)
++			}
++			dialer := new(failingDialer)
++			transport, err := v2ray.NewClientTransport(context.Background(), dialer, M.ParseSocksaddr("127.0.0.1:443"), c.options, tlsConfig)
++			require.NoError(t, err)
++			require.NotNil(t, transport)
++			defer transport.Close()
++			require.NoError(t, transport.Close(), "before the first dial")
++			requireDialReachesServer(t, transport, dialer)
++			require.NoError(t, transport.Close())
++			require.NoError(t, transport.Close(), "twice in a row")
++			requireDialReachesServer(t, transport, dialer)
++		})
++	}
++}
++
++// requireDialReachesServer dials through the transport and expects the failure
++// of the dialer back: the transport went to the server, it did not refuse.
++func requireDialReachesServer(t *testing.T, transport adapter.V2RayClientTransport, dialer *failingDialer) {
++	t.Helper()
++	before := dialer.dials.Load()
++	done := make(chan error, 1)
++	go func() {
++		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
++		defer cancel()
++		conn, err := transport.DialContext(ctx)
++		if err == nil {
++			// The HTTP/2 based transports hand out the connection before the
++			// request is on its way: the failure is that of the first read.
++			_, err = conn.Read(make([]byte, 1))
++			conn.Close()
++		}
++		done <- err
++	}()
++	select {
++	case err := <-done:
++		require.Error(t, err)
++		require.NotErrorIs(t, err, net.ErrClosed)
++		require.NotContains(t, err.Error(), net.ErrClosed.Error())
++		require.ErrorContains(t, err, errTestDial.Error())
++		require.Greater(t, dialer.dials.Load(), before, "the dialer was not asked")
++	case <-time.After(15 * time.Second):
++		t.Fatal("the dial did not return")
++	}
++}
+-- 
+2.53.0
+

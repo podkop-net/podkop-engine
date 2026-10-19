@@ -1,0 +1,335 @@
+From dcedbd297b04712c9848d8add1bd8b8c67ca95a2 Mon Sep 17 00:00:00 2001
+From: FiyeroT <me@fiyero.xyz>
+Date: Sun, 4 Oct 2026 08:40:40 +0300
+Subject: [PATCH 039/148] sniff: a panicking sniffer fails its connection, a
+ UDP sniff reads 16 packets
+
+Sniffers parse whatever a client in the LAN sends, and nothing recovered a
+panic on that path: one bug on unexpected input (the ja3 bounds fixed in the
+previous backport were one) took the whole process down, and with it the DNS
+of the LAN. PeekStream and PeekPacket now recover a sniffer's panic: the sniff
+of that connection fails with ErrSnifferPanicked, the metadata the sniffer had
+set is restored, and the router logs the panic with its stack as an error.
+
+A UDP sniff kept reading while the sniffer asked for more data, each packet
+held in a buffer of its own (16 KiB), as long as every packet came within the
+timeout. QUIC Initials whose CRYPTO frames never complete a ClientHello ran it
+to the 64 KiB bound of the reassembly: 66 packets held per session in the
+test. The sniff now ends after 16 packets with an error later sniffs do not
+resume from; a ClientHello takes one or two Initials.
+---
+ common/sniff/recover_test.go |  63 ++++++++++++++++++++
+ common/sniff/sniff.go        |  24 +++++++-
+ route/route.go               |  23 ++++++++
+ route/route_sniff_test.go    | 109 +++++++++++++++++++++++++++++++++++
+ 4 files changed, 217 insertions(+), 2 deletions(-)
+ create mode 100644 common/sniff/recover_test.go
+ create mode 100644 route/route_sniff_test.go
+
+diff --git a/common/sniff/recover_test.go b/common/sniff/recover_test.go
+new file mode 100644
+index 000000000..b604475be
+--- /dev/null
++++ b/common/sniff/recover_test.go
+@@ -0,0 +1,63 @@
++package sniff
++
++import (
++	"bytes"
++	"context"
++	"errors"
++	"io"
++	"net"
++	"testing"
++
++	"github.com/sagernet/sing-box/adapter"
++	C "github.com/sagernet/sing-box/constant"
++	"github.com/sagernet/sing/common/buf"
++
++	"github.com/stretchr/testify/require"
++)
++
++func panickingStreamSniffer(_ context.Context, metadata *adapter.InboundContext, _ io.Reader) error {
++	metadata.Protocol = C.ProtocolTLS
++	metadata.Domain = "half.example"
++	var empty []byte
++	_ = empty[1]
++	return nil
++}
++
++func panickingPacketSniffer(_ context.Context, metadata *adapter.InboundContext, packet []byte) error {
++	metadata.Protocol = C.ProtocolQUIC
++	metadata.SniffContext = "half"
++	return panickingStreamSniffer(context.Background(), metadata, bytes.NewReader(packet))
++}
++
++// A sniffer that panics fails the sniff of its connection, with the panic and its stack, and
++// leaves the metadata as it found it; the next sniffer still runs.
++func TestSnifferPanicRecovered(t *testing.T) {
++	var metadata adapter.InboundContext
++	err := PeekPacket(context.Background(), &metadata, []byte("packet"), panickingPacketSniffer)
++	require.ErrorIs(t, err, ErrSnifferPanicked)
++	require.Contains(t, err.Error(), "index out of range")
++	require.Contains(t, err.Error(), "panickingStreamSniffer")
++	require.Empty(t, metadata.Protocol)
++	require.Empty(t, metadata.Domain)
++	require.Nil(t, metadata.SniffContext)
++
++	err = PeekPacket(context.Background(), &metadata, []byte("packet"), panickingPacketSniffer,
++		func(_ context.Context, metadata *adapter.InboundContext, _ []byte) error {
++			metadata.Protocol = C.ProtocolDNS
++			return nil
++		})
++	require.NoError(t, err)
++	require.Equal(t, C.ProtocolDNS, metadata.Protocol)
++
++	client, server := net.Pipe()
++	defer client.Close()
++	defer server.Close()
++	go server.Write([]byte("stream"))
++	metadata = adapter.InboundContext{}
++	buffer := buf.NewPacket()
++	defer buffer.Release()
++	err = PeekStream(context.Background(), &metadata, client, nil, buffer, 0, panickingStreamSniffer)
++	require.True(t, errors.Is(err, ErrSnifferPanicked))
++	require.Empty(t, metadata.Protocol)
++	require.Empty(t, metadata.Domain)
++}
+diff --git a/common/sniff/sniff.go b/common/sniff/sniff.go
+index b3651e1ff..d76552ef4 100644
+--- a/common/sniff/sniff.go
++++ b/common/sniff/sniff.go
+@@ -4,8 +4,10 @@ import (
+ 	"bytes"
+ 	"context"
+ 	"errors"
++	"fmt"
+ 	"io"
+ 	"net"
++	"runtime/debug"
+ 	"time"
+ 
+ 	"github.com/sagernet/sing-box/adapter"
+@@ -22,6 +24,24 @@ type (
+ 
+ var ErrNeedMoreData = E.New("need more data")
+ 
++// ErrSnifferPanicked is the failure of a sniffer that panicked. Sniffers parse what any
++// client sends: a panic, a bug on input the sniffer did not expect, costs the sniff of one
++// connection instead of the process.
++var ErrSnifferPanicked = E.New("sniffer panicked")
++
++// recovered runs a sniffer. On a panic it restores the metadata the sniffer may have set
++// and returns ErrSnifferPanicked with the panic and its stack.
++func recovered(metadata *adapter.InboundContext, sniff func() error) (err error) {
++	protocol, domain, client, sniffContext := metadata.Protocol, metadata.Domain, metadata.Client, metadata.SniffContext
++	defer func() {
++		if panicked := recover(); panicked != nil {
++			metadata.Protocol, metadata.Domain, metadata.Client, metadata.SniffContext = protocol, domain, client, sniffContext
++			err = fmt.Errorf("%w: %v\n%s", ErrSnifferPanicked, panicked, debug.Stack())
++		}
++	}()
++	return sniff()
++}
++
+ func Skip(metadata *adapter.InboundContext) bool {
+ 	// skip server first protocols
+ 	switch metadata.Destination.Port {
+@@ -62,7 +82,7 @@ func PeekStream(ctx context.Context, metadata *adapter.InboundContext, conn net.
+ 			reader := io.MultiReader(common.Map(append(buffers, buffer), func(it *buf.Buffer) io.Reader {
+ 				return bytes.NewReader(it.Bytes())
+ 			})...)
+-			err = sniffer(ctx, metadata, reader)
++			err = recovered(metadata, func() error { return sniffer(ctx, metadata, reader) })
+ 			if err == nil {
+ 				return nil
+ 			}
+@@ -78,7 +98,7 @@ func PeekStream(ctx context.Context, metadata *adapter.InboundContext, conn net.
+ func PeekPacket(ctx context.Context, metadata *adapter.InboundContext, packet []byte, sniffers ...PacketSniffer) error {
+ 	var sniffError []error
+ 	for _, sniffer := range sniffers {
+-		err := sniffer(ctx, metadata, packet)
++		err := recovered(metadata, func() error { return sniffer(ctx, metadata, packet) })
+ 		if err == nil {
+ 			return nil
+ 		}
+diff --git a/route/route.go b/route/route.go
+index 4a1bc5590..8563ba1c1 100644
+--- a/route/route.go
++++ b/route/route.go
+@@ -363,6 +363,7 @@ func (r *Router) PreMatch(metadata adapter.InboundContext, firstPacket []byte) a
+ 				packetSniffers = defaultPacketSniffers
+ 			}
+ 			sniffErr := sniff.PeekPacket(ctx, &metadata, firstPacket, packetSniffers...)
++			r.logSnifferPanic(ctx, sniffErr)
+ 			metadata.SnifferNames = action.SnifferNames
+ 			metadata.SniffError = sniffErr
+ 			if sniffErr != nil {
+@@ -793,6 +794,21 @@ match:
+ 	return
+ }
+ 
++// maxSniffPackets bounds the packets a UDP sniff reads and holds. A client that keeps
++// sending packets the sniffer needs more of (QUIC Initials whose CRYPTO frames never
++// complete a ClientHello) would keep it reading, each packet held in a buffer of its own,
++// for as long as every one comes within the timeout. A ClientHello takes few packets:
++// QUIC pads every client Initial to 1200 bytes (RFC 9000, section 14.1), and the largest
++// ClientHellos browsers send, with a post-quantum key share, take two.
++const maxSniffPackets = 16
++
++// logSnifferPanic logs a sniffer that panicked, with its stack: a bug to report.
++func (r *Router) logSnifferPanic(ctx context.Context, err error) {
++	if errors.Is(err, sniff.ErrSnifferPanicked) {
++		r.logger.ErrorContext(ctx, err)
++	}
++}
++
+ func (r *Router) actionSniff(
+ 	ctx context.Context, metadata *adapter.InboundContext, action *R.RuleActionSniff,
+ 	inputConn net.Conn, inputPacketConn N.PacketConn, inputBuffers []*buf.Buffer, inputPacketBuffers []*N.PacketBuffer,
+@@ -834,6 +850,7 @@ func (r *Router) actionSniff(
+ 			action.Timeout,
+ 			streamSniffers...,
+ 		)
++		r.logSnifferPanic(ctx, err)
+ 		metadata.SnifferNames = action.SnifferNames
+ 		metadata.SniffError = err
+ 		if err == nil {
+@@ -899,6 +916,11 @@ func (r *Router) actionSniff(
+ 			goto finally
+ 		}
+ 		for {
++			if len(inputPacketBuffers)+len(packetBuffers) >= maxSniffPackets {
++				err = E.New("no sniff result in ", maxSniffPackets, " packets")
++				metadata.SniffError = err
++				goto finally
++			}
+ 			var (
+ 				sniffBuffer = buf.NewPacket()
+ 				destination M.Socksaddr
+@@ -959,6 +981,7 @@ func (r *Router) actionSniff(
+ 			goto finally
+ 		}
+ 	finally:
++		r.logSnifferPanic(ctx, err)
+ 		if err == nil {
+ 			//goland:noinspection GoDeprecation
+ 			if action.OverrideDestination && M.IsDomainName(metadata.Domain) {
+diff --git a/route/route_sniff_test.go b/route/route_sniff_test.go
+new file mode 100644
+index 000000000..cb0907c55
+--- /dev/null
++++ b/route/route_sniff_test.go
+@@ -0,0 +1,109 @@
++package route
++
++import (
++	"context"
++	"crypto/aes"
++	"crypto/cipher"
++	"crypto/sha256"
++	"encoding/binary"
++	"io"
++	"net"
++	"testing"
++	"time"
++
++	"github.com/sagernet/sing-box/adapter"
++	"github.com/sagernet/sing-box/common/sniff"
++	"github.com/sagernet/sing-box/log"
++	R "github.com/sagernet/sing-box/route/rule"
++	"github.com/sagernet/sing/common/buf"
++	M "github.com/sagernet/sing/common/metadata"
++	N "github.com/sagernet/sing/common/network"
++
++	"github.com/stretchr/testify/require"
++	"golang.org/x/crypto/hkdf"
++)
++
++// quicInitialSaltV1 is the public salt of QUIC v1 Initial keys (RFC 9001, section 5.2).
++var quicInitialSaltV1 = []byte{0x38, 0x76, 0x2c, 0xf7, 0xf5, 0x59, 0x34, 0xb3, 0x4d, 0x17, 0x9a, 0xe6, 0xa4, 0xc8, 0x0c, 0xad, 0xcc, 0xbb, 0x7f, 0x0a}
++
++func hkdfExpandLabel(t *testing.T, secret []byte, label string, length int) []byte {
++	fullLabel := "tls13 " + label
++	info := binary.BigEndian.AppendUint16(nil, uint16(length))
++	info = append(info, byte(len(fullLabel)))
++	info = append(info, fullLabel...)
++	info = append(info, 0)
++	out := make([]byte, length)
++	_, err := io.ReadFull(hkdf.Expand(sha256.New, secret, info), out)
++	require.NoError(t, err)
++	return out
++}
++
++// quicInitial seals a client Initial packet of QUIC v1 with one CRYPTO frame of data at
++// offset.
++func quicInitial(t *testing.T, offset uint64, data []byte) []byte {
++	destination := []byte{1, 2, 3, 4, 5, 6, 7, 8}
++	secret := hkdfExpandLabel(t, hkdf.Extract(sha256.New, destination, quicInitialSaltV1), "client in", sha256.Size)
++	key := hkdfExpandLabel(t, secret, "quic key", 16)
++	iv := hkdfExpandLabel(t, secret, "quic iv", 12)
++	headerKey := hkdfExpandLabel(t, secret, "quic hp", 16)
++
++	payload := []byte{0x06, 0x80 | byte(offset>>24), byte(offset >> 16), byte(offset >> 8), byte(offset)}
++	payload = append(payload, 0x40|byte(len(data)>>8), byte(len(data)))
++	payload = append(payload, data...)
++	header := []byte{0xc0, 0, 0, 0, 1, byte(len(destination))}
++	header = append(header, destination...)
++	header = append(header, 0, 0) // source connection ID, token
++	length := 1 + len(payload) + 16
++	header = append(header, 0x40|byte(length>>8), byte(length))
++	numberOffset := len(header)
++	header = append(header, 0) // packet number 0, its nonce is the IV
++
++	block, err := aes.NewCipher(key)
++	require.NoError(t, err)
++	aead, err := cipher.NewGCM(block)
++	require.NoError(t, err)
++	packet := aead.Seal(append([]byte{}, header...), iv, payload, header)
++	headerBlock, err := aes.NewCipher(headerKey)
++	require.NoError(t, err)
++	mask := make([]byte, aes.BlockSize)
++	headerBlock.Encrypt(mask, packet[numberOffset+4:numberOffset+4+aes.BlockSize])
++	packet[0] ^= mask[0] & 0x0f
++	packet[numberOffset] ^= mask[1]
++	return packet
++}
++
++// initialFlood delivers on every read, at once, the next QUIC Initial of a ClientHello that
++// never completes.
++type initialFlood struct {
++	N.PacketConn
++	t     *testing.T
++	reads int
++}
++
++func (c *initialFlood) ReadPacket(buffer *buf.Buffer) (M.Socksaddr, error) {
++	const fragment = 1000
++	buffer.Write(quicInitial(c.t, uint64(c.reads*fragment), make([]byte, fragment)))
++	c.reads++
++	return M.ParseSocksaddr("192.0.2.1:443"), nil
++}
++
++func (c *initialFlood) SetReadDeadline(time.Time) error { return nil }
++
++func (c *initialFlood) LocalAddr() net.Addr { return &net.UDPAddr{} }
++
++// A client whose QUIC Initials never complete a ClientHello does not keep the sniff reading
++// and holding its packets: it ends after maxSniffPackets, with an error that later sniffs
++// do not resume from.
++func TestSniffPacketsBounded(t *testing.T) {
++	router := &Router{logger: log.NewNOPFactory().NewLogger("router")}
++	conn := &initialFlood{t: t}
++	action := &R.RuleActionSniff{PacketSniffers: []sniff.PacketSniffer{sniff.QUICClientHello}}
++	var metadata adapter.InboundContext
++	_, packetBuffers, fatalErr := router.actionSniff(context.Background(), &metadata, action, nil, conn, nil, nil)
++	require.NoError(t, fatalErr)
++	require.Len(t, packetBuffers, maxSniffPackets)
++	require.Equal(t, maxSniffPackets, conn.reads)
++	require.Error(t, metadata.SniffError)
++	require.NotErrorIs(t, metadata.SniffError, sniff.ErrNeedMoreData)
++	N.ReleaseMultiPacketBuffer(packetBuffers)
++}
+-- 
+2.53.0
+

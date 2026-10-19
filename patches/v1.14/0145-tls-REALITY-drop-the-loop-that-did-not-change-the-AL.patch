@@ -1,0 +1,75 @@
+From 769ec00b426bb4413d74cbe0d2d079f91104f570 Mon Sep 17 00:00:00 2001
+From: FiyeroT <me@fiyero.xyz>
+Date: Mon, 19 Oct 2026 21:12:53 +0300
+Subject: [PATCH 145/148] tls: REALITY: drop the loop that did not change the
+ ALPN
+
+After BuildHandshakeState, uConfig.NextProtos already holds the
+fingerprint's own list, so the loop wrote that list back into the ALPN
+extension: tls.alpn never reached the ClientHello. Making it take effect
+would change the ClientHello after the session ID is sealed and fail every
+handshake, so the loop goes and the docs say that alpn is used with
+REALITY only by the fingerprint randomized.
+---
+ common/tls/reality_client.go        | 12 ++++--------
+ docs/configuration/shared/tls.md    |  5 +++++
+ docs/configuration/shared/tls.zh.md |  4 ++++
+ 3 files changed, 13 insertions(+), 8 deletions(-)
+
+diff --git a/common/tls/reality_client.go b/common/tls/reality_client.go
+index 6e2dc451c..9048098bb 100644
+--- a/common/tls/reality_client.go
++++ b/common/tls/reality_client.go
+@@ -233,14 +233,10 @@ func (e *RealityClientConfig) ClientHandshake(ctx context.Context, conn net.Conn
+ 		return nil, err
+ 	}
+ 
+-	if len(uConfig.NextProtos) > 0 {
+-		for _, extension := range uConn.Extensions {
+-			if alpnExtension, isALPN := extension.(*utls.ALPNExtension); isALPN {
+-				alpnExtension.AlpnProtocols = uConfig.NextProtos
+-				break
+-			}
+-		}
+-	}
++	// The ALPN of the ClientHello is the fingerprint's: BuildHandshakeState has already put
++	// its list in uConfig.NextProtos, and changing the extension here would not reach the
++	// wire before the session ID is sealed below anyway. Only "randomized" reads the
++	// configured ALPN, when it builds its spec.
+ 
+ 	hello := uConn.HandshakeState.Hello
+ 	hello.SessionId = make([]byte, 32)
+diff --git a/docs/configuration/shared/tls.md b/docs/configuration/shared/tls.md
+index 984c6cfe7..3bdf2106b 100644
+--- a/docs/configuration/shared/tls.md
++++ b/docs/configuration/shared/tls.md
+@@ -268,6 +268,11 @@ no mutually supported protocol.
+ 
+ See [Application-Layer Protocol Negotiation](https://en.wikipedia.org/wiki/Application-Layer_Protocol_Negotiation).
+ 
++!!! note ""
++
++    With REALITY the ClientHello carries the ALPN list of the uTLS fingerprint: `alpn` is
++    used only with the fingerprint `randomized`.
++
+ #### min_version
+ 
+ The minimum TLS version that is acceptable.
+diff --git a/docs/configuration/shared/tls.zh.md b/docs/configuration/shared/tls.zh.md
+index 0db72f43a..40ac43894 100644
+--- a/docs/configuration/shared/tls.zh.md
++++ b/docs/configuration/shared/tls.zh.md
+@@ -267,6 +267,10 @@ TLS 版本值：
+ 
+ 参阅 [Application-Layer Protocol Negotiation](https://en.wikipedia.org/wiki/Application-Layer_Protocol_Negotiation)。
+ 
++!!! note ""
++
++    使用 REALITY 时，ClientHello 携带 uTLS 指纹自带的 ALPN 列表：仅 `randomized` 指纹使用 `alpn`。
++
+ #### min_version
+ 
+ 可接受的最低 TLS 版本。
+-- 
+2.53.0
+

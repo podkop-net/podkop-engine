@@ -1,0 +1,224 @@
+From b4b8eecb24e22be4213a13f1fa65d63404899a5d Mon Sep 17 00:00:00 2001
+From: FiyeroT <me@fiyero.xyz>
+Date: Mon, 19 Oct 2026 20:15:14 +0300
+Subject: [PATCH 141/148] xhttp: a write after the server ended the upload is
+ the end of the connection
+
+When the server ends its answer to the request that carries the upload
+(Xray does that as the connection ends, uplinkOnly after the destination
+closed), the HTTP client closes the body of that request, and a later
+write, a TLS close_notify sent on the destination's FIN for one, gets
+io.ErrClosedPipe. ioError turned it into a transportError, which sing-box
+does not take for a closed connection: each such connection logged
+"connection upload closed: io: read/write on closed pipe" as an ERROR.
+It reads as net.ErrClosed now, in stream-up and stream-one alike.
+
+An answer to the stream-up upload cut short (a reset stream, a lost
+connection) now fails the session with its cause, as a failed upload
+request already did: discardBody dropped that error, the download waited
+on, and the reset would have read as a closed connection as well.
+---
+ transport/v2rayxhttp/conn.go            | 31 ++++++++--
+ transport/v2rayxhttp/server_test.go     | 16 +++++
+ transport/v2rayxhttp/upload_end_test.go | 81 +++++++++++++++++++++++++
+ 3 files changed, 123 insertions(+), 5 deletions(-)
+ create mode 100644 transport/v2rayxhttp/upload_end_test.go
+
+diff --git a/transport/v2rayxhttp/conn.go b/transport/v2rayxhttp/conn.go
+index d0f947a85..bd3e68bab 100644
+--- a/transport/v2rayxhttp/conn.go
++++ b/transport/v2rayxhttp/conn.go
+@@ -197,8 +197,10 @@ func (s *session) startDownload(client *poolClient, request *http.Request) {
+ // (stream-up). Its response carries only the server's keep-alive padding.
+ //
+ // Unlike Xray's client, which does not look at the answer to this request, a
+-// failure or an error status ends the session: without its upload it could
+-// only wait.
++// failure, an error status or an answer cut short ends the session: without its
++// upload it could only wait. An answer that ends is the server ending the
++// upload, as Xray does when the connection is over: the HTTP client closes the
++// request body then, and a later write finds it closed (ioError).
+ func (s *session) startStreamUpload(client *poolClient, request *http.Request) {
+ 	go func() {
+ 		// the server ends its answer once it has read the upload to its end
+@@ -213,13 +215,19 @@ func (s *session) startStreamUpload(client *poolClient, request *http.Request) {
+ 			s.fail(E.New("xhttp: upload: unexpected status ", response.Status))
+ 			return
+ 		}
+-		discardBody(response.Body)
++		err = discardBody(response.Body)
++		if err != nil && !s.closed.Load() {
++			s.fail(E.Cause(err, "xhttp: upload"))
++		}
+ 	}()
+ }
+ 
+-func discardBody(body io.ReadCloser) {
+-	io.Copy(io.Discard, body)
++// discardBody reads a body to its end and closes it; the error is the one of the
++// read, nil for a body that ended.
++func discardBody(body io.ReadCloser) error {
++	_, err := io.Copy(io.Discard, body)
+ 	body.Close()
++	return err
+ }
+ 
+ // setDownload sets the download body, or the error that stands for it, once;
+@@ -255,6 +263,16 @@ func (s *session) fail(err error) {
+ // ioError turns an error of the HTTP machinery into the error the session
+ // reports: net.ErrClosed once closed here, the failure that ended the session,
+ // and otherwise an error that does not carry the HTTP/2 error types.
++//
++// io.ErrClosedPipe is a write after the HTTP client closed the body of the
++// request that carries the upload (stream-up, stream-one): the client does that
++// when the request is over, the server having ended its answer. That is the end
++// of the connection, as a closed socket is, not an error to report: a request
++// that failed fails the session first, and its failure is reported instead. The
++// HTTP client closes that body when a request fails too (a lost connection, a
++// reset stream): a write that comes before the failure is known reads as closed
++// as well, and the connection ends with no error reported unless the download
++// reports the cause first.
+ func (s *session) ioError(err error) error {
+ 	if err == nil {
+ 		return nil
+@@ -268,6 +286,9 @@ func (s *session) ioError(err error) error {
+ 	if failure := s.failure.Load(); failure != nil {
+ 		return failure.err
+ 	}
++	if err == io.ErrClosedPipe {
++		return net.ErrClosed
++	}
+ 	return hideHTTPError(err)
+ }
+ 
+diff --git a/transport/v2rayxhttp/server_test.go b/transport/v2rayxhttp/server_test.go
+index d9af9f437..8a1fb4275 100644
+--- a/transport/v2rayxhttp/server_test.go
++++ b/transport/v2rayxhttp/server_test.go
+@@ -35,6 +35,13 @@ type testServer struct {
+ 	maxPacket int
+ 	// abortUploads resets every upload request (RST_STREAM on HTTP/2).
+ 	abortUploads bool
++	// endUploadAfterData ends the answer to a stream-up upload once its first
++	// data is read, as Xray does when the connection ends, while the download
++	// stays; resetUploadAfterData resets that upload instead. endStreamOneAfterData
++	// ends a stream-one request once its first data is echoed.
++	endUploadAfterData    bool
++	resetUploadAfterData  bool
++	endStreamOneAfterData bool
+ 	// received counts the upload bytes of all sessions.
+ 	received atomic.Int64
+ 
+@@ -307,6 +314,12 @@ func (s *testServer) serveHTTP(w http.ResponseWriter, r *http.Request) {
+ 			if n > 0 {
+ 				s.received.Add(int64(n))
+ 				session.push(append([]byte(nil), buffer[:n]...))
++				if s.resetUploadAfterData {
++					panic(http.ErrAbortHandler)
++				}
++				if s.endUploadAfterData {
++					return
++				}
+ 			}
+ 			if err != nil {
+ 				return
+@@ -370,6 +383,9 @@ func (s *testServer) serveStreamOne(w http.ResponseWriter, r *http.Request) {
+ 				} else {
+ 					w.(http.Flusher).Flush()
+ 				}
++				if s.endStreamOneAfterData {
++					return
++				}
+ 			}
+ 		}
+ 		if err != nil {
+diff --git a/transport/v2rayxhttp/upload_end_test.go b/transport/v2rayxhttp/upload_end_test.go
+new file mode 100644
+index 000000000..0f828e3fb
+--- /dev/null
++++ b/transport/v2rayxhttp/upload_end_test.go
+@@ -0,0 +1,81 @@
++package v2rayxhttp
++
++import (
++	"context"
++	"io"
++	"testing"
++	"time"
++
++	"github.com/sagernet/sing-box/option"
++	E "github.com/sagernet/sing/common/exceptions"
++
++	"github.com/stretchr/testify/require"
++)
++
++// writeAfterEnd writes until a write fails, after the server ended the request that
++// carries the upload: the HTTP client then closes the body of that request.
++func writeAfterEnd(t *testing.T, client *Client) error {
++	t.Helper()
++	conn, err := client.DialContext(context.Background())
++	require.NoError(t, err)
++	t.Cleanup(func() { conn.Close() })
++	_, err = conn.Write([]byte("first"))
++	require.NoError(t, err)
++	_, err = io.ReadFull(conn, make([]byte, 5))
++	require.NoError(t, err)
++	var writeErr error
++	require.Eventually(t, func() bool {
++		_, writeErr = conn.Write([]byte("late"))
++		return writeErr != nil
++	}, 5*time.Second, 10*time.Millisecond)
++	return writeErr
++}
++
++// The server ending its answer to the stream-up upload, as Xray does once the
++// connection is over, makes a later write (a TLS close_notify sent on the FIN of
++// the destination, say) fail as closed: sing-box takes that for the end of the
++// connection, not for an error to log.
++func TestXHTTPStreamUpWriteAfterUploadEnded(t *testing.T) {
++	client, _ := newTestPair(t, option.V2RayXHTTPOptions{Mode: modeStreamUp}, "h2", func(s *testServer) { s.endUploadAfterData = true })
++	err := writeAfterEnd(t, client)
++	require.True(t, E.IsClosed(err), "write after the end of the upload: %T %v", err, err)
++}
++
++// The same for stream-one, where one request carries both halves.
++func TestXHTTPStreamOneWriteAfterEnd(t *testing.T) {
++	client, _ := newTestPair(t, option.V2RayXHTTPOptions{Mode: modeStreamOne}, "h2", func(s *testServer) { s.endStreamOneAfterData = true })
++	err := writeAfterEnd(t, client)
++	require.True(t, E.IsClosed(err), "write after the end of the stream-one request: %T %v", err, err)
++}
++
++// A reset of the stream-up upload after its answer began is a failure of the
++// session: the download ends with its cause, not as a clean end, and does not
++// wait on with nothing written.
++func TestXHTTPStreamUpUploadResetFailsSession(t *testing.T) {
++	client, _ := newTestPair(t, option.V2RayXHTTPOptions{Mode: modeStreamUp}, "h2", func(s *testServer) { s.resetUploadAfterData = true })
++	conn, err := client.DialContext(context.Background())
++	require.NoError(t, err)
++	defer conn.Close()
++	_, err = conn.Write([]byte("first"))
++	require.NoError(t, err)
++	// the echo may come before the reset ends the session, or not
++	readErr := make(chan error, 1)
++	go func() {
++		buffer := make([]byte, 64)
++		for {
++			if _, err := conn.Read(buffer); err != nil {
++				readErr <- err
++				return
++			}
++		}
++	}()
++	select {
++	case err = <-readErr:
++	case <-time.After(5 * time.Second):
++		t.Fatal("the download still waits after the upload was reset")
++	}
++	require.False(t, E.IsClosed(err), "a reset upload reads as a clean end: %v", err)
++	_, err = conn.Write([]byte("late"))
++	require.Error(t, err)
++	require.False(t, E.IsClosed(err), "write after a reset upload: %v", err)
++}
+-- 
+2.53.0
+

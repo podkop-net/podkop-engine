@@ -1,0 +1,578 @@
+From 6274e9b00262e8c3343a452d55bdacd1d717719b Mon Sep 17 00:00:00 2001
+From: FiyeroT <me@fiyero.xyz>
+Date: Mon, 5 Oct 2026 22:07:04 +0300
+Subject: [PATCH 056/148] xhttp: data written before a close is sent
+
+sing-box closes a connection as soon as its source is done. The session then
+cancelled its requests at once and dropped what packet-up had not posted yet:
+of 10 connections that sent data and closed, the destination got the data of
+none in packet-up, of 2 to 9 in the stream modes (the Xray client: all 10).
+
+A closed session now ends its upload first: packet-up posts what is pending
+and waits for the answers, a streamed upload ends its request body and waits
+for it to be written (stream-one) or answered (stream-up). When the server has
+not answered the data since it was written, the session stays one more second
+for the server to forward it, as an outbound of Xray does after the end of an
+upload; 5 seconds bound the whole. A session whose last write was answered, the
+usual end of an exchange, is taken down at once as before: 10000 short
+sessions cost the same time and memory as they did.
+---
+ transport/v2rayxhttp/client.go      |   3 +-
+ transport/v2rayxhttp/client_test.go |  16 ++--
+ transport/v2rayxhttp/conn.go        | 129 ++++++++++++++++++++++++++--
+ transport/v2rayxhttp/review_test.go |  65 ++++++++++++--
+ transport/v2rayxhttp/server_test.go |  18 +++-
+ transport/v2rayxhttp/upload.go      |  62 ++++++++++++-
+ 6 files changed, 266 insertions(+), 27 deletions(-)
+
+diff --git a/transport/v2rayxhttp/client.go b/transport/v2rayxhttp/client.go
+index fa1874271..dc23fd30b 100644
+--- a/transport/v2rayxhttp/client.go
++++ b/transport/v2rayxhttp/client.go
+@@ -230,8 +230,9 @@ func (c *Client) dialStreamOne(s *session) error {
+ 	}
+ 	s.hold(client)
+ 	s.count(client)
++	s.single = true
+ 	s.streamBody, s.streamUpload = io.Pipe()
+-	s.startDownload(client, c.up.newStreamRequest(s.ctx, c.upScheme, "", s.streamBody))
++	s.startDownload(client, c.up.newStreamRequest(s.withUploadTrace(s.ctx), c.upScheme, "", s.streamBody))
+ 	return nil
+ }
+ 
+diff --git a/transport/v2rayxhttp/client_test.go b/transport/v2rayxhttp/client_test.go
+index 781e04d3c..f285d8584 100644
+--- a/transport/v2rayxhttp/client_test.go
++++ b/transport/v2rayxhttp/client_test.go
+@@ -502,14 +502,16 @@ func TestXHTTPPoolIdleRetire(t *testing.T) {
+ 			require.NoError(t, err)
+ 			echo(t, conn, 4096)
+ 			time.Sleep(500 * time.Millisecond)
+-			client.upPool.access.Lock()
+-			require.Len(t, client.upPool.clients, 1, "an open session keeps its connection")
+-			client.upPool.access.Unlock()
++			pooled := func() int {
++				client.upPool.access.Lock()
++				defer client.upPool.access.Unlock()
++				return len(client.upPool.clients)
++			}
++			require.Equal(t, 1, pooled(), "an open session keeps its connection")
+ 			conn.Close()
+-			time.Sleep(700 * time.Millisecond)
+-			client.upPool.access.Lock()
+-			require.Empty(t, client.upPool.clients)
+-			client.upPool.access.Unlock()
++			// the session stays for closeGrace after its last write, then the
++			// connection idles out
++			require.Eventually(t, func() bool { return pooled() == 0 }, 3*time.Second, 20*time.Millisecond)
+ 			waitGoroutines(t, baseline)
+ 			conn, err = client.DialContext(context.Background())
+ 			require.NoError(t, err)
+diff --git a/transport/v2rayxhttp/conn.go b/transport/v2rayxhttp/conn.go
+index 9ecff4f8c..1a84c1f76 100644
+--- a/transport/v2rayxhttp/conn.go
++++ b/transport/v2rayxhttp/conn.go
+@@ -24,12 +24,15 @@ import (
+ //
+ // Every request of the session runs on the session's own context, not on the
+ // context of the dial: a dial context is done once the dial returns, and the
+-// session must outlive it. Close cancels the session context, which aborts
+-// every request in flight.
++// session must outlive it. Cancelling the session context aborts every request
++// in flight; Close does it once what was written has been sent.
+ type session struct {
+-	ctx    context.Context
+-	cancel context.CancelFunc
+-	closed atomic.Bool
++	ctx      context.Context
++	cancel   context.CancelFunc
++	closed   atomic.Bool
++	tearOnce sync.Once
++	// unanswered: data was written and no download data has been read since.
++	unanswered atomic.Bool
+ 
+ 	failure atomic.Pointer[failureBox]
+ 
+@@ -55,6 +58,14 @@ type session struct {
+ 	streamBody   *io.PipeReader
+ 	streamUpload *io.PipeWriter
+ 	packetUpload *uploader
++	// single: the download is the response to the request that streams the
++	// upload (stream-one).
++	single bool
++	// uploadWritten is closed when the upload stream is over: the request
++	// written to its end (stream-one), answered to its end (stream-up), or
++	// failed.
++	uploadWritten chan struct{}
++	writtenOnce   sync.Once
+ 
+ 	connected  chan struct{}
+ 	localAddr  net.Addr
+@@ -84,9 +95,27 @@ func newSession(depth int) *session {
+ 		cancel:        cancel,
+ 		downloadReady: make(chan struct{}),
+ 		connected:     make(chan struct{}),
++		uploadWritten: make(chan struct{}),
+ 	}
+ }
+ 
++// closeLinger bounds how long a closed session stays to send what was written
++// to it before the Close; closeGrace is how long it stays after that when the
++// server has not answered the data, for the server to forward it.
++const (
++	closeLinger = 5 * time.Second
++	closeGrace  = time.Second
++)
++
++// withUploadTrace reports the end of the request that streams the upload.
++func (s *session) withUploadTrace(ctx context.Context) context.Context {
++	return httptrace.WithClientTrace(ctx, &httptrace.ClientTrace{
++		WroteRequest: func(httptrace.WroteRequestInfo) {
++			s.writtenOnce.Do(func() { close(s.uploadWritten) })
++		},
++	})
++}
++
+ // hold makes the session keep a client (counted as running by get) until it
+ // closes.
+ func (s *session) hold(client *poolClient) {
+@@ -171,6 +200,8 @@ func (s *session) startDownload(client *poolClient, request *http.Request) {
+ // (stream-up). Its response carries only the server's keep-alive padding.
+ func (s *session) startStreamUpload(client *poolClient, request *http.Request) {
+ 	go func() {
++		// the server ends its answer once it has read the upload to its end
++		defer s.writtenOnce.Do(func() { close(s.uploadWritten) })
+ 		response, err := client.roundTrip(request)
+ 		if err != nil {
+ 			s.fail(E.Cause(err, "xhttp: upload"))
+@@ -255,6 +286,9 @@ func (s *session) Read(b []byte) (int, error) {
+ 		return 0, s.ioError(err)
+ 	}
+ 	n, err := s.download.Read(b)
++	if n > 0 && s.unanswered.Load() {
++		s.unanswered.Store(false)
++	}
+ 	s.flowing = n == len(b)
+ 	if err != nil {
+ 		err = s.ioError(err)
+@@ -283,6 +317,9 @@ func (s *session) waitData() error {
+ 		s.probe = make([]byte, probeSize)
+ 	}
+ 	n, err := s.download.Read(s.probe)
++	if n > 0 && s.unanswered.Load() {
++		s.unanswered.Store(false)
++	}
+ 	s.pending = s.probe[:n]
+ 	s.pendingErr = err
+ 	s.flowing = n == len(s.probe)
+@@ -300,6 +337,9 @@ func (s *session) Write(b []byte) (int, error) {
+ 		n   int
+ 		err error
+ 	)
++	if !s.unanswered.Load() {
++		s.unanswered.Store(true)
++	}
+ 	if s.packetUpload != nil {
+ 		n, err = s.packetUpload.write(b)
+ 	} else {
+@@ -311,14 +351,90 @@ func (s *session) Write(b []byte) (int, error) {
+ 	return n, err
+ }
+ 
++// Close ends the session for its user at once, and the session itself once
++// the data written before has left: sing-box closes a connection as soon as
++// its source is done, and a request, a message or the last part of an upload
++// written just before that must still reach the server, as it does with Xray,
++// whose packet-up uploader and request bodies run to their end after a close.
+ func (s *session) Close() error {
+ 	if s.closed.Swap(true) {
+ 		return nil
+ 	}
+-	s.cancel()
++	// What the server has not answered since it was written may still be on
++	// its way to the destination: the server takes the end of the download
++	// for the end of the session. Such a session stays a moment after its
++	// upload is sent, as an outbound of Xray does after the end of an upload
++	// (a second, by Xray's default policy). A session whose last write was
++	// answered, the usual end of an exchange, has nothing to wait for.
++	unanswered := s.unanswered.Load()
++	var sent <-chan struct{}
++	switch {
++	case s.failure.Load() != nil:
++	case s.packetUpload != nil:
++		if !s.packetUpload.idle() {
++			sent = s.packetUpload.finish()
++		} else if unanswered {
++			sent = closedChannel
++		}
++	case s.streamUpload != nil:
++		// the end of the request body: the HTTP client writes what it holds
++		s.streamUpload.Close()
++		sent = s.uploadWritten
++	}
++	if sent == nil {
++		s.teardown()
++		return nil
++	}
++	if !unanswered {
++		select {
++		case <-sent:
++			s.teardown()
++			return nil
++		default:
++		}
++	}
++	go func() {
++		defer s.teardown()
++		timer := time.NewTimer(closeLinger)
++		defer timer.Stop()
++		select {
++		case <-sent:
++		case <-s.ctx.Done():
++			return
++		case <-timer.C:
++			return
++		}
++		if unanswered {
++			timer.Reset(closeGrace)
++			select {
++			case <-timer.C:
++			case <-s.ctx.Done():
++			}
++		}
++	}()
++	return nil
++}
++
++var closedChannel = func() chan struct{} {
++	channel := make(chan struct{})
++	close(channel)
++	return channel
++}()
++
++// teardown aborts the requests of the session and lets go of its connections.
++func (s *session) teardown() {
++	s.tearOnce.Do(s.doTeardown)
++}
++
++func (s *session) closeDownload() {
+ 	if !s.setDownload(nil, net.ErrClosed) && s.download != nil {
+ 		s.download.Close()
+ 	}
++}
++
++func (s *session) doTeardown() {
++	s.cancel()
++	s.closeDownload()
+ 	if s.streamBody != nil {
+ 		s.streamBody.CloseWithError(net.ErrClosed)
+ 	}
+@@ -335,7 +451,6 @@ func (s *session) Close() error {
+ 	for _, client := range clients {
+ 		client.release()
+ 	}
+-	return nil
+ }
+ 
+ func (s *session) LocalAddr() net.Addr {
+diff --git a/transport/v2rayxhttp/review_test.go b/transport/v2rayxhttp/review_test.go
+index b84b7669a..8aba1fff5 100644
+--- a/transport/v2rayxhttp/review_test.go
++++ b/transport/v2rayxhttp/review_test.go
+@@ -9,6 +9,7 @@ import (
+ 	"time"
+ 
+ 	"github.com/sagernet/sing-box/option"
++	F "github.com/sagernet/sing/common/format"
+ 	M "github.com/sagernet/sing/common/metadata"
+ 	N "github.com/sagernet/sing/common/network"
+ 
+@@ -70,11 +71,17 @@ func TestXHTTPConcurrencyCountsSessions(t *testing.T) {
+ 			for _, conn := range conns {
+ 				conn.Close()
+ 			}
+-			client.upPool.access.Lock()
+-			for _, pooled := range client.upPool.clients {
+-				require.Zero(t, pooled.sessions.Load())
+-			}
+-			client.upPool.access.Unlock()
++			// a closed session is gone once its upload has been sent to the end
++			require.Eventually(t, func() bool {
++				client.upPool.access.Lock()
++				defer client.upPool.access.Unlock()
++				for _, pooled := range client.upPool.clients {
++					if pooled.sessions.Load() != 0 {
++						return false
++					}
++				}
++				return true
++			}, 2*time.Second, 5*time.Millisecond)
+ 		})
+ 	}
+ }
+@@ -186,3 +193,51 @@ func TestXHTTPHeadersTooLarge(t *testing.T) {
+ 		})
+ 	}
+ }
++
++// What was written before a Close reaches the server: sing-box closes the
++// connection as soon as its source is done.
++func TestXHTTPWriteThenClose(t *testing.T) {
++	for _, version := range []string{"h2", "h1-tls"} {
++		for _, mode := range []string{modePacketUp, modeStreamUp, modeStreamOne} {
++			if mode == modeStreamOne && version != "h2" {
++				continue
++			}
++			for _, size := range []int{100, 5000, 300000} {
++				t.Run(F.ToString(version, "/", mode, "/", size), func(t *testing.T) {
++					client, server := newTestPair(t, option.V2RayXHTTPOptions{Mode: mode}, version, nil)
++					baseline := settledGoroutines()
++					const sessions = 10
++					for i := 0; i < sessions; i++ {
++						conn, err := client.DialContext(context.Background())
++						require.NoError(t, err)
++						_, err = conn.Write(randomBytes(size))
++						require.NoError(t, err)
++						require.NoError(t, conn.Close())
++						_, err = conn.Write([]byte{0})
++						require.ErrorIs(t, err, net.ErrClosed)
++					}
++					require.Eventually(t, func() bool { return server.received.Load() == int64(sessions*size) },
++						5*time.Second, 10*time.Millisecond, "the server got %d of %d bytes", server.received.Load(), sessions*size)
++					// and the closed sessions leave nothing behind, once the
++					// connections of the pool are closed too
++					client.Close()
++					waitGoroutines(t, baseline)
++				})
++			}
++		}
++	}
++}
++
++// A closed session whose data cannot be sent is gone after the linger at most,
++// and at once when it has failed.
++func TestXHTTPCloseDoesNotWaitForAFailedSession(t *testing.T) {
++	client, _ := newTestPair(t, option.V2RayXHTTPOptions{Mode: modePacketUp}, "h2", func(s *testServer) { s.abortUploads = true })
++	baseline := settledGoroutines()
++	conn, err := client.DialContext(context.Background())
++	require.NoError(t, err)
++	_, err = conn.Write(randomBytes(1000))
++	require.NoError(t, err)
++	require.NoError(t, conn.Close())
++	client.Close()
++	waitGoroutines(t, baseline)
++}
+diff --git a/transport/v2rayxhttp/server_test.go b/transport/v2rayxhttp/server_test.go
+index d4be858fd..d9af9f437 100644
+--- a/transport/v2rayxhttp/server_test.go
++++ b/transport/v2rayxhttp/server_test.go
+@@ -9,6 +9,7 @@ import (
+ 	"strconv"
+ 	"strings"
+ 	"sync"
++	"sync/atomic"
+ 	"testing"
+ 	"time"
+ )
+@@ -34,6 +35,8 @@ type testServer struct {
+ 	maxPacket int
+ 	// abortUploads resets every upload request (RST_STREAM on HTTP/2).
+ 	abortUploads bool
++	// received counts the upload bytes of all sessions.
++	received atomic.Int64
+ 
+ 	access   sync.Mutex
+ 	sessions map[string]*testSession
+@@ -282,6 +285,7 @@ func (s *testServer) serveHTTP(w http.ResponseWriter, r *http.Request) {
+ 			w.WriteHeader(http.StatusRequestHeaderFieldsTooLarge)
+ 			return
+ 		}
++		s.received.Add(int64(len(data)))
+ 		s.session(sessionID).pushPacket(number, data)
+ 		w.WriteHeader(http.StatusOK)
+ 	default:
+@@ -301,6 +305,7 @@ func (s *testServer) serveHTTP(w http.ResponseWriter, r *http.Request) {
+ 		for {
+ 			n, err := r.Body.Read(buffer)
+ 			if n > 0 {
++				s.received.Add(int64(n))
+ 				session.push(append([]byte(nil), buffer[:n]...))
+ 			}
+ 			if err != nil {
+@@ -352,13 +357,20 @@ func (s *testServer) serveStreamOne(w http.ResponseWriter, r *http.Request) {
+ 	w.WriteHeader(http.StatusOK)
+ 	w.(http.Flusher).Flush()
+ 	buffer := make([]byte, 32*1024)
++	// As with Xray, the upload is read to its end whatever becomes of the
++	// download: a client that is done reading may still be sending.
++	var downloadOver bool
+ 	for {
+ 		n, err := r.Body.Read(buffer)
+ 		if n > 0 {
+-			if _, writeErr := w.Write(buffer[:n]); writeErr != nil {
+-				return
++			s.received.Add(int64(n))
++			if !downloadOver {
++				if _, writeErr := w.Write(buffer[:n]); writeErr != nil {
++					downloadOver = true
++				} else {
++					w.(http.Flusher).Flush()
++				}
+ 			}
+-			w.(http.Flusher).Flush()
+ 		}
+ 		if err != nil {
+ 			return
+diff --git a/transport/v2rayxhttp/upload.go b/transport/v2rayxhttp/upload.go
+index e0495ec61..97cae29c6 100644
+--- a/transport/v2rayxhttp/upload.go
++++ b/transport/v2rayxhttp/upload.go
+@@ -2,10 +2,12 @@ package v2rayxhttp
+ 
+ import (
+ 	"context"
++	"net"
+ 	"net/http"
+ 	"net/http/httptrace"
+ 	"strconv"
+ 	"sync"
++	"sync/atomic"
+ 	"time"
+ 
+ 	E "github.com/sagernet/sing/common/exceptions"
+@@ -36,6 +38,14 @@ type uploader struct {
+ 	writable chan struct{}
+ 	done     chan struct{}
+ 	doneOnce sync.Once
++	// closing is closed by finish: the session is closed, what is pending is
++	// still sent. posts counts the requests on their way; finished is closed
++	// when the last of them is over.
++	closing     chan struct{}
++	closingOnce sync.Once
++	posts       sync.WaitGroup
++	inFlight    atomic.Int32
++	finished    chan struct{}
+ 
+ 	// current is the client the uploads go through until it runs out of its
+ 	// request budget; the uploader holds it (one running count).
+@@ -53,6 +63,8 @@ func newUploader(s *session, client *Client, sessionID string, current *poolClie
+ 		readable:  make(chan struct{}, 1),
+ 		writable:  make(chan struct{}, 1),
+ 		done:      make(chan struct{}),
++		closing:   make(chan struct{}),
++		finished:  make(chan struct{}),
+ 		current:   current,
+ 	}
+ }
+@@ -86,12 +98,34 @@ func (u *uploader) write(b []byte) (int, error) {
+ 		u.access.Unlock()
+ 		select {
+ 		case <-u.writable:
++		case <-u.closing:
+ 		case <-u.done:
+ 		}
+ 	}
+ 	return n, nil
+ }
+ 
++// idle tells that nothing written is waiting to be sent or to be answered.
++func (u *uploader) idle() bool {
++	u.access.Lock()
++	defer u.access.Unlock()
++	return len(u.pending) == 0 && u.inFlight.Load() == 0
++}
++
++// finish ends the uploader after a Close of its session: writes fail from then
++// on, and the returned channel is closed once the data taken before has been
++// sent and answered.
++func (u *uploader) finish() <-chan struct{} {
++	u.access.Lock()
++	if u.err == nil {
++		u.err = net.ErrClosed
++	}
++	u.access.Unlock()
++	u.closingOnce.Do(func() { close(u.closing) })
++	notify(u.writable)
++	return u.finished
++}
++
+ // interrupt stops the uploader: writes fail with err from then on.
+ func (u *uploader) interrupt(err error) {
+ 	u.access.Lock()
+@@ -108,24 +142,39 @@ func (u *uploader) run() {
+ 		if u.current != nil {
+ 			u.current.release()
+ 		}
++		u.posts.Wait()
++		close(u.finished)
+ 	}()
+ 	var (
+ 		seq      int64
+ 		lastPost time.Time
++		closing  bool
+ 	)
+ 	for {
+-		select {
+-		case <-u.readable:
+-		case <-u.done:
+-			return
++		if !closing {
++			select {
++			case <-u.readable:
++			case <-u.closing:
++				closing = true
++			case <-u.done:
++				return
++			}
+ 		}
+ 		u.access.Lock()
+ 		// The backlog never exceeds the request size, so all of it fits in one
+ 		// request and is handed over without a copy.
+ 		data := u.pending
+ 		u.pending = nil
++		if len(data) > 0 {
++			// counted from here on, under the lock: idle must not see the gap
++			// between the backlog and the request
++			u.inFlight.Add(1)
++		}
+ 		u.access.Unlock()
+ 		if len(data) == 0 {
++			if closing {
++				return
++			}
+ 			continue
+ 		}
+ 		notify(u.writable)
+@@ -137,6 +186,7 @@ func (u *uploader) run() {
+ 				case <-timer.C:
+ 				case <-u.done:
+ 					timer.Stop()
++					u.inFlight.Add(-1)
+ 					return
+ 				}
+ 			}
+@@ -144,10 +194,12 @@ func (u *uploader) run() {
+ 		lastPost = time.Now()
+ 		client, err := u.nextClient()
+ 		if err != nil {
++			u.inFlight.Add(-1)
+ 			u.session.fail(E.Cause(err, "xhttp: upload"))
+ 			return
+ 		}
+ 		wrote := make(chan struct{})
++		u.posts.Add(1)
+ 		go u.post(client, strconv.FormatInt(seq, 10), data, wrote)
+ 		seq++
+ 		// The next request goes once this one is written, not answered.
+@@ -186,6 +238,8 @@ func (u *uploader) nextClient() (*poolClient, error) {
+ }
+ 
+ func (u *uploader) post(client *poolClient, seq string, data []byte, wrote chan struct{}) {
++	defer u.posts.Done()
++	defer u.inFlight.Add(-1)
+ 	defer client.release()
+ 	var once sync.Once
+ 	written := func() { once.Do(func() { close(wrote) }) }
+-- 
+2.53.0
+

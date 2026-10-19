@@ -1,0 +1,62 @@
+From 651f44c0d5c46d081e4ce0083b661716e9b67917 Mon Sep 17 00:00:00 2001
+From: FiyeroT <me@fiyero.xyz>
+Date: Sat, 10 Oct 2026 20:48:31 +0300
+Subject: [PATCH 122/148] xhttp: the test of oversized upload headers no longer
+ races the server's settings
+
+TestXHTTPHeadersTooLarge wrote 16 KiB right after the dial and expected the
+HTTP/2 client to refuse the request for its size. The client can do that only
+once it has read the settings of the server, which carry the limit; a request
+encoded before that is sent, and a Go server ends the connection for a header
+block of more than twice its limit (GOAWAY, PROTOCOL_ERROR). The pool opens a
+connection for each of its first three sessions, so every round of the test
+ran that race, and lost it in most runs on the lab host.
+
+The upload now waits for the answer to the download, which comes on the same
+connection after the settings: the case the test is about, the limit known.
+---
+ transport/v2rayxhttp/review_test.go | 17 ++++++++++++++++-
+ 1 file changed, 16 insertions(+), 1 deletion(-)
+
+diff --git a/transport/v2rayxhttp/review_test.go b/transport/v2rayxhttp/review_test.go
+index 7feccc002..3d6bf13e7 100644
+--- a/transport/v2rayxhttp/review_test.go
++++ b/transport/v2rayxhttp/review_test.go
+@@ -156,6 +156,16 @@ func TestXHTTPCloseReachesRetiredClients(t *testing.T) {
+ // An upload whose headers are larger than the server takes fails its own
+ // session, with the setting named, and nothing else: the connection stays in
+ // service and other sessions of the outbound are not made to wait.
++//
++// The HTTP/2 client can refuse such a request only once it has read the
++// settings of the server, which carry the limit. Until then it sends the
++// request, and a Go server, Xray among them, answers a header block of more
++// than twice its limit by ending the connection (GOAWAY, PROTOCOL_ERROR). That
++// takes the first write of a session on a new connection to be over the limit,
++// and the pool opens a connection for each of its first three sessions: with a
++// write right after the dial it is a race, which this test lost in most runs.
++// So the upload here waits for the answer to the download: it comes on the
++// same connection after the settings.
+ func TestXHTTPHeadersTooLarge(t *testing.T) {
+ 	size := option.V2RayXHTTPRange{From: 16384, To: 16384}
+ 	options := option.V2RayXHTTPOptions{Mode: modePacketUp, V2RayXHTTPBaseOptions: option.V2RayXHTTPBaseOptions{
+@@ -176,11 +186,16 @@ func TestXHTTPHeadersTooLarge(t *testing.T) {
+ 			for round := 0; round < 3; round++ {
+ 				conn, err := client.DialContext(context.Background())
+ 				require.NoError(t, err, "round %d", round)
++				select {
++				case <-conn.(*session).downloadReady:
++				case <-time.After(5 * time.Second):
++					t.Fatal("no answer to the download, round ", round)
++				}
+ 				_, err = conn.Write(randomBytes(16384))
+ 				if err == nil {
+ 					_, err = conn.Read(make([]byte, 1))
+ 				}
+-				require.ErrorContains(t, err, "sc_max_each_post_bytes")
++				require.ErrorContains(t, err, "sc_max_each_post_bytes", "round %d", round)
+ 				conn.Close()
+ 			}
+ 			// small uploads of other sessions pass at once, through the same connection
+-- 
+2.53.0
+

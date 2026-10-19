@@ -1,0 +1,372 @@
+From 7a13b24228389bcd00731a7e9284a4e0128bbcb7 Mon Sep 17 00:00:00 2001
+From: FiyeroT <me@fiyero.xyz>
+Date: Thu, 8 Oct 2026 18:14:02 +0300
+Subject: [PATCH 102/148] decode-link: what the links of Marzban and Remnawave
+ showed
+
+The decoder was run over the links the generators of the two panels write for a matrix
+of inbounds (protocol, transport, security, header type, host settings, flow):
+
+- VMess of Marzban writes the gRPC mode into "type" only when there is one, "none"
+  otherwise, and an IPv6 address in brackets: both were refused or kept;
+- Hysteria 2 of Remnawave carries the obfuscation, the port hopping and the speeds in
+  fm (the finalmask of Xray): they are read from there when the link does not say them
+  itself;
+- ech as a name and a resolver joined with "+" read as two links glued together,
+  the "+" being a space after form decoding;
+- the HTTP header of the TCP transport has a list of paths: the first is taken;
+- x_padding_bytes of an xhttp link got a warning although it is read;
+- fragment and noise, the client's own settings a panel writes into a link, get a
+  warning that says so; the WebSocket heartbeat of Xray's client gets none;
+- the parameters of TLS in a link without TLS get no warning: the generators write
+  them anyway;
+- the gRPC authority gets its warning only when it is not what sing-box sends, the
+  server name of TLS, and the warning says what follows.
+---
+ common/sharelink/link.go         |  4 ++
+ common/sharelink/link_test.go    |  3 +-
+ common/sharelink/policy_test.go  | 31 ++++++++++++++
+ common/sharelink/quic.go         | 70 +++++++++++++++++++++++++++++++-
+ common/sharelink/schemes_test.go | 14 +++++++
+ common/sharelink/tls.go          | 10 +++--
+ common/sharelink/transport.go    | 37 ++++++++++++++---
+ common/sharelink/vmess.go        |  8 +++-
+ 8 files changed, 164 insertions(+), 13 deletions(-)
+
+diff --git a/common/sharelink/link.go b/common/sharelink/link.go
+index a9c394e76..7ad77f4d0 100644
+--- a/common/sharelink/link.go
++++ b/common/sharelink/link.go
+@@ -186,6 +186,10 @@ func (d *decoder) split(rest string) error {
+ 	// The same for a link after the last parameter: its user would end up in
+ 	// that parameter, and in an error message about it.
+ 	for key, value := range d.query {
++		if key == "ech" {
++			// a name and a resolver joined with "+", which form decoding reads as a space
++			continue
++		}
+ 		if strings.Contains(value, "://") && strings.ContainsAny(value, " \t\r\n") {
+ 			return E.New("the link parameter ", d.names[key], " contains a space and another link")
+ 		}
+diff --git a/common/sharelink/link_test.go b/common/sharelink/link_test.go
+index 2c1eb0bed..b8a1b80c4 100644
+--- a/common/sharelink/link_test.go
++++ b/common/sharelink/link_test.go
+@@ -334,7 +334,8 @@ func TestFoundInTheWild(t *testing.T) {
+ 	}
+ 
+ 	_, warnings := decodeJSON(t, base+"type=xhttp&mux=1&pinSHA256=x&spx=%2F&extra="+url.QueryEscape(`{"xmux":{"cMaxLifetimeMs":5,"maxConnections":1}}`))
+-	require.Equal(t, []string{"extra.xmux: cMaxLifetimeMs is not supported and is ignored", "mux is not supported and is ignored", "pinSHA256 is not supported and is ignored"}, warnings)
++	// pinSHA256 belongs to TLS, which this link does not have: nothing to warn of
++	require.Equal(t, []string{"extra.xmux: cMaxLifetimeMs is not supported and is ignored", "mux is not supported and is ignored"}, warnings)
+ 
+ 	for name, link := range map[string]string{
+ 		"flat range":      base + "type=xhttp&xPaddingBytes=a-b",
+diff --git a/common/sharelink/policy_test.go b/common/sharelink/policy_test.go
+index 568d0cdfd..11da7166e 100644
+--- a/common/sharelink/policy_test.go
++++ b/common/sharelink/policy_test.go
+@@ -186,6 +186,37 @@ func TestLeniencies(t *testing.T) {
+ 			"ech":{"enabled":true,"query_server_name":"ech.example.org"}}}`,
+ 			[]string{"the resolver named in ech is not used"},
+ 		},
++		"ECH from DNS, with the plus of the link read as a space": {
++			policyBase + "security=tls&ech=ech.example.org+https%3A%2F%2F1.1.1.1%2Fdns-query",
++			`{"type":"vless","server":"example.org","server_port":443,"uuid":"` + testUUID + `","tls":{"enabled":true,"utls":{"enabled":true,"fingerprint":"chrome"},
++			"ech":{"enabled":true,"query_server_name":"ech.example.org"}}}`,
++			[]string{"the resolver named in ech is not used"},
++		},
++		"the parameters of TLS without TLS, the settings of the client of Xray": {
++			policyBase + "security=none&sni=s.example.org&fp=chrome&alpn=h2&allowInsecure=1&heartbeatPeriod=30&fragment=100-200%2C10-20%2Ctlshello&noise=rand",
++			`{"type":"vless","server":"example.org","server_port":443,"uuid":"` + testUUID + `"}`,
++			[]string{"fragment is a setting of the client of Xray and is not applied", "noise is a setting of the client of Xray and is not applied"},
++		},
++		"the padding of 3x-ui outside of extra": {
++			policyBase + "type=xhttp&x_padding_bytes=200-300",
++			`{"type":"vless","server":"example.org","server_port":443,"uuid":"` + testUUID + `","transport":{"type":"xhttp","x_padding_bytes":"200-300"}}`,
++			nil,
++		},
++		"the HTTP header of TCP with a list of paths": {
++			policyBase + "type=tcp&headerType=http&host=a.example.org&path=%2Fa%2C%2Fb",
++			`{"type":"vless","server":"example.org","server_port":443,"uuid":"` + testUUID + `","transport":{"type":"http","host":"a.example.org","path":"/a"}}`,
++			nil,
++		},
++		"a gRPC authority that is the server name of TLS": {
++			policyBase + "security=tls&sni=s.example.org&type=grpc&serviceName=svc&authority=S.example.org",
++			`{"type":"vless","server":"example.org","server_port":443,"uuid":"` + testUUID + `","tls":{"enabled":true,"server_name":"s.example.org","utls":{"enabled":true,"fingerprint":"chrome"}},"transport":{"type":"grpc","service_name":"svc"}}`,
++			nil,
++		},
++		"a gRPC authority of its own": {
++			policyBase + "security=tls&sni=s.example.org&type=grpc&serviceName=svc&authority=cdn.example.org",
++			`{"type":"vless","server":"example.org","server_port":443,"uuid":"` + testUUID + `","tls":{"enabled":true,"server_name":"s.example.org","utls":{"enabled":true,"fingerprint":"chrome"}},"transport":{"type":"grpc","service_name":"svc"}}`,
++			[]string{"the gRPC authority is not supported: the server name of TLS is sent instead"},
++		},
+ 		"no SNI and a certificate to trust": {
+ 			policyBase + "security=tls&disable_sni=1&cert=-----BEGIN%20CERTIFICATE-----%0AMIIB%0A-----END%20CERTIFICATE-----",
+ 			`{"type":"vless","server":"example.org","server_port":443,"uuid":"` + testUUID + `","tls":{"enabled":true,"disable_sni":true,
+diff --git a/common/sharelink/quic.go b/common/sharelink/quic.go
+index 86a933c53..543108618 100644
+--- a/common/sharelink/quic.go
++++ b/common/sharelink/quic.go
+@@ -6,6 +6,7 @@ import (
+ 
+ 	"github.com/sagernet/sing-box/option"
+ 	E "github.com/sagernet/sing/common/exceptions"
++	"github.com/sagernet/sing/common/json"
+ 	"github.com/sagernet/sing/common/json/badoption"
+ )
+ 
+@@ -86,7 +87,7 @@ func hopPorts(body string) (string, string) {
+ // hysteria2 reads a Hysteria 2 link, as its project defines it:
+ // "hysteria2://[auth@]host[:ports]/?parameters#name", also as "hy2://".
+ func (d *decoder) hysteria2() (any, error) {
+-	d.reads("obfs", "obfs-password", "mport", "up", "down", "upmbps", "downmbps")
++	d.reads("obfs", "obfs-password", "mport", "up", "down", "upmbps", "downmbps", "fm")
+ 	body, ports := hopPorts(d.body)
+ 	user, _, server, _, err := parseAuthority(body, 443)
+ 	if err != nil {
+@@ -111,10 +112,77 @@ func (d *decoder) hysteria2() (any, error) {
+ 	if obfs := strings.ToLower(d.query["obfs"]); obfs != "" && obfs != "none" && obfs != "plain" {
+ 		options.Obfs = &option.Hysteria2Obfs{Type: obfs, Password: d.query["obfs-password"]}
+ 	}
++	err = d.hysteria2Mask(&options)
++	if err != nil {
++		return nil, err
++	}
+ 	options.TLS = d.tlsAlways()
+ 	return options, nil
+ }
+ 
++// hysteria2Mask reads "fm", the finalmask of Xray, in a Hysteria 2 link: Remnawave writes
++// the obfuscation, the port hopping and the speeds of its Hysteria inbounds there.
++func (d *decoder) hysteria2Mask(options *option.Hysteria2OutboundOptions) error {
++	content := strings.TrimSpace(d.query["fm"])
++	if content == "" {
++		return nil
++	}
++	var mask struct {
++		UDP []struct {
++			Type     string `json:"type"`
++			Settings struct {
++				Password string `json:"password"`
++			} `json:"settings"`
++		} `json:"udp"`
++		QUIC struct {
++			BrutalUp   vmessText `json:"brutalUp"`
++			BrutalDown vmessText `json:"brutalDown"`
++			UDPHop     struct {
++				Ports    vmessText `json:"ports"`
++				Interval vmessText `json:"interval"`
++			} `json:"udpHop"`
++		} `json:"quicParams"`
++	}
++	err := json.Unmarshal([]byte(content), &mask)
++	if err != nil {
++		d.warn("fm (finalmask) cannot be read and is ignored")
++		return nil
++	}
++	for _, entry := range mask.UDP {
++		switch strings.ToLower(entry.Type) {
++		case "salamander":
++			if options.Obfs == nil {
++				options.Obfs = &option.Hysteria2Obfs{Type: "salamander", Password: entry.Settings.Password}
++			}
++		case "noise":
++		default:
++			return refuse("finalmask", "fm (finalmask) asks for the mask", shown(entry.Type), ", which is not supported: the server expects it")
++		}
++	}
++	if ports := string(mask.QUIC.UDPHop.Ports); ports != "" && len(options.ServerPorts) == 0 {
++		ranges, err := portRanges(ports)
++		if err != nil {
++			return err
++		}
++		options.ServerPorts = badoption.Listable[string](ranges)
++		// seconds; a range of them is how often Xray hops, between the two
++		interval, _, _ := strings.Cut(string(mask.QUIC.UDPHop.Interval), "-")
++		if seconds, err := strconv.Atoi(strings.TrimSpace(interval)); err == nil && seconds > 0 {
++			err = options.HopInterval.UnmarshalJSON([]byte(strconv.Quote(strconv.Itoa(seconds) + "s")))
++			if err != nil {
++				return E.New("invalid hop interval in fm")
++			}
++		}
++	}
++	if options.UpMbps == 0 {
++		options.UpMbps = megabits(string(mask.QUIC.BrutalUp))
++	}
++	if options.DownMbps == 0 {
++		options.DownMbps = megabits(string(mask.QUIC.BrutalDown))
++	}
++	return nil
++}
++
+ // hysteria reads a link of the first Hysteria:
+ // "hysteria://host:port?protocol=udp&auth=...&peer=...&upmbps=...&downmbps=...#name".
+ func (d *decoder) hysteria() (any, error) {
+diff --git a/common/sharelink/schemes_test.go b/common/sharelink/schemes_test.go
+index 18702ea0d..0caa1f779 100644
+--- a/common/sharelink/schemes_test.go
++++ b/common/sharelink/schemes_test.go
+@@ -86,6 +86,19 @@ func TestSchemes(t *testing.T) {
+ 			"hysteria2://p@[2001:db8::1]:443?mport=20000-30000",
+ 			`{"type":"hysteria2","server":"2001:db8::1","server_port":443,"server_ports":"20000:30000","password":"p","tls":{"enabled":true}}`, nil,
+ 		},
++		"hysteria2 of Remnawave: obfuscation, port hopping and speeds in fm": {
++			"hysteria2://p@example.com:443/?sni=s.example.com&fm=" + uriComponent(`{"udp":[{"type":"salamander","settings":{"password":"obfs pass"}},{"type":"noise"}],"quicParams":{"brutalUp":"50 mbps","brutalDown":200,"udpHop":{"ports":"20000-30000,40000","interval":"10-30"}}}`),
++			`{"type":"hysteria2","server":"example.com","server_port":443,"server_ports":["20000:30000","40000:40000"],"hop_interval":"10s","up_mbps":50,"down_mbps":200,
++			"obfs":{"type":"salamander","password":"obfs pass"},"password":"p","tls":{"enabled":true,"server_name":"s.example.com"}}`, nil,
++		},
++		"hysteria2 with fm that says what the link says already": {
++			"hysteria2://p@example.com:443/?obfs=salamander&obfs-password=link&mport=5000-6000&fm=" + uriComponent(`{"udp":[{"type":"salamander","settings":{"password":"mask"}}],"quicParams":{"udpHop":{"ports":"1-2"}}}`),
++			`{"type":"hysteria2","server":"example.com","server_port":443,"server_ports":"5000:6000","obfs":{"type":"salamander","password":"link"},"password":"p","tls":{"enabled":true}}`, nil,
++		},
++		"vmess of Marzban: gRPC with type none, an IPv6 address in brackets": {
++			"vmess://" + b64(`{"add": "[2001:db8::10]", "aid": "0", "host": "", "id": "`+testUUID+`", "net": "grpc", "path": "svc", "port": 443, "ps": "m", "scy": "auto", "tls": "tls", "type": "none", "v": "2"}`),
++			`{"type":"vmess","tag":"m","server":"2001:db8::10","server_port":443,"uuid":"` + testUUID + `","security":"auto","tls":{"enabled":true,"utls":{"enabled":true,"fingerprint":"chrome"}},"transport":{"type":"grpc","service_name":"svc"}}`, nil,
++		},
+ 		"tuic": {
+ 			"tuic://" + testUUID + ":pass%3Aword@example.org:443?congestion_control=bbr&udp_relay_mode=native&alpn=h3&sni=s.example.org&allow_insecure=1&disable_sni=1&reduce_rtt=1&heartbeat_interval=10#t",
+ 			`{"type":"tuic","tag":"t","server":"example.org","server_port":443,"uuid":"` + testUUID + `","password":"pass:word","congestion_control":"bbr","udp_relay_mode":"native",
+@@ -165,6 +178,7 @@ func TestSchemeRefusals(t *testing.T) {
+ 		"tuic://token@example.org:443":              "tuic-v4",
+ 		"vmess://" + b64(`{"add":"h","port":1,"id":"`+testUUID+`","net":"kcp","type":"none","path":"seed"}`):        "kcp",
+ 		"vmess://" + b64(`{"add":"h","port":1,"id":"`+testUUID+`","net":"quic","host":"aes-128-gcm","path":"key"}`): "quic-security",
++		"hysteria2://p@example.org?fm=" + uriComponent(`{"udp":[{"type":"xdns"}]}`):                                 "finalmask",
+ 	} {
+ 		require.Equal(t, id, refusalID(t, link), link)
+ 	}
+diff --git a/common/sharelink/tls.go b/common/sharelink/tls.go
+index ea51a72a6..79335ace9 100644
+--- a/common/sharelink/tls.go
++++ b/common/sharelink/tls.go
+@@ -101,7 +101,8 @@ func (d *decoder) tlsCommon(tlsOptions *option.OutboundTLSOptions) {
+ // ech reads the "ech" of a link: the ECH configuration list in base64 or, as Xray takes
+ // it, where to ask for it: a resolver, or a name and a resolver joined with "+".
+ func (d *decoder) ech() *option.OutboundECHOptions {
+-	value := strings.TrimSpace(d.query["ech"])
++	// form decoding has made a space of every "+"
++	value := strings.ReplaceAll(strings.TrimSpace(d.query["ech"]), " ", "+")
+ 	if value == "" {
+ 		return nil
+ 	}
+@@ -113,8 +114,6 @@ func (d *decoder) ech() *option.OutboundECHOptions {
+ 		d.warn("the resolver named in ech is not used: the ECH configuration is asked from the DNS of sing-box")
+ 		return echOptions
+ 	}
+-	// form decoding has made a space of every "+"
+-	value = strings.ReplaceAll(value, " ", "+")
+ 	var list []byte
+ 	for _, encoding := range []*base64.Encoding{base64.StdEncoding, base64.RawStdEncoding, base64.URLEncoding, base64.RawURLEncoding} {
+ 		decoded, err := encoding.DecodeString(value)
+@@ -140,7 +139,10 @@ func (d *decoder) ech() *option.OutboundECHOptions {
+ // security reads the TLS of a link of the VLESS family (the proposal of Xray-core
+ // discussion #716): "security" chooses none, TLS or REALITY.
+ func (d *decoder) security(defaultSecurity string) (*option.OutboundTLSOptions, error) {
+-	d.reads("security", "fp", "pbk", "sid", "pqv", "spx", "spiderx")
++	// also the ones a link without TLS carries along: the generators write them anyway
++	d.reads("security", "fp", "pbk", "sid", "pqv", "spx", "spiderx",
++		"sni", "servername", "peer", "allowinsecure", "allow_insecure", "insecure", "skip-cert-verify",
++		"alpn", "disable_sni", "nosni", "cert", "ech", "pcs", "pinsha256", "vcn", "cs")
+ 	security := strings.ToLower(d.query["security"])
+ 	if security == "" {
+ 		security = defaultSecurity
+diff --git a/common/sharelink/transport.go b/common/sharelink/transport.go
+index 114c30620..0f96b203c 100644
+--- a/common/sharelink/transport.go
++++ b/common/sharelink/transport.go
+@@ -21,6 +21,18 @@ var knownKeys = make(map[string]bool)
+ // server expects it.
+ var localMasks = map[string]bool{"fragment": true, "noise": true}
+ 
++// clientSide warns of the settings of Xray's client that a panel writes into a link: how
++// it fragments and pads its own packets. The server is reached without them.
++func (d *decoder) clientSide() {
++	d.reads("fragment", "noise", "noises")
++	if d.query["fragment"] != "" {
++		d.warn("fragment is a setting of the client of Xray and is not applied (sb.tls.fragment=1 turns on the fragmenting of sing-box)")
++	}
++	if d.first("noise", "noises") != "" {
++		d.warn("noise is a setting of the client of Xray and is not applied")
++	}
++}
++
+ // finalMask reads "fm", the finalmask object of Xray.
+ func (d *decoder) finalMask() error {
+ 	d.reads("fm")
+@@ -53,8 +65,11 @@ func (d *decoder) finalMask() error {
+ // transport reads the transport of a link of the VLESS family. tls tells whether the
+ // link has TLS, and serverName the name it is asked by.
+ func (d *decoder) transport(tlsOptions *option.OutboundTLSOptions) (*option.V2RayTransportOptions, error) {
+-	d.reads("type", "host", "path", "mode", "xhttpmode", "extra", "headertype", "servicename", "authority", "ed", "eh", "method",
+-		"seed", "mtu", "tti", "quicsecurity", "key")
++	d.reads("type", "host", "path", "mode", "xhttpmode", "extra", "x_padding_bytes", "headertype", "servicename", "authority",
++		"ed", "eh", "method", "seed", "mtu", "tti", "quicsecurity", "key",
++		// how often the client of Xray pings over WebSocket: its own business
++		"heartbeatperiod")
++	d.clientSide()
+ 	network := strings.ToLower(d.query["type"])
+ 	if tlsOptions != nil && tlsOptions.Reality != nil {
+ 		switch network {
+@@ -78,9 +93,14 @@ func (d *decoder) transport(tlsOptions *option.OutboundTLSOptions) (*option.V2Ra
+ 			if tlsOptions != nil {
+ 				return nil, refuse("tcp-http-header-tls", "the HTTP header of the TCP transport (headerType=http) is not supported together with TLS")
+ 			}
++			// Xray takes a list of paths and asks for one of them at random
++			path := d.query["path"]
++			if paths := splitList(path); len(paths) > 1 {
++				path = paths[0]
++			}
+ 			return &option.V2RayTransportOptions{
+ 				Type:        C.V2RayTransportTypeHTTP,
+-				HTTPOptions: option.V2RayHTTPOptions{Host: splitList(d.query["host"]), Path: d.query["path"]},
++				HTTPOptions: option.V2RayHTTPOptions{Host: splitList(d.query["host"]), Path: path},
+ 			}, nil
+ 		default:
+ 			return nil, refuse("tcp-header", "unsupported header type of the TCP transport", shown(headerType))
+@@ -129,8 +149,15 @@ func (d *decoder) transport(tlsOptions *option.OutboundTLSOptions) (*option.V2Ra
+ 			// the server answers both kinds of stream under the usual names
+ 			d.warn("the gRPC mode multi is not supported, gun is used")
+ 		}
+-		if d.query["authority"] != "" {
+-			d.warn("the gRPC authority is not supported and is ignored")
++		// sing-box sends the server name of TLS, or the address of the server, there
++		if authority := d.query["authority"]; authority != "" {
++			sent := ""
++			if tlsOptions != nil {
++				sent = tlsOptions.ServerName
++			}
++			if !strings.EqualFold(authority, sent) {
++				d.warn("the gRPC authority is not supported: the server name of TLS is sent instead, and a reverse proxy that chooses the server by the authority may not find it")
++			}
+ 		}
+ 		return &option.V2RayTransportOptions{
+ 			Type:        C.V2RayTransportTypeGRPC,
+diff --git a/common/sharelink/vmess.go b/common/sharelink/vmess.go
+index 8f6de0cc4..634ad7ec6 100644
+--- a/common/sharelink/vmess.go
++++ b/common/sharelink/vmess.go
+@@ -110,7 +110,9 @@ func (d *decoder) vmess() (any, error) {
+ 	case "grpc":
+ 		// the service name is in "path", the mode in "type"
+ 		d.query["servicename"] = d.query["path"]
+-		d.query["mode"] = string(link.HeaderType)
++		if mode := strings.ToLower(string(link.HeaderType)); mode == "gun" || mode == "multi" {
++			d.query["mode"] = mode
++		}
+ 		delete(d.query, "path")
+ 	case "kcp", "mkcp":
+ 	case "quic":
+@@ -129,7 +131,9 @@ func (d *decoder) vmess() (any, error) {
+ 		d.names[key] = key
+ 	}
+ 	alterID, _ := strconv.Atoi(string(link.AlterID))
+-	return d.vmessOptions(string(link.ID), option.ServerOptions{Server: string(link.Address), ServerPort: uint16(port)}, alterID)
++	// some generators write an IPv6 address in brackets here too
++	address := strings.TrimSuffix(strings.TrimPrefix(string(link.Address), "["), "]")
++	return d.vmessOptions(string(link.ID), option.ServerOptions{Server: address, ServerPort: uint16(port)}, alterID)
+ }
+ 
+ func (d *decoder) vmessURL() (any, error) {
+-- 
+2.53.0
+

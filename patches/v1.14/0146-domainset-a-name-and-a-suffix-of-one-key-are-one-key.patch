@@ -1,0 +1,246 @@
+From 810ae65f222b68563f74788076bf5d165b9b6fc0 Mon Sep 17 00:00:00 2001
+From: FiyeroT <me@fiyero.xyz>
+Date: Mon, 19 Oct 2026 21:19:17 +0300
+Subject: [PATCH 146/148] domainset: a name and a suffix of one key are one
+ key, as in sing v0.9.7
+
+sing v0.9.7 (sing-box 1.14.3) compacts the sorted keys of domain.NewMatcher:
+a name and a suffix that make the same key (a name that begins with "\n" or
+"\r", as no domain does) are one key now, where sing used to stop the
+process. The trie builds them the same way instead of refusing them, and so
+does the build of sorted keys (the legacy way of rule sets of version 1, a
+list with a name that is not valid UTF-8), which read past the end of the
+second copy.
+
+That build refuses an empty suffix now, as the trie does where sing stops
+the process; so does NewSet before it hands a list with a name that is not
+valid UTF-8 to sing.
+---
+ common/domainset/collector.go      |  8 +---
+ common/domainset/domainset.go      | 10 +++--
+ common/domainset/domainset_test.go | 69 ++++++++++++++++++++++--------
+ common/domainset/legacy.go         | 20 ++++++---
+ common/domainset/trie.go           |  5 +--
+ 5 files changed, 77 insertions(+), 35 deletions(-)
+
+diff --git a/common/domainset/collector.go b/common/domainset/collector.go
+index 8b6130641..d4d7eb4b5 100644
+--- a/common/domainset/collector.go
++++ b/common/domainset/collector.go
+@@ -31,12 +31,8 @@ var (
+ 	// ErrEmptySuffix is an empty name in a list of suffixes: sing has no key for it (its
+ 	// domain.NewMatcher stops the process with an index out of range).
+ 	ErrEmptySuffix = E.New("an empty domain suffix")
+-	// errSameKey is a name and a suffix that make the same key: a name that begins with
+-	// "\n" or "\r" and a suffix without it. sing's trie cannot hold one key twice (its
+-	// domain.NewMatcher stops the process with an index out of range).
+-	errSameKey = E.New("a domain and a domain suffix that make the same key")
+-	errTooLong = E.New("a list of domains too long to build")
+-	errNotUTF8 = E.New("a domain that is not valid UTF-8")
++	errTooLong     = E.New("a list of domains too long to build")
++	errNotUTF8     = E.New("a domain that is not valid UTF-8")
+ )
+ 
+ // ref is a key of the trie: a name of length bytes at offset in one of the buffers of the
+diff --git a/common/domainset/domainset.go b/common/domainset/domainset.go
+index 7cf17e0a5..a7ef77f7a 100644
+--- a/common/domainset/domainset.go
++++ b/common/domainset/domainset.go
+@@ -8,8 +8,7 @@
+ //   - What it builds is what sing-box builds of the same input: the same matcher, byte for
+ //     byte, and the same rules around it. Input it cannot read so is left to the code of
+ //     sing-box (ReadSource), or refused with the reason (NewMatcher): it never guesses.
+-//     Where sing stops the process (an empty suffix, a name and a suffix of the same key)
+-//     it gives an error instead.
++//     Where sing stops the process (an empty suffix) it gives an error instead.
+ //   - A name is not copied: a key of the trie is where the name is in the text it was
+ //     read from, read from its end. Only a name written with escapes, or not ASCII, is
+ //     copied, once.
+@@ -28,6 +27,7 @@
+ package domainset
+ 
+ import (
++	"slices"
+ 	"strings"
+ 	"unicode/utf8"
+ 
+@@ -46,6 +46,10 @@ type Matcher interface {
+ // around them.
+ func NewSet(domains []string, domainSuffix []string) (Matcher, error) {
+ 	if !validNames(domains, domainSuffix) {
++		// an empty suffix stops sing's build
++		if slices.Contains(domainSuffix, "") {
++			return nil, ErrEmptySuffix
++		}
+ 		return domain.NewMatcher(domains, domainSuffix, false), nil
+ 	}
+ 	collector, err := collect(domains, domainSuffix)
+@@ -87,7 +91,7 @@ func Describe(domains []string, domainCount int, domainSuffix []string, domainSu
+ // writes it, the form a rule set in the binary format carries.
+ func Encode(domains []string, domainSuffix []string, generateLegacy bool) ([]byte, error) {
+ 	if generateLegacy || !validNames(domains, domainSuffix) {
+-		return encodeSorted(domains, domainSuffix, generateLegacy), nil
++		return encodeSorted(domains, domainSuffix, generateLegacy)
+ 	}
+ 	collector, err := collect(domains, domainSuffix)
+ 	if err != nil {
+diff --git a/common/domainset/domainset_test.go b/common/domainset/domainset_test.go
+index 45ded88bc..117f941bb 100644
+--- a/common/domainset/domainset_test.go
++++ b/common/domainset/domainset_test.go
+@@ -88,7 +88,8 @@ func TestSameAsSing(t *testing.T) {
+ 
+ // Names sing takes that a list of a rule set hardly has: empty, in capitals, with the
+ // labels of the trie inside them, of one byte, a name that is a suffix of another in
+-// every way; and names that are not valid UTF-8, which go the way sing builds them.
++// every way; and names that are not valid UTF-8, which go the way sing builds them. The
++// random lists go every way: with a name that is not valid UTF-8 or not, legacy or not.
+ func TestSameAsSingOddNames(t *testing.T) {
+ 	for _, lists := range [][2][]string{
+ 		{{""}, nil},
+@@ -121,23 +122,35 @@ func TestSameAsSingOddNames(t *testing.T) {
+ 		if len(lists[0])+len(lists[1]) == 0 {
+ 			continue
+ 		}
+-		var want []byte
+-		func() {
+-			defer func() {
+-				if recover() != nil {
+-					want = nil
++		// a name that is not valid UTF-8 takes the list to the build of sorted keys, as
++		// the legacy way does (two bytes before the bad one: sing's reverse of a name puts
++		// U+FFFD, three bytes, where that byte goes and needs room for it)
++		odd := append(append([]string(nil), lists[0]...), "ab\xffcd")
++		for _, domains := range [][]string{lists[0], odd} {
++			for _, legacy := range []bool{false, true} {
++				var want []byte
++				func() {
++					defer func() {
++						if recover() != nil {
++							want = nil
++						}
++					}()
++					want = singBytes(t, domains, lists[1], legacy)
++				}()
++				encoded, err := Encode(domains, lists[1], legacy)
++				if want == nil {
++					// sing stops the process: an empty suffix
++					require.Error(t, err, "%q %q legacy %v", domains, lists[1], legacy)
++				} else {
++					require.NoError(t, err, "%q %q legacy %v", domains, lists[1], legacy)
++					require.Equal(t, want, encoded, "%q %q legacy %v", domains, lists[1], legacy)
+ 				}
+-			}()
+-			want = singBytes(t, lists[0], lists[1], false)
+-		}()
+-		encoded, err := Encode(lists[0], lists[1], false)
+-		if want == nil {
+-			// sing stops the process: an empty suffix, a name and a suffix of one key
+-			require.Error(t, err, "%q", lists)
+-			continue
++				if !legacy {
++					_, err = NewSet(domains, lists[1])
++					require.Equal(t, want == nil, err != nil, "%q %q", domains, lists[1])
++				}
++			}
+ 		}
+-		require.NoError(t, err, "%q", lists)
+-		require.Equal(t, want, encoded, "%q", lists)
+ 	}
+ }
+ 
+@@ -145,8 +158,28 @@ func TestSameAsSingOddNames(t *testing.T) {
+ func TestRefused(t *testing.T) {
+ 	_, err := NewSet(nil, []string{"a", ""})
+ 	require.ErrorIs(t, err, ErrEmptySuffix)
+-	_, err = NewSet([]string{"\na"}, []string{"a"})
+-	require.ErrorIs(t, err, errSameKey)
++	_, err = NewSet([]string{"ab\xffcd"}, []string{"a", ""})
++	require.ErrorIs(t, err, ErrEmptySuffix)
++	_, err = Encode(nil, []string{"a", ""}, true)
++	require.ErrorIs(t, err, ErrEmptySuffix)
++}
++
++// A name and a suffix that make the same key are one key, as in sing since v0.9.7: in the
++// trie of Collector, and in the build of sorted keys (the legacy way, a name that is not
++// valid UTF-8).
++func TestSameKey(t *testing.T) {
++	for _, item := range []struct {
++		domains, domainSuffix []string
++		legacy                bool
++	}{
++		{[]string{"\na"}, []string{"a"}, false},
++		{[]string{"\r.a"}, []string{"a"}, true},
++		{[]string{"\na", "ab\xffcd"}, []string{"a"}, false},
++	} {
++		encoded, err := Encode(item.domains, item.domainSuffix, item.legacy)
++		require.NoError(t, err, "%q", item)
++		require.Equal(t, singBytes(t, item.domains, item.domainSuffix, item.legacy), encoded, "%q", item)
++	}
+ }
+ 
+ // What a list of 100000 names of no pattern costs to build: here and in sing.
+diff --git a/common/domainset/legacy.go b/common/domainset/legacy.go
+index 40448f46e..1d06b73e3 100644
+--- a/common/domainset/legacy.go
++++ b/common/domainset/legacy.go
+@@ -20,17 +20,25 @@ const (
+ // map and sorted: for the legacy way of rule sets of version 1 (a suffix is two keys,
+ // one of them for a name that is not in the list) and for names that are not valid UTF-8.
+ // Only the walk of the trie is the lean one of Collector.build, one level at a time.
+-func encodeSorted(domains []string, domainSuffix []string, generateLegacy bool) []byte {
+-	return buildSorted(keys(domains, domainSuffix, generateLegacy))
++func encodeSorted(domains []string, domainSuffix []string, generateLegacy bool) ([]byte, error) {
++	list, err := keys(domains, domainSuffix, generateLegacy)
++	if err != nil {
++		return nil, err
++	}
++	return buildSorted(list), nil
+ }
+ 
+ // keys are the keys of the trie, as domain.NewMatcher makes them: a name reversed, with a
+ // label for how it matches, each once, in order. A name of domains that is a suffix too is
+-// the suffix only, as there.
+-func keys(domains []string, domainSuffix []string, generateLegacy bool) []string {
++// the suffix only, as there, and a name and a suffix that make the same key are one key.
++// An empty suffix, which stops the process there, is an error.
++func keys(domains []string, domainSuffix []string, generateLegacy bool) ([]string, error) {
+ 	seen := make(map[string]bool, len(domainSuffix)+len(domains))
+ 	list := make([]string, 0, len(domains)+len(domainSuffix))
+ 	for _, name := range domainSuffix {
++		if name == "" {
++			return nil, ErrEmptySuffix
++		}
+ 		if seen[name] {
+ 			continue
+ 		}
+@@ -59,7 +67,9 @@ func keys(domains []string, domainSuffix []string, generateLegacy bool) []string
+ 	// the map is no longer needed: a big list should not keep it while the trie is built
+ 	seen = nil
+ 	slices.Sort(list)
+-	return list
++	// a name that begins with "\n" or "\r" can make the key of a suffix: sing keeps it once
++	// (slices.Compact since v0.9.7), and buildSorted cannot hold it twice
++	return slices.Compact(list), nil
+ }
+ 
+ // reverse is reverseDomain of sing: the runes in the other order.
+diff --git a/common/domainset/trie.go b/common/domainset/trie.go
+index 9a8ebd621..a61c6e571 100644
+--- a/common/domainset/trie.go
++++ b/common/domainset/trie.go
+@@ -195,9 +195,8 @@ func (c *Collector) build() (trie, error) {
+ 				}
+ 				out = int(place)
+ 			}
+-			if enderDomain && enderSuffix {
+-				return trie{}, errSameKey
+-			}
++			// a name and a suffix that make the same key (a name that begins with "\n" or
++			// "\r") are one key, as sing makes them (slices.Compact since v0.9.7)
+ 			if enderSuffix || enderDomain && !sameName {
+ 				setBit(&built.leaves, node)
+ 			}
+-- 
+2.53.0
+

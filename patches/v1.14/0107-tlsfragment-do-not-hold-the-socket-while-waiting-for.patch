@@ -1,0 +1,168 @@
+From a9d517c47cafec0647131dd17bb75f07c10d800c Mon Sep 17 00:00:00 2001
+From: FiyeroT <me@fiyero.xyz>
+Date: Fri, 9 Oct 2026 16:15:03 +0300
+Subject: [PATCH 107/148] tlsfragment: do not hold the socket while waiting for
+ an acknowledgment
+
+After a piece of the ClientHello the writer waits until the peer has
+acknowledged it. The wait was made inside one visit to the socket
+(RawConn.Control), sleeping there between looks at TCP_INFO, and a Close
+waits for such a visit to end. When the piece was never acknowledged
+nothing could end the write: not the handshake timeout, which closes the
+connection, and not the caller. The connection hung until the kernel
+gave it up, about a quarter of an hour.
+
+The socket is now visited for a moment at each look, so a closed
+connection ends the wait at the next one.
+---
+ common/tlsfragment/wait_linux.go      | 43 +++++++++------
+ common/tlsfragment/wait_linux_test.go | 79 +++++++++++++++++++++++++++
+ 2 files changed, 106 insertions(+), 16 deletions(-)
+ create mode 100644 common/tlsfragment/wait_linux_test.go
+
+diff --git a/common/tlsfragment/wait_linux.go b/common/tlsfragment/wait_linux.go
+index 517d6ea5e..284f4bb58 100644
+--- a/common/tlsfragment/wait_linux.go
++++ b/common/tlsfragment/wait_linux.go
+@@ -15,26 +15,37 @@ func writeAndWaitAck(ctx context.Context, conn *net.TCPConn, payload []byte, fal
+ 	if err != nil {
+ 		return err
+ 	}
+-	return control.Conn(conn, func(fd uintptr) error {
+-		start := time.Now()
+-		for {
+-			select {
+-			case <-ctx.Done():
+-				return ctx.Err()
+-			default:
+-			}
++	// The socket is looked at for a moment at a time (podkop-engine). The wait used to be
++	// made inside one visit to it, and a Close waits for such a visit to end: when the
++	// piece was never acknowledged, nothing could end the write short of the kernel
++	// giving the connection up, not the handshake timeout either, which closes the
++	// connection. A closed connection now ends the wait at its next look.
++	start := time.Now()
++	for {
++		select {
++		case <-ctx.Done():
++			return ctx.Err()
++		default:
++		}
++		var unacked uint32
++		err = control.Conn(conn, func(fd uintptr) error {
+ 			tcpInfo, err := unix.GetsockoptTCPInfo(int(fd), unix.IPPROTO_TCP, unix.TCP_INFO)
+ 			if err != nil {
+ 				return err
+ 			}
+-			if tcpInfo.Unacked == 0 {
+-				if time.Since(start) <= 20*time.Millisecond {
+-					// under transparent proxy
+-					time.Sleep(fallbackDelay)
+-				}
+-				return nil
++			unacked = tcpInfo.Unacked
++			return nil
++		})
++		if err != nil {
++			return err
++		}
++		if unacked == 0 {
++			if time.Since(start) <= 20*time.Millisecond {
++				// under transparent proxy
++				time.Sleep(fallbackDelay)
+ 			}
+-			time.Sleep(10 * time.Millisecond)
++			return nil
+ 		}
+-	})
++		time.Sleep(10 * time.Millisecond)
++	}
+ }
+diff --git a/common/tlsfragment/wait_linux_test.go b/common/tlsfragment/wait_linux_test.go
+new file mode 100644
+index 000000000..a61e46cda
+--- /dev/null
++++ b/common/tlsfragment/wait_linux_test.go
+@@ -0,0 +1,79 @@
++package tf
++
++import (
++	"context"
++	"fmt"
++	"io"
++	"net"
++	"os"
++	"os/exec"
++	"strings"
++	"testing"
++	"time"
++
++	"github.com/stretchr/testify/require"
++)
++
++// A piece that is never acknowledged does not keep the connection from being closed, and
++// the close ends the wait for the acknowledgment: this is how the handshake timeout ends
++// a fragmented ClientHello that a middlebox drops. Needs root and nft, in a network
++// namespace of its own (a container).
++func TestIntegrationWaitAckGivesWayToClose(t *testing.T) {
++	if os.Geteuid() != 0 {
++		t.Skip("needs root and nft")
++	}
++	listener, err := net.Listen("tcp4", "127.0.0.1:0")
++	require.NoError(t, err)
++	defer listener.Close()
++	go func() {
++		for {
++			conn, err := listener.Accept()
++			if err != nil {
++				return
++			}
++			go func() {
++				io.Copy(io.Discard, conn)
++				conn.Close()
++			}()
++		}
++	}()
++	port := listener.Addr().(*net.TCPAddr).Port
++	// dropped on the way in: on the way out the packet would not count as sent
++	table := fmt.Sprintf("tfwait%d", port)
++	command := exec.Command("nft", "-f", "-")
++	command.Stdin = strings.NewReader(fmt.Sprintf("add table inet %s\nadd chain inet %s input { type filter hook input priority 0; }\nadd rule inet %s input tcp dport %d meta length > 100 counter drop\n", table, table, table, port))
++	output, err := command.CombinedOutput()
++	if err != nil {
++		t.Skip("nft: ", err, ": ", string(output))
++	}
++	defer exec.Command("nft", "delete", "table", "inet", table).Run()
++
++	conn, err := net.Dial("tcp4", listener.Addr().String())
++	require.NoError(t, err)
++	defer conn.Close()
++	waited := make(chan error, 1)
++	go func() {
++		waited <- writeAndWaitAck(context.Background(), conn.(*net.TCPConn), make([]byte, 600), time.Millisecond)
++	}()
++	select {
++	case err = <-waited:
++		t.Fatal("the wait ended though the piece was not acknowledged: ", err)
++	case <-time.After(300 * time.Millisecond):
++	}
++	closed := make(chan struct{})
++	go func() {
++		conn.Close()
++		close(closed)
++	}()
++	select {
++	case <-closed:
++	case <-time.After(2 * time.Second):
++		t.Fatal("the close waits for the piece to be acknowledged")
++	}
++	select {
++	case err = <-waited:
++		require.Error(t, err)
++	case <-time.After(2 * time.Second):
++		t.Fatal("the wait goes on after the connection was closed")
++	}
++}
+-- 
+2.53.0
+

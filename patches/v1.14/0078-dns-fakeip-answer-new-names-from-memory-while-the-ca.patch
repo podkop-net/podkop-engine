@@ -1,0 +1,448 @@
+From a1d517992f4648772691966e82f666bf0b8f75e4 Mon Sep 17 00:00:00 2001
+From: FiyeroT <me@fiyero.xyz>
+Date: Tue, 6 Oct 2026 23:39:17 +0300
+Subject: [PATCH 078/148] dns/fakeip: answer new names from memory while the
+ cache file cannot be written
+
+With a cache file the store gave out addresses only within a reserve saved ahead (1024
+addresses) and, in a full range, only after the records that made room had left the file.
+When the file could not be written (no space left on the overlay, a file system remounted
+read-only, a damaged cache file that could not be reopened) the reserve ran out and every
+new name got an error instead of an address, at once when the first save at start had
+failed: the query had no answer and the error was logged per query, although the whole
+table is in memory. It lasted until the file could be written again.
+
+The store now remembers that the last write failed and, until one succeeds, gives out
+addresses past the saved reserve and lets a full range make room in memory. The records
+stay pending and reach the file, with a new reserve, with the first write that succeeds;
+the records that made room meanwhile are removed from the file by the same write. Create
+no longer returns the error of a save: the background loop logs the failure once and
+retries every second, as before.
+
+The price is stated in the comment of Store: a crash or a kill while the file cannot be
+written is not covered by the reserve. An address given out past it can be given to
+another domain after the restart, and an address that made room can lead to its previous
+domain. Addresses that had reached the file keep their guarantee.
+---
+ dns/transport/fakeip/store.go      |  80 +++++++++++++----
+ dns/transport/fakeip/store_test.go | 135 ++++++++++++++++++++++++-----
+ 2 files changed, 176 insertions(+), 39 deletions(-)
+
+diff --git a/dns/transport/fakeip/store.go b/dns/transport/fakeip/store.go
+index 8c3571288..b7a1dcb53 100644
+--- a/dns/transport/fakeip/store.go
++++ b/dns/transport/fakeip/store.go
+@@ -110,6 +110,9 @@ type pool struct {
+ 	reserveLast uint32
+ 	dirty       []*record
+ 	expired     []removal
++	// offsets of records that left the memory while the storage could not be written:
++	// the storage still has them, the next save removes them there
++	forgotten []uint32
+ 
+ 	limit      int    // records kept when there is a choice: more go, the ones unused longest first
+ 	max        uint32 // records at most: a new domain then takes the place of the ones unused longest
+@@ -318,6 +321,15 @@ func (p *pool) oldest(count uint32, protect uint32, tick uint32) []removal {
+ //     old domain back to an address that was given out again;
+ //   - a record is removed when neither a query nor a new connection used it for
+ //     idleTimeout, or to keep the number of records down, the ones unused longest first.
++//
++// While the storage cannot be written (no space left, a file system turned read-only, a
++// cache file that could not be reopened) the store goes on from memory: new domains get
++// addresses past the saved reserve, and a full range makes room without the storage. The
++// first write that succeeds saves all of it and a new reserve. A crash or a kill during
++// such a time is not covered by the above: an address given out past the reserve has no
++// record and can be given to another domain, and an address that made room can lead to its
++// previous domain. That is what any address could do before the reserve existed, and a
++// query without an answer for as long as the file cannot be written is worse.
+ type Store struct {
+ 	ctx        context.Context
+ 	logger     logger.Logger
+@@ -343,6 +355,8 @@ type Store struct {
+ 	storage    tableStorage // nil: nothing is saved
+ 	saveAccess sync.Mutex   // one write to the storage at a time
+ 	generation uint64
++	// the last write to the storage failed: queries do not wait for it, see allocate
++	storageFailed bool
+ 
+ 	wake     chan struct{}
+ 	done     chan struct{}
+@@ -468,7 +482,8 @@ func (s *Store) load(storage tableStorage) {
+ 			p.hold(last, uint64(s.startTick-1-(s.idleTicks-s.protectTicks))<<32)
+ 		}
+ 	}
+-	// nothing is given out until the reserve is in the storage
++	// the reserve goes to the storage before anything is given out; when it cannot be
++	// written, the store goes on from memory as it does whenever the storage fails
+ 	err = s.save(saveRequest{})
+ 	if err != nil {
+ 		s.logger.Error("fakeip: save the allocation position: ", err)
+@@ -557,17 +572,13 @@ func (s *Store) Create(domain string, isIPv6 bool) (netip.Addr, error) {
+ 	}
+ 	for {
+ 		address, need, err := s.allocate(p, domain)
++		// A save that fails does not fail the query: once the storage is known to fail,
++		// allocate goes on from memory, and it is allocate that refuses a closed store.
+ 		switch need {
+ 		case needReserve:
+-			err = s.save(saveRequest{reserve: true})
+-			if err != nil {
+-				return netip.Addr{}, E.Cause(err, "save FakeIP allocation position")
+-			}
++			_ = s.save(saveRequest{reserve: true})
+ 		case needRoom:
+-			err = s.makeRoom(p)
+-			if err != nil {
+-				return netip.Addr{}, E.Cause(err, "remove unused FakeIP addresses")
+-			}
++			s.makeRoom(p)
+ 		default:
+ 			return address, err
+ 		}
+@@ -600,13 +611,15 @@ func (s *Store) allocate(p *pool, domain string) (netip.Addr, int, error) {
+ 		return netip.Addr{}, needReserve, nil
+ 	}
+ 	for {
+-		if saved && p.budget == 0 {
++		// while the storage fails there is no reserve to wait for: what is left of the
++		// saved one is used up, then addresses are given out past it
++		if saved && p.budget == 0 && !s.storageFailed {
+ 			return netip.Addr{}, needReserve, nil
+ 		}
+ 		offset := p.next
+ 		p.next = p.after(offset)
+ 		p.advanced++
+-		if saved {
++		if saved && p.budget > 0 {
+ 			p.budget--
+ 		}
+ 		if p.byOffset[offset] != nil {
+@@ -625,8 +638,8 @@ func (s *Store) allocate(p *pool, domain string) (netip.Addr, int, error) {
+ }
+ 
+ // makeRoom is called when a new domain finds the range full: the records unused longest
+-// go, whatever their age.
+-func (s *Store) makeRoom(p *pool) error {
++// go, whatever their age. They go even when the storage cannot be written, see save.
++func (s *Store) makeRoom(p *pool) {
+ 	s.access.Lock()
+ 	if time.Since(p.fullWarned) > time.Minute {
+ 		p.fullWarned = time.Now()
+@@ -639,10 +652,10 @@ func (s *Store) makeRoom(p *pool) error {
+ 			}
+ 		}
+ 		s.access.Unlock()
+-		return nil
++		return
+ 	}
+ 	s.access.Unlock()
+-	return s.save(saveRequest{room: p})
++	_ = s.save(saveRequest{room: p})
+ }
+ 
+ func (s *Store) Lookup(address netip.Addr) (string, bool) {
+@@ -683,6 +696,7 @@ func (s *Store) Reset() error {
+ 		clear(p.byOffset)
+ 		p.dirty = nil
+ 		p.expired = nil
++		p.forgotten = nil
+ 	}
+ 	return nil
+ }
+@@ -721,6 +735,7 @@ func (s *Store) save(request saveRequest) error {
+ 		for _, p := range pools {
+ 			p.reserved = false
+ 			p.budget = 0
++			p.forgotten = nil
+ 			p.dirty = p.dirty[:0]
+ 			for _, r := range p.byOffset {
+ 				if r.held() {
+@@ -773,6 +788,12 @@ func (s *Store) save(request saveRequest) error {
+ 			removals = append(removals, candidate)
+ 		}
+ 		p.expired = nil
++		for _, offset := range p.forgotten {
++			// an address that was given out again is written with its new domain
++			if p.byOffset[offset] == nil {
++				deletes = append(deletes, p.address(offset))
++			}
++		}
+ 		var later []*record
+ 		for _, r := range p.dirty {
+ 			if !r.dirty || p.byOffset[r.offset] != r {
+@@ -818,6 +839,7 @@ func (s *Store) save(request saveRequest) error {
+ 	s.access.Lock()
+ 	defer s.access.Unlock()
+ 	if err != nil {
++		s.storageFailed = true
+ 		// the changes stay for the next attempt; the records to remove are found again
+ 		for _, change := range written {
+ 			change.pool.dirty = append(change.pool.dirty, change.record)
+@@ -825,11 +847,30 @@ func (s *Store) save(request saveRequest) error {
+ 		for _, candidate := range removals {
+ 			candidate.record.removing = false
+ 		}
++		if request.room != nil && request.room.full() {
++			// The query that found the range full gets its address all the same: the
++			// records chosen to go leave the memory now, and the storage with the next
++			// write that succeeds.
++			for _, candidate := range removals {
++				p, r := candidate.pool, candidate.record
++				if p != request.room || p.byOffset[r.offset] != r || r.lastUse.Load() != candidate.lastUse {
++					continue
++				}
++				s.release(p, r)
++				if !r.dirty {
++					p.forgotten = append(p.forgotten, r.offset)
++				}
++			}
++		}
+ 		return err
+ 	}
++	s.storageFailed = false
+ 	for _, change := range written {
+ 		change.record.dirty = false
+ 	}
++	for _, p := range pools {
++		p.forgotten = nil
++	}
+ 	var removed int
+ 	for _, candidate := range removals {
+ 		p, r := candidate.pool, candidate.record
+@@ -852,7 +893,10 @@ func (s *Store) save(request saveRequest) error {
+ 		p := saved.pool
+ 		p.reserved = true
+ 		p.reserveLast = saved.last
+-		p.budget = p.step - uint32(p.advanced-saved.advanced)
++		// what was given out while the reserve was written; more than the reserve when
++		// the storage was failing until this write: what lies past it then is covered
++		// by the next save, which a budget of zero asks for at once
++		p.budget = p.step - uint32(min(p.advanced-saved.advanced, uint64(p.step)))
+ 	}
+ 	if removed > 0 {
+ 		var left int
+@@ -918,7 +962,7 @@ func (s *Store) savePending() bool {
+ 		return true
+ 	}
+ 	for _, p := range s.pools() {
+-		if len(p.dirty) > 0 || len(p.expired) > 0 || !p.reserved || p.budget < p.step/2 {
++		if len(p.dirty) > 0 || len(p.expired) > 0 || len(p.forgotten) > 0 || !p.reserved || p.budget < p.step/2 {
+ 			return true
+ 		}
+ 	}
+@@ -959,7 +1003,7 @@ func (s *Store) loop() {
+ 				default:
+ 				}
+ 				if !saveFailed {
+-					s.logger.Error("fakeip: save addresses: ", err)
++					s.logger.Error("fakeip: save addresses: ", err, " (new addresses are kept in memory until the cache file can be written)")
+ 				}
+ 				saveFailed = true
+ 				retry = time.After(s.saveRetry)
+diff --git a/dns/transport/fakeip/store_test.go b/dns/transport/fakeip/store_test.go
+index 4c5a80c1e..961b56188 100644
+--- a/dns/transport/fakeip/store_test.go
++++ b/dns/transport/fakeip/store_test.go
+@@ -325,30 +325,91 @@ func TestReserveIsExtendedBeforeItIsUsedUp(t *testing.T) {
+ 	}
+ }
+ 
++// While the storage fails, new names are answered from memory, past the saved reserve, and
++// everything reaches the storage with the first save that succeeds.
+ func TestStorageFailure(t *testing.T) {
+ 	t.Parallel()
+ 	storage := newFakeStorage()
+ 	store := newTestStore(t, storage, "198.18.0.0/15", "")
+ 	known := mustCreate(t, store, "known.test")
++	require.NoError(t, store.save(saveRequest{}))
+ 	storage.fail = true
+-	// known domains keep answering, new ones while the saved reserve lasts
+ 	require.Equal(t, known, mustCreate(t, store, "known.test"))
+-	var given int
+-	for {
+-		_, err := store.Create(fmt.Sprint("new-", given, ".test"), false)
+-		if err != nil {
+-			break
++	given := map[netip.Addr]bool{known: true}
++	for i := range 3 * reserveStep {
++		next := mustCreate(t, store, fmt.Sprint("new-", i, ".test"))
++		require.False(t, given[next], "an address is given out once")
++		given[next] = true
++	}
++	require.Error(t, store.save(saveRequest{}))
++	require.Equal(t, 1, storage.records())
++
++	storage.fail = false
++	require.NoError(t, store.save(saveRequest{}))
++	require.Equal(t, len(given), storage.records(), "what was given out during the failure is saved once the storage works")
++	last := storage.cursor.Inet4Current
++	for next := range given {
++		require.False(t, last.Less(next), "the saved position ", last, " is behind ", next)
++	}
++	// the reserve is back: allocation waits for it again
++	require.Equal(t, store.pool4.step, store.pool4.budget)
++	store.pool4.budget = 0
++	storage.fail = true
++	_, need, err := store.allocate(store.pool4, "waits.test")
++	require.NoError(t, err)
++	require.Equal(t, needReserve, need)
++	storage.fail = false
++	after := mustCreate(t, store, "waits.test")
++	require.False(t, storage.cursor.Inet4Current.Less(after))
++	given[after] = true
++	// a crash now: nothing given out so far is given out again
++	killed := newTestStore(t, storage.crash(), "198.18.0.0/15", "")
++	for i := range 3000 {
++		next := mustCreate(t, killed, fmt.Sprint("later-", i, ".test"))
++		require.False(t, given[next], next)
++	}
++}
++
++// A full range makes room in memory while the storage fails; the first save that succeeds
++// leaves in the storage what the memory holds.
++func TestFullRangeWhileStorageFails(t *testing.T) {
++	t.Parallel()
++	storage := newFakeStorage()
++	// 61 addresses
++	store := newTestStore(t, storage, "198.18.0.0/26", "")
++	hot := mustCreate(t, store, "hot.test")
++	for i := range 100 {
++		store.advance(1)
++		mustCreate(t, store, fmt.Sprint("old-", i, ".test"))
++		if i%10 == 0 {
++			mustCreate(t, store, "hot.test")
+ 		}
+-		given++
+-		require.Less(t, given, reserveStep+1, "nothing is given out past the saved reserve")
+ 	}
+-	require.Greater(t, given, 0)
++	require.NoError(t, store.save(saveRequest{}))
++	storage.fail = true
++	for i := range 500 {
++		store.advance(1)
++		next := mustCreate(t, store, fmt.Sprint("name-", i, ".test"))
++		require.NotEqual(t, hot, next, "an address in use is not given to another domain")
++		if i%10 == 0 {
++			require.Equal(t, hot, mustCreate(t, store, "hot.test"))
++		}
++	}
++	require.LessOrEqual(t, uint32(len(store.pool4.byOffset)), store.pool4.max)
+ 	require.Error(t, store.save(saveRequest{}))
+-	require.Equal(t, 0, storage.records())
++
+ 	storage.fail = false
+-	mustCreate(t, store, "after.test")
+ 	require.NoError(t, store.save(saveRequest{}))
+-	require.Equal(t, given+2, storage.records(), "what was given out during the failure is saved once the storage works")
++	var records int
++	for offset, r := range store.pool4.byOffset {
++		if r.held() {
++			continue
++		}
++		records++
++		require.Equal(t, r.domain, storage.domainOf(store.pool4.address(offset)))
++	}
++	require.Equal(t, records, storage.records(), "no record the memory has given up stays in the storage")
++	require.False(t, store.savePending())
+ }
+ 
+ func TestUnusedRecordsAreRemoved(t *testing.T) {
+@@ -844,7 +905,7 @@ func TestCleanStop(t *testing.T) {
+ 		require.NoError(t, store.Close())
+ 		saves := storage.saves
+ 		// a query that found the range full just before the stop
+-		require.Error(t, store.makeRoom(store.pool4))
++		store.makeRoom(store.pool4)
+ 		require.Equal(t, saves, storage.saves)
+ 		require.Equal(t, 13, storage.records())
+ 		require.NotNil(t, storage.cleanKey)
+@@ -863,10 +924,8 @@ func TestTableIsKeptWhenTheFileCannotBeChangedAtStart(t *testing.T) {
+ 	storage.fail = true
+ 	store = newTestStore(t, storage, "198.18.0.0/15", "")
+ 	require.Equal(t, old, mustCreate(t, store, "a.test"), "known domains answer")
+-	_, err := store.Create("new.test", false)
+-	require.Error(t, err, "new ones wait for the storage")
++	require.Equal(t, address("198.18.0.4"), mustCreate(t, store, "new.test"), "new ones too, not with an address a client holds")
+ 	storage.fail = false
+-	require.Equal(t, address("198.18.0.4"), mustCreate(t, store, "new.test"), "not an address a client holds")
+ 	require.NoError(t, store.save(saveRequest{}))
+ 	require.Equal(t, "a.test", storage.domainOf(old))
+ }
+@@ -935,9 +994,35 @@ func TestBackgroundSave(t *testing.T) {
+ 	require.NoError(t, store.Close())
+ }
+ 
++// With the loop: an outage of the storage longer than the reserve lasts does not stop new
++// names, and the loop saves them when the outage ends.
++func TestNewNamesWhileTheLoopCannotSave(t *testing.T) {
++	t.Parallel()
++	storage := newFakeStorage()
++	store := NewStore(context.Background(), logger.NOP(), netip.MustParsePrefix("198.18.0.0/15"), netip.Prefix{})
++	store.testStorage = storage
++	store.saveRetry = 20 * time.Millisecond
++	require.NoError(t, store.Start())
++	storage.access.Lock()
++	storage.fail = true
++	storage.access.Unlock()
++	const names = 2*reserveStep + 10
++	for i := range names {
++		mustCreate(t, store, fmt.Sprint("name-", i, ".test"))
++	}
++	require.Equal(t, 0, storage.records())
++	storage.access.Lock()
++	storage.fail = false
++	storage.access.Unlock()
++	require.Eventually(t, func() bool { return storage.records() == names }, 5*time.Second, 5*time.Millisecond)
++	require.NoError(t, store.Close())
++}
++
+ // A model of the clients: the address each one was given and holds. Whatever happens,
+ // crashes included, such an address leads to the domain it was given for or to nothing,
+ // and is not given to another domain, until the store removes the record by its rules.
++// The exception is a crash while the storage could not be written: it is kept for the
++// addresses the storage has.
+ func TestClientsNeverReachAnotherDomain(t *testing.T) {
+ 	t.Parallel()
+ 	for _, test := range []struct {
+@@ -974,7 +1059,9 @@ func runClientModel(t *testing.T, prefix string, domains int, seed uint64) {
+ 				delete(held, gone)
+ 				return
+ 			}
+-			require.NotEqual(t, r.domain, storage.domainOf(gone), "a record leaves memory only after it left the storage")
++			if !store.storageFailed {
++				require.NotEqual(t, r.domain, storage.domainOf(gone), "a record leaves memory only after it left the storage")
++			}
+ 			if held[gone] == r.domain {
+ 				delete(held, gone)
+ 				delete(saved, gone)
+@@ -1044,10 +1131,7 @@ func runClientModel(t *testing.T, prefix string, domains int, seed uint64) {
+ 		case choice < 60:
+ 			domain := fmt.Sprint("name-", random.IntN(domains), ".test")
+ 			given, err := store.Create(domain, false)
+-			if err != nil {
+-				require.True(t, storage.fail, err)
+-				continue
+-			}
++			require.NoError(t, err, "a name is answered whatever the storage does")
+ 			if holder, isHeld := held[given]; isHeld {
+ 				require.Equal(t, holder, domain, "seed ", seed, ": ", given, " is given to another domain")
+ 			}
+@@ -1072,6 +1156,15 @@ func runClientModel(t *testing.T, prefix string, domains int, seed uint64) {
+ 			storage.fail = !storage.fail
+ 		case choice < 98:
+ 			// a crash
++			if store.storageFailed {
++				// while the storage could not be written: the addresses that did not reach
++				// it are not covered, see Store
++				for address := range held {
++					if saved[address] == "" {
++						delete(held, address)
++					}
++				}
++			}
+ 			storage.fail = false
+ 			storage = storage.crash()
+ 			start()
+-- 
+2.53.0
+

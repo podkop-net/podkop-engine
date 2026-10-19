@@ -1,0 +1,260 @@
+From 2281112e9275f7412f53f10dd6b5a47e0292ca00 Mon Sep 17 00:00:00 2001
+From: FiyeroT <me@fiyero.xyz>
+Date: Thu, 8 Oct 2026 18:37:12 +0300
+Subject: [PATCH 103/148] decode-link: what the fuzzer and the comparison with
+ podkop's shell decoder showed
+
+- A parameter whose name grows when lowered (a letter of another alphabet after
+  "sb.") was an index out of range: the path is now cut by what the name starts with.
+- An option of a structure with several shapes (a transport, an obfuscation) is taken
+  by the shape the structure has: one of another shape is "no such option" at once,
+  not at the building of the outbound. A type named by a path is set before the rest.
+- vcn gets a warning only when the certificate would be verified by another name than
+  Xray verifies it by, and the warning says what follows; cs says what it is.
+
+The fuzz target now holds, for any input: no message repeats the user of the link;
+what is printed reads back and into the options of its type with no option the type
+does not have; nothing a link may not set is in it. 10 million inputs in 150 s pass.
+
+The decoder was also compared with the shell code of podkop over 1533 links: every
+difference is one of the intended ones (uTLS chrome by default, TLS for Trojan,
+allowInsecure, early data of WebSocket, httpupgrade and http transports, a "+" in a
+password, IPv6 addresses, the links podkop made dead outbounds of).
+---
+ common/sharelink/fallback.go      | 26 +++++++++--
+ common/sharelink/fallback_test.go | 12 ++---
+ common/sharelink/link_test.go     | 73 ++++++++++++++++++++++++++++++-
+ common/sharelink/policy_test.go   |  7 ++-
+ common/sharelink/tls.go           | 14 ++++--
+ 5 files changed, 119 insertions(+), 13 deletions(-)
+
+diff --git a/common/sharelink/fallback.go b/common/sharelink/fallback.go
+index 32284cfbf..95b1bc0d2 100644
+--- a/common/sharelink/fallback.go
++++ b/common/sharelink/fallback.go
+@@ -185,13 +185,21 @@ func optionType(valueType reflect.Type, segments []string, node *object, walked
+ 			return nil, false, refuse("sb-unknown", "this sing-box has no option ", walked)
+ 		}
+ 		chosen := candidates[0]
+-		if node != nil {
++		if node != nil && node.text("type") != "" {
++			// the shape the structure has now: an option of another shape is not one
++			// the outbound has
+ 			member := unionMembers[strings.ToLower(node.text("type"))]
++			found := false
+ 			for _, candidate := range candidates {
+-				if candidate.member != "" && candidate.member == member {
++				if candidate.member == "" || candidate.member == member {
+ 					chosen = candidate
++					found = true
++					break
+ 				}
+ 			}
++			if !found {
++				return nil, false, refuse("sb-unknown", "this sing-box has no option ", walked, " for the type ", node.text("type"))
++			}
+ 		}
+ 		if reason := deniedOption(name, &chosen.field); reason != "" {
+ 			return nil, false, refuse("sb-denied", "the option ", walked, " is not for a link to set (", reason, ")")
+@@ -317,7 +325,14 @@ func (d *decoder) fallback(outboundType string, options *object) error {
+ 		if strings.HasPrefix(key, "sb.") {
+ 			// the path with the case the link writes: a header has one
+ 			name := d.names[key]
+-			settings = append(settings, setting{name, name[len(name)-len(key)+len("sb."):], text})
++			path := name
++			if len(path) >= len("amp;") && strings.EqualFold(path[:len("amp;")], "amp;") {
++				path = path[len("amp;"):]
++			}
++			if len(path) < len("sb.") || !strings.EqualFold(path[:len("sb.")], "sb.") {
++				continue
++			}
++			settings = append(settings, setting{name, path[len("sb."):], text})
+ 		}
+ 	}
+ 	if len(settings) == 0 {
+@@ -328,6 +343,11 @@ func (d *decoder) fallback(outboundType string, options *object) error {
+ 		if iPath != jPath {
+ 			return jPath
+ 		}
++		// a type first: it tells which options the structure has
++		iType, jType := strings.HasSuffix(settings[i].path, ".type"), strings.HasSuffix(settings[j].path, ".type")
++		if iType != jType {
++			return iType
++		}
+ 		return settings[i].key < settings[j].key
+ 	})
+ 	structType, known := optionTypes[outboundType]
+diff --git a/common/sharelink/fallback_test.go b/common/sharelink/fallback_test.go
+index 681a9f8c8..fc5020f35 100644
+--- a/common/sharelink/fallback_test.go
++++ b/common/sharelink/fallback_test.go
+@@ -112,11 +112,13 @@ func TestOptionRefusals(t *testing.T) {
+ 		"sb.tls.no_such_option=1":                   "sb-unknown",
+ 		"sb.tls.alpn.first=h2":                      "sb-unknown",
+ 		"sb.=1":                                     "sb-unknown",
+-		"sb.tls..fragment=1":                        "sb-unknown",
+-		"sb.tls.fragment=maybe":                     "sb-value",
+-		"sb.multiplex.max_connections=many":         "sb-value",
+-		"sb.connect_timeout=soon":                   "sb-value",
+-		"sb.multiplex=on":                           "sb-value",
++		// a name that grows when lowered: found by the fuzzer
++		"SB.%C4%B0=1":                       "sb-unknown",
++		"sb.tls..fragment=1":                "sb-unknown",
++		"sb.tls.fragment=maybe":             "sb-value",
++		"sb.multiplex.max_connections=many": "sb-value",
++		"sb.connect_timeout=soon":           "sb-value",
++		"sb.multiplex=on":                   "sb-value",
+ 	} {
+ 		require.Equal(t, id, refusalID(t, fallbackBase+"&"+parameter), parameter)
+ 	}
+diff --git a/common/sharelink/link_test.go b/common/sharelink/link_test.go
+index b8a1b80c4..f118acccb 100644
+--- a/common/sharelink/link_test.go
++++ b/common/sharelink/link_test.go
+@@ -1,7 +1,9 @@
+ package sharelink
+ 
+ import (
++	"context"
+ 	"net/url"
++	"reflect"
+ 	"strings"
+ 	"testing"
+ 
+@@ -271,19 +273,88 @@ func TestRoundTrip(t *testing.T) {
+ 	require.Equal(t, []string{"h3", "h2"}, []string(got.XHTTPOptions.Download.TLS.ALPN))
+ }
+ 
++// deniedIn finds an option a link may not set in what the decoder made of one.
++func deniedIn(value any) string {
++	node, isObject := value.(*object)
++	if !isObject {
++		return ""
++	}
++	for _, key := range node.keys {
++		if reason := deniedOption(key, nil); reason != "" {
++			return key
++		}
++		if found := deniedIn(node.values[key]); found != "" {
++			return found
++		}
++	}
++	return ""
++}
++
+ func FuzzDecode(f *testing.F) {
++	const canary = "5ec2e7aa-cana-4000-8000-5ec2e7000000"
+ 	f.Add(xhttpLink(`{"xPaddingBytes":"100-1000","xmux":{"maxConcurrency":"16-32"},"downloadSettings":{"address":"a","port":1}}`, url.QueryEscape, ""))
+ 	f.Add("trojan://p@example.org:443?type=ws&path=%2Fws%3Fed%3D2560#n")
+ 	f.Add("vless://u@[::1]:1?security=reality&pbk=k&type=grpc")
++	f.Add("vless://" + testUUID + "@h:1?security=tls&sb.tls.fragment=1&sb.multiplex.protocol=h2mux&sb.detour=x&sb.transport.type=ws&sb.transport.headers.A=b,c")
++	f.Add("ss://" + b64url("aes-256-gcm:p") + "@h:1/?plugin=obfs-local%3Bobfs%3Dhttp&uot=1#n")
++	f.Add("ss://" + b64("aes-256-gcm:p@h:1") + "#n")
++	f.Add("socks://" + b64("u:p") + "@h:1")
++	f.Add("hysteria2://p@h:1,2-3/?obfs=salamander&obfs-password=x&fm=" + uriComponent(`{"udp":[{"type":"salamander","settings":{"password":"p"}}],"quicParams":{"udpHop":{"ports":"1-2","interval":"3-4"}}}`))
++	f.Add("tuic://" + testUUID + ":p@h:1?congestion_control=bbr&heartbeat_interval=10")
++	f.Add("vmess://" + b64(`{"add":"h","port":"1","id":"`+testUUID+`","net":"ws","tls":"tls","path":"/p?ed=1","host":"x","type":"none"}`))
++	f.Add("vmess://" + testUUID + "@h:1?type=grpc&mode=multi&serviceName=%2Fa%2FTun")
++	f.Add("https://u:p@h:1?sni=s&fp=chrome")
++	f.Add("hysteria://h:1?auth=a&obfs=xplus&obfsParam=p&mport=1-2")
++	f.Add("anytls://p@h/?sni=s&insecure=1")
++	f.Add("naive+https://u:p@h?extra-headers=A%3A%20b%0D%0AC%3A%20d")
+ 	f.Fuzz(func(t *testing.T, link string) {
++		// the user of the link is a secret: no message repeats it
++		if strings.Count(link, "://") == 1 && !strings.Contains(link, canary) {
++			scheme, rest, _ := strings.Cut(link, "://")
++			_, warnings, err := Decode(scheme + "://" + canary + "@" + strings.TrimLeft(rest, "@"))
++			if err != nil && strings.Contains(err.Error(), canary) {
++				t.Fatalf("the error repeats the user of the link: %v", err)
++			}
++			for _, warning := range warnings {
++				if strings.Contains(warning, canary) {
++					t.Fatalf("a warning repeats the user of the link: %s", warning)
++				}
++			}
++		}
+ 		outbound, _, err := Decode(link)
+ 		if err != nil {
+ 			return
+ 		}
+-		_, err = json.Marshal(outbound)
++		content, err := json.Marshal(outbound)
+ 		if err != nil {
+ 			t.Fatal(err)
+ 		}
++		// what is written is JSON that reads back, and has nothing a link may not set
++		parsed, err := parseObject(content)
++		if err != nil {
++			t.Fatalf("the outbound does not read back: %v", err)
++		}
++		for _, key := range outbound.options.keys {
++			if found := deniedIn(outbound.options.values[key]); found != "" {
++				t.Fatalf("the outbound has the option %s, which a link may not set", found)
++			}
++			if deniedOption(key, nil) != "" {
++				t.Fatalf("the outbound has the option %s, which a link may not set", key)
++			}
++		}
++		if parsed.text("type") != outbound.Type {
++			t.Fatal("the type of the outbound is not the type of the scheme")
++		}
++		// the options read into the structure of the type, with no option it does not have
++		target := reflect.New(optionTypes[outbound.Type]).Interface()
++		options, err := json.Marshal(outbound.options)
++		if err != nil {
++			t.Fatal(err)
++		}
++		err = json.UnmarshalContextDisallowUnknownFields(context.Background(), options, target)
++		if err != nil && strings.Contains(err.Error(), "unknown field") {
++			t.Fatalf("the outbound has an option its type does not have: %v", err)
++		}
+ 	})
+ }
+ 
+diff --git a/common/sharelink/policy_test.go b/common/sharelink/policy_test.go
+index 11da7166e..0a8e575e4 100644
+--- a/common/sharelink/policy_test.go
++++ b/common/sharelink/policy_test.go
+@@ -167,7 +167,12 @@ func TestLeniencies(t *testing.T) {
+ 		"a pinned certificate": {
+ 			policyBase + "security=tls&pcs=0123abcd&vcn=example.org",
+ 			`{"type":"vless","server":"example.org","server_port":443,"uuid":"` + testUUID + `","tls":{"enabled":true,"utls":{"enabled":true,"fingerprint":"chrome"}}}`,
+-			[]string{"the pinned certificate (pcs, pinSHA256) is not supported", "vcn is not supported and is ignored"},
++			[]string{"the pinned certificate (pcs, pinSHA256) is not supported", "vcn (the names the certificate is verified by) is not supported"},
++		},
++		"the certificate verified by the name that is sent": {
++			policyBase + "security=tls&sni=s.example.org&vcn=other.example.org,S.example.org&cs=TLS_AES_128_GCM_SHA256",
++			`{"type":"vless","server":"example.org","server_port":443,"uuid":"` + testUUID + `","tls":{"enabled":true,"server_name":"s.example.org","utls":{"enabled":true,"fingerprint":"chrome"}}}`,
++			[]string{"cs (the cipher suites of TLS) is not supported and is ignored"},
+ 		},
+ 		"a pinned certificate, not verified anyway": {
+ 			policyBase + "security=tls&pcs=0123abcd&allowInsecure=1",
+diff --git a/common/sharelink/tls.go b/common/sharelink/tls.go
+index 79335ace9..1591f1ace 100644
+--- a/common/sharelink/tls.go
++++ b/common/sharelink/tls.go
+@@ -91,10 +91,18 @@ func (d *decoder) tlsCommon(tlsOptions *option.OutboundTLSOptions) {
+ 		// one cannot be made from the other
+ 		d.warn("the pinned certificate (pcs, pinSHA256) is not supported: the server is verified against the system roots, and one with a self-signed certificate is refused")
+ 	}
+-	for _, key := range []string{"vcn", "cs"} {
+-		if d.query[key] != "" {
+-			d.warn(key, " is not supported and is ignored")
++	if names := splitList(d.query["vcn"]); len(names) > 0 && !tlsOptions.Insecure {
++		// Xray verifies the certificate by these names instead of the one it sends
++		same := false
++		for _, name := range names {
++			same = same || strings.EqualFold(name, tlsOptions.ServerName)
+ 		}
++		if !same {
++			d.warn("vcn (the names the certificate is verified by) is not supported: the certificate is verified by the server name of TLS, and a server with a certificate for another name is refused")
++		}
++	}
++	if d.query["cs"] != "" {
++		d.warn("cs (the cipher suites of TLS) is not supported and is ignored")
+ 	}
+ }
+ 
+-- 
+2.53.0
+

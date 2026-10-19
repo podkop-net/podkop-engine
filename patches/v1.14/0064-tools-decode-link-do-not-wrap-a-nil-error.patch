@@ -1,0 +1,29 @@
+From 20f608a16a93cd4f1ae36235e71515eaab43d0a2 Mon Sep 17 00:00:00 2001
+From: FiyeroT <me@fiyero.xyz>
+Date: Tue, 6 Oct 2026 05:06:27 +0300
+Subject: [PATCH 064/148] tools decode-link: do not wrap a nil error
+
+E.Cause panics on one: every xhttp link that passed the check of its options
+crashed the command.
+---
+ cmd/sing-box/cmd_tools_decode_link.go | 6 +++++-
+ 1 file changed, 5 insertions(+), 1 deletion(-)
+
+diff --git a/cmd/sing-box/cmd_tools_decode_link.go b/cmd/sing-box/cmd_tools_decode_link.go
+index 3d0b091da..05acdf6cb 100644
+--- a/cmd/sing-box/cmd_tools_decode_link.go
++++ b/cmd/sing-box/cmd_tools_decode_link.go
+@@ -124,5 +124,9 @@ func checkDecoded(outbound *sharelink.Outbound) error {
+ 	if transport == nil || transport.Type != C.V2RayTransportTypeXHTTP {
+ 		return nil
+ 	}
+-	return E.Cause(v2rayxhttp.CheckOptions(transport.XHTTPOptions), "xhttp")
++	err := v2rayxhttp.CheckOptions(transport.XHTTPOptions)
++	if err != nil {
++		return E.Cause(err, "xhttp")
++	}
++	return nil
+ }
+-- 
+2.53.0
+

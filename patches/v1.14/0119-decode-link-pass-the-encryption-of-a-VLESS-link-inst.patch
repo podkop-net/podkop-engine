@@ -1,0 +1,233 @@
+From 1b97d216cefa111a14017d36fabcf2eb7f7a7dca Mon Sep 17 00:00:00 2001
+From: FiyeroT <me@fiyero.xyz>
+Date: Sat, 10 Oct 2026 15:33:14 +0300
+Subject: [PATCH 119/148] decode-link: pass the encryption of a VLESS link
+ instead of refusing it
+
+The parameter "encryption" of a link becomes the option of the outbound when it is a
+setting Xray takes (mode, 1rtt or 0rtt, padding, keys of 32 or 1184 bytes), from the
+parameter or by its path; another is refused. With it a flow is accepted over a
+transport and without TLS, as Xray accepts it.
+---
+ common/sharelink/encryption_test.go        | 75 ++++++++++++++++++++++
+ common/sharelink/link.go                   | 18 ++++++
+ common/sharelink/policy.go                 |  6 +-
+ common/sharelink/testdata/options-1.13.txt |  1 +
+ common/sharelink/testdata/options-1.14.txt |  1 +
+ common/sharelink/vless.go                  | 19 ++++--
+ 6 files changed, 110 insertions(+), 10 deletions(-)
+ create mode 100644 common/sharelink/encryption_test.go
+
+diff --git a/common/sharelink/encryption_test.go b/common/sharelink/encryption_test.go
+new file mode 100644
+index 000000000..9b570513b
+--- /dev/null
++++ b/common/sharelink/encryption_test.go
+@@ -0,0 +1,75 @@
++package sharelink
++
++import (
++	"encoding/base64"
++	"testing"
++
++	"github.com/sagernet/sing-box/option"
++
++	"github.com/stretchr/testify/require"
++)
++
++// VLESS Encryption: the setting of a link is passed as it is written, and with it the
++// flow is taken where it is refused without.
++func TestVLESSEncryption(t *testing.T) {
++	t.Parallel()
++	key := base64.RawURLEncoding.EncodeToString(make([]byte, 32))
++	setting := "mlkem768x25519plus.native.0rtt." + key
++	vless := func(link string) option.VLESSOutboundOptions {
++		outbound, _, err := Decode(link)
++		require.NoError(t, err, link)
++		return optionsOf[option.VLESSOutboundOptions](t, outbound)
++	}
++	// the link that came from the field: xhttp over REALITY
++	options := vless(policyBase + "encryption=" + setting + "&security=reality&pbk=" + key + "&sid=ab&sni=s.example.org&fp=firefox&type=xhttp&mode=stream-up&path=%2Fapi")
++	require.Equal(t, setting, options.Encryption)
++	require.Equal(t, "xhttp", options.Transport.Type)
++	// none and nothing are no encryption
++	require.Empty(t, vless(policyBase+"encryption=none&security=tls").Encryption)
++	require.Empty(t, vless(policyBase+"security=tls").Encryption)
++	// the padding and several keys
++	long := "mlkem768x25519plus.random.1rtt.100-111-1111.75-0-111.50-0-3333." + key + "." + key
++	require.Equal(t, long, vless(policyBase+"encryption="+long).Encryption)
++	// with the encryption the flow goes over a transport and without TLS, as in Xray
++	for _, parameters := range []string{
++		"&security=tls&type=xhttp&path=%2Fx",
++		"&security=tls&type=ws&path=%2Fws",
++		"&security=tls&type=grpc&serviceName=s",
++		"&security=none&type=tcp",
++		"&security=reality&pbk=" + key,
++	} {
++		options := vless(policyBase + "encryption=" + setting + "&flow=xtls-rprx-vision" + parameters)
++		require.Equal(t, "xtls-rprx-vision", options.Flow, parameters)
++		require.Equal(t, setting, options.Encryption, parameters)
++	}
++	// by its path too
++	require.Equal(t, setting, vless(policyBase+"security=tls&sb.encryption="+setting).Encryption)
++
++	// a setting Xray would not take is refused
++	for _, bad := range []string{
++		"mlkem768x25519plus.native.0rtt.KEY",
++		"mlkem768x25519plus.native.0rtt",
++		"mlkem768x25519plus.plain.0rtt." + key,
++		"mlkem768x25519plus.native.2rtt." + key,
++		"mlkem768x25519plus.native.0rtt." + key[:40],
++	} {
++		require.Equal(t, "vless-encryption", refusalID(t, policyBase+"encryption="+bad), bad)
++	}
++	// one set by its path as well
++	require.Equal(t, "vless-encryption", refusalID(t, policyBase+"security=tls&sb.encryption=mlkem768x25519plus.native.0rtt.KEY"))
++	require.Equal(t, "vless-encryption", refusalID(t, policyBase+"security=tls&sb.encryption=aes-128-gcm"))
++
++	// what is said of a refused setting repeats nothing of the link: a second link glued
++	// to the first one, a key where the mode belongs, a wrong padding
++	for _, bad := range []string{
++		"mlkem768x25519plus.native.0rttvless://" + testUUID + "@192.0.2.9:443?security=tls",
++		"mlkem768x25519plus." + key + ".native.0rtt",
++		"mlkem768x25519plus.native.1rtt.100-s3cret-5." + key,
++	} {
++		_, _, err := Decode(policyBase + "encryption=" + bad)
++		require.Error(t, err, bad)
++		for _, piece := range []string{key, testUUID, "192.0.2.9", "vless://", "s3cret"} {
++			require.NotContains(t, err.Error(), piece, bad)
++		}
++	}
++}
+diff --git a/common/sharelink/link.go b/common/sharelink/link.go
+index 29db3cb55..054eb6aab 100644
+--- a/common/sharelink/link.go
++++ b/common/sharelink/link.go
+@@ -16,6 +16,7 @@ import (
+ 
+ 	C "github.com/sagernet/sing-box/constant"
+ 	"github.com/sagernet/sing-box/option"
++	"github.com/sagernet/sing-box/protocol/vless/encryption"
+ 	"github.com/sagernet/sing-box/transport/sip003"
+ 	E "github.com/sagernet/sing/common/exceptions"
+ )
+@@ -191,6 +192,18 @@ func consistent(outboundType string, options *object) error {
+ 	if outboundType != C.TypeVLESS {
+ 		return nil
+ 	}
++	// VLESS Encryption, from the parameter of the link or set by its path: a setting Xray
++	// would not take is not passed on
++	encryptionSetting := options.text("encryption")
++	if encryptionSetting == "none" {
++		encryptionSetting = ""
++	}
++	if encryptionSetting != "" {
++		_, err := encryption.NewClient(encryptionSetting)
++		if err != nil {
++			return refuse("vless-encryption", "invalid VLESS encryption: ", err.Error())
++		}
++	}
+ 	flow := options.text("flow")
+ 	if flow == "" {
+ 		return nil
+@@ -200,6 +213,11 @@ func consistent(outboundType string, options *object) error {
+ 	if flow != "xtls-rprx-vision" {
+ 		return refuse("flow", "unsupported flow", shown(flow))
+ 	}
++	if encryptionSetting != "" {
++		// with VLESS Encryption Vision works on that layer, over any transport and
++		// without TLS, as in Xray
++		return nil
++	}
+ 	if transport, hasTransport := options.values["transport"].(*object); hasTransport && transport.text("type") != "" {
+ 		// Vision works on the TLS connection itself. Over ws, grpc and http sing-box has
+ 		// none to give it and fails every connection; over httpupgrade and xhttp an Xray
+diff --git a/common/sharelink/policy.go b/common/sharelink/policy.go
+index 71b07bc0a..fef25936a 100644
+--- a/common/sharelink/policy.go
++++ b/common/sharelink/policy.go
+@@ -16,10 +16,10 @@ var refusals = map[string]string{
+ 	"no-link-form":          "tor, ssh, shadowtls and snell are configured as outbounds: nothing generates links for them",
+ 	"security":              "a value of security other than none, tls and reality names a transport security sing-box does not have (xtls)",
+ 	"fingerprint-reality":   "REALITY is built on uTLS: Xray refuses a fingerprint it does not know too",
+-	"vless-encryption":      "VLESS Encryption (mlkem768x25519plus...) changes the protocol and is not in sing-box",
++	"vless-encryption":      "a setting of VLESS Encryption that Xray does not take either (infra/conf/vless.go): the mode, 1rtt or 0rtt, the padding, keys of 32 or 1184 bytes",
+ 	"flow":                  "a flow other than xtls-rprx-vision is not in sing-box; Xray has removed the older ones",
+-	"flow-transport":        "lab: with the flow over ws and grpc sing-box fails every connection itself, over httpupgrade Xray answers \"XTLS only supports TLS and REALITY directly\"; over xhttp Xray takes a flow only with VLESS Encryption; the http transport fails as ws does",
+-	"flow-no-tls":           "Vision works on a TLS connection: without TLS or REALITY there is none",
++	"flow-transport":        "lab: with the flow over ws and grpc sing-box fails every connection itself, over httpupgrade Xray answers \"XTLS only supports TLS and REALITY directly\"; over xhttp Xray takes a flow only with VLESS Encryption, and with it the flow is taken over every transport; the http transport fails as ws does",
++	"flow-no-tls":           "Vision works on a TLS connection: without TLS, REALITY or VLESS Encryption there is none",
+ 	"finalmask":             "a mask of finalmask other than fragment and noise changes what goes over the wire, and the server expects it",
+ 	"tcp-http-header-tls":   "lab: the HTTP header of the TCP transport works as the http transport of sing-box without TLS; with TLS that transport speaks HTTP/2",
+ 	"tcp-header":            "a header type of the TCP transport other than none and http does not exist in Xray either",
+diff --git a/common/sharelink/testdata/options-1.13.txt b/common/sharelink/testdata/options-1.13.txt
+index 4f7249e9a..eadd890f7 100644
+--- a/common/sharelink/testdata/options-1.13.txt
++++ b/common/sharelink/testdata/options-1.13.txt
+@@ -651,6 +651,7 @@ vless detour denied: another object
+ vless disable_tcp_keep_alive sb
+ vless domain_resolver denied: another object
+ vless domain_strategy denied: deprecated
++vless encryption sb
+ vless fallback_delay denied: the local route
+ vless fallback_network_type denied: the local route
+ vless flow sb
+diff --git a/common/sharelink/testdata/options-1.14.txt b/common/sharelink/testdata/options-1.14.txt
+index a5726add2..521a98581 100644
+--- a/common/sharelink/testdata/options-1.14.txt
++++ b/common/sharelink/testdata/options-1.14.txt
+@@ -694,6 +694,7 @@ vless detour denied: another object
+ vless disable_tcp_keep_alive sb
+ vless domain_resolver denied: another object
+ vless domain_strategy denied: deprecated
++vless encryption sb
+ vless fallback_delay denied: the local route
+ vless fallback_network_type denied: the local route
+ vless flow sb
+diff --git a/common/sharelink/vless.go b/common/sharelink/vless.go
+index aecc13d66..987a3f989 100644
+--- a/common/sharelink/vless.go
++++ b/common/sharelink/vless.go
+@@ -5,6 +5,7 @@ import (
+ 	"strings"
+ 
+ 	"github.com/sagernet/sing-box/option"
++	"github.com/sagernet/sing-box/protocol/vless/encryption"
+ 	E "github.com/sagernet/sing/common/exceptions"
+ )
+ 
+@@ -16,13 +17,16 @@ func (d *decoder) vless() (any, error) {
+ 	if err != nil {
+ 		return nil, err
+ 	}
+-	// VLESS Encryption changes the protocol itself. Its values begin with the name of the
+-	// key exchange; anything else in the parameter cannot stand for it, and Xray itself
+-	// refuses such a configuration.
+-	switch encryption := d.query["encryption"]; {
+-	case encryption == "" || encryption == "none":
+-	case strings.HasPrefix(encryption, "mlkem768x25519plus"):
+-		return nil, refuse("vless-encryption", "VLESS encryption is not supported")
++	// VLESS Encryption is a layer of its own under VLESS, and a server that has it set
++	// takes no client without it. Its setting begins with the name of the key exchange
++	// and is passed as it is written; anything else in the parameter cannot stand for
++	// it, and Xray itself refuses such a configuration.
++	var encryptionSetting string
++	switch setting := d.query["encryption"]; {
++	case setting == "" || setting == "none":
++	case strings.HasPrefix(setting, encryption.Prefix):
++		// whether it is one Xray takes is looked at with the whole outbound (consistent)
++		encryptionSetting = setting
+ 	default:
+ 		d.warn("encryption has a value that is not VLESS encryption, it is read as none")
+ 	}
+@@ -44,6 +48,7 @@ func (d *decoder) vless() (any, error) {
+ 		ServerOptions: server,
+ 		UUID:          uuid,
+ 		Flow:          flow,
++		Encryption:    encryptionSetting,
+ 	}
+ 	if packetEncoding := d.first("packetencoding", "packet-encoding"); packetEncoding != "" {
+ 		switch packetEncoding {
+-- 
+2.53.0
+

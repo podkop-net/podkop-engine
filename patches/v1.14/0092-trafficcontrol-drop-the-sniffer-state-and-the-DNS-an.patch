@@ -1,0 +1,91 @@
+From e8126b24bb4f907f9a3f24d5154264ccfeacfb3f Mon Sep 17 00:00:00 2001
+From: FiyeroT <me@fiyero.xyz>
+Date: Thu, 8 Oct 2026 16:44:37 +0300
+Subject: [PATCH 092/148] trafficcontrol: drop the sniffer state and the DNS
+ answers from a tracker's metadata
+
+A tracker keeps a copy of the connection's metadata for as long as the connection
+lives, and then in the list of closed connections. The copy carried what only routing
+reads: the sniffer's working state (for QUIC, the client hello fragments collected so
+far), its error and the DNS answers. The connection list shows none of it.
+---
+ common/trafficcontrol/tracker.go              | 12 +++++++
+ .../trafficcontrol/tracker_metadata_test.go   | 36 +++++++++++++++++++
+ 2 files changed, 48 insertions(+)
+ create mode 100644 common/trafficcontrol/tracker_metadata_test.go
+
+diff --git a/common/trafficcontrol/tracker.go b/common/trafficcontrol/tracker.go
+index 260eb70fc..d406a8630 100644
+--- a/common/trafficcontrol/tracker.go
++++ b/common/trafficcontrol/tracker.go
+@@ -91,6 +91,7 @@ func (m *Manager) newTrackerMetadata(metadata adapter.InboundContext, matchedRul
+ 		}
+ 		next = outboundGroup.Now()
+ 	}
++	trimTrackedMetadata(&metadata)
+ 	return TrackerMetadata{
+ 		ID:           id,
+ 		Metadata:     metadata,
+@@ -104,6 +105,17 @@ func (m *Manager) newTrackerMetadata(metadata adapter.InboundContext, matchedRul
+ 	}
+ }
+ 
++// trimTrackedMetadata drops from the tracker's copy what only routing needed: the sniffer's
++// working state (for QUIC, the fragments of the client hello collected so far) and the DNS
++// answers. A tracker lives as long as its connection, and then in the list of closed
++// connections.
++func trimTrackedMetadata(metadata *adapter.InboundContext) {
++	metadata.SniffContext = nil
++	metadata.SniffError = nil
++	metadata.DNSResponse = nil
++	metadata.NamedDNSResponses = nil
++}
++
+ type connTracker struct {
+ 	N.ExtendedConn
+ 	metadata TrackerMetadata
+diff --git a/common/trafficcontrol/tracker_metadata_test.go b/common/trafficcontrol/tracker_metadata_test.go
+new file mode 100644
+index 000000000..7deeb8c27
+--- /dev/null
++++ b/common/trafficcontrol/tracker_metadata_test.go
+@@ -0,0 +1,36 @@
++package trafficcontrol
++
++import (
++	"errors"
++	"testing"
++
++	"github.com/sagernet/sing-box/adapter"
++
++	mDNS "github.com/miekg/dns"
++	"github.com/stretchr/testify/require"
++)
++
++// The tracker's copy of the metadata drops the sniffer's state and the DNS answers; the
++// caller's metadata keeps them, and what the connection list shows stays.
++func TestTrimTrackedMetadata(t *testing.T) {
++	original := adapter.InboundContext{
++		Protocol:          "quic",
++		Domain:            "example.com",
++		SniffContext:      make([]byte, 4096),
++		SniffError:        errors.New("need more packets"),
++		DNSResponse:       new(mDNS.Msg),
++		NamedDNSResponses: map[string]*mDNS.Msg{"a": new(mDNS.Msg)},
++	}
++	tracked := original
++	trimTrackedMetadata(&tracked)
++	require.Nil(t, tracked.SniffContext)
++	require.NoError(t, tracked.SniffError)
++	require.Nil(t, tracked.DNSResponse)
++	require.Nil(t, tracked.NamedDNSResponses)
++	require.Equal(t, "quic", tracked.Protocol)
++	require.Equal(t, "example.com", tracked.Domain)
++	require.NotNil(t, original.SniffContext)
++	require.Error(t, original.SniffError)
++	require.NotNil(t, original.DNSResponse)
++	require.Len(t, original.NamedDNSResponses, 1)
++}
+-- 
+2.53.0
+

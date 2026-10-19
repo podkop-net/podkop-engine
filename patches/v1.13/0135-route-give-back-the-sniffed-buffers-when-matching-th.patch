@@ -1,0 +1,41 @@
+From 671fab42efe5041b98a41a74e691722098a084df Mon Sep 17 00:00:00 2001
+From: FiyeroT <me@fiyero.xyz>
+Date: Mon, 19 Oct 2026 21:11:19 +0300
+Subject: [PATCH 135/140] route: give back the sniffed buffers when matching
+ the rules fails
+
+routeConnection and routePacketConnection returned the error of matchRule
+without releasing the buffers sniffing had read and handed back: for
+podkop, the first datagram of a QUIC ClientHello split over several, when
+the next read ends with the NAT session or the inbound. They go back to
+their pools now.
+---
+ route/route.go | 5 +++++
+ 1 file changed, 5 insertions(+)
+
+diff --git a/route/route.go b/route/route.go
+index 83c73b39e..3ffb74e5d 100644
+--- a/route/route.go
++++ b/route/route.go
+@@ -94,6 +94,8 @@ func (r *Router) routeConnection(ctx context.Context, conn net.Conn, metadata ad
+ 	}
+ 	selectedRule, _, buffers, _, err := r.matchRule(ctx, &metadata, false, false, conn, nil)
+ 	if err != nil {
++		// what sniffing read before the failure goes back to its pool
++		buf.ReleaseMulti(buffers)
+ 		return err
+ 	}
+ 	var selectedOutbound adapter.Outbound
+@@ -227,6 +229,9 @@ func (r *Router) routePacketConnection(ctx context.Context, conn N.PacketConn, m
+ 
+ 	selectedRule, _, _, packetBuffers, err := r.matchRule(ctx, &metadata, false, false, nil, conn)
+ 	if err != nil {
++		// the packets sniffing held (a QUIC ClientHello split over datagrams) go back to
++		// their pool
++		N.ReleaseMultiPacketBuffer(packetBuffers)
+ 		return err
+ 	}
+ 	var selectedOutbound adapter.Outbound
+-- 
+2.53.0
+

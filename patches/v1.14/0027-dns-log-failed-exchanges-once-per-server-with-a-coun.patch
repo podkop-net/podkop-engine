@@ -1,7 +1,7 @@
-From aa05568ee2c5c30c7ec71245dafb99eedad4cc4a Mon Sep 17 00:00:00 2001
+From bcb319b80cb44af6ea981e7979799d103de9a358 Mon Sep 17 00:00:00 2001
 From: FiyeroT <me@fiyero.xyz>
 Date: Sat, 3 Oct 2026 17:42:50 +0300
-Subject: [PATCH 027/125] dns: log failed exchanges once per server, with a
+Subject: [PATCH 027/148] dns: log failed exchanges once per server, with a
  count every 10 s
 
 A failed DNS exchange was not logged at all on most paths of 1.14 (the rule
@@ -243,10 +243,10 @@ index 000000000..1c8409742
 +	}
 +}
 diff --git a/dns/router.go b/dns/router.go
-index 8ef47cba0..d32f1b53c 100644
+index 1145d4639..719cb402b 100644
 --- a/dns/router.go
 +++ b/dns/router.go
-@@ -536,7 +536,7 @@ func (r *Router) settleDNSFutures(ctx context.Context, message *mDNS.Msg, state
+@@ -531,7 +531,7 @@ func (r *Router) settleDNSFutures(ctx context.Context, message *mDNS.Msg, state
  			continue
  		}
  		future.settled = true
@@ -255,7 +255,7 @@ index 8ef47cba0..d32f1b53c 100644
  			r.logger.ErrorContext(ctx, E.Cause(future.err, "exchange failed for ", FormatQuestion(message.Question[0].String())))
  		}
  		if future.tag == "" {
-@@ -1175,10 +1175,12 @@ func (r *Router) exchangeLegacy(ctx context.Context, exchangeCtx *dnsExchangeCon
+@@ -1174,10 +1174,12 @@ func (r *Router) exchangeLegacy(ctx context.Context, exchangeCtx *dnsExchangeCon
  			} else if errors.Is(err, ErrResponseRejected) {
  				rejected = true
  				r.logger.DebugContext(ctx, E.Cause(err, "response rejected for ", FormatQuestion(message.Question[0].String())))
@@ -272,7 +272,7 @@ index 8ef47cba0..d32f1b53c 100644
  			}
  		}
  		if responseCheck != nil && rejected {
-@@ -1273,7 +1275,7 @@ func (r *Router) Lookup(ctx context.Context, domain string, options adapter.DNSQ
+@@ -1272,7 +1274,7 @@ func (r *Router) Lookup(ctx context.Context, domain string, options adapter.DNSQ
  				r.logger.DebugContext(ctx, "lookup rejected for ", domain)
  			} else if errors.Is(err, ErrNotCached) {
  				r.logger.DebugContext(ctx, "cache-only lookup missed for ", domain)

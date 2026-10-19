@@ -1,0 +1,137 @@
+From 9f9ec8d3baf7f39884857f63bee4ef55d032ae04 Mon Sep 17 00:00:00 2001
+From: FiyeroT <me@fiyero.xyz>
+Date: Fri, 9 Oct 2026 16:15:04 +0300
+Subject: [PATCH 112/148] rule-set: one plain line of what the server said
+
+The error of a failed download quotes the beginning of the answer. It is
+written as one line of printable characters, 512 bytes at most: an HTML
+page of an error, or anything else a server sends in place of a rule-set,
+went to the log as it was.
+---
+ route/rule/rule_set_remote.go           | 26 ++++++++++++++++++++----
+ route/rule/rule_set_remote_body_test.go | 27 ++++++++++++++++++++-----
+ 2 files changed, 44 insertions(+), 9 deletions(-)
+
+diff --git a/route/rule/rule_set_remote.go b/route/rule/rule_set_remote.go
+index f3aea8a5b..40793ff9a 100644
+--- a/route/rule/rule_set_remote.go
++++ b/route/rule/rule_set_remote.go
+@@ -14,6 +14,8 @@ import (
+ 	"sync"
+ 	"sync/atomic"
+ 	"time"
++	"unicode"
++	"unicode/utf8"
+ 
+ 	"github.com/sagernet/sing-box/adapter"
+ 	"github.com/sagernet/sing-box/common/interrupt"
+@@ -160,7 +162,7 @@ func (s *RemoteRuleSet) StartContext(ctx context.Context, startContext *adapter.
+ 		if err != nil {
+ 			// Start with an empty rule-set instead of failing the whole start:
+ 			// RuleSetUpdater keeps retrying until the first download succeeds.
+-			s.logger.Error(E.Cause(err, "initial rule-set: ", s.tag, ", starting empty and retrying"))
++			s.logger.Error("initial rule-set: ", s.tag, ", starting empty and retrying: ", logText(err))
+ 			s.startedEmpty = true
+ 			// The DNS router decides its rule mode from the metadata of the referenced sets
+ 			// when it starts, right after this. Until the content is known, report it as
+@@ -298,15 +300,31 @@ func (s *RemoteRuleSet) fetchFailed(err error) {
+ 	switch {
+ 	case s.failures == 1:
+ 		s.failureLogged = time.Now()
+-		s.logger.Error("fetch rule-set ", s.tag, ": ", err)
++		s.logger.Error("fetch rule-set ", s.tag, ": ", logText(err))
+ 	case time.Since(s.failureLogged) >= ruleSetFailureLogInterval:
+ 		s.failureLogged = time.Now()
+-		s.logger.Error("fetch rule-set ", s.tag, ": ", s.failures, " failed attempts, the last: ", err)
++		s.logger.Error("fetch rule-set ", s.tag, ": ", s.failures, " failed attempts, the last: ", logText(err))
+ 	default:
+-		s.logger.Debug("fetch rule-set ", s.tag, ": ", err)
++		s.logger.Debug("fetch rule-set ", s.tag, ": ", logText(err))
+ 	}
+ }
+ 
++// logText makes one line of the error of a fetch. It may carry what the server sent: the
++// status line of the answer, the text of a rule that does not parse. That text is cut,
++// and what is not printable in it is replaced.
++func logText(err error) string {
++	text := err.Error()
++	if len(text) > 512 {
++		text = strings.ToValidUTF8(text[:512], "") + "..."
++	}
++	return strings.Map(func(r rune) rune {
++		if r == utf8.RuneError || !unicode.IsPrint(r) {
++			return '?'
++		}
++		return r
++	}, text)
++}
++
+ // A rule-set download must not hang the start (the inbounds listen only after every rule-set
+ // has started) nor the background updates, yet a large list on a slow router link is normal
+ // and must still load. So the start gets a short TOTAL deadline — on timeout it starts empty
+diff --git a/route/rule/rule_set_remote_body_test.go b/route/rule/rule_set_remote_body_test.go
+index 117cce19a..e4a1ad995 100644
+--- a/route/rule/rule_set_remote_body_test.go
++++ b/route/rule/rule_set_remote_body_test.go
+@@ -10,10 +10,12 @@ import (
+ 	"strings"
+ 	"testing"
+ 	"time"
++	"unicode/utf8"
+ 
+ 	"github.com/sagernet/sing-box/common/interrupt"
+ 	C "github.com/sagernet/sing-box/constant"
+ 	"github.com/sagernet/sing-box/log"
++	E "github.com/sagernet/sing/common/exceptions"
+ 
+ 	"github.com/stretchr/testify/require"
+ )
+@@ -30,13 +32,16 @@ const testSourceSet = `{"version":3,"rules":[{"domain_suffix":["example.com"]}]}
+ // is read into memory.
+ func TestRemoteRuleSetDeclaredTooLarge(t *testing.T) {
+ 	defer swapMaxSize(1 << 20)()
++	// far more than the socket buffers of both ends take in: a server whose answer is
++	// not read cannot have written all of it
++	const declared = 64 << 20
+ 	var sent int
+ 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+-		w.Header().Set("Content-Length", strconv.Itoa(2<<20))
++		w.Header().Set("Content-Length", strconv.Itoa(declared))
+ 		w.WriteHeader(http.StatusOK)
+-		chunk := strings.Repeat("A", 64<<10)
+-		for range 32 {
+-			n, err := w.Write([]byte(chunk))
++		chunk := []byte(strings.Repeat("A", 64<<10))
++		for sent < declared {
++			n, err := w.Write(chunk)
+ 			sent += n
+ 			if err != nil {
+ 				return
+@@ -50,7 +55,7 @@ func TestRemoteRuleSetDeclaredTooLarge(t *testing.T) {
+ 	require.Error(t, err)
+ 	require.Contains(t, err.Error(), "larger than 1 MB")
+ 	server.Close()
+-	require.Less(t, sent, 2<<20, "the client must stop the transfer instead of reading it")
++	require.Less(t, sent, declared, "the client must stop the transfer instead of reading it")
+ }
+ 
+ // A page served with status 200 where a binary rule-set is expected is refused by its first
+@@ -153,3 +158,15 @@ func TestRemoteRuleSetFetchIsExternalConnection(t *testing.T) {
+ 	require.NoError(t, set.fetch(context.Background(), false))
+ 	require.True(t, external)
+ }
++
++// What a server sends reaches the log as one printable line of a bounded length.
++func TestRuleSetLogText(t *testing.T) {
++	t.Parallel()
++	require.Equal(t, "unexpected status: 404 Not?Found??[31m", logText(E.New("unexpected status: 404 Not\nFound\r\x1b[31m")))
++	require.Equal(t, "rules[0]: unknown rule type: x?y", logText(E.New("rules[0]: unknown rule type: x\x00y")))
++	long := logText(E.New(strings.Repeat("\u044f", 600)))
++	require.LessOrEqual(t, len(long), 515)
++	require.True(t, strings.HasSuffix(long, "..."))
++	require.True(t, utf8.ValidString(long))
++	require.NotContains(t, long, "?")
++}
+-- 
+2.53.0
+

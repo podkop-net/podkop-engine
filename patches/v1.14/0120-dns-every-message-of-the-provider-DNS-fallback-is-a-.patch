@@ -1,0 +1,142 @@
+From 3b3c9d604cebc4d0d2102eaab7ded3d8a9923c26 Mon Sep 17 00:00:00 2001
+From: FiyeroT <me@fiyero.xyz>
+Date: Sat, 10 Oct 2026 17:02:44 +0300
+Subject: [PATCH 120/148] dns: every message of the provider DNS fallback is a
+ warning
+
+Whether a server has the fallback, the provider's servers read for it and
+the return of a server that had been set aside were logged at the info
+level. A log at the warn level said nothing about the fallback until a
+server had failed twice in a row, so it could not be told from such a log
+whether the fallback was on at all, or which servers it would ask.
+
+TestFallbackLogs now sends every message of the fallback through a logger
+at the warn level.
+---
+ dns/client_fallback.go          | 10 ++++++---
+ dns/client_fallback_provider.go |  4 ++--
+ dns/client_fallback_test.go     | 38 +++++++++++++++++++++++++++++----
+ 3 files changed, 43 insertions(+), 9 deletions(-)
+
+diff --git a/dns/client_fallback.go b/dns/client_fallback.go
+index 47e372f15..cacbe32b2 100644
+--- a/dns/client_fallback.go
++++ b/dns/client_fallback.go
+@@ -49,6 +49,10 @@ import (
+ // twice in a row, the fallback is off for that server for a minute. A network reset
+ // starts the counts over and makes the provider usable again; a server that is set aside
+ // stays so but is probed with the next query, see reset.
++//
++// Everything the fallback writes to the log is a warning: whether a server has it, the
++// provider's servers and every change of state are there in a log that is not at the
++// info level.
+ var fallbackEnabled = os.Getenv("SING_BOX_DNS_FALLBACK") != ""
+ 
+ const (
+@@ -175,7 +179,7 @@ func probeServer(ctx context.Context, logger logger.ContextLogger, transport ada
+ 	state.failures = 0
+ 	state.access.Unlock()
+ 	if wasDown && logger != nil {
+-		logger.InfoContext(ctx, "server ", transport.Tag(), " answers again, provider DNS no longer used")
++		logger.WarnContext(ctx, "server ", transport.Tag(), " answers again, provider DNS no longer used")
+ 	}
+ }
+ 
+@@ -204,9 +208,9 @@ func (s *fallbackServer) decide(ctx context.Context, logger logger.ContextLogger
+ 			return
+ 		}
+ 		if s.eligible {
+-			logger.Info("server ", tag, " falls back to provider DNS when it fails")
++			logger.Warn("server ", tag, " falls back to provider DNS when it fails")
+ 		} else {
+-			logger.Info("no provider DNS fallback for server ", tag, ": ", reason)
++			logger.Warn("no provider DNS fallback for server ", tag, ": ", reason)
+ 		}
+ 	})
+ 	return s.eligible
+diff --git a/dns/client_fallback_provider.go b/dns/client_fallback_provider.go
+index 636efd2d8..c707d61bb 100644
+--- a/dns/client_fallback_provider.go
++++ b/dns/client_fallback_provider.go
+@@ -158,9 +158,9 @@ func (p *providerSet) refresh(logger logger.ContextLogger, device string) []M.So
+ 			case err != nil:
+ 				logger.Warn("no provider DNS for the fallback: ", err)
+ 			case len(servers) == 0:
+-				logger.Info("no provider DNS for the fallback on ", device)
++				logger.Warn("no provider DNS for the fallback on ", device)
+ 			default:
+-				logger.Info("provider DNS for the fallback on ", device, " (", strings.Join(names, ", "), "): ", joinServers(servers))
++				logger.Warn("provider DNS for the fallback on ", device, " (", strings.Join(names, ", "), "): ", joinServers(servers))
+ 			}
+ 		}
+ 	}
+diff --git a/dns/client_fallback_test.go b/dns/client_fallback_test.go
+index 2812d1ba0..b95eac970 100644
+--- a/dns/client_fallback_test.go
++++ b/dns/client_fallback_test.go
+@@ -173,16 +173,38 @@ func TestCapTTL(t *testing.T) {
+ }
+ 
+ // The logger formats only strings, numbers, errors and Stringers and panics on anything
+-// else: every message of the fallback goes through a real one here.
++// else: every message of the fallback goes through a real one here. It is at the warn
++// level: a message of the fallback written below that level would be missing.
+ func TestFallbackLogs(t *testing.T) {
+ 	t.Parallel()
+ 	var output bytes.Buffer
+ 	factory := log.NewDefaultFactory(context.Background(), log.Formatter{BaseTime: time.Now(), DisableColors: true}, &output, "", nil, false)
+-	factory.SetLevel(log.LevelTrace)
++	factory.SetLevel(log.LevelWarn)
+ 	if err := factory.Start(); err != nil {
+ 		t.Fatal(err)
+ 	}
+ 	logger := factory.NewLogger("dns")
++	var dump struct {
++		Interface []netifdInterface `json:"interface"`
++	}
++	if err := json.Unmarshal([]byte(testUbusDump), &dump); err != nil {
++		t.Fatal(err)
++	}
++	readDump := func(ctx context.Context) ([]netifdInterface, error) { return dump.Interface, nil }
++
++	// the decision, with the provider's servers read for it
++	qualifies := &fallbackServer{
++		options:   option.RemoteDNSServerOptions{DNSServerAddressOptions: option.DNSServerAddressOptions{Server: "77.88.8.8"}},
++		providers: &providerSet{read: readDump},
++	}
++	if !qualifies.decide(context.Background(), logger, "dns-server") {
++		t.Error("a server at a public address does not qualify")
++	}
++	(&fallbackServer{}).decide(nil, logger, "dns-server") //nolint:staticcheck
++	(&providerSet{read: readDump}).refresh(logger, "eth9")
++	(&providerSet{read: func(ctx context.Context) ([]netifdInterface, error) { return nil, E.New("no ubus in tests") }}).refresh(logger, "")
++
++	// the server fails, the provider fails, the server is back
+ 	state := &fallbackServer{providers: &providerSet{
+ 		servers: []M.Socksaddr{M.ParseSocksaddrHostPort("10.99.0.53", 53), M.ParseSocksaddrHostPort("fe80::1%eth1", 53)},
+ 		readAt:  time.Now(),
+@@ -197,11 +219,19 @@ func TestFallbackLogs(t *testing.T) {
+ 	if state.usable(context.Background(), logger) {
+ 		t.Error("fallback still usable after the provider failed")
+ 	}
+-	(&fallbackServer{}).decide(nil, logger, "dns-server") //nolint:staticcheck
++	transport, setAside, _ := newFallbackTest()
++	setAside.down = true
++	probeServer(context.Background(), logger, transport, setAside, freshTestQuery())
++
+ 	for _, message := range []string{
++		"provider DNS for the fallback on wan0 (wan, wan6): 10.99.0.53, 10.99.0.54, fe80::1%wan0, 2a00::53",
++		"server dns-server falls back to provider DNS when it fails",
++		"no provider DNS fallback for server dns-server: no context",
++		"no provider DNS for the fallback on eth9",
++		"no provider DNS for the fallback: no ubus in tests",
+ 		"failed 2 times in a row (timeout), answering from provider DNS 10.99.0.53, fe80::1%eth1 until it is back",
+ 		"provider DNS does not answer for server dns-server (timeout), no fallback for it for 1m0s",
+-		"no provider DNS fallback for server dns-server: no context",
++		"server dns-server answers again, provider DNS no longer used",
+ 	} {
+ 		if !strings.Contains(output.String(), message) {
+ 			t.Errorf("missing %q in:\n%s", message, output.String())
+-- 
+2.53.0
+

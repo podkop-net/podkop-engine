@@ -1,7 +1,7 @@
-From 9597e91d9f3ab139975a6de8b9e3a5a2c0e8012a Mon Sep 17 00:00:00 2001
+From 61cc82ea760d363dffc6fa61a3faae628d1cbda1 Mon Sep 17 00:00:00 2001
 From: FiyeroT <me@fiyero.xyz>
 Date: Sat, 3 Oct 2026 20:42:34 +0300
-Subject: [PATCH 032/125] box: let the Go memory limit follow the memory the
+Subject: [PATCH 032/148] box: let the Go memory limit follow the memory the
  system can still give
 
 Without a limit the collector lets the heap grow to twice its live size before
@@ -33,35 +33,21 @@ memory was short; with memory to spare CPU and RSS are unchanged.
  create mode 100644 memory_limit_test.go
 
 diff --git a/box.go b/box.go
-index 92cd1ecdd..be70e05df 100644
+index ba5eff387..31e7731bc 100644
 --- a/box.go
 +++ b/box.go
-@@ -48,6 +48,7 @@ type Box struct {
- 	createdAt           time.Time
- 	debugOptions        option.DebugOptions
- 	debugHTTPServer     *http.Server
-+	memoryLimit         func()
- 	logFactory          log.Factory
- 	logger              log.ContextLogger
- 	network             *route.NetworkManager
-@@ -536,6 +537,7 @@ func (s *Box) preStart() error {
- 		return E.Cause(err, "start logger")
+@@ -543,6 +543,11 @@ func (s *Box) preStart() error {
  	}
+ 	s.scope.Add(s.logFactory.Close)
  	applyDebugOptions(s.debugOptions)
-+	s.memoryLimit = startMemoryLimit(s.logger, s.debugOptions)
- 	s.debugHTTPServer, err = startDebugHTTPServer(s.debugOptions)
++	stopMemoryLimit := startMemoryLimit(s.logger, s.debugOptions)
++	s.scope.Add(func() error {
++		stopMemoryLimit()
++		return nil
++	})
+ 	debugHTTPServer, err := startDebugHTTPServer(s.debugOptions)
  	if err != nil {
  		return err
-@@ -611,6 +613,9 @@ func (s *Box) Close() error {
- 		close(s.done)
- 	}
- 	var err error
-+	if s.memoryLimit != nil {
-+		s.memoryLimit()
-+	}
- 	if s.debugHTTPServer != nil {
- 		err = E.Append(err, s.debugHTTPServer.Close(), func(err error) error {
- 			return E.Cause(err, "close debug HTTP server")
 diff --git a/memory_limit.go b/memory_limit.go
 new file mode 100644
 index 000000000..530e89ac9

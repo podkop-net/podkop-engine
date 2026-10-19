@@ -1,0 +1,291 @@
+From 24293dc15f376f18c62a57a1c12749bd46ceb433 Mon Sep 17 00:00:00 2001
+From: FiyeroT <me@fiyero.xyz>
+Date: Tue, 6 Oct 2026 23:57:40 +0300
+Subject: [PATCH 082/148] sniff: log the stack of a panicking sniffer once a
+ minute, not per connection
+
+A sniffer that panics is recovered, and the error returned carried the whole stack in its
+text. The router logged it at the error level for every connection, and the same text
+stayed in the metadata of the connection, which the trackers keep for the live and the
+last thousand closed connections. A client repeating the input that trips a sniffer bug
+got a stack of several kilobytes per connection into the log.
+
+The panic is now a SnifferPanicError: its text is one line, the stack is a field, and
+errors.Is still finds ErrSnifferPanicked. The router logs the stack for the first panic
+and then at most once a minute, with the number of panics in between, which are left to
+the debug level; it drops the stack from the error once it has seen it, so the metadata
+keeps the short text only.
+---
+ common/sniff/recover_test.go | 23 ++++++++--
+ common/sniff/sniff.go        | 21 ++++++++-
+ route/route.go               | 35 ++++++++++++++-
+ route/route_log_test.go      | 82 ++++++++++++++++++++++++++++++++++++
+ route/router.go              |  1 +
+ 5 files changed, 154 insertions(+), 8 deletions(-)
+
+diff --git a/common/sniff/recover_test.go b/common/sniff/recover_test.go
+index b604475be..0779bf452 100644
+--- a/common/sniff/recover_test.go
++++ b/common/sniff/recover_test.go
+@@ -6,6 +6,7 @@ import (
+ 	"errors"
+ 	"io"
+ 	"net"
++	"os"
+ 	"testing"
+ 
+ 	"github.com/sagernet/sing-box/adapter"
+@@ -29,14 +30,16 @@ func panickingPacketSniffer(_ context.Context, metadata *adapter.InboundContext,
+ 	return panickingStreamSniffer(context.Background(), metadata, bytes.NewReader(packet))
+ }
+ 
+-// A sniffer that panics fails the sniff of its connection, with the panic and its stack, and
+-// leaves the metadata as it found it; the next sniffer still runs.
++// A sniffer that panics fails the sniff of its connection, with the panic in one line and
++// its stack apart, and leaves the metadata as it found it; the next sniffer still runs.
+ func TestSnifferPanicRecovered(t *testing.T) {
+ 	var metadata adapter.InboundContext
+ 	err := PeekPacket(context.Background(), &metadata, []byte("packet"), panickingPacketSniffer)
+ 	require.ErrorIs(t, err, ErrSnifferPanicked)
+-	require.Contains(t, err.Error(), "index out of range")
+-	require.Contains(t, err.Error(), "panickingStreamSniffer")
++	require.Equal(t, "sniffer panicked: runtime error: index out of range [1] with length 0", err.Error())
++	var panicError *SnifferPanicError
++	require.ErrorAs(t, err, &panicError)
++	require.Contains(t, string(panicError.Stack), "panickingStreamSniffer")
+ 	require.Empty(t, metadata.Protocol)
+ 	require.Empty(t, metadata.Domain)
+ 	require.Nil(t, metadata.SniffContext)
+@@ -49,6 +52,18 @@ func TestSnifferPanicRecovered(t *testing.T) {
+ 	require.NoError(t, err)
+ 	require.Equal(t, C.ProtocolDNS, metadata.Protocol)
+ 
++	// among the failures of other sniffers the panic and its stack are still found
++	metadata = adapter.InboundContext{}
++	err = PeekPacket(context.Background(), &metadata, []byte("packet"),
++		func(context.Context, *adapter.InboundContext, []byte) error { return os.ErrInvalid },
++		panickingPacketSniffer)
++	require.ErrorIs(t, err, os.ErrInvalid)
++	require.ErrorIs(t, err, ErrSnifferPanicked)
++	panicError = nil
++	require.ErrorAs(t, err, &panicError)
++	require.NotEmpty(t, panicError.Stack)
++	require.NotContains(t, err.Error(), "\n")
++
+ 	client, server := net.Pipe()
+ 	defer client.Close()
+ 	defer server.Close()
+diff --git a/common/sniff/sniff.go b/common/sniff/sniff.go
+index d76552ef4..a4f61dd14 100644
+--- a/common/sniff/sniff.go
++++ b/common/sniff/sniff.go
+@@ -29,14 +29,31 @@ var ErrNeedMoreData = E.New("need more data")
+ // connection instead of the process.
+ var ErrSnifferPanicked = E.New("sniffer panicked")
+ 
++// SnifferPanicError is what a sniffer that panicked returns; errors.Is finds
++// ErrSnifferPanicked in it. Its text is one line: it stays in the metadata of the
++// connection, which trackers keep, and such connections can come by the hundred. The stack
++// is apart, for whoever logs the bug.
++type SnifferPanicError struct {
++	Value string // the panic
++	Stack []byte
++}
++
++func (e *SnifferPanicError) Error() string {
++	return ErrSnifferPanicked.Error() + ": " + e.Value
++}
++
++func (e *SnifferPanicError) Unwrap() error {
++	return ErrSnifferPanicked
++}
++
+ // recovered runs a sniffer. On a panic it restores the metadata the sniffer may have set
+-// and returns ErrSnifferPanicked with the panic and its stack.
++// and returns a SnifferPanicError with the panic and its stack.
+ func recovered(metadata *adapter.InboundContext, sniff func() error) (err error) {
+ 	protocol, domain, client, sniffContext := metadata.Protocol, metadata.Domain, metadata.Client, metadata.SniffContext
+ 	defer func() {
+ 		if panicked := recover(); panicked != nil {
+ 			metadata.Protocol, metadata.Domain, metadata.Client, metadata.SniffContext = protocol, domain, client, sniffContext
+-			err = fmt.Errorf("%w: %v\n%s", ErrSnifferPanicked, panicked, debug.Stack())
++			err = &SnifferPanicError{Value: fmt.Sprint(panicked), Stack: debug.Stack()}
+ 		}
+ 	}()
+ 	return sniff()
+diff --git a/route/route.go b/route/route.go
+index ed9c6ecff..ab9d477a1 100644
+--- a/route/route.go
++++ b/route/route.go
+@@ -6,6 +6,7 @@ import (
+ 	"net"
+ 	"net/netip"
+ 	"strings"
++	"sync"
+ 	"time"
+ 
+ 	"github.com/sagernet/sing-box/adapter"
+@@ -818,10 +819,40 @@ match:
+ // ClientHellos browsers send, with a post-quantum key share, take two.
+ const maxSniffPackets = 16
+ 
++// A sniffer that panics on what a client sends panics for every such connection. The stack
++// is logged for the first one and then once per snifferPanicLogInterval, with the number
++// of panics in between; those are left to the debug level.
++var snifferPanicLogInterval = time.Minute
++
++type snifferPanicLog struct {
++	access  sync.Mutex
++	logged  time.Time // the last stack
++	skipped int       // panics since then
++}
++
+ // logSnifferPanic logs a sniffer that panicked, with its stack: a bug to report.
+ func (r *Router) logSnifferPanic(ctx context.Context, err error) {
+-	if errors.Is(err, sniff.ErrSnifferPanicked) {
+-		r.logger.ErrorContext(ctx, err)
++	var panicked *sniff.SnifferPanicError
++	if !errors.As(err, &panicked) {
++		return
++	}
++	// the error stays in the metadata of the connection: the stack does not
++	stack := panicked.Stack
++	panicked.Stack = nil
++	r.snifferPanics.access.Lock()
++	if !r.snifferPanics.logged.IsZero() && time.Since(r.snifferPanics.logged) < snifferPanicLogInterval {
++		r.snifferPanics.skipped++
++		r.snifferPanics.access.Unlock()
++		r.logger.DebugContext(ctx, panicked)
++		return
++	}
++	skipped := r.snifferPanics.skipped
++	r.snifferPanics.logged, r.snifferPanics.skipped = time.Now(), 0
++	r.snifferPanics.access.Unlock()
++	if skipped > 0 {
++		r.logger.ErrorContext(ctx, panicked, " (", skipped, " more since the last stack was logged)\n", string(stack))
++	} else {
++		r.logger.ErrorContext(ctx, panicked, "\n", string(stack))
+ 	}
+ }
+ 
+diff --git a/route/route_log_test.go b/route/route_log_test.go
+index cee65c8b6..f2d12f64e 100644
+--- a/route/route_log_test.go
++++ b/route/route_log_test.go
+@@ -3,6 +3,7 @@ package route
+ import (
+ 	"bytes"
+ 	"context"
++	"io"
+ 	"net"
+ 	"net/netip"
+ 	"strings"
+@@ -11,8 +12,11 @@ import (
+ 	"time"
+ 
+ 	"github.com/sagernet/sing-box/adapter"
++	"github.com/sagernet/sing-box/common/sniff"
+ 	C "github.com/sagernet/sing-box/constant"
+ 	"github.com/sagernet/sing-box/log"
++	R "github.com/sagernet/sing-box/route/rule"
++	"github.com/sagernet/sing/common/buf"
+ 	M "github.com/sagernet/sing/common/metadata"
+ 	N "github.com/sagernet/sing/common/network"
+ 
+@@ -215,3 +219,81 @@ func TestLoopRefusalsAreCounted(t *testing.T) {
+ 	require.Len(t, lines, 4, output.String())
+ 	require.Contains(t, lines[3], "inbound dns-in: 1 more refused in 2s, the last: refused packet")
+ }
++
++// onePacket delivers the same packet on every read.
++type onePacket struct {
++	N.PacketConn
++}
++
++func (onePacket) ReadPacket(buffer *buf.Buffer) (M.Socksaddr, error) {
++	buffer.Write([]byte("packet"))
++	return M.ParseSocksaddr("192.0.2.1:443"), nil
++}
++
++func (onePacket) SetReadDeadline(time.Time) error { return nil }
++
++func panickingSniffer(context.Context, *adapter.InboundContext, []byte) error {
++	var empty []byte
++	_ = empty[1]
++	return nil
++}
++
++func panickingStreamSniffer(context.Context, *adapter.InboundContext, io.Reader) error {
++	return panickingSniffer(nil, nil, nil)
++}
++
++// A sniffer that panics on what a client sends panics for every such connection: its stack
++// is logged for the first one and then at most once per interval, with the number of
++// panics in between, and the error kept in the metadata of each connection is one line.
++func TestSnifferPanicStackIsLoggedOncePerInterval(t *testing.T) {
++	router, output := newLoggedRouter(t)
++	action := &R.RuleActionSniff{
++		PacketSniffers: []sniff.PacketSniffer{panickingSniffer},
++		StreamSniffers: []sniff.StreamSniffer{panickingStreamSniffer},
++	}
++	sniffPacket := func() {
++		var metadata adapter.InboundContext
++		_, packetBuffers, fatalErr := router.actionSniff(context.Background(), &metadata, action, nil, onePacket{}, nil, nil)
++		require.NoError(t, fatalErr)
++		N.ReleaseMultiPacketBuffer(packetBuffers)
++		require.ErrorIs(t, metadata.SniffError, sniff.ErrSnifferPanicked)
++		require.Contains(t, metadata.SniffError.Error(), "index out of range")
++		require.NotContains(t, metadata.SniffError.Error(), "\n", "the error of the connection carries no stack")
++	}
++	sniffStream := func() {
++		var metadata adapter.InboundContext
++		conn, peer := net.Pipe()
++		defer conn.Close()
++		defer peer.Close()
++		go peer.Write([]byte("stream"))
++		buffer, _, fatalErr := router.actionSniff(context.Background(), &metadata, action, conn, nil, nil, nil)
++		require.NoError(t, fatalErr)
++		buffer.Release()
++		require.ErrorIs(t, metadata.SniffError, sniff.ErrSnifferPanicked)
++		require.NotContains(t, metadata.SniffError.Error(), "\n", "the error of the connection carries no stack")
++	}
++	sniffPacket()
++	for range 3 {
++		sniffPacket()
++		sniffStream()
++	}
++	logged := output.String()
++	require.Equal(t, 1, strings.Count(logged, " [running]:"), logged)
++	require.Contains(t, logged, "panickingSniffer")
++	errorLines := 0
++	for _, line := range output.lines() {
++		if strings.HasPrefix(line, "ERROR") {
++			errorLines++
++			require.Contains(t, line, "sniffer panicked: runtime error: index out of range")
++		}
++	}
++	require.Equal(t, 1, errorLines, logged)
++
++	// the interval is over
++	snifferPanicLogInterval = time.Nanosecond
++	defer func() { snifferPanicLogInterval = time.Minute }()
++	sniffPacket()
++	logged = output.String()
++	require.Equal(t, 2, strings.Count(logged, " [running]:"), logged)
++	require.Contains(t, logged, "6 more since the last stack was logged")
++}
+diff --git a/route/router.go b/route/router.go
+index f932d068a..14cf72f98 100644
+--- a/route/router.go
++++ b/route/router.go
+@@ -48,6 +48,7 @@ type Router struct {
+ 	trackers          []adapter.ConnectionTracker
+ 	platformInterface adapter.PlatformInterface
+ 	loopRefusals      loopRefusalLog
++	snifferPanics     snifferPanicLog
+ }
+ 
+ func NewRouter(ctx context.Context, logFactory log.Factory, options option.RouteOptions, dnsOptions option.DNSOptions) *Router {
+-- 
+2.53.0
+

@@ -1,0 +1,87 @@
+From 1c20cac47268c7394e4b48efbd7824a3d2909a9d Mon Sep 17 00:00:00 2001
+From: FiyeroT <me@fiyero.xyz>
+Date: Tue, 6 Oct 2026 23:40:17 +0300
+Subject: [PATCH 079/148] dns/fakeip: tell the loop to stop before the store
+ refuses saves
+
+Close set closed, released the lock and only then closed the channel that stops the
+background loop. A save of the loop that took the lock in between was refused with
+"fakeip store closed", found the loop not told to stop yet and logged the refusal as a
+failed save: a misleading error line at the moment of a stop or a restart. Nothing was
+lost, Close saves everything itself.
+
+The channel is now closed inside the critical section that sets closed, so a refused save
+of the loop always finds it closed and the loop exits silently. Close still waits for the
+loop outside the lock, which the loop's save needs.
+---
+ dns/transport/fakeip/store.go      |  6 +++++-
+ dns/transport/fakeip/store_test.go | 34 ++++++++++++++++++++++++++++++
+ 2 files changed, 39 insertions(+), 1 deletion(-)
+
+diff --git a/dns/transport/fakeip/store.go b/dns/transport/fakeip/store.go
+index b7a1dcb53..ad3f301f8 100644
+--- a/dns/transport/fakeip/store.go
++++ b/dns/transport/fakeip/store.go
+@@ -502,9 +502,13 @@ func (s *Store) Close() error {
+ 		return nil
+ 	}
+ 	s.closed = true
+-	s.access.Unlock()
+ 	if s.loopDone != nil {
++		// before closed can be seen: a save of the loop that is refused because of it
++		// finds the loop told to stop, and does not log the refusal as a failed save
+ 		close(s.done)
++	}
++	s.access.Unlock()
++	if s.loopDone != nil {
+ 		<-s.loopDone
+ 	}
+ 	err := s.save(saveRequest{clean: true})
+diff --git a/dns/transport/fakeip/store_test.go b/dns/transport/fakeip/store_test.go
+index 961b56188..9d22fe6e1 100644
+--- a/dns/transport/fakeip/store_test.go
++++ b/dns/transport/fakeip/store_test.go
+@@ -1018,6 +1018,40 @@ func TestNewNamesWhileTheLoopCannotSave(t *testing.T) {
+ 	require.NoError(t, store.Close())
+ }
+ 
++// Close stops the loop no later than it makes the store refuse saves: a save of the loop
++// that is refused finds the loop told to stop, and is not logged as a failure.
++func TestCloseStopsTheLoopBeforeSavesAreRefused(t *testing.T) {
++	t.Parallel()
++	for range 300 {
++		store := NewStore(context.Background(), logger.NOP(), netip.MustParsePrefix("198.18.0.0/15"), netip.Prefix{})
++		store.testStorage = newFakeStorage()
++		require.NoError(t, store.Start())
++		refusedWhileRunning := make(chan bool)
++		go func() {
++			// what a save of the loop sees, as often as the lock is free
++			for {
++				if !store.access.TryRLock() {
++					continue
++				}
++				closed := store.closed
++				stopped := false
++				select {
++				case <-store.done:
++					stopped = true
++				default:
++				}
++				store.access.RUnlock()
++				if closed {
++					refusedWhileRunning <- !stopped
++					return
++				}
++			}
++		}()
++		require.NoError(t, store.Close())
++		require.False(t, <-refusedWhileRunning, "the store refuses saves while the loop is not told to stop")
++	}
++}
++
+ // A model of the clients: the address each one was given and holds. Whatever happens,
+ // crashes included, such an address leads to the domain it was given for or to nothing,
+ // and is not given to another domain, until the store removes the record by its rules.
+-- 
+2.53.0
+

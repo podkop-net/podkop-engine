@@ -1,0 +1,535 @@
+From 68bfe0aa4585f52397bae1d7bc27f1cd74ba2c64 Mon Sep 17 00:00:00 2001
+From: FiyeroT <me@fiyero.xyz>
+Date: Mon, 5 Oct 2026 12:16:15 +0300
+Subject: [PATCH 047/148] xhttp: cap the frame size the HTTP/2 client writes,
+ wait for data on a small probe, retire idle pooled connections
+
+A streamed request body was written through a buffer as large as the server's
+maximum frame size, up to 512 KiB, for as long as the session lived: every
+idle stream-one and stream-up session over HTTP/2 held it (lab: 567 KB per
+session against Xray). The first SETTINGS of the server is now read with its
+SETTINGS_MAX_FRAME_SIZE at 16 KiB, the initial value, what Chrome sends.
+
+The copy loop waits for download data through a read waiter that reads a
+512 byte probe, instead of holding its 32 KiB buffer while the server is
+silent.
+
+A pooled connection no session used for five minutes is retired: QUIC's
+keep-alive kept an idle HTTP/3 connection open for good.
+---
+ transport/v2rayxhttp/client.go          |   2 +-
+ transport/v2rayxhttp/client_test.go     |  72 +++++++++++++++
+ transport/v2rayxhttp/conn.go            |  48 ++++++++++
+ transport/v2rayxhttp/frame_size.go      |  73 +++++++++++++++
+ transport/v2rayxhttp/frame_size_test.go | 116 ++++++++++++++++++++++++
+ transport/v2rayxhttp/pool.go            |  50 +++++++++-
+ transport/v2rayxhttp/upload.go          |   4 +-
+ 7 files changed, 359 insertions(+), 6 deletions(-)
+ create mode 100644 transport/v2rayxhttp/frame_size.go
+ create mode 100644 transport/v2rayxhttp/frame_size_test.go
+
+diff --git a/transport/v2rayxhttp/client.go b/transport/v2rayxhttp/client.go
+index 10a108d84..a1c1cc232 100644
+--- a/transport/v2rayxhttp/client.go
++++ b/transport/v2rayxhttp/client.go
+@@ -258,7 +258,7 @@ func (c *Client) sessionClients(s *session) (*poolClient, *poolClient, error) {
+ 	}
+ 	s.hold(downClient)
+ 	if c.upPool == c.downPool {
+-		downClient.running.Add(1)
++		downClient.acquire()
+ 		return downClient, downClient, nil
+ 	}
+ 	upClient, err := c.upPool.get()
+diff --git a/transport/v2rayxhttp/client_test.go b/transport/v2rayxhttp/client_test.go
+index efebd13f0..cac128bc6 100644
+--- a/transport/v2rayxhttp/client_test.go
++++ b/transport/v2rayxhttp/client_test.go
+@@ -446,3 +446,75 @@ func TestXHTTPDownloadLeg(t *testing.T) {
+ 		})
+ 	}
+ }
++
++// Through the read waiter the download arrives whole and in order, whether it
++// comes after a pause (probe first) or in a stream, and a close ends the wait.
++func TestXHTTPReadWaiter(t *testing.T) {
++	for _, mode := range []string{modePacketUp, modeStreamOne} {
++		t.Run(mode, func(t *testing.T) {
++			client, _ := newTestPair(t, option.V2RayXHTTPOptions{Mode: mode}, "h2", nil)
++			conn, err := client.DialContext(context.Background())
++			require.NoError(t, err)
++			waiter, created := conn.(N.ReadWaitCreator).CreateReadWaiter()
++			require.True(t, created)
++			waiter.InitializeReadWaiter(N.ReadWaitOptions{})
++			var sent bytes.Buffer
++			go func() {
++				for _, size := range []int{1, 100, 511, 512, 513, 4096, 200 * 1024, 7} {
++					data := randomBytes(size)
++					sent.Write(data)
++					conn.Write(data)
++					time.Sleep(30 * time.Millisecond)
++				}
++			}()
++			const total = 1 + 100 + 511 + 512 + 513 + 4096 + 200*1024 + 7
++			received := make([]byte, 0, total)
++			for len(received) < total {
++				buffer, err := waiter.WaitReadBuffer()
++				require.NoError(t, err)
++				received = append(received, buffer.Bytes()...)
++				buffer.Release()
++			}
++			require.True(t, bytes.Equal(sent.Bytes(), received))
++			done := make(chan error, 1)
++			go func() {
++				_, err := waiter.WaitReadBuffer()
++				done <- err
++			}()
++			time.Sleep(50 * time.Millisecond)
++			conn.Close()
++			require.ErrorIs(t, <-done, net.ErrClosed)
++		})
++	}
++}
++
++// A pooled connection no session uses is retired after the idle timeout, for
++// every HTTP version (HTTP/3 would otherwise stay open on its keep-alive).
++func TestXHTTPPoolIdleRetire(t *testing.T) {
++	saved := poolIdleTimeout
++	poolIdleTimeout = 300 * time.Millisecond
++	defer func() { poolIdleTimeout = saved }()
++	for _, version := range []string{"h1", "h2"} {
++		t.Run(version, func(t *testing.T) {
++			client, _ := newTestPair(t, option.V2RayXHTTPOptions{Mode: modePacketUp}, version, nil)
++			baseline := settledGoroutines()
++			conn, err := client.DialContext(context.Background())
++			require.NoError(t, err)
++			echo(t, conn, 4096)
++			time.Sleep(500 * time.Millisecond)
++			client.upPool.access.Lock()
++			require.Len(t, client.upPool.clients, 1, "an open session keeps its connection")
++			client.upPool.access.Unlock()
++			conn.Close()
++			time.Sleep(700 * time.Millisecond)
++			client.upPool.access.Lock()
++			require.Empty(t, client.upPool.clients)
++			client.upPool.access.Unlock()
++			waitGoroutines(t, baseline)
++			conn, err = client.DialContext(context.Background())
++			require.NoError(t, err)
++			echo(t, conn, 4096)
++			conn.Close()
++		})
++	}
++}
+diff --git a/transport/v2rayxhttp/conn.go b/transport/v2rayxhttp/conn.go
+index fda85a090..3bdffce53 100644
+--- a/transport/v2rayxhttp/conn.go
++++ b/transport/v2rayxhttp/conn.go
+@@ -11,9 +11,11 @@ import (
+ 	"sync/atomic"
+ 	"time"
+ 
++	"github.com/sagernet/sing-box/common/readwait"
+ 	"github.com/sagernet/sing/common/baderror"
+ 	E "github.com/sagernet/sing/common/exceptions"
+ 	M "github.com/sagernet/sing/common/metadata"
++	N "github.com/sagernet/sing/common/network"
+ )
+ 
+ // session is the net.Conn of one XHTTP session: a download (the body of a GET,
+@@ -39,6 +41,14 @@ type session struct {
+ 	download      io.ReadCloser
+ 	downloadErr   error
+ 
++	// The read waiter waits for download data on a small probe instead of the
++	// copy buffer: what the probe read is delivered first. Both are used by
++	// the one reader of the session only.
++	probe      []byte
++	pending    []byte
++	pendingErr error
++	flowing    bool
++
+ 	// streamBody is the body of the request that streams the upload: closing it
+ 	// with an error is what releases a Write blocked on a failed request.
+ 	streamBody   *io.PipeReader
+@@ -207,13 +217,51 @@ func (s *session) Read(b []byte) (int, error) {
+ 	if s.download == nil {
+ 		return 0, s.ioError(s.downloadErr)
+ 	}
++	if len(s.pending) > 0 {
++		n := copy(b, s.pending)
++		s.pending = s.pending[n:]
++		return n, nil
++	}
++	if s.pendingErr != nil {
++		err := s.pendingErr
++		s.pendingErr = nil
++		return 0, s.ioError(err)
++	}
+ 	n, err := s.download.Read(b)
++	s.flowing = n == len(b)
+ 	if err != nil {
+ 		err = s.ioError(err)
+ 	}
+ 	return n, err
+ }
+ 
++// probeSize is what an idle session holds while it waits for the server.
++const probeSize = 512
++
++// CreateReadWaiter lets the copy loop of sing wait for download data without
++// its buffer: an idle session otherwise held a 32 KiB buffer for as long as
++// the server stayed silent. The response body of HTTP/2 and 3 can't be peeked,
++// so the waiter reads a small probe and hands it over before anything else;
++// while data keeps filling whole buffers it reads straight away.
++func (s *session) CreateReadWaiter() (N.ReadWaiter, bool) {
++	return readwait.NewPeekWaiter(s, s.waitData), true
++}
++
++func (s *session) waitData() error {
++	<-s.downloadReady
++	if s.download == nil || len(s.pending) > 0 || s.pendingErr != nil || s.flowing {
++		return nil
++	}
++	if s.probe == nil {
++		s.probe = make([]byte, probeSize)
++	}
++	n, err := s.download.Read(s.probe)
++	s.pending = s.probe[:n]
++	s.pendingErr = err
++	s.flowing = n == len(s.probe)
++	return nil
++}
++
+ func (s *session) Write(b []byte) (int, error) {
+ 	if len(b) == 0 {
+ 		return 0, nil
+diff --git a/transport/v2rayxhttp/frame_size.go b/transport/v2rayxhttp/frame_size.go
+new file mode 100644
+index 000000000..3ae5ec68b
+--- /dev/null
++++ b/transport/v2rayxhttp/frame_size.go
+@@ -0,0 +1,73 @@
++package v2rayxhttp
++
++import (
++	"encoding/binary"
++	"io"
++	"net"
++)
++
++// maxWriteFrameSize is the largest HTTP/2 DATA frame sent to the server, the
++// protocol's initial value and what Chrome sends.
++const maxWriteFrameSize = 16 * 1024
++
++// frameSizeCapConn lowers the SETTINGS_MAX_FRAME_SIZE of the server's first
++// SETTINGS frame to maxWriteFrameSize before the HTTP/2 client reads it.
++//
++// The client of golang.org/x/net/http2 writes a request body through a
++// buffer as large as the server's maximum frame size, up to 512 KiB, held
++// until the body ends. A streamed upload (stream-up, stream-one) ends with its
++// session, and Xray's server announces 1 MiB: every such session held 512 KiB
++// (lab: 300 idle stream-one sessions, 567 KB each). Smaller frames cost a few
++// more of them on a bulk upload.
++//
++// The server's connection preface starts with a SETTINGS frame; a later
++// SETTINGS frame raising the size again is left alone.
++type frameSizeCapConn struct {
++	net.Conn
++	done    bool
++	pending []byte
++}
++
++// maxSettingsFrame bounds the first frame read whole: a SETTINGS frame has
++// six bytes per setting, and there are few.
++const maxSettingsFrame = 1024
++
++func (c *frameSizeCapConn) Read(b []byte) (int, error) {
++	if len(c.pending) > 0 {
++		n := copy(b, c.pending)
++		c.pending = c.pending[n:]
++		return n, nil
++	}
++	if c.done {
++		return c.Conn.Read(b)
++	}
++	c.done = true
++	frame := make([]byte, 9, 9+64)
++	_, err := io.ReadFull(c.Conn, frame)
++	if err != nil {
++		return 0, err
++	}
++	length := int(frame[0])<<16 | int(frame[1])<<8 | int(frame[2])
++	const frameTypeSettings, flagAck = 0x4, 0x1
++	if frame[3] == frameTypeSettings && frame[4]&flagAck == 0 && length <= maxSettingsFrame && length%6 == 0 {
++		payload := make([]byte, length)
++		_, err = io.ReadFull(c.Conn, payload)
++		if err != nil {
++			return 0, err
++		}
++		const settingMaxFrameSize = 0x5
++		for i := 0; i+6 <= len(payload); i += 6 {
++			if binary.BigEndian.Uint16(payload[i:]) == settingMaxFrameSize && binary.BigEndian.Uint32(payload[i+2:]) > maxWriteFrameSize {
++				binary.BigEndian.PutUint32(payload[i+2:], maxWriteFrameSize)
++			}
++		}
++		frame = append(frame, payload...)
++	}
++	n := copy(b, frame)
++	c.pending = frame[n:]
++	return n, nil
++}
++
++func (c *frameSizeCapConn) Upstream() any {
++	return c.Conn
++}
+diff --git a/transport/v2rayxhttp/frame_size_test.go b/transport/v2rayxhttp/frame_size_test.go
+new file mode 100644
+index 000000000..9e55e700a
+--- /dev/null
++++ b/transport/v2rayxhttp/frame_size_test.go
+@@ -0,0 +1,116 @@
++package v2rayxhttp
++
++import (
++	"bytes"
++	"context"
++	"encoding/binary"
++	"io"
++	"net"
++	"runtime"
++	"testing"
++	"time"
++
++	"github.com/sagernet/sing-box/option"
++
++	"github.com/stretchr/testify/require"
++)
++
++func settingsFrame(flags byte, settings ...uint32) []byte {
++	payload := make([]byte, 0, len(settings)*3)
++	for i := 0; i+1 < len(settings); i += 2 {
++		payload = binary.BigEndian.AppendUint16(payload, uint16(settings[i]))
++		payload = binary.BigEndian.AppendUint32(payload, settings[i+1])
++	}
++	frame := []byte{byte(len(payload) >> 16), byte(len(payload) >> 8), byte(len(payload)), 0x4, flags, 0, 0, 0, 0}
++	return append(frame, payload...)
++}
++
++// oneByteConn delivers what it holds a byte per read.
++type oneByteConn struct {
++	net.Conn
++	data *bytes.Reader
++}
++
++func (c *oneByteConn) Read(b []byte) (int, error) {
++	return c.data.Read(b[:min(len(b), 1)])
++}
++
++func TestFrameSizeCap(t *testing.T) {
++	const initialWindow, maxFrameSize = 0x4, 0x5
++	data := []byte("after the frame")
++	cases := map[string]struct {
++		input, expected []byte
++	}{
++		"lowered": {
++			append(settingsFrame(0, initialWindow, 1<<20, maxFrameSize, 1<<20), data...),
++			append(settingsFrame(0, initialWindow, 1<<20, maxFrameSize, 16384), data...),
++		},
++		"already small": {
++			append(settingsFrame(0, maxFrameSize, 16384), data...),
++			append(settingsFrame(0, maxFrameSize, 16384), data...),
++		},
++		"not settings": {
++			append([]byte{0, 0, 2, 0x1, 0x4, 0, 0, 0, 1, 1, 2}, settingsFrame(0, maxFrameSize, 1<<20)...),
++			append([]byte{0, 0, 2, 0x1, 0x4, 0, 0, 0, 1, 1, 2}, settingsFrame(0, maxFrameSize, 1<<20)...),
++		},
++		"acknowledgement": {
++			settingsFrame(0x1), settingsFrame(0x1),
++		},
++	}
++	for name, c := range cases {
++		for _, split := range []bool{false, true} {
++			var conn net.Conn = &oneByteConn{data: bytes.NewReader(c.input)}
++			if !split {
++				reader := bytes.NewReader(c.input)
++				conn = &readerConn{reader}
++			}
++			output, err := io.ReadAll(&frameSizeCapConn{Conn: conn})
++			require.NoError(t, err, name)
++			require.Equal(t, c.expected, output, name)
++		}
++	}
++}
++
++type readerConn struct {
++	*bytes.Reader
++}
++
++func (c *readerConn) Close() error                     { return nil }
++func (c *readerConn) Write(b []byte) (int, error)      { return len(b), nil }
++func (c *readerConn) LocalAddr() net.Addr              { return nil }
++func (c *readerConn) RemoteAddr() net.Addr             { return nil }
++func (c *readerConn) SetDeadline(time.Time) error      { return nil }
++func (c *readerConn) SetReadDeadline(time.Time) error  { return nil }
++func (c *readerConn) SetWriteDeadline(time.Time) error { return nil }
++
++// The Go server of the test, like Xray's, announces 1 MiB frames: without the
++// cap every idle stream-one session held a 512 KiB request body buffer.
++func TestXHTTPStreamedUploadMemory(t *testing.T) {
++	client, _ := newTestPair(t, option.V2RayXHTTPOptions{Mode: modeStreamOne}, "h2", nil)
++	warmup, err := client.DialContext(context.Background())
++	require.NoError(t, err)
++	echo(t, warmup, 1024)
++	warmup.Close()
++	heap := func() uint64 {
++		runtime.GC()
++		runtime.GC()
++		var stats runtime.MemStats
++		runtime.ReadMemStats(&stats)
++		return stats.HeapAlloc
++	}
++	before := heap()
++	const sessions = 50
++	var conns []net.Conn
++	for i := 0; i < sessions; i++ {
++		conn, err := client.DialContext(context.Background())
++		require.NoError(t, err)
++		echo(t, conn, 1024)
++		conns = append(conns, conn)
++	}
++	perSession := (int64(heap()) - int64(before)) / sessions
++	for _, conn := range conns {
++		conn.Close()
++	}
++	t.Logf("heap per idle stream-one session (client and test server): %d B", perSession)
++	require.Less(t, perSession, int64(128*1024))
++}
+diff --git a/transport/v2rayxhttp/pool.go b/transport/v2rayxhttp/pool.go
+index e1a246a61..910ce75b2 100644
+--- a/transport/v2rayxhttp/pool.go
++++ b/transport/v2rayxhttp/pool.go
+@@ -49,6 +49,7 @@ type pooledConnection interface {
+ type pool struct {
+ 	newConnection func() pooledConnection
+ 	config        xmuxConfig
++	idleTimeout   time.Duration
+ 	concurrency   int32
+ 	connections   int32
+ 
+@@ -65,6 +66,7 @@ func newPool(config xmuxConfig, newConnection func() pooledConnection) *pool {
+ 	return &pool{
+ 		newConnection: newConnection,
+ 		config:        config,
++		idleTimeout:   poolIdleTimeout,
+ 		concurrency:   config.maxConcurrency.rand(),
+ 		connections:   config.maxConnections.rand(),
+ 	}
+@@ -84,8 +86,16 @@ type poolClient struct {
+ 	broken       atomic.Bool
+ 	removed      atomic.Bool
+ 	closeOnce    sync.Once
++	// idleGeneration changes whenever the client is taken, so that a check
++	// scheduled when it went idle knows whether it stayed idle.
++	idleGeneration atomic.Uint64
+ }
+ 
++// poolIdleTimeout retires a pooled connection no session has used for this
++// long. HTTP/3 needs it: the QUIC keep-alive keeps an idle connection open
++// for good (Xray keeps it until XMUX retires it, 30 to 50 minutes on).
++var poolIdleTimeout = connectionIdleTimeout
++
+ // get returns a client for a new session (or for the next upload request of
+ // one) and counts it as running; release gives it back.
+ func (p *pool) get() (*poolClient, error) {
+@@ -132,10 +142,16 @@ func (p *pool) get() (*poolClient, error) {
+ 		}
+ 		client = p.newClient(now)
+ 	}
+-	client.running.Add(1)
++	client.acquire()
+ 	return client, nil
+ }
+ 
++// acquire counts one more user of the client; release ends it.
++func (c *poolClient) acquire() {
++	c.running.Add(1)
++	c.idleGeneration.Add(1)
++}
++
+ func (p *pool) newClient(now time.Time) *poolClient {
+ 	client := &poolClient{
+ 		pool:       p,
+@@ -205,9 +221,33 @@ func (p *pool) noteFailure(client *poolClient, err error) {
+ }
+ 
+ func (c *poolClient) release() {
+-	if c.running.Add(-1) <= 0 {
++	if c.running.Add(-1) > 0 {
++		return
++	}
++	if c.removed.Load() {
+ 		c.closeIfIdle()
++		return
++	}
++	generation := c.idleGeneration.Load()
++	time.AfterFunc(c.pool.idleTimeout, func() {
++		if c.running.Load() <= 0 && c.idleGeneration.Load() == generation {
++			c.pool.retire(c)
++		}
++	})
++}
++
++// retire takes an idle client out of the pool and closes it.
++func (p *pool) retire(client *poolClient) {
++	p.access.Lock()
++	for i, candidate := range p.clients {
++		if candidate == client {
++			p.clients = append(p.clients[:i], p.clients[i+1:]...)
++			break
++		}
+ 	}
++	p.access.Unlock()
++	client.removed.Store(true)
++	client.closeIfIdle()
+ }
+ 
+ func (c *poolClient) closeIfIdle() {
+@@ -294,7 +334,11 @@ func newHTTP2Connection(tlsDialer tls.Dialer, serverAddr M.Socksaddr, keepAliveP
+ 	connection := &http2Connection{}
+ 	connection.transport = &http2.Transport{
+ 		DialTLSContext: func(ctx context.Context, network, addr string, cfg *tls.STDConfig) (net.Conn, error) {
+-			return connection.tracker.track(tlsDialer.DialTLSContext(ctx, serverAddr))
++			conn, err := tlsDialer.DialTLSContext(ctx, serverAddr)
++			if err != nil {
++				return nil, err
++			}
++			return connection.tracker.track(&frameSizeCapConn{Conn: conn}, nil)
+ 		},
+ 		ReadIdleTimeout: keepAlivePeriod,
+ 		IdleConnTimeout: connectionIdleTimeout,
+diff --git a/transport/v2rayxhttp/upload.go b/transport/v2rayxhttp/upload.go
+index 509e776a3..5584cd2b5 100644
+--- a/transport/v2rayxhttp/upload.go
++++ b/transport/v2rayxhttp/upload.go
+@@ -161,7 +161,7 @@ func (u *uploader) run() {
+ // new one from the pool, which becomes current.
+ func (u *uploader) nextClient() (*poolClient, error) {
+ 	if u.current != nil && u.current.usable() {
+-		u.current.running.Add(1)
++		u.current.acquire()
+ 		return u.current, nil
+ 	}
+ 	client, err := u.client.upPool.get()
+@@ -171,7 +171,7 @@ func (u *uploader) nextClient() (*poolClient, error) {
+ 	if u.current != nil {
+ 		u.current.release()
+ 	}
+-	client.running.Add(1)
++	client.acquire()
+ 	u.current = client
+ 	return client, nil
+ }
+-- 
+2.53.0
+

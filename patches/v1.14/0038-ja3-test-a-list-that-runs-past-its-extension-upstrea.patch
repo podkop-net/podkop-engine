@@ -1,0 +1,73 @@
+From ca3c0dabf0e7d5fd5763a2406aaf8da24cc894fb Mon Sep 17 00:00:00 2001
+From: FiyeroT <me@fiyero.xyz>
+Date: Sun, 4 Oct 2026 08:35:15 +0300
+Subject: [PATCH 038/148] ja3: test a list that runs past its extension
+ (upstream 07512b109)
+
+What is left of the backport of "Fix protocol input validation" from the
+stable branch after 1.14.2: 1.14.3 has the fix itself (52f9bad03), this is
+the test that came with the backport. A supported_versions or
+signature_algorithms list longer than its extension was read past the end:
+one QUIC Initial from any client in the LAN, sniffed, crashed the process.
+---
+ common/ja3/parser_test.go | 48 +++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 48 insertions(+)
+ create mode 100644 common/ja3/parser_test.go
+
+diff --git a/common/ja3/parser_test.go b/common/ja3/parser_test.go
+new file mode 100644
+index 000000000..16e4b5cbd
+--- /dev/null
++++ b/common/ja3/parser_test.go
+@@ -0,0 +1,48 @@
++package ja3
++
++import (
++	"encoding/binary"
++	"testing"
++
++	"github.com/stretchr/testify/require"
++)
++
++// clientHello makes a TLS record with a ClientHello that carries one extension.
++func clientHello(extensionType uint16, extensionData []byte) []byte {
++	extension := binary.BigEndian.AppendUint16(nil, extensionType)
++	extension = binary.BigEndian.AppendUint16(extension, uint16(len(extensionData)))
++	extension = append(extension, extensionData...)
++	body := []byte{0x03, 0x03}
++	body = append(body, make([]byte, randomDataLen)...)
++	body = append(body, 0)                // session ID
++	body = append(body, 0, 2, 0x13, 0x01) // cipher suites
++	body = append(body, 1, 0)             // compression methods
++	body = binary.BigEndian.AppendUint16(body, uint16(len(extension)))
++	body = append(body, extension...)
++	handshake := append([]byte{handshakeType, 0, byte(len(body) >> 8), byte(len(body))}, body...)
++	return append([]byte{contentType, 0x03, 0x01, byte(len(handshake) >> 8), byte(len(handshake))}, handshake...)
++}
++
++// A list length past the end of its extension is an error, not a panic: the QUIC sniffer
++// parses ClientHellos that any client in the LAN can send.
++func TestComputeListLengthPastExtension(t *testing.T) {
++	for _, testCase := range []struct {
++		name          string
++		extensionType uint16
++		data          []byte
++	}{
++		{"supported_versions", versionExtensionType, []byte{0xfe, 0x03, 0x04}},
++		{"signature_algorithms", signatureAlgorithmsExtensionType, []byte{0xff, 0xff, 0x04, 0x03}},
++	} {
++		t.Run(testCase.name, func(t *testing.T) {
++			_, err := Compute(clientHello(testCase.extensionType, testCase.data))
++			require.Error(t, err)
++		})
++	}
++	hello, err := Compute(clientHello(versionExtensionType, []byte{0x02, 0x03, 0x04}))
++	require.NoError(t, err)
++	require.Equal(t, []uint16{tls13}, hello.Versions)
++	hello, err = Compute(clientHello(signatureAlgorithmsExtensionType, []byte{0x00, 0x02, 0x04, 0x03}))
++	require.NoError(t, err)
++	require.Equal(t, []uint16{0x0403}, hello.SignatureAlgorithms)
++}
+-- 
+2.53.0
+

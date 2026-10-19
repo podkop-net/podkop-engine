@@ -19,21 +19,24 @@
    Для патча include (0035 в r9) проверить, не появились ли в `include/registry.go` новые
    регистрации: новый тип выхода — в `include/podkop_full.go` и `podkop_full_stub.go`, новый вход,
    DNS-сервер или служба — в `podkop_slim.go` и `podkop_slim_stub.go` (иначе он молча попадёт в
-   `podkop-engine`); и что `cmd/sing-box/cmd_api*.go` по-прежнему исчерпывают CLI `api`.
+   `podkop-engine`); и что `cmd/sing-box/cmd_api*.go` по-прежнему исчерпывают CLI `api`
+   (на 1.14 с r15 командная строка — пакет `cmd/sing-box/cli`, и её файлы `cmd_api*.go` закрыты
+   ограничением сборки `!podkop_slim`: у нового файла `api` оно должно быть тоже).
    При новой версии cronet-go сверить `openwrt/podkop-engine/naive.pkgarchs` со строками
    `openwrt:` матрицы naive в `.github/workflows/build.yml` sing-box, а `LLD_URL`/`LLD_SHA256`
    в `versions.env` — с `CLANG_REVISION`/`CLANG_SUB_REVISION` в
    `src/tools/clang/scripts/update.py` naiveproxy той же версии cronet.
    Новая ветка (например 1.15): каталог `patches/v1.15`, строка в `LINES`.
 
-   **Форки библиотек.** sing-vmess и sing-quic берутся из форков
+   **Форки библиотек.** sing-vmess (обе линии) и sing-quic (только 1.13) берутся из форков
    [FiyeroT/sing-vmess](https://github.com/FiyeroT/sing-vmess) и
    [FiyeroT/sing-quic](https://github.com/FiyeroT/sing-quic): директивы `replace` в `go.mod`,
-   патчи `go.mod: …`. Исправление в библиотеке — это коммит в ветке форка (`pdk-1.13`,
-   `pdk-1.14`), новый тег (sing-vmess: `v0.2.8-pdk13.N` и `v0.2.8-pdk.N`, sing-quic:
-   `v0.6.5-pdk13.N` и `v0.7.1-pdk.N`) и новые строки
+   патчи `go.mod: …`. Исправление в библиотеке — это коммит в ветке форка (sing-vmess:
+   `pdk-1.13`, `pdk-1.14.3`; sing-quic: `pdk-1.13`), новый тег (sing-vmess: `v0.2.8-pdk13.N`
+   и `v0.2.9-pdk.N`, sing-quic: `v0.6.5-pdk13.N`) и новые строки
    `go.mod` и `go.sum` в sing-box. Тег должен быть опубликован до сборки: SDK берёт модули
-   через прокси Go.
+   через прокси Go. С r15 линия 1.14 стоит на 1.14.3, где исправления форка sing-quic уже в
+   версии upstream: форк там не нужен.
 
 2. **versions.env**: `SB_<ветка>_VERSION`, `SB_<ветка>_HASH`
    (`curl -sL https://codeload.github.com/SagerNet/sing-box/tar.gz/v<версия> | sha256sum`),

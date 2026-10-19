@@ -1,7 +1,7 @@
 From 81838e48f78c20d592ac4e2da76ef3e82d548deb Mon Sep 17 00:00:00 2001
 From: FiyeroT <me@fiyero.xyz>
 Date: Thu, 8 Oct 2026 17:44:10 +0300
-Subject: [PATCH 099/126] decode-link: build the outbound to validate it,
+Subject: [PATCH 099/140] decode-link: build the outbound to validate it,
  refuse by a table of reasons
 
 The command now builds the outbound it is about to print the way "sing-box check"

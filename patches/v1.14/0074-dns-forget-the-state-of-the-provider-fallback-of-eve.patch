@@ -1,0 +1,163 @@
+From e7dff55b33cf796052bf231cf15227dd6f8b970e Mon Sep 17 00:00:00 2001
+From: FiyeroT <me@fiyero.xyz>
+Date: Tue, 6 Oct 2026 23:36:00 +0300
+Subject: [PATCH 074/148] dns: forget the state of the provider fallback of
+ every server on a network reset
+
+A network reset made the fallback read the provider's servers again and nothing else.
+What each server had learned on the old network stayed: the minute without the fallback
+after the provider failed twice, the count of provider failures, the server being set
+aside and the interval of its probes, up to 5 minutes. A WAN outage sets exactly this
+state. Where the server never answers and the LAN lives on the provider's DNS, names
+went unanswered for up to a minute after the link was back, although sing-box had been
+told that the network changed; after a switch to another uplink a server that is
+reachable again stayed aside until its next probe.
+
+Give the state of a server a reset and call it for every DNS server from the router's
+ResetNetwork, next to ResetFallbackProviders. It makes the provider usable again and
+starts the failure counts over; queries that were on their way fail with the connections
+the reset closes and are not counted. A server that is set aside stays so, because
+asking a dead server first would cost the next queries its timeout again, but its probe
+is due with the next query and the probe interval starts from 30 s.
+---
+ dns/client_fallback.go               | 25 +++++++++++-
+ dns/client_fallback_exchange_test.go | 61 ++++++++++++++++++++++++++++
+ dns/router.go                        |  3 ++
+ 3 files changed, 87 insertions(+), 2 deletions(-)
+
+diff --git a/dns/client_fallback.go b/dns/client_fallback.go
+index f1483561b..527367122 100644
+--- a/dns/client_fallback.go
++++ b/dns/client_fallback.go
+@@ -45,7 +45,9 @@ import (
+ // fail together are one failure: the second is a query that started after the first was
+ // counted. A SERVFAIL is retried through the provider as well but does not count
+ // against the server: it is usually about one domain. When the provider fails to answer
+-// twice in a row, the fallback is off for that server for a minute.
++// twice in a row, the fallback is off for that server for a minute. A network reset
++// starts the counts over and makes the provider usable again; a server that is set aside
++// stays so but is probed with the next query, see reset.
+ var fallbackEnabled = os.Getenv("SING_BOX_DNS_FALLBACK") != ""
+ 
+ const (
+@@ -74,7 +76,7 @@ type fallbackServer struct {
+ 
+ 	access        sync.Mutex
+ 	failures      int
+-	countedAt     time.Time // the last failure counted
++	countedAt     time.Time // the last failure counted or the last network reset
+ 	providerFails int
+ 	down          bool
+ 	probeAt       time.Time
+@@ -360,6 +362,25 @@ func (s *fallbackServer) failure(ctx context.Context, logger logger.ContextLogge
+ 	}
+ }
+ 
++// reset forgets what was learned on the network that sing-box has just left: the DNS
++// router calls it when sing-box resets the network. The provider is usable again and the
++// failure counts start over; queries on their way fail with the connections that the
++// reset closes and count nothing. A server that is set aside stays so, since asking a
++// dead server first would cost the next queries its timeout, but it is probed with the
++// next query.
++func (s *fallbackServer) reset() {
++	s.access.Lock()
++	s.failures = 0
++	s.countedAt = time.Now()
++	s.providerFails = 0
++	s.unusableUntil = time.Time{}
++	if s.down {
++		s.probeAt = s.countedAt
++		s.probeEvery = fallbackProbeFirst
++	}
++	s.access.Unlock()
++}
++
+ // providerFailed stops using the provider: for a while when it fails to answer twice in a
+ // row, until it is listed again when there is none.
+ func (s *fallbackServer) providerFailed(ctx context.Context, logger logger.ContextLogger, tag string, cause error) {
+diff --git a/dns/client_fallback_exchange_test.go b/dns/client_fallback_exchange_test.go
+index f96c0a7a1..8182dd6bc 100644
+--- a/dns/client_fallback_exchange_test.go
++++ b/dns/client_fallback_exchange_test.go
+@@ -565,3 +565,64 @@ func TestFallbackCountsResolvedOnly(t *testing.T) {
+ 		}
+ 	}
+ }
++
++// A network reset forgives what the fallback learned on the old network.
++func TestFallbackNetworkReset(t *testing.T) {
++	t.Parallel()
++	newRouter := func(transport adapter.DNSTransport) *Router {
++		return &Router{transport: &TransportManager{transports: []adapter.DNSTransport{transport}}}
++	}
++	t.Run("the provider is usable again", func(t *testing.T) {
++		t.Parallel()
++		transport, state, _ := newFallbackTest(testResolver(t, mDNS.RcodeSuccess))
++		for i := 0; i < fallbackProviderAfter+1; i++ {
++			state.providerFailed(context.Background(), nil, "dns-server", E.New("timeout"))
++		}
++		if got := state.testState(); !got.unusable || got.providerFails != 1 {
++			t.Fatalf("state %+v before the reset", got)
++		}
++		newRouter(transport).ResetNetwork()
++		if got := state.testState(); got.unusable || got.providerFails != 0 {
++			t.Errorf("state %+v after the reset, want the provider usable", got)
++		}
++		transport.serve(fallbackTestFails)
++		if got, err := fallbackTestExchange(transport, state); got != "provider" || err != nil {
++			t.Errorf("answered by %q (%v), want the provider", got, err)
++		}
++	})
++	t.Run("a server set aside is probed at once", func(t *testing.T) {
++		t.Parallel()
++		transport, state, _ := newFallbackTest(testResolver(t, mDNS.RcodeSuccess))
++		state.access.Lock()
++		state.down, state.probeEvery, state.probeAt = true, fallbackProbeMax, time.Now().Add(fallbackProbeMax)
++		state.access.Unlock()
++		newRouter(transport).ResetNetwork()
++		if got := state.testState(); !got.down || got.probeIn > 0 || got.probeEvery != fallbackProbeFirst {
++			t.Fatalf("state %+v after the reset, want down and a probe due, the next in %v", got, fallbackProbeFirst)
++		}
++		if got, err := fallbackTestExchange(transport, state); got != "provider" || err != nil {
++			t.Errorf("answered by %q (%v), want the provider", got, err)
++		}
++		waitFallbackTest(t, "the server is back", func() bool { return !state.isDown() })
++	})
++	t.Run("failures around the reset do not add up", func(t *testing.T) {
++		t.Parallel()
++		transport, state, _ := newFallbackTest(testResolver(t, mDNS.RcodeSuccess))
++		router := newRouter(transport)
++		transport.serve(fallbackTestFails)
++		if got, err := fallbackTestExchange(transport, state); got != "provider" || err != nil {
++			t.Fatalf("answered by %q (%v), want the provider", got, err)
++		}
++		// a query on its way when the network is reset fails with the connections
++		transport.serve(func(ctx context.Context, message *mDNS.Msg) (*mDNS.Msg, error) {
++			router.ResetNetwork()
++			return nil, errFallbackTestServer
++		})
++		if got, err := fallbackTestExchange(transport, state); got != "provider" || err != nil {
++			t.Fatalf("answered by %q (%v), want the provider", got, err)
++		}
++		if got := state.testState(); got.failures != 0 || got.down {
++			t.Errorf("state %+v, want no failure counted on the new network yet", got)
++		}
++	})
++}
+diff --git a/dns/router.go b/dns/router.go
+index 719cb402b..05ddac937 100644
+--- a/dns/router.go
++++ b/dns/router.go
+@@ -1394,6 +1394,9 @@ func (r *Router) LookupReverseMapping(ip netip.Addr) (string, bool) {
+ func (r *Router) ResetNetwork() {
+ 	for _, transport := range r.transport.Transports() {
+ 		transport.Reset()
++		if state := fallbackFor(transport); state != nil {
++			state.reset()
++		}
+ 	}
+ 	ResetFallbackProviders() // the output device may have changed
+ }
+-- 
+2.53.0
+

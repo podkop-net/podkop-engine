@@ -1,0 +1,1330 @@
+From 882732615cb408d953ff78ea75872621149274da Mon Sep 17 00:00:00 2001
+From: FiyeroT <me@fiyero.xyz>
+Date: Sun, 18 Oct 2026 16:29:29 +0300
+Subject: [PATCH 132/140] cidrset: CIDR lists of rule sets as ranges of their
+ own
+
+netipx.IPSet keeps a range as two netip.Addr, 48 bytes, and its builder
+sorts by reflection and copies the ranges three times more: a rule set
+of a million subnets held some 40 MB and took 170 MB (.srs) to 390 MB
+(JSON) at its peak on x86.
+
+common/cidrset is the set of the same ranges: IPv4 in a uint64 a range
+(8 bytes), IPv6 in 32, sorted and merged in place in the slice they
+were gathered in, made once of the size counted; Contains is
+netipx.IPSet.Contains. A canonical IPv4 address or prefix is read from
+its bytes (Parse4); any other text by netip, as NewIPCIDRItem reads it.
+
+- NewIPCIDRItem builds a cidrset.Set; route/rule makes an item of a
+  set (SourceIPRanges, IPRanges, json:"-"); the item gives a TUN that
+  routes a rule set a netipx.IPSet made of its ranges.
+- domainset.ReadSource reads source_ip_cidr and ip_cidr straight into
+  sets; an item netip refuses leaves the rule to sing-box.
+- srs.ReadSets, which the loaders of rule sets use, reads the ranges of
+  a binary rule set into a set of the size the file tells; srs.Read is
+  unchanged.
+- The metadata of a rule set counts IPRanges as IP CIDR, as IPSet.
+
+Parse4 is held to netip (300000 random texts, FuzzParse4 15.6 million
+inputs); a set to netipx on the ranges and Contains of random lists of
+both families, IPv4-mapped IPv6, nested, touching and repeated
+prefixes, the edges of both spaces, a zone; ReadSets to Read;
+TestReadSourceSameAsStock compares the sets and their descriptions with
+what sing-box reads.
+---
+ common/cidrset/cidrset.go       | 366 ++++++++++++++++++++++++++++++++
+ common/cidrset/cidrset_test.go  | 216 +++++++++++++++++++
+ common/domainset/source.go      |  66 +++++-
+ common/domainset/source_test.go |  78 +++++--
+ common/srs/binary.go            |  33 ++-
+ common/srs/ip_ranges_test.go    |  59 +++++
+ common/srs/ip_set.go            |  37 ++++
+ option/rule_set.go              |   6 +
+ route/rule/rule_headless.go     |   8 +
+ route/rule/rule_item_cidr.go    |  81 +++++--
+ route/rule/rule_set.go          |   4 +-
+ route/rule/rule_set_local.go    |   2 +-
+ route/rule/rule_set_remote.go   |   2 +-
+ 13 files changed, 907 insertions(+), 51 deletions(-)
+ create mode 100644 common/cidrset/cidrset.go
+ create mode 100644 common/cidrset/cidrset_test.go
+ create mode 100644 common/srs/ip_ranges_test.go
+
+diff --git a/common/cidrset/cidrset.go b/common/cidrset/cidrset.go
+new file mode 100644
+index 000000000..39d2e18a8
+--- /dev/null
++++ b/common/cidrset/cidrset.go
+@@ -0,0 +1,366 @@
++// Package cidrset is a set of IP addresses for the CIDR lists of rule sets: what
++// netipx.IPSet holds of the same prefixes, in a fraction of its memory, built without its
++// copies.
++//
++// The rules it keeps:
++//
++//   - What a set holds and answers is what netipx.IPSetBuilder makes of the same prefixes
++//     and addresses: the ranges sorted, the ones that overlap or touch merged, IPv4 and
++//     IPv6 apart (an IPv4-mapped IPv6 address is IPv6, as netip has it; the zone of an
++//     address is dropped, as netipx.IPRangeFrom drops it); Contains is
++//     netipx.IPSet.Contains, false for an address with a zone.
++//   - A range of IPv4 is 8 bytes (its first and last address in one uint64), of IPv6 32
++//     bytes; netipx keeps 48 bytes a range of either.
++//   - The builder sorts and merges in place, in the slice it gathered the ranges in, which
++//     is made once of the size the caller counted: netipx sorts by reflection and copies
++//     the ranges three times more.
++//   - A canonical IPv4 address or prefix ("192.0.2.1", "192.0.2.0/24") is read from its
++//     bytes (Parse4); any other text is read by netip, as NewIPCIDRItem of route/rule
++//     reads it.
++package cidrset
++
++import (
++	"encoding/binary"
++	"math"
++	"math/bits"
++	"net/netip"
++	"runtime"
++	"slices"
++
++	"go4.org/netipx"
++)
++
++// Set is a set of IP addresses, as ranges.
++type Set struct {
++	// first and last address of each range of IPv4, the first in the high 32 bits
++	v4 []uint64
++	v6 []range6
++	// what the set tells of itself
++	description string
++}
++
++type range6 struct {
++	from, to uint128
++}
++
++type uint128 struct {
++	hi, lo uint64
++}
++
++func (u uint128) less(other uint128) bool {
++	return u.hi < other.hi || u.hi == other.hi && u.lo < other.lo
++}
++
++func (u uint128) next() (uint128, bool) {
++	lo, carry := bits.Add64(u.lo, 1, 0)
++	hi, overflow := bits.Add64(u.hi, 0, carry)
++	return uint128{hi, lo}, overflow == 0
++}
++
++func from16(address [16]byte) uint128 {
++	return uint128{binary.BigEndian.Uint64(address[:8]), binary.BigEndian.Uint64(address[8:])}
++}
++
++func (u uint128) addr() netip.Addr {
++	var address [16]byte
++	binary.BigEndian.PutUint64(address[:8], u.hi)
++	binary.BigEndian.PutUint64(address[8:], u.lo)
++	return netip.AddrFrom16(address)
++}
++
++// Contains tells whether the set has the address, as netipx.IPSet.Contains does.
++func (s *Set) Contains(address netip.Addr) bool {
++	if address.Zone() != "" {
++		return false
++	}
++	if address.Is4() {
++		bytes := address.As4()
++		value := uint64(binary.BigEndian.Uint32(bytes[:]))
++		// the last range that begins at the address or before it
++		low, high := 0, len(s.v4)
++		key := value<<32 | math.MaxUint32
++		for low < high {
++			middle := int(uint(low+high) >> 1)
++			if s.v4[middle] <= key {
++				low = middle + 1
++			} else {
++				high = middle
++			}
++		}
++		return low > 0 && s.v4[low-1]&math.MaxUint32 >= value
++	}
++	if address.Is6() {
++		value := from16(address.As16())
++		low, high := 0, len(s.v6)
++		for low < high {
++			middle := int(uint(low+high) >> 1)
++			if !value.less(s.v6[middle].from) {
++				low = middle + 1
++			} else {
++				high = middle
++			}
++		}
++		return low > 0 && !s.v6[low-1].to.less(value)
++	}
++	return false
++}
++
++// String is the description the set was made with.
++func (s *Set) String() string {
++	return s.description
++}
++
++// Len is the number of ranges of the set.
++func (s *Set) Len() int {
++	return len(s.v4) + len(s.v6)
++}
++
++// Ranges are the ranges of the set, in order, IPv4 first.
++func (s *Set) Ranges() []netipx.IPRange {
++	if s.Len() == 0 {
++		return nil
++	}
++	ranges := make([]netipx.IPRange, 0, s.Len())
++	for _, item := range s.v4 {
++		ranges = append(ranges, netipx.IPRangeFrom(addr4(uint32(item>>32)), addr4(uint32(item))))
++	}
++	for _, item := range s.v6 {
++		ranges = append(ranges, netipx.IPRangeFrom(item.from.addr(), item.to.addr()))
++	}
++	return ranges
++}
++
++// Prefixes are the prefixes that make up the set, in order, as netipx.IPSet.Prefixes has
++// them.
++func (s *Set) Prefixes() []netip.Prefix {
++	var prefixes []netip.Prefix
++	for _, item := range s.Ranges() {
++		prefixes = item.AppendPrefixes(prefixes)
++	}
++	return prefixes
++}
++
++// IPSet is the set as a netipx.IPSet, for those who take one (a TUN that routes the
++// addresses of a rule set).
++func (s *Set) IPSet() (*netipx.IPSet, error) {
++	var builder netipx.IPSetBuilder
++	for _, item := range s.Ranges() {
++		builder.AddRange(item)
++	}
++	return builder.IPSet()
++}
++
++func addr4(value uint32) netip.Addr {
++	var address [4]byte
++	binary.BigEndian.PutUint32(address[:], value)
++	return netip.AddrFrom4(address)
++}
++
++// Builder gathers the prefixes and addresses of a set.
++type Builder struct {
++	v4 []uint64
++	v6 []range6
++}
++
++// Grow makes room for count more ranges of IPv4, so that a big list is gathered without
++// the copies a growing slice makes.
++func (b *Builder) Grow(count int) {
++	b.v4 = slices.Grow(b.v4, count)
++}
++
++// Add4 takes the range of IPv4 from the first address to the last.
++func (b *Builder) Add4(from uint32, to uint32) {
++	b.v4 = append(b.v4, uint64(from)<<32|uint64(to))
++}
++
++// AddPrefix takes the addresses of a valid prefix, as netipx.IPSetBuilder.AddPrefix does:
++// those of the prefix with its host bits cleared. It tells false for a prefix that is not
++// valid.
++func (b *Builder) AddPrefix(prefix netip.Prefix) bool {
++	prefix = prefix.Masked()
++	if !prefix.IsValid() {
++		return false
++	}
++	return b.AddRange(netipx.RangeOfPrefix(prefix))
++}
++
++// AddAddr takes one address, as netipx.IPSetBuilder.Add does: without its zone, which
++// netipx.IPRangeFrom drops. It tells false for an address that is not valid.
++func (b *Builder) AddAddr(address netip.Addr) bool {
++	if !address.IsValid() {
++		return false
++	}
++	return b.AddRange(netipx.IPRangeFrom(address, address))
++}
++
++// AddRange takes a valid range, as netipx.IPSetBuilder.AddRange does. It tells false for a
++// range that is not valid: of two families, or out of order.
++func (b *Builder) AddRange(item netipx.IPRange) bool {
++	if !item.IsValid() {
++		return false
++	}
++	from, to := item.From(), item.To()
++	if from.Is4() {
++		first, last := from.As4(), to.As4()
++		b.Add4(binary.BigEndian.Uint32(first[:]), binary.BigEndian.Uint32(last[:]))
++		return true
++	}
++	b.v6 = append(b.v6, range6{from16(from.As16()), from16(to.As16())})
++	return true
++}
++
++// Set makes the set of what was gathered: sorted and merged in place. The builder is
++// spent. The description is what the set tells of itself.
++func (b *Builder) Set(description string) *Set {
++	v4, v6 := merge4(b.v4), merge6(b.v6)
++	b.v4, b.v6 = nil, nil
++	// a list of many overlapping prefixes leaves room behind it; the garbage of the
++	// reading is collected first when it is big, so that the copy does not come on top
++	// of it
++	if cap(v4)-len(v4) > len(v4)/8 && len(v4) > 1<<17 {
++		runtime.GC()
++	}
++	return &Set{v4: fit(v4), v6: fit(v6), description: description}
++}
++
++func merge4(ranges []uint64) []uint64 {
++	if !slices.IsSorted(ranges) {
++		slices.Sort(ranges)
++	}
++	kept := ranges[:0]
++	for _, item := range ranges {
++		if last := len(kept) - 1; last >= 0 {
++			end := kept[last] & math.MaxUint32
++			if end == math.MaxUint32 || item>>32 <= end+1 {
++				if item&math.MaxUint32 > end {
++					kept[last] = kept[last]&^math.MaxUint32 | item&math.MaxUint32
++				}
++				continue
++			}
++		}
++		kept = append(kept, item)
++	}
++	if len(kept) == 0 {
++		return nil
++	}
++	return kept
++}
++
++func merge6(ranges []range6) []range6 {
++	order := func(left range6, right range6) int {
++		switch {
++		case left.from.less(right.from):
++			return -1
++		case right.from.less(left.from):
++			return 1
++		}
++		return 0
++	}
++	if !slices.IsSortedFunc(ranges, order) {
++		slices.SortFunc(ranges, order)
++	}
++	kept := ranges[:0]
++	for _, item := range ranges {
++		if last := len(kept) - 1; last >= 0 {
++			next, ok := kept[last].to.next()
++			if !ok || !next.less(item.from) {
++				if kept[last].to.less(item.to) {
++					kept[last].to = item.to
++				}
++				continue
++			}
++		}
++		kept = append(kept, item)
++	}
++	if len(kept) == 0 {
++		return nil
++	}
++	return kept
++}
++
++// fit is a slice without the room it was made with beyond an eighth of what it holds.
++func fit[T any](items []T) []T {
++	if cap(items)-len(items) > len(items)/8 {
++		return slices.Clone(items)
++	}
++	return items
++}
++
++// Parse4 reads a canonical IPv4 address or prefix from its text: four decimal octets with
++// no leading zero, and the length of the prefix after a slash, decimal with no leading
++// zero. It gives the first and the last address, the host bits of a prefix cleared. Any
++// other text it leaves (false): netip reads it, and what netip takes of a text that is
++// canonical is what Parse4 gives.
++func Parse4[T string | []byte](text T) (uint32, uint32, bool) {
++	var value uint32
++	index := 0
++	for octet := 0; octet < 4; octet++ {
++		if octet > 0 {
++			if index >= len(text) || text[index] != '.' {
++				return 0, 0, false
++			}
++			index++
++		}
++		start := index
++		number := 0
++		for index < len(text) && text[index] >= '0' && text[index] <= '9' && index-start < 3 {
++			number = number*10 + int(text[index]-'0')
++			index++
++		}
++		if index == start || number > 255 || index-start > 1 && text[start] == '0' {
++			return 0, 0, false
++		}
++		value = value<<8 | uint32(number)
++	}
++	if index == len(text) {
++		return value, value, true
++	}
++	if text[index] != '/' {
++		return 0, 0, false
++	}
++	index++
++	start := index
++	length := 0
++	for index < len(text) && text[index] >= '0' && text[index] <= '9' && index-start < 2 {
++		length = length*10 + int(text[index]-'0')
++		index++
++	}
++	if index != len(text) || index == start || length > 32 || index-start > 1 && text[start] == '0' {
++		return 0, 0, false
++	}
++	// the host bits; a shift of 32 is 0 in Go, and 0 - 1 all of them, for /0
++	host := uint32(0)
++	if length < 32 {
++		host = uint32(1)<<(32-length) - 1
++	}
++	from := value &^ host
++	return from, from | host, true
++}
++
++// Describe is what route/rule tells of a CIDR item of the list: the first three prefixes
++// and whether there are more of them than that.
++func Describe(source bool, first []string, count int) string {
++	description := "ip_cidr="
++	if source {
++		description = "source_ip_cidr="
++	}
++	if count == 1 {
++		description += first[0]
++	} else if count > 3 {
++		description += "[" + join(first[:3]) + "...]"
++	} else {
++		description += "[" + join(first) + "]"
++	}
++	return description
++}
++
++func join(items []string) string {
++	var text string
++	for index, item := range items {
++		if index > 0 {
++			text += " "
++		}
++		text += item
++	}
++	return text
++}
+diff --git a/common/cidrset/cidrset_test.go b/common/cidrset/cidrset_test.go
+new file mode 100644
+index 000000000..698bf7bc3
+--- /dev/null
++++ b/common/cidrset/cidrset_test.go
+@@ -0,0 +1,216 @@
++package cidrset
++
++import (
++	"fmt"
++	"math/rand"
++	"net/netip"
++	"strings"
++	"testing"
++
++	"github.com/stretchr/testify/require"
++	"go4.org/netipx"
++)
++
++// reference reads a text as NewIPCIDRItem of route/rule read it into netipx: a prefix, or
++// else an address.
++func reference(text string) (netipx.IPRange, bool) {
++	if prefix, err := netip.ParsePrefix(text); err == nil {
++		return netipx.RangeOfPrefix(prefix.Masked()), true
++	}
++	if address, err := netip.ParseAddr(text); err == nil {
++		return netipx.IPRangeFrom(address, address), true
++	}
++	return netipx.IPRange{}, false
++}
++
++func sameAsReference(t testing.TB, text string) {
++	from, to, ok := Parse4(text)
++	if !ok {
++		return
++	}
++	want, wantOK := reference(text)
++	require.True(t, wantOK, "Parse4 read %q, netip does not", text)
++	require.True(t, want.From().Is4(), "%q", text)
++	require.Equal(t, want, netipx.IPRangeFrom(addr4(from), addr4(to)), "%q", text)
++}
++
++// What Parse4 reads of a text is what netip reads of it; a canonical IPv4 address or
++// prefix it always reads.
++func TestParse4SameAsNetip(t *testing.T) {
++	for _, text := range []string{
++		"0.0.0.0", "255.255.255.255", "1.2.3.4", "1.2.3.4/32", "1.2.3.4/24", "1.2.3.4/0", "10.0.0.0/8",
++		"01.2.3.4", "1.2.3.04", "256.0.0.0", "1.2.3", "1.2.3.4.5", "1.2.3.4/", "1.2.3.4/33", "1.2.3.4/032",
++		"1.2.3.4/00", "1.2.3.4/+8", "1.2.3.4 ", " 1.2.3.4", "1..2.3", "1.2.3.4/8/8", "::1", "::ffff:1.2.3.4",
++		"1.2.3.4%eth0", "1.2.3.1000", "1.2.3.4/3x", "", "/24", "1.2.3.4/024",
++	} {
++		sameAsReference(t, text)
++	}
++	random := rand.New(rand.NewSource(1))
++	alphabet := "0123456789./:%x"
++	for range 300000 {
++		var text strings.Builder
++		for range random.Intn(20) {
++			text.WriteByte(alphabet[random.Intn(len(alphabet))])
++		}
++		sameAsReference(t, text.String())
++	}
++	for range 100000 {
++		text := fmt.Sprintf("%d.%d.%d.%d", random.Intn(256), random.Intn(256), random.Intn(256), random.Intn(256))
++		if random.Intn(2) == 0 {
++			text += fmt.Sprintf("/%d", random.Intn(33))
++		}
++		_, _, ok := Parse4(text)
++		require.True(t, ok, "%q", text)
++		sameAsReference(t, text)
++	}
++}
++
++func FuzzParse4(f *testing.F) {
++	for _, seed := range []string{"1.2.3.4", "1.2.3.4/24", "01.2.3.4", "::1", "1.2.3.4/033"} {
++		f.Add(seed)
++	}
++	f.Fuzz(func(t *testing.T, text string) {
++		sameAsReference(t, text)
++	})
++}
++
++// cidrItems makes a list as lists of subnets have them, and the odd ones: overlapping,
++// touching, nested prefixes, the edges of both families, IPv4-mapped IPv6, repeats.
++func cidrItems(random *rand.Rand, count int) []string {
++	items := make([]string, 0, count)
++	for len(items) < count {
++		a, b, c, d := random.Intn(256), random.Intn(256), random.Intn(256), random.Intn(256)
++		if random.Intn(4) > 0 {
++			// a small space, so that ranges meet and overlap
++			a, b = 10, random.Intn(4)
++		}
++		switch x := random.Intn(30); {
++		case x < 8:
++			items = append(items, fmt.Sprintf("%d.%d.%d.%d", a, b, c, d))
++		case x < 14:
++			items = append(items, fmt.Sprintf("%d.%d.%d.%d/%d", a, b, c, d, 20+random.Intn(13)))
++		case x < 18:
++			items = append(items, fmt.Sprintf("%d.%d.%d.0/%d", a, b, c, random.Intn(33)))
++		case x < 21:
++			items = append(items, fmt.Sprintf("2001:db8:%x::%x/%d", random.Intn(8), random.Intn(65536), 40+random.Intn(89)))
++		case x < 23:
++			items = append(items, fmt.Sprintf("::ffff:%d.%d.%d.%d/%d", a, b, c, d, 96+random.Intn(33)))
++		case x < 24:
++			items = append(items, fmt.Sprintf("::ffff:%d.%d.%d.%d", a, b, c, d))
++		case x < 25:
++			items = append(items, []string{"0.0.0.0/0", "255.255.255.255", "::/0", "ffff:ffff:ffff:ffff:ffff:ffff:ffff:ffff", "0.0.0.0", "::"}[random.Intn(6)])
++		case x < 27 && len(items) > 0:
++			items = append(items, items[random.Intn(len(items))])
++		default:
++			items = append(items, fmt.Sprintf("%d.%d.%d.%d/%d", a, b, c, d, random.Intn(33)))
++		}
++	}
++	return items
++}
++
++func build(t testing.TB, items []string) (*Set, *netipx.IPSet) {
++	var builder Builder
++	var reference netipx.IPSetBuilder
++	for _, item := range items {
++		if from, to, ok := Parse4(item); ok {
++			builder.Add4(from, to)
++		} else if prefix, err := netip.ParsePrefix(item); err == nil {
++			require.True(t, builder.AddPrefix(prefix), "%q", item)
++		} else {
++			address, err := netip.ParseAddr(item)
++			require.NoError(t, err)
++			require.True(t, builder.AddAddr(address), "%q", item)
++		}
++		if prefix, err := netip.ParsePrefix(item); err == nil {
++			reference.AddPrefix(prefix)
++		} else {
++			reference.Add(netip.MustParseAddr(item))
++		}
++	}
++	want, err := reference.IPSet()
++	require.NoError(t, err)
++	return builder.Set("x"), want
++}
++
++// A set holds the ranges netipx makes of the same list and answers what netipx answers:
++// on the edges of every range, around them, on random addresses of both families, on
++// IPv4-mapped IPv6, on an address with a zone.
++func TestSetSameAsNetipx(t *testing.T) {
++	random := rand.New(rand.NewSource(2))
++	for _, count := range []int{1, 2, 3, 10, 100, 1000, 20000} {
++		for range 30 {
++			set, want := build(t, cidrItems(random, count))
++			require.Equal(t, want.Ranges(), set.Ranges(), "%d items", count)
++			require.Equal(t, want.Prefixes(), set.Prefixes())
++			var probes []netip.Addr
++			for _, item := range want.Ranges() {
++				probes = append(probes, item.From(), item.To(), item.From().Prev(), item.To().Next())
++			}
++			for range 200 {
++				var address [16]byte
++				random.Read(address[:])
++				probes = append(probes, netip.AddrFrom16(address), netip.AddrFrom16(address).Unmap(),
++					netip.AddrFrom4([4]byte{10, byte(random.Intn(4)), byte(random.Intn(256)), byte(random.Intn(256))}))
++			}
++			probes = append(probes, netip.Addr{}, netip.MustParseAddr("fe80::1%eth0"), netip.MustParseAddr("::ffff:10.0.0.1"),
++				netip.MustParseAddr("0.0.0.0"), netip.MustParseAddr("255.255.255.255"), netip.MustParseAddr("::"))
++			for _, probe := range probes {
++				require.Equal(t, want.Contains(probe), set.Contains(probe), "%v in %d items", probe, count)
++			}
++			if count == 1000 {
++				ipSet, err := set.IPSet()
++				require.NoError(t, err)
++				require.Equal(t, want.Ranges(), ipSet.Ranges())
++			}
++		}
++	}
++}
++
++// What a set takes not: an address that is not valid, a range out of order or of two
++// families. An address with a zone it takes without the zone, as netipx does, and answers
++// as netipx does for it.
++func TestBuilderRefuses(t *testing.T) {
++	var builder Builder
++	require.False(t, builder.AddAddr(netip.Addr{}))
++	require.False(t, builder.AddRange(netipx.IPRangeFrom(netip.MustParseAddr("10.0.0.2"), netip.MustParseAddr("10.0.0.1"))))
++	require.False(t, builder.AddRange(netipx.IPRangeFrom(netip.MustParseAddr("10.0.0.1"), netip.MustParseAddr("::1"))))
++	require.Equal(t, 0, builder.Set("").Len())
++	zoned := netip.MustParseAddr("fe80::1%eth0")
++	require.True(t, builder.AddAddr(zoned))
++	set := builder.Set("")
++	var reference netipx.IPSetBuilder
++	reference.Add(zoned)
++	want, err := reference.IPSet()
++	require.NoError(t, err)
++	require.Equal(t, want.Ranges(), set.Ranges())
++	for _, probe := range []netip.Addr{zoned, netip.MustParseAddr("fe80::1"), netip.MustParseAddr("fe80::1%eth1")} {
++		require.Equal(t, want.Contains(probe), set.Contains(probe), "%v", probe)
++	}
++}
++
++// What a set tells of itself is what route/rule told of a CIDR item.
++func TestDescribe(t *testing.T) {
++	require.Equal(t, "ip_cidr=1.2.3.4", Describe(false, []string{"1.2.3.4"}, 1))
++	require.Equal(t, "source_ip_cidr=[a b]", Describe(true, []string{"a", "b"}, 2))
++	require.Equal(t, "ip_cidr=[a b c...]", Describe(false, []string{"a", "b", "c"}, 4))
++}
++
++// What a list of a million subnets costs to build.
++func BenchmarkBuild(b *testing.B) {
++	items := cidrItems(rand.New(rand.NewSource(3)), 1000000)
++	b.ReportAllocs()
++	for range b.N {
++		var builder Builder
++		builder.Grow(len(items))
++		for _, item := range items {
++			if from, to, ok := Parse4(item); ok {
++				builder.Add4(from, to)
++			} else if prefix, err := netip.ParsePrefix(item); err == nil {
++				builder.AddPrefix(prefix)
++			} else {
++				builder.AddAddr(netip.MustParseAddr(item))
++			}
++		}
++		builder.Set("")
++	}
++}
+diff --git a/common/domainset/source.go b/common/domainset/source.go
+index 92ccf3321..ce2310945 100644
+--- a/common/domainset/source.go
++++ b/common/domainset/source.go
+@@ -3,9 +3,11 @@ package domainset
+ import (
+ 	"bytes"
+ 	"context"
++	"net/netip"
+ 	"strings"
+ 	"unicode/utf8"
+ 
++	"github.com/sagernet/sing-box/common/cidrset"
+ 	C "github.com/sagernet/sing-box/constant"
+ 	"github.com/sagernet/sing-box/option"
+ 	"github.com/sagernet/sing/common/json"
+@@ -16,9 +18,10 @@ import (
+ // ReadSource reads a rule set of the source format, JSON, into what
+ // json.UnmarshalExtended[option.PlainRuleSetCompat] reads of it, in one pass and without
+ // a copy of the names where it can. The rules differ in one way: the names of a rule of
+-// the default type (domain, domain_suffix) come as their trie (DomainSet), not as lists
+-// of strings; the trie, and what it tells of itself, are what route/rule builds of those
+-// lists.
++// the default type (domain, domain_suffix) come as their trie (DomainSet), and its CIDR
++// lists (source_ip_cidr, ip_cidr) as their sets (SourceIPRanges, IPRanges), not as lists
++// of strings; the trie and the sets, and what they tell of themselves, are what
++// route/rule builds of those lists.
+ //
+ // What it reads so is JSON of a strict shape: the object of the rule set with "version"
+ // (a digit) and "rules", nothing around it but white space. In a rule it reads the lists of
+@@ -190,6 +193,10 @@ func (r *reader) rule() (option.HeadlessRule, bool, bool) {
+ 		// the first names of domain and domain_suffix, and how many there are
+ 		first  [2][]string
+ 		counts [2]int
++		// the ranges of source_ip_cidr and ip_cidr, their first items, how many there are
++		cidrs      [2]cidrset.Builder
++		cidrFirst  [2][]string
++		cidrCounts [2]int
+ 		// the other members, as their text
+ 		rest [][]byte
+ 	)
+@@ -222,6 +229,10 @@ func (r *reader) rule() (option.HeadlessRule, bool, bool) {
+ 					side := field - fieldDomain
+ 					count, ok = r.names(names, field == fieldDomainSuffix, &first[side])
+ 					counts[side] = count
++				} else if field == fieldSourceIPCIDR || field == fieldIPCIDR {
++					side := field - fieldSourceIPCIDR
++					count, ok = r.cidrs(&cidrs[side], &cidrFirst[side])
++					cidrCounts[side] = count
+ 				} else {
+ 					lists[field], ok = r.strings()
+ 					count = len(lists[field])
+@@ -280,8 +291,12 @@ func (r *reader) rule() (option.HeadlessRule, bool, bool) {
+ 	fields := &rule.DefaultOptions
+ 	fields.DomainKeyword = badoption.Listable[string](lists[fieldDomainKeyword])
+ 	fields.DomainRegex = badoption.Listable[string](lists[fieldDomainRegex])
+-	fields.SourceIPCIDR = badoption.Listable[string](lists[fieldSourceIPCIDR])
+-	fields.IPCIDR = badoption.Listable[string](lists[fieldIPCIDR])
++	if cidrCounts[0] > 0 {
++		fields.SourceIPRanges = cidrs[0].Set(cidrset.Describe(true, cidrFirst[0], cidrCounts[0]))
++	}
++	if cidrCounts[1] > 0 {
++		fields.IPRanges = cidrs[1].Set(cidrset.Describe(false, cidrFirst[1], cidrCounts[1]))
++	}
+ 	if names != nil && names.Len() > 0 {
+ 		set, err := names.Set(Describe(first[0], counts[0], first[1], counts[1]))
+ 		if err != nil {
+@@ -378,6 +393,47 @@ func (r *reader) names(names *Collector, suffix bool, first *[]string) (int, boo
+ 	return count, ok
+ }
+ 
++// cidrs reads a value of source_ip_cidr or ip_cidr into the builder: a string, an array of
++// strings or null. A canonical IPv4 prefix is read from its text, any other by netip as
++// NewIPCIDRItem reads it; one netip refuses is NewIPCIDRItem's to tell: the rule goes to
++// sing-box. It tells how many items it read, and keeps the first three of them for the
++// description of the rule.
++func (r *reader) cidrs(builder *cidrset.Builder, first *[]string) (int, bool) {
++	builder.Grow(r.countStrings())
++	count := 0
++	ok := r.each(func(start int, end int, plain bool) bool {
++		count++
++		var text string
++		if plain {
++			if from, to, ok := cidrset.Parse4(r.text[start:end]); ok {
++				builder.Add4(from, to)
++				if len(*first) < 3 {
++					*first = append(*first, string(r.text[start:end]))
++				}
++				return true
++			}
++			text = string(r.text[start:end])
++		} else {
++			var ok bool
++			text, ok = r.unquote(start, end)
++			if !ok {
++				return false
++			}
++		}
++		if len(*first) < 3 {
++			*first = append(*first, text)
++		}
++		if prefix, err := netip.ParsePrefix(text); err == nil {
++			return builder.AddPrefix(prefix)
++		}
++		if address, err := netip.ParseAddr(text); err == nil {
++			return builder.AddAddr(address)
++		}
++		return false
++	})
++	return count, ok
++}
++
+ // strings reads a value of one of the other lists: a string, an array of strings or null.
+ func (r *reader) strings() ([]string, bool) {
+ 	var list []string
+diff --git a/common/domainset/source_test.go b/common/domainset/source_test.go
+index 10589b7ea..0d86d1c53 100644
+--- a/common/domainset/source_test.go
++++ b/common/domainset/source_test.go
+@@ -4,18 +4,22 @@ import (
+ 	"bytes"
+ 	"fmt"
+ 	"math/rand"
++	"net/netip"
+ 	"reflect"
+ 	"slices"
+ 	"strings"
+ 	"testing"
+ 
++	"github.com/sagernet/sing-box/common/cidrset"
+ 	C "github.com/sagernet/sing-box/constant"
+ 	"github.com/sagernet/sing-box/option"
+ 	"github.com/sagernet/sing/common/domain"
+ 	"github.com/sagernet/sing/common/json"
++	"github.com/sagernet/sing/common/json/badoption"
+ 	"github.com/sagernet/sing/common/varbin"
+ 
+ 	"github.com/stretchr/testify/require"
++	"go4.org/netipx"
+ )
+ 
+ // sourceText makes the text of rule sets of the source format of every shape sing-box
+@@ -120,7 +124,13 @@ func (g sourceText) rule(depth int) string {
+ 	add := func(key string, value string) {
+ 		members = append(members, g.member(key, value))
+ 	}
+-	cidr := func() string { return g.one("10.0.0.0/8", "192.0.2.1", "2001:db8::/32", "bad") }
++	cidr := func() string {
++		if g.random.Intn(3) == 0 {
++			return fmt.Sprintf("10.%d.%d.%d/%d", g.random.Intn(4), g.random.Intn(256), g.random.Intn(256), 16+g.random.Intn(17))
++		}
++		return g.one("10.0.0.0/8", "192.0.2.1", "192.0.2.0/24", "2001:db8::/32", "::ffff:192.0.2.1", "::ffff:192.0.2.0/120",
++			"0.0.0.0/0", "255.255.255.255", "fe80::1%eth0", "01.2.3.4", "1.2.3.4/033", "bad")
++	}
+ 	word := func() string { return g.one("ex", "ample", "^a.*$", "q") }
+ 	for range 1 + g.random.Intn(4) {
+ 		switch g.random.Intn(22) {
+@@ -242,30 +252,60 @@ func sameAsStock(t testing.TB, text []byte) bool {
+ 			// route/rule refuses an empty name: the rule must reach it as lists
+ 			require.Nil(t, mine.DomainSet, "an empty name built here:\n%s", text)
+ 		}
+-		if mine.DomainSet == nil {
+-			continue
+-		}
+-		require.True(t, len(theirs.Domain)+len(theirs.DomainSuffix) > 0, "%s", text)
+-		var want *domain.Matcher
+-		func() {
+-			defer func() {
+-				if recover() != nil {
+-					want = nil
+-				}
++		sameCIDR(t, text, true, &mine.SourceIPRanges, &theirs.SourceIPCIDR)
++		sameCIDR(t, text, false, &mine.IPRanges, &theirs.IPCIDR)
++		if mine.DomainSet != nil {
++			require.True(t, len(theirs.Domain)+len(theirs.DomainSuffix) > 0, "%s", text)
++			var want *domain.Matcher
++			func() {
++				defer func() {
++					if recover() != nil {
++						want = nil
++					}
++				}()
++				want = domain.NewMatcher(theirs.Domain, theirs.DomainSuffix, false)
+ 			}()
+-			want = domain.NewMatcher(theirs.Domain, theirs.DomainSuffix, false)
+-		}()
+-		require.NotNil(t, want, "sing stops on these names, readSource built them:\n%s", text)
+-		require.Equal(t, written(t, want), written(t, mine.DomainSet), "%s", text)
+-		require.Equal(t, Describe(theirs.Domain[:min(3, len(theirs.Domain))], len(theirs.Domain),
+-			theirs.DomainSuffix[:min(3, len(theirs.DomainSuffix))], len(theirs.DomainSuffix)), mine.DomainSet.String(), "%s", text)
+-		mine.DomainSet = nil
+-		theirs.Domain, theirs.DomainSuffix = nil, nil
++			require.NotNil(t, want, "sing stops on these names, readSource built them:\n%s", text)
++			require.Equal(t, written(t, want), written(t, mine.DomainSet), "%s", text)
++			require.Equal(t, Describe(theirs.Domain[:min(3, len(theirs.Domain))], len(theirs.Domain),
++				theirs.DomainSuffix[:min(3, len(theirs.DomainSuffix))], len(theirs.DomainSuffix)), mine.DomainSet.String(), "%s", text)
++			mine.DomainSet = nil
++			theirs.Domain, theirs.DomainSuffix = nil, nil
++		}
+ 	}
+ 	require.True(t, reflect.DeepEqual(stock, fast), "%s\nsing-box: %#v\nhere: %#v", text, stock, fast)
+ 	return true
+ }
+ 
++// sameCIDR checks the set of a CIDR list read here against the list sing-box read: the
++// ranges and the description NewIPCIDRItem makes of it. A list with an item netip refuses
++// must reach route/rule as it is. Both are then put aside.
++func sameCIDR(t testing.TB, text []byte, source bool, mine **cidrset.Set, theirs *badoption.Listable[string]) {
++	var reference netipx.IPSetBuilder
++	takes := true
++	for _, item := range *theirs {
++		if prefix, err := netip.ParsePrefix(item); err == nil {
++			reference.AddPrefix(prefix)
++		} else if address, err := netip.ParseAddr(item); err == nil {
++			reference.Add(address)
++		} else {
++			takes = false
++		}
++	}
++	if !takes {
++		require.Nil(t, *mine, "a list cidrset does not take, built here:\n%s", text)
++	}
++	if *mine == nil {
++		return
++	}
++	require.NotEmpty(t, *theirs, "%s", text)
++	want, err := reference.IPSet()
++	require.NoError(t, err)
++	require.Equal(t, want.Ranges(), (*mine).Ranges(), "%s", text)
++	require.Equal(t, cidrset.Describe(source, (*theirs)[:min(3, len(*theirs))], len(*theirs)), (*mine).String(), "%s", text)
++	*mine, *theirs = nil, nil
++}
++
+ // What the source format reads here is what sing-box reads, for a hundred thousand rule
+ // sets of every shape; and ReadSource gives what sing-box gives for each of them, an error
+ // included.
+diff --git a/common/srs/binary.go b/common/srs/binary.go
+index f1a4228d8..8b84e53d3 100644
+--- a/common/srs/binary.go
++++ b/common/srs/binary.go
+@@ -51,6 +51,17 @@ const (
+ )
+ 
+ func Read(reader io.Reader, recover bool) (ruleSetCompat option.PlainRuleSetCompat, err error) {
++	return read(reader, recover, false)
++}
++
++// ReadSets is Read for a rule set that is matched: the lists of source_ip_cidr and
++// ip_cidr come as cidrset.Set (SourceIPRanges, IPRanges), read into ranges of their own,
++// not as netipx.IPSet.
++func ReadSets(reader io.Reader) (option.PlainRuleSetCompat, error) {
++	return read(reader, false, true)
++}
++
++func read(reader io.Reader, recover bool, sets bool) (ruleSetCompat option.PlainRuleSetCompat, err error) {
+ 	var magicBytes [3]byte
+ 	_, err = io.ReadFull(reader, magicBytes[:])
+ 	if err != nil {
+@@ -80,7 +91,7 @@ func Read(reader io.Reader, recover bool) (ruleSetCompat option.PlainRuleSetComp
+ 	ruleSetCompat.Version = version
+ 	for i := range length {
+ 		var rule option.HeadlessRule
+-		rule, err = readRule(bReader, recover, 0)
++		rule, err = readRule(bReader, recover, sets, 0)
+ 		if err != nil {
+ 			err = E.Cause(err, "read rule[", i, "]")
+ 			return
+@@ -123,7 +134,7 @@ func Write(writer io.Writer, ruleSet option.PlainRuleSet, generateVersion uint8)
+ 
+ const maxLogicalRuleDepth = 100
+ 
+-func readRule(reader varbin.Reader, recover bool, depth int) (rule option.HeadlessRule, err error) {
++func readRule(reader varbin.Reader, recover bool, sets bool, depth int) (rule option.HeadlessRule, err error) {
+ 	if depth > maxLogicalRuleDepth {
+ 		err = E.New("logical rule nested too deep")
+ 		return
+@@ -136,10 +147,10 @@ func readRule(reader varbin.Reader, recover bool, depth int) (rule option.Headle
+ 	switch ruleType {
+ 	case 0:
+ 		rule.Type = C.RuleTypeDefault
+-		rule.DefaultOptions, err = readDefaultRule(reader, recover)
++		rule.DefaultOptions, err = readDefaultRule(reader, recover, sets)
+ 	case 1:
+ 		rule.Type = C.RuleTypeLogical
+-		rule.LogicalOptions, err = readLogicalRule(reader, recover, depth)
++		rule.LogicalOptions, err = readLogicalRule(reader, recover, sets, depth)
+ 	default:
+ 		err = E.New("unknown rule type: ", ruleType)
+ 	}
+@@ -157,7 +168,7 @@ func writeRule(writer varbin.Writer, rule option.HeadlessRule, generateVersion u
+ 	}
+ }
+ 
+-func readDefaultRule(reader varbin.Reader, recover bool) (rule option.DefaultHeadlessRule, err error) {
++func readDefaultRule(reader varbin.Reader, recover bool, sets bool) (rule option.DefaultHeadlessRule, err error) {
+ 	var lastItemType uint8
+ 	for {
+ 		var itemType uint8
+@@ -192,6 +203,10 @@ func readDefaultRule(reader varbin.Reader, recover bool) (rule option.DefaultHea
+ 		case ruleItemDomainRegex:
+ 			rule.DomainRegex, err = readRuleItemString(reader)
+ 		case ruleItemSourceIPCIDR:
++			if sets {
++				rule.SourceIPRanges, err = readIPRanges(reader, true)
++				break
++			}
+ 			rule.SourceIPSet, err = readIPSet(reader)
+ 			if err != nil {
+ 				return
+@@ -200,6 +215,10 @@ func readDefaultRule(reader varbin.Reader, recover bool) (rule option.DefaultHea
+ 				rule.SourceIPCIDR = common.Map(rule.SourceIPSet.Prefixes(), netip.Prefix.String)
+ 			}
+ 		case ruleItemIPCIDR:
++			if sets {
++				rule.IPRanges, err = readIPRanges(reader, false)
++				break
++			}
+ 			rule.IPSet, err = readIPSet(reader)
+ 			if err != nil {
+ 				return
+@@ -609,7 +628,7 @@ func writeRuleItemCIDR(writer varbin.Writer, itemType uint8, value []string) err
+ 	return writeIPSet(writer, ipSet)
+ }
+ 
+-func readLogicalRule(reader varbin.Reader, recovery bool, depth int) (logicalRule option.LogicalHeadlessRule, err error) {
++func readLogicalRule(reader varbin.Reader, recovery bool, sets bool, depth int) (logicalRule option.LogicalHeadlessRule, err error) {
+ 	mode, err := reader.ReadByte()
+ 	if err != nil {
+ 		return
+@@ -629,7 +648,7 @@ func readLogicalRule(reader varbin.Reader, recovery bool, depth int) (logicalRul
+ 	}
+ 	for i := range length {
+ 		var rule option.HeadlessRule
+-		rule, err = readRule(reader, recovery, depth+1)
++		rule, err = readRule(reader, recovery, sets, depth+1)
+ 		if err != nil {
+ 			err = E.Cause(err, "read logical rule [", i, "]")
+ 			return
+diff --git a/common/srs/ip_ranges_test.go b/common/srs/ip_ranges_test.go
+new file mode 100644
+index 000000000..981c4e406
+--- /dev/null
++++ b/common/srs/ip_ranges_test.go
+@@ -0,0 +1,59 @@
++package srs
++
++import (
++	"bytes"
++	"fmt"
++	"math/rand"
++	"testing"
++
++	C "github.com/sagernet/sing-box/constant"
++	"github.com/sagernet/sing-box/option"
++
++	"github.com/stretchr/testify/require"
++)
++
++// A rule set read for matching (ReadSets) holds in its sets the ranges Read gives as
++// netipx sets: of source_ip_cidr and ip_cidr, in default rules and in logical ones.
++func TestReadSetsSameAsRead(t *testing.T) {
++	random := rand.New(rand.NewSource(1))
++	list := func(count int) []string {
++		items := make([]string, count)
++		for index := range items {
++			switch random.Intn(4) {
++			case 0:
++				items[index] = fmt.Sprintf("10.%d.%d.%d", random.Intn(4), random.Intn(256), random.Intn(256))
++			case 1:
++				items[index] = fmt.Sprintf("10.%d.%d.0/%d", random.Intn(4), random.Intn(256), 16+random.Intn(17))
++			case 2:
++				items[index] = fmt.Sprintf("2001:db8:%x::/%d", random.Intn(16), 40+random.Intn(89))
++			default:
++				items[index] = fmt.Sprintf("::ffff:10.%d.%d.0/%d", random.Intn(4), random.Intn(256), 112+random.Intn(17))
++			}
++		}
++		return items
++	}
++	for _, count := range []int{1, 10, 1000, 30000} {
++		ruleSet := option.PlainRuleSet{Rules: []option.HeadlessRule{
++			{Type: C.RuleTypeDefault, DefaultOptions: option.DefaultHeadlessRule{IPCIDR: list(count), SourceIPCIDR: list(count/2 + 1)}},
++			{Type: C.RuleTypeLogical, LogicalOptions: option.LogicalHeadlessRule{Mode: C.LogicalTypeOr, Rules: []option.HeadlessRule{
++				{Type: C.RuleTypeDefault, DefaultOptions: option.DefaultHeadlessRule{IPCIDR: list(count)}},
++				{Type: C.RuleTypeDefault, DefaultOptions: option.DefaultHeadlessRule{Domain: []string{"x.example"}}},
++			}}},
++		}}
++		var content bytes.Buffer
++		require.NoError(t, Write(&content, ruleSet, C.RuleSetVersionCurrent))
++		plain, err := Read(bytes.NewReader(content.Bytes()), false)
++		require.NoError(t, err)
++		sets, err := ReadSets(bytes.NewReader(content.Bytes()))
++		require.NoError(t, err)
++		first, second := plain.Options.Rules[0].DefaultOptions, sets.Options.Rules[0].DefaultOptions
++		require.Nil(t, second.IPSet)
++		require.Equal(t, first.IPSet.Ranges(), second.IPRanges.Ranges(), "%d", count)
++		require.Equal(t, first.SourceIPSet.Ranges(), second.SourceIPRanges.Ranges())
++		require.Equal(t, "ip_cidr=<binary>", second.IPRanges.String())
++		require.Equal(t, "source_ip_cidr=<binary>", second.SourceIPRanges.String())
++		nested := sets.Options.Rules[1].LogicalOptions.Rules[0].DefaultOptions
++		require.Equal(t, plain.Options.Rules[1].LogicalOptions.Rules[0].DefaultOptions.IPSet.Ranges(), nested.IPRanges.Ranges())
++		require.NotNil(t, sets.Options.Rules[1].LogicalOptions.Rules[1].DefaultOptions.DomainMatcher)
++	}
++}
+diff --git a/common/srs/ip_set.go b/common/srs/ip_set.go
+index 01def6bb2..8f7c24956 100644
+--- a/common/srs/ip_set.go
++++ b/common/srs/ip_set.go
+@@ -7,6 +7,7 @@ import (
+ 	"os"
+ 	"unsafe"
+ 
++	"github.com/sagernet/sing-box/common/cidrset"
+ 	M "github.com/sagernet/sing/common/metadata"
+ 	"github.com/sagernet/sing/common/varbin"
+ 
+@@ -52,6 +53,42 @@ func readIPSet(reader varbin.Reader) (*netipx.IPSet, error) {
+ 	return (*netipx.IPSet)(unsafe.Pointer(mySet)), nil
+ }
+ 
++// readIPRanges is readIPSet into a cidrset.Set: the ranges go into room made of the size
++// the file tells (a million at most at first: the count is only the file's word), and are
++// merged as netipx merges them. A range a netipx.IPSet would hold out of order, or of two
++// families, makes no set: it is an error.
++func readIPRanges(reader varbin.Reader, source bool) (*cidrset.Set, error) {
++	version, err := reader.ReadByte()
++	if err != nil {
++		return nil, err
++	}
++	if version != 1 {
++		return nil, os.ErrInvalid
++	}
++	var length uint64
++	err = binary.Read(reader, binary.BigEndian, &length)
++	if err != nil {
++		return nil, err
++	}
++	var builder cidrset.Builder
++	builder.Grow(int(min(length, 1<<20)))
++	for range length {
++		var from, to netip.Addr
++		from, err = readIPSetAddr(reader)
++		if err != nil {
++			return nil, err
++		}
++		to, err = readIPSetAddr(reader)
++		if err != nil {
++			return nil, err
++		}
++		if !builder.AddRange(netipx.IPRangeFrom(from, to)) {
++			return nil, os.ErrInvalid
++		}
++	}
++	return builder.Set(cidrset.Describe(source, []string{"<binary>"}, 1)), nil
++}
++
+ func readIPSetAddr(reader varbin.Reader) (netip.Addr, error) {
+ 	addrLen, err := binary.ReadUvarint(reader)
+ 	if err != nil {
+diff --git a/option/rule_set.go b/option/rule_set.go
+index 9b3cdadb4..9091236c7 100644
+--- a/option/rule_set.go
++++ b/option/rule_set.go
+@@ -5,6 +5,7 @@ import (
+ 	"path/filepath"
+ 	"reflect"
+ 
++	"github.com/sagernet/sing-box/common/cidrset"
+ 	"github.com/sagernet/sing-box/common/domainset/succinct"
+ 	C "github.com/sagernet/sing-box/constant"
+ 	"github.com/sagernet/sing/common"
+@@ -214,6 +215,11 @@ type DefaultHeadlessRule struct {
+ 	SourceIPSet   *netipx.IPSet   `json:"-"`
+ 	IPSet         *netipx.IPSet   `json:"-"`
+ 
++	// the lists of source_ip_cidr and ip_cidr as common/cidrset builds them, in place of
++	// the lists (common/domainset.ReadSource) or of the sets above (srs.ReadSets)
++	SourceIPRanges *cidrset.Set `json:"-"`
++	IPRanges       *cidrset.Set `json:"-"`
++
+ 	AdGuardDomain        badoption.Listable[string] `json:"-"`
+ 	AdGuardDomainMatcher *domain.AdGuardMatcher     `json:"-"`
+ }
+diff --git a/route/rule/rule_headless.go b/route/rule/rule_headless.go
+index c801b6bfa..1a6d7dca1 100644
+--- a/route/rule/rule_headless.go
++++ b/route/rule/rule_headless.go
+@@ -95,6 +95,10 @@ func NewDefaultHeadlessRule(ctx context.Context, options option.DefaultHeadlessR
+ 		item := NewRawIPCIDRItem(true, options.SourceIPSet)
+ 		rule.sourceAddressItems = append(rule.sourceAddressItems, item)
+ 		rule.allItems = append(rule.allItems, item)
++	} else if options.SourceIPRanges != nil {
++		item := NewCIDRSetItem(true, options.SourceIPRanges)
++		rule.sourceAddressItems = append(rule.sourceAddressItems, item)
++		rule.allItems = append(rule.allItems, item)
+ 	}
+ 	if len(options.IPCIDR) > 0 {
+ 		item, err := NewIPCIDRItem(false, options.IPCIDR)
+@@ -107,6 +111,10 @@ func NewDefaultHeadlessRule(ctx context.Context, options option.DefaultHeadlessR
+ 		item := NewRawIPCIDRItem(false, options.IPSet)
+ 		rule.destinationIPCIDRItems = append(rule.destinationIPCIDRItems, item)
+ 		rule.allItems = append(rule.allItems, item)
++	} else if options.IPRanges != nil {
++		item := NewCIDRSetItem(false, options.IPRanges)
++		rule.destinationIPCIDRItems = append(rule.destinationIPCIDRItems, item)
++		rule.allItems = append(rule.allItems, item)
+ 	}
+ 	if len(options.SourcePort) > 0 {
+ 		item := NewPortItem(true, options.SourcePort)
+diff --git a/route/rule/rule_item_cidr.go b/route/rule/rule_item_cidr.go
+index 1b0105ea9..3710656ca 100644
+--- a/route/rule/rule_item_cidr.go
++++ b/route/rule/rule_item_cidr.go
+@@ -3,9 +3,9 @@ package rule
+ import (
+ 	"net/netip"
+ 	"slices"
+-	"strings"
+ 
+ 	"github.com/sagernet/sing-box/adapter"
++	"github.com/sagernet/sing-box/common/cidrset"
+ 	E "github.com/sagernet/sing/common/exceptions"
+ 
+ 	"go4.org/netipx"
+@@ -14,12 +14,51 @@ import (
+ var _ RuleItem = (*IPCIDRItem)(nil)
+ 
+ type IPCIDRItem struct {
+-	ipSet       *netipx.IPSet
++	ipSet       ipSet
+ 	isSource    bool
+ 	description string
+ }
+ 
++// ipSet is what an item asks of its addresses: netipx.IPSet, or a cidrset.Set.
++type ipSet interface {
++	Contains(netip.Addr) bool
++}
++
+ func NewIPCIDRItem(isSource bool, prefixStrings []string) (*IPCIDRItem, error) {
++	// the set of common/cidrset: the ranges netipx makes of the same list, in a fraction
++	// of its memory; a canonical IPv4 prefix is read from its text, any other by netip
++	var builder cidrset.Builder
++	builder.Grow(len(prefixStrings))
++	for i, prefixString := range prefixStrings {
++		if from, to, ok := cidrset.Parse4(prefixString); ok {
++			builder.Add4(from, to)
++			continue
++		}
++		prefix, err := netip.ParsePrefix(prefixString)
++		if err == nil {
++			if !builder.AddPrefix(prefix) {
++				return newNetipxCIDRItem(isSource, prefixStrings)
++			}
++			continue
++		}
++		addr, addrErr := netip.ParseAddr(prefixString)
++		if addrErr == nil {
++			if !builder.AddAddr(addr) {
++				return newNetipxCIDRItem(isSource, prefixStrings)
++			}
++			continue
++		}
++		return nil, E.Cause(err, "parse [", i, "]")
++	}
++	return &IPCIDRItem{
++		ipSet:       builder.Set(""),
++		isSource:    isSource,
++		description: cidrset.Describe(isSource, prefixStrings[:min(3, len(prefixStrings))], len(prefixStrings)),
++	}, nil
++}
++
++// newNetipxCIDRItem is the item as upstream builds it, for a list cidrset does not take.
++func newNetipxCIDRItem(isSource bool, prefixStrings []string) (*IPCIDRItem, error) {
+ 	var builder netipx.IPSetBuilder
+ 	for i, prefixString := range prefixStrings {
+ 		prefix, err := netip.ParsePrefix(prefixString)
+@@ -34,19 +73,6 @@ func NewIPCIDRItem(isSource bool, prefixStrings []string) (*IPCIDRItem, error) {
+ 		}
+ 		return nil, E.Cause(err, "parse [", i, "]")
+ 	}
+-	var description string
+-	if isSource {
+-		description = "source_ip_cidr="
+-	} else {
+-		description = "ip_cidr="
+-	}
+-	if dLen := len(prefixStrings); dLen == 1 {
+-		description += prefixStrings[0]
+-	} else if dLen > 3 {
+-		description += "[" + strings.Join(prefixStrings[:3], " ") + "...]"
+-	} else {
+-		description += "[" + strings.Join(prefixStrings, " ") + "]"
+-	}
+ 	ipSet, err := builder.IPSet()
+ 	if err != nil {
+ 		return nil, err
+@@ -54,7 +80,7 @@ func NewIPCIDRItem(isSource bool, prefixStrings []string) (*IPCIDRItem, error) {
+ 	return &IPCIDRItem{
+ 		ipSet:       ipSet,
+ 		isSource:    isSource,
+-		description: description,
++		description: cidrset.Describe(isSource, prefixStrings[:min(3, len(prefixStrings))], len(prefixStrings)),
+ 	}, nil
+ }
+ 
+@@ -73,6 +99,29 @@ func NewRawIPCIDRItem(isSource bool, ipSet *netipx.IPSet) *IPCIDRItem {
+ 	}
+ }
+ 
++// NewCIDRSetItem is the item of a set common/cidrset built of the list of a rule.
++func NewCIDRSetItem(isSource bool, set *cidrset.Set) *IPCIDRItem {
++	return &IPCIDRItem{
++		ipSet:       set,
++		isSource:    isSource,
++		description: set.String(),
++	}
++}
++
++// netipxSet is the set of the item as a netipx.IPSet, for a TUN that routes it.
++func (r *IPCIDRItem) netipxSet() *netipx.IPSet {
++	switch set := r.ipSet.(type) {
++	case *netipx.IPSet:
++		return set
++	case *cidrset.Set:
++		ipSet, err := set.IPSet()
++		if err == nil {
++			return ipSet
++		}
++	}
++	return new(netipx.IPSet)
++}
++
+ func (r *IPCIDRItem) Match(metadata *adapter.InboundContext) bool {
+ 	if r.isSource || metadata.IPCIDRMatchSource {
+ 		return r.ipSet.Contains(metadata.Source.Addr)
+diff --git a/route/rule/rule_set.go b/route/rule/rule_set.go
+index 39068dbf3..43c9baf5d 100644
+--- a/route/rule/rule_set.go
++++ b/route/rule/rule_set.go
+@@ -30,7 +30,7 @@ func extractIPSetFromRule(rawRule adapter.HeadlessRule) []*netipx.IPSet {
+ 		return common.FlatMap(rule.destinationIPCIDRItems, func(rawItem RuleItem) []*netipx.IPSet {
+ 			switch item := rawItem.(type) {
+ 			case *IPCIDRItem:
+-				return []*netipx.IPSet{item.ipSet}
++				return []*netipx.IPSet{item.netipxSet()}
+ 			default:
+ 				return nil
+ 			}
+@@ -67,5 +67,5 @@ func isWIFIHeadlessRule(rule option.DefaultHeadlessRule) bool {
+ }
+ 
+ func isIPCIDRHeadlessRule(rule option.DefaultHeadlessRule) bool {
+-	return len(rule.IPCIDR) > 0 || rule.IPSet != nil
++	return len(rule.IPCIDR) > 0 || rule.IPSet != nil || rule.IPRanges != nil
+ }
+diff --git a/route/rule/rule_set_local.go b/route/rule/rule_set_local.go
+index a124ee28f..5bf2b2c31 100644
+--- a/route/rule/rule_set_local.go
++++ b/route/rule/rule_set_local.go
+@@ -131,7 +131,7 @@ func (s *LocalRuleSet) reloadFile(path string) error {
+ 			return err
+ 		}
+ 		defer setFile.Close()
+-		ruleSet, err = srs.Read(setFile, false)
++		ruleSet, err = srs.ReadSets(setFile)
+ 		if err != nil {
+ 			return err
+ 		}
+diff --git a/route/rule/rule_set_remote.go b/route/rule/rule_set_remote.go
+index 7c4ff57c7..e86fc5115 100644
+--- a/route/rule/rule_set_remote.go
++++ b/route/rule/rule_set_remote.go
+@@ -200,7 +200,7 @@ func (s *RemoteRuleSet) loadBytes(content []byte) error {
+ 			return err
+ 		}
+ 	case C.RuleSetFormatBinary:
+-		ruleSet, err = srs.Read(bytes.NewReader(content), false)
++		ruleSet, err = srs.ReadSets(bytes.NewReader(content))
+ 		if err != nil {
+ 			return err
+ 		}
+-- 
+2.53.0
+

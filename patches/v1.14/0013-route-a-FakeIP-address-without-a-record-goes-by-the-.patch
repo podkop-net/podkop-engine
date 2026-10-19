@@ -1,7 +1,7 @@
-From 8e838643afba680460ab3ad8627f38f97c1de047 Mon Sep 17 00:00:00 2001
+From 6522748211558b26939c03d996a421c2bc79d92d Mon Sep 17 00:00:00 2001
 From: FiyeroT <me@fiyero.xyz>
 Date: Fri, 2 Oct 2026 06:52:21 +0300
-Subject: [PATCH 013/125] route: a FakeIP address without a record goes by the
+Subject: [PATCH 013/148] route: a FakeIP address without a record goes by the
  sniffed domain
 
 A connection to a FakeIP address the store has no record for was refused
@@ -25,7 +25,7 @@ domain are refused. QUIC is not tested.
  1 file changed, 33 insertions(+), 1 deletion(-)
 
 diff --git a/route/route.go b/route/route.go
-index 62f1c8650..6c99cc23b 100644
+index 8dddb0431..bc1d41b4c 100644
 --- a/route/route.go
 +++ b/route/route.go
 @@ -542,6 +542,11 @@ func (r *Router) preMatchFlow(ctx context.Context, metadata *adapter.InboundCont

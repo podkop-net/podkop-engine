@@ -159,10 +159,14 @@ https://example.com/f"; do
   ;;
 esac
 
+# the http outbound is in both packages since r15: a local HTTP proxy set as a raw outbound
+# (opera-proxy and the like)
+printf '{"outbounds": [{"tag": "x", "type": "http", "server": "127.0.0.1", "server_port": 18080}]}\n' > /tmp/pk/one.json
+sing-box check -c /tmp/pk/one.json || fail "$PKG refuses the http outbound"
+
 # the outbounds only podkop-engine-full has (raw outbound configurations in podkop)
 TLS='"server": "203.0.113.20", "server_port": 443, "tls": {"enabled": true, "server_name": "e.example.com"}'
 for o in '"type": "vmess", "server": "203.0.113.20", "server_port": 443, "uuid": "6f1c9a0e-3b52-4c1e-9a55-2d4a1b0f7c11"' \
-         '"type": "http", "server": "203.0.113.20", "server_port": 3128' \
          "\"type\": \"anytls\", $TLS, \"password\": \"p\"" \
          "\"type\": \"naive\", $TLS, \"username\": \"u\", \"password\": \"p\""; do
   printf '{"outbounds": [{"tag": "x", %s}]}\n' "$o" > /tmp/pk/one.json

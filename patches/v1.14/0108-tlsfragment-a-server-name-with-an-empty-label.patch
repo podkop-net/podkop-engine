@@ -1,0 +1,175 @@
+From bc3eb0c3c3bc638da7647238d0c4236fac4dd296 Mon Sep 17 00:00:00 2001
+From: FiyeroT <me@fiyero.xyz>
+Date: Fri, 9 Oct 2026 16:15:03 +0300
+Subject: [PATCH 108/148] tlsfragment: a server name with an empty label
+
+The place of a cut inside a label was drawn with rand.Intn(len(label)).
+For an empty label that is rand.Intn(0), which panics, and nothing
+recovers a panic of a connection: sing-box ended at the first connection
+with such a name, and again after every restart. A name that begins with
+a dot has an empty first label; the TLS clients send it as it is, and
+the route option tls_fragment meets whatever a client of the LAN sends.
+
+The cut is now made where the empty label stands, and a piece that
+would be empty (a name that ends with a dot at the very end of the
+ClientHello) is not written: an empty record is not one a server takes.
+The pieces stay in order, and the ClientHello arrives whole.
+---
+ common/tlsfragment/conn.go            |  13 ++-
+ common/tlsfragment/conn_label_test.go | 113 ++++++++++++++++++++++++++
+ 2 files changed, 125 insertions(+), 1 deletion(-)
+ create mode 100644 common/tlsfragment/conn_label_test.go
+
+diff --git a/common/tlsfragment/conn.go b/common/tlsfragment/conn.go
+index fb6e5e0b8..79dec8022 100644
+--- a/common/tlsfragment/conn.go
++++ b/common/tlsfragment/conn.go
+@@ -66,7 +66,12 @@ func (c *Conn) Write(b []byte) (n int, err error) {
+ 			}
+ 			var splitIndexes []int
+ 			for i, split := range splits {
+-				splitAt := rand.Intn(len(split))
++				// a name may have an empty label, the first one when it begins with a
++				// dot: the cut is then made where the label stands (podkop-engine)
++				var splitAt int
++				if len(split) > 0 {
++					splitAt = rand.Intn(len(split))
++				}
+ 				splitIndexes = append(splitIndexes, currentIndex+splitAt)
+ 				currentIndex += len(split)
+ 				if i != len(splits)-1 {
+@@ -83,6 +88,12 @@ func (c *Conn) Write(b []byte) (n int, err error) {
+ 					}
+ 				} else if i == len(splitIndexes) {
+ 					payload = b[splitIndexes[i-1]:]
++					// a name that ends with a dot at the very end of the ClientHello:
++					// nothing is left after the last cut, and an empty record is not
++					// one a server takes (podkop-engine)
++					if len(payload) == 0 {
++						continue
++					}
+ 				} else {
+ 					payload = b[splitIndexes[i-1]:splitIndexes[i]]
+ 				}
+diff --git a/common/tlsfragment/conn_label_test.go b/common/tlsfragment/conn_label_test.go
+new file mode 100644
+index 000000000..64cd9c719
+--- /dev/null
++++ b/common/tlsfragment/conn_label_test.go
+@@ -0,0 +1,113 @@
++package tf_test
++
++import (
++	"context"
++	"crypto/tls"
++	"encoding/binary"
++	"io"
++	"net"
++	"testing"
++	"time"
++
++	tf "github.com/sagernet/sing-box/common/tlsfragment"
++
++	"github.com/stretchr/testify/require"
++)
++
++// readClientHello reads records until they hold a whole handshake message, and returns
++// the message.
++func readClientHello(conn net.Conn) []byte {
++	var message []byte
++	header := make([]byte, 5)
++	for {
++		if _, err := io.ReadFull(conn, header); err != nil {
++			return message
++		}
++		payload := make([]byte, binary.BigEndian.Uint16(header[3:]))
++		if _, err := io.ReadFull(conn, payload); err != nil {
++			return message
++		}
++		message = append(message, payload...)
++		if len(message) >= 4 && len(message) >= 4+(int(message[1])<<16|int(message[2])<<8|int(message[3])) {
++			return message
++		}
++	}
++}
++
++// A server name with an empty label, as one that begins with a dot has, used to end the
++// process: the place of a cut was drawn from the length of the label, and there is no
++// number below zero to draw. The ClientHello is now cut where the label stands and
++// arrives whole.
++func TestFragmentEmptyLabel(t *testing.T) {
++	t.Parallel()
++	for _, serverName := range []string{".example.org", "example..org", "a..b", ".a", "www.example.org"} {
++		for _, mode := range [][2]bool{{false, true}, {true, false}, {true, true}} {
++			client, server := net.Pipe()
++			received := make(chan []byte, 1)
++			go func() {
++				server.SetReadDeadline(time.Now().Add(5 * time.Second))
++				received <- readClientHello(server)
++				server.Close()
++			}()
++			tlsConn := tls.Client(tf.NewConn(client, context.Background(), mode[0], mode[1], time.Millisecond), &tls.Config{
++				ServerName:         serverName,
++				InsecureSkipVerify: true,
++			})
++			// nobody answers: the handshake ends when the other side has the ClientHello
++			require.Error(t, tlsConn.Handshake(), serverName)
++			client.Close()
++			message := <-received
++			require.Contains(t, string(message), serverName, "%s, split packet %v, split record %v", serverName, mode[0], mode[1])
++			require.Equal(t, len(message), 4+(int(message[1])<<16|int(message[2])<<8|int(message[3])), serverName)
++		}
++	}
++}
++
++// clientHelloWithName makes a ClientHello record whose only extension is the server name:
++// the name is the last of its bytes.
++func clientHelloWithName(name string) []byte {
++	extension := []byte{0, 0, 0, byte(len(name) + 5), 0, byte(len(name) + 3), 0, 0, byte(len(name))}
++	extension = append(extension, name...)
++	body := []byte{3, 3}
++	body = append(body, make([]byte, 32)...)
++	body = append(body, 0, 0, 2, 0x13, 0x01, 1, 0, 0, byte(len(extension)))
++	body = append(body, extension...)
++	handshake := append([]byte{1, 0, 0, byte(len(body))}, body...)
++	return append([]byte{22, 3, 1, 0, byte(len(handshake))}, handshake...)
++}
++
++// A name that ends with a dot has an empty last label, and at the very end of the
++// ClientHello nothing is left after the cut made there: no empty piece is written (an
++// empty record is not one a server takes), and the ClientHello arrives whole. Such a name
++// comes from a client of the LAN, with the route options; the TLS clients of sing-box
++// take the dot away.
++func TestFragmentNameAtTheEnd(t *testing.T) {
++	t.Parallel()
++	for _, serverName := range []string{"example.org.", "a.", "example.org", "."} {
++		hello := clientHelloWithName(serverName)
++		for _, mode := range [][2]bool{{false, true}, {true, false}, {true, true}} {
++			client, server := net.Pipe()
++			received := make(chan []byte, 1)
++			go func() {
++				server.SetReadDeadline(time.Now().Add(5 * time.Second))
++				content, _ := io.ReadAll(server)
++				received <- content
++			}()
++			written, err := tf.NewConn(client, context.Background(), mode[0], mode[1], time.Millisecond).Write(hello)
++			require.NoError(t, err, serverName)
++			require.Equal(t, len(hello), written, serverName)
++			client.Close()
++			content := <-received
++			var message []byte
++			for len(content) > 0 {
++				require.GreaterOrEqual(t, len(content), 5, serverName)
++				length := int(binary.BigEndian.Uint16(content[3:5]))
++				require.NotZero(t, length, "%s, split packet %v, split record %v: an empty record", serverName, mode[0], mode[1])
++				require.GreaterOrEqual(t, len(content), 5+length, serverName)
++				message = append(message, content[5:5+length]...)
++				content = content[5+length:]
++			}
++			require.Equal(t, hello[5:], message, "%s, split packet %v, split record %v", serverName, mode[0], mode[1])
++		}
++	}
++}
+-- 
+2.53.0
+

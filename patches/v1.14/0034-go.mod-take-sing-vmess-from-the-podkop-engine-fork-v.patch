@@ -1,10 +1,10 @@
-From 8190e63cc584762ece292e10f73198cde343e42f Mon Sep 17 00:00:00 2001
+From 12b2a1bfb3c760c363cdc780914d63147d402fce Mon Sep 17 00:00:00 2001
 From: FiyeroT <me@fiyero.xyz>
-Date: Sun, 4 Oct 2026 01:15:12 +0300
-Subject: [PATCH 034/125] go.mod: take sing-vmess from the podkop-engine fork
- (v0.2.8-pdk.1)
+Date: Mon, 19 Oct 2026 20:58:05 +0300
+Subject: [PATCH 034/148] go.mod: take sing-vmess from the podkop-engine fork
+ (v0.2.9-pdk.1)
 
-github.com/FiyeroT/sing-vmess v0.2.8-pdk.1 is the sing-vmess of this line plus one
+github.com/FiyeroT/sing-vmess v0.2.9-pdk.1 is the sing-vmess of this line plus one
 change: under Vision in direct mode the connection reports the read side
 replaceable, so the copy loop reads the raw TCP connection (splice, no
 buffer held while idle) once the buffered remainder is out.
@@ -14,7 +14,7 @@ buffer held while idle) once the buffered remainder is out.
  2 files changed, 4 insertions(+), 2 deletions(-)
 
 diff --git a/go.mod b/go.mod
-index b2ab87cab..4da65f79c 100644
+index 53b8a1cae..d7afdd217 100644
 --- a/go.mod
 +++ b/go.mod
 @@ -198,3 +198,5 @@ require (
@@ -22,26 +22,26 @@ index b2ab87cab..4da65f79c 100644
  	zombiezen.com/go/capnproto2 v2.18.2+incompatible // indirect
  )
 +
-+replace github.com/sagernet/sing-vmess => github.com/FiyeroT/sing-vmess v0.2.8-pdk.1
++replace github.com/sagernet/sing-vmess => github.com/FiyeroT/sing-vmess v0.2.9-pdk.1
 diff --git a/go.sum b/go.sum
-index 3172be80a..5824f367d 100644
+index ed70f5876..384c69ba4 100644
 --- a/go.sum
 +++ b/go.sum
 @@ -10,6 +10,8 @@ filippo.io/edwards25519 v1.2.0/go.mod h1:xzAOLCNug/yB62zG1bQ8uziwrIqIuxhctzJT18Q
  filippo.io/hpke v0.4.0 h1:p575VVQ6ted4pL+it6M00V/f2qTZITO0zgmdKCkd5+A=
  filippo.io/hpke v0.4.0/go.mod h1:EmAN849/P3qdeK+PCMkDpDm83vRHM5cDipBJ8xbQLVY=
  github.com/BurntSushi/toml v0.3.1/go.mod h1:xHWCNGjB5oqiDr8zfno3MHue2Ht5sIBksp03qcyfWMU=
-+github.com/FiyeroT/sing-vmess v0.2.8-pdk.1 h1:8SV/xJZAojpjTq2ggcgfxnmDI5gZEPvd/+TI+6bCvAk=
-+github.com/FiyeroT/sing-vmess v0.2.8-pdk.1/go.mod h1:YgeiBUO7ODoWPJr3rMWMJnu2wUNLyv0SHKv7lzqv4UM=
++github.com/FiyeroT/sing-vmess v0.2.9-pdk.1 h1:+fBtfTV63DE19qLO9TtgB1eLl9sqJlsTqeP4WVrzv3w=
++github.com/FiyeroT/sing-vmess v0.2.9-pdk.1/go.mod h1:RVJpToy1dBdA+RLfTwE8UKIvIhjDovH6KOmBcxsdZUI=
  github.com/RyuaNerin/go-krypto v1.3.0 h1:smavTzSMAx8iuVlGb4pEwl9MD2qicqMzuXR2QWp2/Pg=
  github.com/RyuaNerin/go-krypto v1.3.0/go.mod h1:9R9TU936laAIqAmjcHo/LsaXYOZlymudOAxjaBf62UM=
  github.com/RyuaNerin/testingutil v0.1.0 h1:IYT6JL57RV3U2ml3dLHZsVtPOP6yNK7WUVdzzlpNrss=
-@@ -342,8 +344,6 @@ github.com/sagernet/sing-tun v0.9.6-0.20260924001923-ddaa4ca25e3b h1:tjQUA4fQi0O
- github.com/sagernet/sing-tun v0.9.6-0.20260924001923-ddaa4ca25e3b/go.mod h1:3EgPst7agntRO7D6GOsiZ1l9FoqdLeuWmKT5TnWkmf0=
+@@ -342,8 +344,6 @@ github.com/sagernet/sing-tun v0.9.7-0.20261009020158-bca4bf029237 h1:B9tUcRf1FAa
+ github.com/sagernet/sing-tun v0.9.7-0.20261009020158-bca4bf029237/go.mod h1:3EgPst7agntRO7D6GOsiZ1l9FoqdLeuWmKT5TnWkmf0=
  github.com/sagernet/sing-usbip v0.0.0-20260817040617-28bd42667eca h1:5wA+IE0Fq1CGVLOgSpm0gKKZ03HzugcJ2JyhmDqeX6A=
  github.com/sagernet/sing-usbip v0.0.0-20260817040617-28bd42667eca/go.mod h1:ADAZZU85MnM91XNhd2TdZRTaIbA7RjTZuQ1KCHcUbNg=
--github.com/sagernet/sing-vmess v0.2.8 h1:xd5nnDOMlC76RgrLksS4jlk3eMt3c3CvQY3NsjWPWeI=
--github.com/sagernet/sing-vmess v0.2.8/go.mod h1:P11scgTxMxVVQ8dlM27yNm3Cro40mD0+gHbnqrNGDuY=
+-github.com/sagernet/sing-vmess v0.2.9-0.20260929152519-9b95ab8c9478 h1:q2eQn4nq8oWGxRm9zXesXSlPr9GEgPrOGzf4iPtzG9A=
+-github.com/sagernet/sing-vmess v0.2.9-0.20260929152519-9b95ab8c9478/go.mod h1:P11scgTxMxVVQ8dlM27yNm3Cro40mD0+gHbnqrNGDuY=
  github.com/sagernet/smux v1.5.50-sing-box-mod.1 h1:XkJcivBC9V4wBjiGXIXZ229aZCU1hzcbp6kSkkyQ478=
  github.com/sagernet/smux v1.5.50-sing-box-mod.1/go.mod h1:NjhsCEWedJm7eFLyhuBgIEzwfhRmytrUoiLluxs5Sk8=
  github.com/sagernet/tailscale v1.102.1-sing-box-1.14-mod.5 h1:mGLWVgj2Pl2NlgE1+sEUIDIMB42JdWEPwYmxTnVWg44=

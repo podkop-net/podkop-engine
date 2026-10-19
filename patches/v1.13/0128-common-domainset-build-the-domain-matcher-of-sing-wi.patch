@@ -1,0 +1,354 @@
+From 9e67d055fd5888ea997b5d871e33e5c080707f78 Mon Sep 17 00:00:00 2001
+From: FiyeroT <me@fiyero.xyz>
+Date: Sun, 18 Oct 2026 10:26:56 +0300
+Subject: [PATCH 128/140] common/domainset: build the domain matcher of sing
+ with a fraction of its memory
+
+domain.NewMatcher keeps the whole queue of its breadth-first walk while it
+builds the trie, 24 bytes a node: a list of 100000 varied names takes it
+past the memory of a router with 256 MB. Build walks a level at a time and
+hands the trie to sing as a binary rule set carries it (domain.ReadMatcher).
+The result is the same byte for byte (TestSameAsSing). Domain rules and the
+rule-set compiler use it.
+
+100000 varied names: 41 ms and 37 MB allocated a build, against 72 ms and
+160 MB.
+---
+ common/domainset/domainset.go      | 168 +++++++++++++++++++++++++++++
+ common/domainset/domainset_test.go |  98 +++++++++++++++++
+ common/srs/binary.go               |   4 +-
+ route/rule/rule_item_domain.go     |   8 +-
+ 4 files changed, 276 insertions(+), 2 deletions(-)
+ create mode 100644 common/domainset/domainset.go
+ create mode 100644 common/domainset/domainset_test.go
+
+diff --git a/common/domainset/domainset.go b/common/domainset/domainset.go
+new file mode 100644
+index 000000000..2fd7bd154
+--- /dev/null
++++ b/common/domainset/domainset.go
+@@ -0,0 +1,168 @@
++// Package domainset builds the domain matcher of sing (common/domain) with far less memory
++// than domain.NewMatcher: the matcher is the same, bit for bit.
++//
++// domain.NewMatcher keeps the queue of its breadth-first walk of the trie whole until the
++// trie is built, an entry of 24 bytes for every node, and the queue grows by doubling: a
++// list of 100000 varied names, about two million nodes, takes it to the peak of a hundred
++// megabytes and more, which a router with 128 MB does not have (D28 of the podkop 0.8
++// review). Here the walk keeps one level of the trie and the next, at most an entry a
++// name each, and the trie is handed to sing in the form a rule set in the binary format
++// carries it (domain.ReadMatcher).
++package domainset
++
++import (
++	"bytes"
++	"encoding/binary"
++	"slices"
++	"unicode/utf8"
++
++	"github.com/sagernet/sing/common/domain"
++	"github.com/sagernet/sing/common/varbin"
++)
++
++// the labels of sing (common/domain/matcher.go): a key that ends a suffix, and one that
++// ends a name and its subdomains
++const (
++	prefixLabel = '\r'
++	rootLabel   = '\n'
++)
++
++// NewMatcher is domain.NewMatcher: the names matched as they are (domains) and with their
++// subdomains (domainSuffix; one that begins with "." matches its subdomains only), in the
++// legacy way of rule sets of version 1 when generateLegacy is set.
++func NewMatcher(domains []string, domainSuffix []string, generateLegacy bool) (*domain.Matcher, error) {
++	if len(domains) == 0 && len(domainSuffix) == 0 {
++		// as sing has it, whatever that does with nothing to match
++		return domain.NewMatcher(domains, domainSuffix, generateLegacy), nil
++	}
++	return domain.ReadMatcher(bytes.NewReader(Encode(domains, domainSuffix, generateLegacy)))
++}
++
++// Encode is the matcher of NewMatcher as domain.Matcher.Write writes it, the form a rule set
++// in the binary format carries.
++func Encode(domains []string, domainSuffix []string, generateLegacy bool) []byte {
++	return Build(keys(domains, domainSuffix, generateLegacy))
++}
++
++// keys are the keys of the trie, as domain.NewMatcher makes them: a name reversed, with a
++// label for how it matches, each once, in order. A name of domains that is a suffix too is
++// the suffix only, as there.
++func keys(domains []string, domainSuffix []string, generateLegacy bool) []string {
++	seen := make(map[string]bool, len(domainSuffix)+len(domains))
++	list := make([]string, 0, len(domains)+len(domainSuffix))
++	for _, name := range domainSuffix {
++		if seen[name] {
++			continue
++		}
++		seen[name] = true
++		switch {
++		case name[0] == '.':
++			list = append(list, reverse(string(prefixLabel)+name))
++		case generateLegacy:
++			list = append(list, reverse(name))
++			suffix := "." + name
++			if !seen[suffix] {
++				seen[suffix] = true
++				list = append(list, reverse(string(prefixLabel)+suffix))
++			}
++		default:
++			list = append(list, reverse(string(rootLabel)+name))
++		}
++	}
++	for _, name := range domains {
++		if seen[name] {
++			continue
++		}
++		seen[name] = true
++		list = append(list, reverse(name))
++	}
++	// the map is no longer needed: a big list should not keep it while the trie is built
++	seen = nil
++	slices.Sort(list)
++	return list
++}
++
++// reverse is reverseDomain of sing: the runes in the other order.
++func reverse(name string) string {
++	length := len(name)
++	reversed := make([]byte, length)
++	for index := 0; index < length; {
++		character, size := utf8.DecodeRuneInString(name[index:])
++		index += size
++		utf8.EncodeRune(reversed[length-index:], character)
++	}
++	return string(reversed)
++}
++
++// span is a node of the trie as the walk sees it: the keys from start to end that share
++// their first column bytes.
++type span struct {
++	start, end, column int32
++}
++
++// Build makes the succinct set of sorted keys, the trie of newSuccinctSet of sing, written
++// as succinctSet.Write writes it. The walk goes a level at a time: the nodes of a level
++// are a span each, and a level has at most as many nodes as there are keys.
++func Build(keys []string) []byte {
++	var (
++		leaves, labelBitmap []uint64
++		labels              []byte
++	)
++	setBit := func(words *[]uint64, index int) {
++		for index>>6 >= len(*words) {
++			*words = append(*words, 0)
++		}
++		(*words)[index>>6] |= 1 << uint(index&63)
++	}
++	bit := 0
++	node := 0
++	level := []span{{0, int32(len(keys)), 0}}
++	var next []span
++	for len(level) > 0 {
++		next = next[:0]
++		for _, item := range level {
++			start := int(item.start)
++			column := int(item.column)
++			if column == len(keys[start]) {
++				// a key ends here: a leaf
++				start++
++				setBit(&leaves, node)
++			}
++			for index := start; index < int(item.end); {
++				first := index
++				for index < int(item.end) && keys[index][column] == keys[first][column] {
++					index++
++				}
++				next = append(next, span{int32(first), int32(index), int32(column + 1)})
++				labels = append(labels, keys[first][column])
++				// a zero bit for each label
++				bit++
++			}
++			setBit(&labelBitmap, bit)
++			bit++
++			node++
++		}
++		level, next = next, level
++	}
++	var content bytes.Buffer
++	content.Grow(16 + 8*(len(leaves)+len(labelBitmap)) + len(labels))
++	content.WriteByte(0)
++	writeWords(&content, leaves)
++	writeWords(&content, labelBitmap)
++	writeLength(&content, len(labels))
++	content.Write(labels)
++	return content.Bytes()
++}
++
++func writeLength(content *bytes.Buffer, length int) {
++	_, _ = varbin.WriteUvarint(content, uint64(length))
++}
++
++func writeWords(content *bytes.Buffer, words []uint64) {
++	writeLength(content, len(words))
++	var word [8]byte
++	for _, value := range words {
++		binary.BigEndian.PutUint64(word[:], value)
++		content.Write(word[:])
++	}
++}
+diff --git a/common/domainset/domainset_test.go b/common/domainset/domainset_test.go
+new file mode 100644
+index 000000000..1ef5d465d
+--- /dev/null
++++ b/common/domainset/domainset_test.go
+@@ -0,0 +1,98 @@
++package domainset
++
++import (
++	"bytes"
++	"math/rand"
++	"strings"
++	"testing"
++
++	"github.com/sagernet/sing/common/domain"
++
++	"github.com/stretchr/testify/require"
++)
++
++// names makes count names of no pattern, some with a dot in front, some repeated, some
++// not of ASCII.
++func names(random *rand.Rand, count int) []string {
++	letters := "abcdefghijklmnopqrstuvwxyz0123456789-"
++	tlds := []string{"com", "net", "org", "ru", "io", "co.uk", "рф", "xn--p1ai"}
++	result := make([]string, 0, count)
++	for len(result) < count {
++		var name strings.Builder
++		if random.Intn(10) == 0 {
++			name.WriteByte('.')
++		}
++		for range 1 + random.Intn(3) {
++			for range 1 + random.Intn(10) {
++				name.WriteByte(letters[random.Intn(26)])
++			}
++			if random.Intn(5) == 0 {
++				name.WriteString("-" + string(letters[random.Intn(len(letters))]))
++			}
++			name.WriteByte('.')
++		}
++		name.WriteString(tlds[random.Intn(len(tlds))])
++		result = append(result, name.String())
++		if random.Intn(20) == 0 && len(result) < count {
++			// the same name again
++			result = append(result, result[random.Intn(len(result))])
++		}
++	}
++	return result
++}
++
++func singBytes(t *testing.T, domains []string, domainSuffix []string, generateLegacy bool) []byte {
++	var content bytes.Buffer
++	require.NoError(t, domain.NewMatcher(domains, domainSuffix, generateLegacy).Write(&content))
++	return content.Bytes()
++}
++
++// The matcher is the one of sing, byte for byte as it is written into a rule set: names and
++// suffixes of no pattern, repeated, in both lists, with a dot in front, not of ASCII, in
++// the legacy way and not, from a few to many.
++func TestSameAsSing(t *testing.T) {
++	random := rand.New(rand.NewSource(1))
++	for _, count := range []int{1, 2, 3, 10, 100, 1000, 20000} {
++		for _, legacy := range []bool{false, true} {
++			domains, suffixes := names(random, count), names(random, count)
++			// a name in both lists, and a suffix of a name
++			domains = append(domains, suffixes[0])
++			suffixes = append(suffixes, "."+strings.TrimPrefix(domains[0], "."))
++			for _, lists := range [][2][]string{{domains, suffixes}, {domains, nil}, {nil, suffixes}} {
++				want := singBytes(t, lists[0], lists[1], legacy)
++				require.Equal(t, want, Encode(lists[0], lists[1], legacy), "%d names, legacy %v", count, legacy)
++				matcher, err := NewMatcher(lists[0], lists[1], legacy)
++				require.NoError(t, err)
++				var written bytes.Buffer
++				require.NoError(t, matcher.Write(&written))
++				require.Equal(t, want, written.Bytes())
++			}
++		}
++	}
++	// one name and one suffix, and a name that is a suffix of another
++	for _, lists := range [][2][]string{
++		{{"example.com"}, nil}, {nil, {"example.com"}}, {nil, {".example.com"}},
++		{{"a.b.c", "b.c"}, {"c", ".b.c"}}, {{"x"}, {"x"}},
++	} {
++		require.Equal(t, singBytes(t, lists[0], lists[1], false), Encode(lists[0], lists[1], false), "%v", lists)
++	}
++}
++
++// What a list of 100000 names of no pattern costs to build: here and in sing.
++func BenchmarkBuild(b *testing.B) {
++	list := names(rand.New(rand.NewSource(2)), 100000)
++	b.Run("domainset", func(b *testing.B) {
++		b.ReportAllocs()
++		for range b.N {
++			if _, err := NewMatcher(nil, list, false); err != nil {
++				b.Fatal(err)
++			}
++		}
++	})
++	b.Run("sing", func(b *testing.B) {
++		b.ReportAllocs()
++		for range b.N {
++			domain.NewMatcher(nil, list, false)
++		}
++	})
++}
+diff --git a/common/srs/binary.go b/common/srs/binary.go
+index 95b054b26..01bd5a838 100644
+--- a/common/srs/binary.go
++++ b/common/srs/binary.go
+@@ -8,6 +8,7 @@ import (
+ 	"net/netip"
+ 	"unsafe"
+ 
++	"github.com/sagernet/sing-box/common/domainset"
+ 	C "github.com/sagernet/sing-box/constant"
+ 	"github.com/sagernet/sing-box/option"
+ 	"github.com/sagernet/sing/common"
+@@ -324,7 +325,8 @@ func writeDefaultRule(writer varbin.Writer, rule option.DefaultHeadlessRule, gen
+ 		if err != nil {
+ 			return err
+ 		}
+-		err = domain.NewMatcher(rule.Domain, rule.DomainSuffix, generateVersion == C.RuleSetVersion1).Write(writer)
++		// what domain.NewMatcher(...).Write writes, built with a fraction of its memory
++		_, err = writer.Write(domainset.Encode(rule.Domain, rule.DomainSuffix, generateVersion == C.RuleSetVersion1))
+ 		if err != nil {
+ 			return err
+ 		}
+diff --git a/route/rule/rule_item_domain.go b/route/rule/rule_item_domain.go
+index 7e6484ea8..57323360d 100644
+--- a/route/rule/rule_item_domain.go
++++ b/route/rule/rule_item_domain.go
+@@ -5,6 +5,7 @@ import (
+ 	"strings"
+ 
+ 	"github.com/sagernet/sing-box/adapter"
++	"github.com/sagernet/sing-box/common/domainset"
+ 	"github.com/sagernet/sing/common/domain"
+ 	E "github.com/sagernet/sing/common/exceptions"
+ )
+@@ -45,8 +46,13 @@ func NewDomainItem(domains []string, domainSuffixes []string) (*DomainItem, erro
+ 			description += "domain_suffix=[" + strings.Join(domainSuffixes, " ") + "]"
+ 		}
+ 	}
++	// the matcher of sing built with a fraction of the memory domain.NewMatcher takes
++	matcher, err := domainset.NewMatcher(domains, domainSuffixes, false)
++	if err != nil {
++		return nil, err
++	}
+ 	return &DomainItem{
+-		domain.NewMatcher(domains, domainSuffixes, false),
++		matcher,
+ 		description,
+ 	}, nil
+ }
+-- 
+2.53.0
+

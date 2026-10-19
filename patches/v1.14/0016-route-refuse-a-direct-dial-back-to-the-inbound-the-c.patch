@@ -1,7 +1,7 @@
-From 9807801291491750e350a391b05d3a27b33274e3 Mon Sep 17 00:00:00 2001
+From 3b7bb2ffb03918c4e6b2dc153cf487c65205dbc9 Mon Sep 17 00:00:00 2001
 From: FiyeroT <me@fiyero.xyz>
 Date: Sat, 3 Oct 2026 11:27:47 +0300
-Subject: [PATCH 016/125] route: refuse a direct dial back to the inbound the
+Subject: [PATCH 016/148] route: refuse a direct dial back to the inbound the
  connection came in on
 
 A direct inbound hands out its own listen address as the destination of
@@ -26,7 +26,7 @@ another local inbound, through a proxy outbound, is untouched.
  create mode 100644 route/route_loop_test.go
 
 diff --git a/adapter/inbound.go b/adapter/inbound.go
-index ae1067d9a..f3ee22532 100644
+index b081ddc94..4cc05632d 100644
 --- a/adapter/inbound.go
 +++ b/adapter/inbound.go
 @@ -21,6 +21,14 @@ type Inbound interface {
@@ -45,7 +45,7 @@ index ae1067d9a..f3ee22532 100644
  	Inbound
  	ConnectionHandler
 diff --git a/protocol/direct/inbound.go b/protocol/direct/inbound.go
-index 34ebbb15d..f82be0024 100644
+index 603ba6882..3c24e2cbb 100644
 --- a/protocol/direct/inbound.go
 +++ b/protocol/direct/inbound.go
 @@ -3,6 +3,7 @@ package direct
@@ -74,8 +74,8 @@ index 34ebbb15d..f82be0024 100644
  	inbound.listener = listener.New(listener.Options{
  		Context:           ctx,
  		Logger:            logger,
-@@ -77,6 +82,12 @@ func (i *Inbound) Start(stage adapter.StartStage) error {
- 	return i.listener.Start()
+@@ -82,6 +87,12 @@ func (i *Inbound) Start(stage adapter.StartStage, scope *adapter.Scope) error {
+ 	return nil
  }
  
 +// ListenAddress reports the address this inbound listens on, which it also hands out as the
@@ -88,7 +88,7 @@ index 34ebbb15d..f82be0024 100644
  	i.udpNat.Purge()
  }
 diff --git a/route/route.go b/route/route.go
-index 6c99cc23b..bce492074 100644
+index bc1d41b4c..4a1bc5590 100644
 --- a/route/route.go
 +++ b/route/route.go
 @@ -160,6 +160,10 @@ func (r *Router) routeConnection(ctx context.Context, conn net.Conn, metadata ad

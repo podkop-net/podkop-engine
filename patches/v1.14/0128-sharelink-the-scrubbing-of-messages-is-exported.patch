@@ -1,0 +1,116 @@
+From 82c6a4f857adb780daeec53aa98ba570fa0b1b95 Mon Sep 17 00:00:00 2001
+From: FiyeroT <me@fiyero.xyz>
+Date: Mon, 12 Oct 2026 16:56:27 +0300
+Subject: [PATCH 128/148] sharelink: the scrubbing of messages is exported
+
+PlainMessage and OneLine move from the decode-link command into the package:
+another caller that reports why a link cannot be used needs the same text
+without the secrets of the link. The command keeps its output.
+---
+ cmd/sing-box/cmd_tools_decode_link.go | 32 +++-------------------
+ common/sharelink/message.go           | 39 +++++++++++++++++++++++++++
+ 2 files changed, 43 insertions(+), 28 deletions(-)
+ create mode 100644 common/sharelink/message.go
+
+diff --git a/cmd/sing-box/cmd_tools_decode_link.go b/cmd/sing-box/cmd_tools_decode_link.go
+index f90b00fe3..caf40ed90 100644
+--- a/cmd/sing-box/cmd_tools_decode_link.go
++++ b/cmd/sing-box/cmd_tools_decode_link.go
+@@ -7,7 +7,6 @@ import (
+ 	stdJSON "encoding/json"
+ 	"io"
+ 	"os"
+-	"strconv"
+ 	"strings"
+ 	"time"
+ 
+@@ -120,37 +119,14 @@ func decodeLink(args []string, input io.Reader, output io.Writer, errorOutput io
+ 	return 0
+ }
+ 
+-// plainMessage makes one line of what the outbound said when it could not be built: the
+-// first line of it, without what the link keeps secret and without its free text (the
+-// values that are not plain names). Such a message is written by code that reports to a
+-// log, and some of it quotes what it was given.
++// plainMessage and oneLine are those of the package that decodes links: other code that
++// reports about a link writes its messages the same way.
+ func plainMessage(message string, secrets []string) string {
+-	// first of all, while the message has them as they are: a value may be of several
+-	// lines or have a tab in it
+-	for _, secret := range secrets {
+-		message = strings.ReplaceAll(message, secret, "...")
+-		// as a message that quotes its input writes it
+-		if quoted := strings.Trim(strconv.Quote(secret), `"`); quoted != secret {
+-			message = strings.ReplaceAll(message, quoted, "...")
+-		}
+-	}
+-	message, _, _ = strings.Cut(message, "\n")
+-	message = oneLine(message)
+-	message = strings.TrimRight(strings.TrimSpace(message), ":")
+-	if message == "" {
+-		message = "this sing-box does not take the outbound of the link"
+-	}
+-	return message
++	return sharelink.PlainMessage(message, secrets)
+ }
+ 
+-// oneLine keeps a message on the line it begins: a script reads the output by lines.
+ func oneLine(message string) string {
+-	return strings.Map(func(character rune) rune {
+-		if character < 0x20 || character == 0x7f {
+-			return ' '
+-		}
+-		return character
+-	}, message)
++	return sharelink.OneLine(message)
+ }
+ 
+ // decodeLinkNotes collects what sing-box would report as deprecated while it builds the
+diff --git a/common/sharelink/message.go b/common/sharelink/message.go
+new file mode 100644
+index 000000000..bd244b8df
+--- /dev/null
++++ b/common/sharelink/message.go
+@@ -0,0 +1,39 @@
++package sharelink
++
++import (
++	"strconv"
++	"strings"
++)
++
++// PlainMessage makes one line of what the outbound said when it could not be built: the
++// first line of it, without what the link keeps secret and without its free text (the
++// values that are not plain names). Such a message is written by code that reports to a
++// log, and some of it quotes what it was given.
++func PlainMessage(message string, secrets []string) string {
++	// first of all, while the message has them as they are: a value may be of several
++	// lines or have a tab in it
++	for _, secret := range secrets {
++		message = strings.ReplaceAll(message, secret, "...")
++		// as a message that quotes its input writes it
++		if quoted := strings.Trim(strconv.Quote(secret), `"`); quoted != secret {
++			message = strings.ReplaceAll(message, quoted, "...")
++		}
++	}
++	message, _, _ = strings.Cut(message, "\n")
++	message = OneLine(message)
++	message = strings.TrimRight(strings.TrimSpace(message), ":")
++	if message == "" {
++		message = "this sing-box does not take the outbound of the link"
++	}
++	return message
++}
++
++// OneLine keeps a message on the line it begins: a script reads the output by lines.
++func OneLine(message string) string {
++	return strings.Map(func(character rune) rune {
++		if character < 0x20 || character == 0x7f {
++			return ' '
++		}
++		return character
++	}, message)
++}
+-- 
+2.53.0
+

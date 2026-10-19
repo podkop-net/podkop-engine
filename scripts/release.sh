@@ -49,8 +49,8 @@ $patches
 $(if [ "$n_full" -gt 0 ]; then cat <<FULL
 
 **Два пакета, ставится один из них:**
-- \`podkop-engine\` — то, что использует podkop: входы tproxy, direct, mixed; выходы direct, socks, shadowsocks, trojan, vless, hysteria2, tuic, selector, urltest. Остальные типы в «Outbound Config» отвергаются с подсказкой поставить \`podkop-engine-full\`.
-- \`podkop-engine-full\` — то же плюс все остальные выходы: http, vmess, snell (1.14), tor (нужен пакет tor), ssh, shadowtls, anytls, hysteria и NaiveProxy (кроме архитектур ниже). Теги — те же плюс \`podkop_full\` (и \`with_naive_outbound,with_musl\`, где есть NaiveProxy).
+- \`podkop-engine\` — то, что использует podkop: входы tproxy, direct, mixed; выходы direct, socks, shadowsocks, trojan, vless, hysteria2, tuic, selector, urltest, http. Остальные типы в «Outbound Config» отвергаются с подсказкой поставить \`podkop-engine-full\`.
+- \`podkop-engine-full\` — то же плюс все остальные выходы: vmess, snell (1.14), tor (нужен пакет tor), ssh, shadowtls, anytls, hysteria и NaiveProxy (кроме архитектур ниже). Теги — те же плюс \`podkop_full\` (и \`with_naive_outbound,with_musl\`, где есть NaiveProxy).
 
 **NaiveProxy в \`podkop-engine-full\` есть не на всех архитектурах.** Он работает на cronet (сетевом стеке Chromium), который sing-box выпускает не для всех процессоров; бинарь с NaiveProxy больше на 11 МБ (x86_64) — 17 МБ (mipsel).
 - есть: $naive_yes

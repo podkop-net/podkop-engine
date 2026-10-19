@@ -1,7 +1,7 @@
 From 87ad36fb0c0c90e54c54ec2a599e61b57af8280d Mon Sep 17 00:00:00 2001
 From: FiyeroT <me@fiyero.xyz>
 Date: Sun, 4 Oct 2026 01:56:14 +0300
-Subject: [PATCH 035/126] include: podkop_slim keeps podkop's protocols,
+Subject: [PATCH 035/140] include: podkop_slim keeps podkop's protocols,
  podkop_full adds every outbound
 
 podkop writes the inbounds tproxy, direct and mixed, the outbounds direct,

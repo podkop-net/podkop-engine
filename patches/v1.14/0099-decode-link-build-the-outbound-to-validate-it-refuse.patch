@@ -1,0 +1,1986 @@
+From fb59c19364d291e2b2ad5e596b5c6d8b312769d5 Mon Sep 17 00:00:00 2001
+From: FiyeroT <me@fiyero.xyz>
+Date: Thu, 8 Oct 2026 17:43:29 +0300
+Subject: [PATCH 099/148] decode-link: build the outbound to validate it,
+ refuse by a table of reasons
+
+The command now builds the outbound it is about to print the way "sing-box check"
+builds a configuration, as the only outbound of one. What is printed is therefore an
+outbound this very sing-box takes: with the protocols it was built with, the options
+its line has and the checks of the outbound itself. The decoder's own tables of what
+the outbound would refuse are gone.
+
+The decoder writes the options by name into an ordered tree, so that its text does not
+depend on the option structures of the sing-box it is built into.
+
+A link is refused only when the server cannot be reached without what it asks for;
+every such refusal has an ID and a row in a table with what it rests on (the interop
+stand against Xray-core, or the code). What the client alone decides is a warning:
+
+- gRPC mode multi: gun is used, the server answers both; a custom path maps only as
+  /name/Tun, the one shape sing-box can say;
+- the HTTP header of the TCP transport without TLS is the http transport; with TLS it
+  is refused;
+- a fingerprint only Xray knows gives the one of the same browser; one nobody knows,
+  no imitation, as in Xray (REALITY refuses both);
+- a value of encryption that is not VLESS Encryption reads as none;
+- a 32-digit UUID without dashes is read as Xray reads it;
+- finalmask: fragment and noise are the client's own, any other mask is refused;
+- ech is mapped (a configuration list, or "ask DNS"); a pinned certificate gets a
+  warning that says what follows;
+- ws without host takes the server name of TLS, as Xray does; httpupgrade drops the
+  early data of its path;
+- a flow over ws, grpc, http and httpupgrade is refused, as over xhttp, and so is one
+  without TLS;
+- tor, ssh, shadowtls and snell are named as having no link form.
+
+Error messages no longer repeat a range value they could not read, nor name a type of
+the program.
+---
+ cmd/sing-box/cmd_tools_decode_link.go      |  85 ++--
+ cmd/sing-box/cmd_tools_decode_link_test.go |   2 +-
+ common/sharelink/link.go                   | 444 ++++++---------------
+ common/sharelink/link_review_test.go       |  64 ++-
+ common/sharelink/link_test.go              |  11 +-
+ common/sharelink/policy.go                 |  31 ++
+ common/sharelink/policy_test.go            | 231 +++++++++++
+ common/sharelink/tls.go                    | 185 +++++++++
+ common/sharelink/transport.go              | 202 ++++++++++
+ common/sharelink/tree.go                   | 239 +++++++++++
+ common/sharelink/vless.go                  | 130 ++++++
+ common/sharelink/xhttp.go                  |  21 +-
+ 12 files changed, 1266 insertions(+), 379 deletions(-)
+ create mode 100644 common/sharelink/policy.go
+ create mode 100644 common/sharelink/policy_test.go
+ create mode 100644 common/sharelink/tls.go
+ create mode 100644 common/sharelink/transport.go
+ create mode 100644 common/sharelink/tree.go
+ create mode 100644 common/sharelink/vless.go
+
+diff --git a/cmd/sing-box/cmd_tools_decode_link.go b/cmd/sing-box/cmd_tools_decode_link.go
+index c7c6d0388..aa72078b8 100644
+--- a/cmd/sing-box/cmd_tools_decode_link.go
++++ b/cmd/sing-box/cmd_tools_decode_link.go
+@@ -2,16 +2,21 @@ package main
+ 
+ import (
+ 	"bufio"
++	"bytes"
++	"context"
++	stdJSON "encoding/json"
+ 	"io"
+ 	"os"
+ 	"strings"
+ 
++	"github.com/sagernet/sing-box"
+ 	"github.com/sagernet/sing-box/common/sharelink"
+-	C "github.com/sagernet/sing-box/constant"
++	"github.com/sagernet/sing-box/experimental/deprecated"
++	"github.com/sagernet/sing-box/include"
+ 	"github.com/sagernet/sing-box/option"
+-	"github.com/sagernet/sing-box/transport/v2rayxhttp"
+ 	E "github.com/sagernet/sing/common/exceptions"
+ 	"github.com/sagernet/sing/common/json"
++	"github.com/sagernet/sing/service"
+ 
+ 	"github.com/spf13/cobra"
+ )
+@@ -82,44 +87,70 @@ func decodeLink(args []string, input io.Reader, output io.Writer, errorOutput io
+ 		return decodeLinkExitBadLink
+ 	}
+ 	outbound, warnings, err := sharelink.Decode(link)
+-	if err == nil {
+-		err = checkDecoded(outbound)
++	if err != nil {
++		io.WriteString(errorOutput, "error: "+err.Error()+"\n")
++		return decodeLinkExitBadLink
++	}
++	content, err := json.Marshal(outbound)
++	if err != nil {
++		io.WriteString(errorOutput, "error: "+E.Cause(err, "encode the outbound").Error()+"\n")
++		return decodeLinkExitOther
+ 	}
++	notes, err := checkDecoded(content)
+ 	if err != nil {
+ 		io.WriteString(errorOutput, "error: "+err.Error()+"\n")
+ 		return decodeLinkExitBadLink
+ 	}
+-	for _, warning := range warnings {
++	for _, warning := range append(warnings, notes...) {
+ 		io.WriteString(errorOutput, "warning: "+warning+"\n")
+ 	}
+-	encoder := json.NewEncoder(output)
+ 	if !commandDecodeLinkFlagCompact {
+-		encoder.SetIndent("", "  ")
+-	}
+-	err = encoder.Encode(outbound)
+-	if err != nil {
+-		io.WriteString(errorOutput, "error: "+E.Cause(err, "encode the outbound").Error()+"\n")
+-		return decodeLinkExitOther
++		var indented bytes.Buffer
++		err = stdJSON.Indent(&indented, content, "", "  ")
++		if err != nil {
++			io.WriteString(errorOutput, "error: "+E.Cause(err, "encode the outbound").Error()+"\n")
++			return decodeLinkExitOther
++		}
++		content = indented.Bytes()
+ 	}
++	output.Write(content)
++	io.WriteString(output, "\n")
+ 	return 0
+ }
+ 
+-// checkDecoded reports now what the transport would refuse when the outbound
+-// starts: a link is then known to be unusable where it is entered.
+-func checkDecoded(outbound *sharelink.Outbound) error {
+-	var transport *option.V2RayTransportOptions
+-	switch options := outbound.Options.(type) {
+-	case option.VLESSOutboundOptions:
+-		transport = options.Transport
+-	case option.TrojanOutboundOptions:
+-		transport = options.Transport
+-	}
+-	if transport == nil || transport.Type != C.V2RayTransportTypeXHTTP {
+-		return nil
++// decodeLinkNotes collects what sing-box would report as deprecated while it builds the
++// outbound: the manager of a run prints such a note, and for one about to be removed
++// ends the process.
++type decodeLinkNotes struct {
++	notes []string
++}
++
++func (n *decodeLinkNotes) ReportDeprecated(feature deprecated.Note) {
++	n.notes = append(n.notes, feature.Message())
++}
++
++// checkDecoded builds the outbound the way "sing-box check" builds a configuration, as
++// the only outbound of one: what is printed is then an outbound this very sing-box
++// takes, with the protocols and the options it was built with. Nothing is opened, read
++// or dialed by it: an outbound from a link names no files, and connections are made
++// when it is used.
++func checkDecoded(outbound []byte) ([]string, error) {
++	notes := new(decodeLinkNotes)
++	ctx, cancel := context.WithCancel(service.ExtendContext(include.Context(service.ContextWith[deprecated.Manager](context.Background(), notes))))
++	defer cancel()
++	configuration := append(append([]byte(`{"log":{"disabled":true},"outbounds":[`), outbound...), "]}"...)
++	options, err := json.UnmarshalExtendedContext[option.Options](ctx, configuration)
++	if err != nil {
++		return nil, E.New("this sing-box does not take the outbound of the link: ", strings.TrimPrefix(err.Error(), "outbounds[0]."))
+ 	}
+-	err := v2rayxhttp.CheckOptions(transport.XHTTPOptions)
++	instance, err := box.New(box.Options{Context: ctx, Options: options})
+ 	if err != nil {
+-		return E.Cause(err, "xhttp")
++		message := err.Error()
++		for _, prefix := range []string{"initialize outbound[0]: ", "create client transport: "} {
++			message = strings.TrimPrefix(message, prefix)
++		}
++		return nil, E.New(message)
+ 	}
+-	return nil
++	instance.Close()
++	return notes.notes, nil
+ }
+diff --git a/cmd/sing-box/cmd_tools_decode_link_test.go b/cmd/sing-box/cmd_tools_decode_link_test.go
+index c18423434..2daac2b6a 100644
+--- a/cmd/sing-box/cmd_tools_decode_link_test.go
++++ b/cmd/sing-box/cmd_tools_decode_link_test.go
+@@ -52,7 +52,7 @@ func TestDecodeLinkCommand(t *testing.T) {
+ 		args  []string
+ 		say   string
+ 	}{
+-		"unsupported":         {"", []string{"vless://u@example.org:443?type=kcp"}, "error: unsupported transport: kcp\n"},
++		"unsupported":         {"", []string{"vless://u@example.org:443?type=kcp"}, "error: the mKCP transport is not supported\n"},
+ 		"refused by xhttp":    {"", []string{strings.Replace(link, "mode=packet-up", "mode=stream-up", 1) + "&extra=%7B%22uplinkHTTPMethod%22%3A%22GET%22%7D"}, "error: xhttp: "},
+ 		"flow over xhttp":     {"", []string{link + "&flow=xtls-rprx-vision"}, "error: flow xtls-rprx-vision is not supported over the xhttp transport\n"},
+ 		"no link":             {"\n\n", nil, "error: no link\n"},
+diff --git a/common/sharelink/link.go b/common/sharelink/link.go
+index b6faa8a42..08bf297b3 100644
+--- a/common/sharelink/link.go
++++ b/common/sharelink/link.go
+@@ -16,96 +16,162 @@ import (
+ 	C "github.com/sagernet/sing-box/constant"
+ 	"github.com/sagernet/sing-box/option"
+ 	E "github.com/sagernet/sing/common/exceptions"
+-	"github.com/sagernet/sing/common/json/badjson"
+-	"github.com/sagernet/sing/common/json/badoption"
+ )
+ 
+ // Outbound is a decoded link: an outbound of the given type with its options,
+ // tagged with the name the link carries.
+ type Outbound struct {
+-	Type    string
+-	Tag     string
+-	Options any
++	Type string
++	Tag  string
++	// the options as the configuration writes them, without the type and the tag
++	options *object
+ }
+ 
+-type outboundHeader struct {
+-	Type string `json:"type"`
+-	Tag  string `json:"tag,omitempty"`
++// MarshalJSON gives the outbound as an object of the "outbounds" list.
++func (o Outbound) MarshalJSON() ([]byte, error) {
++	whole := newObject()
++	whole.put("type", o.Type)
++	if o.Tag != "" {
++		whole.put("tag", o.Tag)
++	}
++	if o.options != nil {
++		for _, key := range o.options.keys {
++			whole.put(key, o.options.values[key])
++		}
++	}
++	return whole.MarshalJSON()
+ }
+ 
+-func (o Outbound) MarshalJSON() ([]byte, error) {
+-	return badjson.MarshallObjects(outboundHeader{o.Type, o.Tag}, o.Options)
++// Refusal is the error of a link that asks for what sing-box cannot do, where the server
++// cannot be reached without it. ID names the rule (see the policy table).
++type Refusal struct {
++	ID      string
++	message string
++}
++
++func (r *Refusal) Error() string {
++	return r.message
++}
++
++func refuse(id string, message ...any) error {
++	return &Refusal{ID: id, message: E.New(message...).Error()}
++}
++
++// A scheme is a kind of share link.
++type scheme struct {
++	// the type of the outbound the link makes
++	outbound string
++	// decode reads the link into the options of the outbound
++	decode func(d *decoder) (any, error)
++	// the link is not "user@host:port?parameters#name": decode takes it whole
++	opaque bool
++}
++
++var schemes = map[string]scheme{
++	"vless":  {outbound: C.TypeVLESS, decode: (*decoder).vless},
++	"trojan": {outbound: C.TypeTrojan, decode: (*decoder).trojan},
++}
++
++// The outbound types that are configured as an outbound and not as a link: nothing
++// generates links for them, and what they need (a second outbound, local files, host
++// keys) is not for a link to say.
++var noLinkForm = map[string]bool{
++	"tor": true, "ssh": true, "shadowtls": true, "snell": true,
+ }
+ 
+ // Decode reads one share link. The warnings name what the link asks for and
+ // the outbound cannot do, where the connection is still expected to work.
+ func Decode(link string) (*Outbound, []string, error) {
+ 	link = strings.TrimSpace(strings.TrimPrefix(link, "\ufeff"))
+-	scheme, rest, found := strings.Cut(link, "://")
+-	if !found || scheme == "" || strings.ContainsAny(scheme, " \t@?#/&=") {
++	schemeName, rest, found := strings.Cut(link, "://")
++	if !found || schemeName == "" || strings.ContainsAny(schemeName, " \t@?#/&=") {
+ 		return nil, nil, E.New("not a share link")
+ 	}
+-	var tag string
+-	if index := strings.IndexByte(rest, '#'); index >= 0 {
+-		tag = rest[index+1:]
+-		// a name is free text, often with a stray "%"
+-		if decoded, err := url.PathUnescape(tag); err == nil {
+-			tag = decoded
++	schemeName = strings.ToLower(schemeName)
++	linkScheme, known := schemes[schemeName]
++	if !known {
++		if noLinkForm[schemeName] {
++			return nil, nil, refuse("no-link-form", "a ", schemeName, " outbound has no link form, configure it as an outbound")
+ 		}
+-		rest = rest[:index]
+-	}
+-	var rawQuery string
+-	if index := strings.IndexByte(rest, '?'); index >= 0 {
+-		rawQuery = rest[index+1:]
+-		rest = rest[:index]
++		return nil, nil, E.New("unsupported link type", shown(schemeName))
+ 	}
+-	// Two links on one line would read as one, with the first as its user.
+-	if strings.ContainsAny(rest, " \t\r\n") || strings.Contains(rest, "://") {
+-		return nil, nil, E.New("the address of the link contains a space or another link")
++	d := &decoder{scheme: schemeName, known: make(map[string]bool)}
++	var tag string
++	if !linkScheme.opaque {
++		if index := strings.IndexByte(rest, '#'); index >= 0 {
++			tag = rest[index+1:]
++			// a name is free text, often with a stray "%"
++			if decoded, err := url.PathUnescape(tag); err == nil {
++				tag = decoded
++			}
++			rest = rest[:index]
++		}
++		var rawQuery string
++		if index := strings.IndexByte(rest, '?'); index >= 0 {
++			rawQuery = rest[index+1:]
++			rest = rest[:index]
++		}
++		// Two links on one line would read as one, with the first as its user.
++		if strings.ContainsAny(rest, " \t\r\n") || strings.Contains(rest, "://") {
++			return nil, nil, E.New("the address of the link contains a space or another link")
++		}
++		var err error
++		d.query, d.names, err = parseQuery(rawQuery)
++		if err != nil {
++			return nil, nil, err
++		}
++		// The same for a link after the last parameter: its user would end up in
++		// that parameter, and in an error message about it.
++		for key, value := range d.query {
++			if strings.Contains(value, "://") && strings.ContainsAny(value, " \t\r\n") {
++				return nil, nil, E.New("the link parameter ", d.names[key], " contains a space and another link")
++			}
++		}
+ 	}
+-	query, names, err := parseQuery(rawQuery)
++	d.body = rest
++	d.tag = tag
++	typed, err := linkScheme.decode(d)
+ 	if err != nil {
+ 		return nil, nil, err
+ 	}
+-	// The same for a link after the last parameter: its user would end up in
+-	// that parameter, and in an error message about it.
+-	for key, value := range query {
+-		if strings.Contains(value, "://") && strings.ContainsAny(value, " \t\r\n") {
+-			return nil, nil, E.New("the link parameter ", names[key], " contains a space and another link")
+-		}
+-	}
+-	d := &decoder{query: query}
+-	var options any
+-	scheme = strings.ToLower(scheme)
+-	switch scheme {
+-	case C.TypeVLESS:
+-		options, err = d.vless(rest)
+-	case C.TypeTrojan:
+-		options, err = d.trojan(rest)
+-	default:
+-		return nil, nil, E.New("unsupported link type", shown(scheme))
+-	}
++	options, err := objectOf(typed)
+ 	if err != nil {
+-		return nil, nil, err
++		return nil, nil, E.Cause(err, "write the options")
+ 	}
+ 	var unknown []string
+-	for key := range query {
+-		if !knownKeys[key] && key != "" {
+-			unknown = append(unknown, names[key])
++	for key := range d.query {
++		if !knownKeys[key] && !d.known[key] && key != "" {
++			unknown = append(unknown, d.names[key])
+ 		}
+ 	}
+ 	sort.Strings(unknown)
+ 	for _, key := range unknown {
+ 		d.warn(key, " is not supported and is ignored")
+ 	}
+-	return &Outbound{Type: scheme, Tag: strings.TrimSpace(tag), Options: options}, d.warnings, nil
++	return &Outbound{Type: linkScheme.outbound, Tag: strings.TrimSpace(d.tag), options: options}, d.warnings, nil
+ }
+ 
+ type decoder struct {
+-	query    map[string]string
++	scheme string
++	// the link between "://" and its parameters, or all of it after "://" for a scheme
++	// that is not a URL
++	body string
++	tag  string
++	// the parameters by their names in lower case, and the names as the link writes them
++	query map[string]string
++	names map[string]string
++	// the parameters the scheme reads
++	known    map[string]bool
+ 	warnings []string
+ }
+ 
++// reads marks the parameters the scheme reads: any other gets a warning.
++func (d *decoder) reads(keys ...string) {
++	for _, key := range keys {
++		d.known[key] = true
++	}
++}
++
+ func (d *decoder) warn(message ...any) {
+ 	d.warnings = append(d.warnings, E.New(message...).Error())
+ }
+@@ -201,98 +267,6 @@ func parseServer(authority string) (string, option.ServerOptions, error) {
+ 	return userinfo, option.ServerOptions{Server: host, ServerPort: uint16(portNumber)}, nil
+ }
+ 
+-func (d *decoder) vless(authority string) (any, error) {
+-	uuid, server, err := parseServer(authority)
+-	if err != nil {
+-		return nil, err
+-	}
+-	// VLESS Encryption (anything but "none") changes the protocol itself
+-	if encryption := d.query["encryption"]; encryption != "" && encryption != "none" {
+-		return nil, E.New("VLESS encryption is not supported")
+-	}
+-	// Xray takes a UUID or a string of up to 30 bytes that it turns into one.
+-	if len(uuid) > 30 && !isUUID(uuid) {
+-		return nil, E.New("the user of the link is not a UUID")
+-	}
+-	flow := d.query["flow"]
+-	switch flow {
+-	case "", "xtls-rprx-vision":
+-	case "xtls-rprx-vision-udp443":
+-		// the same flow that also carries UDP to port 443, which sing-box
+-		// does not single out
+-		flow = "xtls-rprx-vision"
+-	default:
+-		return nil, E.New("unsupported flow", shown(flow))
+-	}
+-	options := option.VLESSOutboundOptions{
+-		ServerOptions: server,
+-		UUID:          uuid,
+-		Flow:          flow,
+-	}
+-	if packetEncoding := d.first("packetencoding", "packet-encoding"); packetEncoding != "" {
+-		if packetEncoding == "none" {
+-			packetEncoding = ""
+-		}
+-		options.PacketEncoding = &packetEncoding
+-	}
+-	options.TLS, err = d.security("none")
+-	if err != nil {
+-		return nil, err
+-	}
+-	options.Transport, err = d.transport()
+-	if err != nil {
+-		return nil, err
+-	}
+-	if flow != "" && options.Transport != nil && options.Transport.Type == C.V2RayTransportTypeXHTTP {
+-		// the outbound refuses it: with Xray a flow goes over XHTTP only with
+-		// VLESS Encryption
+-		return nil, E.New("flow ", flow, " is not supported over the xhttp transport")
+-	}
+-	return options, nil
+-}
+-
+-func isUUID(value string) bool {
+-	if len(value) != 36 {
+-		return false
+-	}
+-	for i, c := range []byte(value) {
+-		switch i {
+-		case 8, 13, 18, 23:
+-			if c != '-' {
+-				return false
+-			}
+-		default:
+-			if !(c >= '0' && c <= '9' || c >= 'a' && c <= 'f' || c >= 'A' && c <= 'F') {
+-				return false
+-			}
+-		}
+-	}
+-	return true
+-}
+-
+-func (d *decoder) trojan(authority string) (any, error) {
+-	password, server, err := parseServer(authority)
+-	if err != nil {
+-		return nil, err
+-	}
+-	options := option.TrojanOutboundOptions{
+-		ServerOptions: server,
+-		Password:      password,
+-	}
+-	if d.query["flow"] != "" {
+-		d.warn("flow is not a setting of Trojan and is ignored")
+-	}
+-	options.TLS, err = d.security("tls")
+-	if err != nil {
+-		return nil, err
+-	}
+-	options.Transport, err = d.transport()
+-	if err != nil {
+-		return nil, err
+-	}
+-	return options, nil
+-}
+-
+ // first returns the first of the link parameters that is set.
+ func (d *decoder) first(keys ...string) string {
+ 	for _, key := range keys {
+@@ -303,20 +277,6 @@ func (d *decoder) first(keys ...string) string {
+ 	return ""
+ }
+ 
+-// The parameters read somewhere; any other gets a warning. The settings of
+-// XHTTP a link may carry outside of "extra" are added by init.
+-var knownKeys = map[string]bool{
+-	"type": true, "security": true, "encryption": true, "flow": true, "packetencoding": true, "packet-encoding": true,
+-	"sni": true, "servername": true, "peer": true, "alpn": true, "fp": true, "pbk": true, "sid": true,
+-	"allowinsecure": true, "allow_insecure": true, "insecure": true,
+-	"host": true, "path": true, "mode": true, "xhttpmode": true, "extra": true, "x_padding_bytes": true,
+-	"headertype": true, "servicename": true, "authority": true, "ed": true, "eh": true,
+-	// have warnings of their own
+-	"pqv": true, "ech": true, "pcs": true, "vcn": true, "cs": true, "fm": true,
+-	// REALITY's spiderX: the path the client of Xray crawls the cover site from
+-	"spx": true, "spiderx": true,
+-}
+-
+ func isTrue(value string) bool {
+ 	return value == "1" || strings.EqualFold(value, "true")
+ }
+@@ -330,171 +290,3 @@ func splitList(value string) []string {
+ 	}
+ 	return list
+ }
+-
+-func (d *decoder) security(defaultSecurity string) (*option.OutboundTLSOptions, error) {
+-	security := strings.ToLower(d.query["security"])
+-	if security == "" {
+-		security = defaultSecurity
+-	}
+-	switch security {
+-	case "none":
+-		return nil, nil
+-	case "tls", "reality":
+-	default:
+-		return nil, E.New("unsupported security", shown(security))
+-	}
+-	tlsOptions := &option.OutboundTLSOptions{
+-		Enabled:    true,
+-		ServerName: d.first("sni", "servername", "peer"),
+-		Insecure:   isTrue(d.first("allowinsecure", "allow_insecure", "insecure")),
+-		ALPN:       splitList(d.query["alpn"]),
+-	}
+-	var err error
+-	tlsOptions.UTLS, err = utlsOptions(d.query["fp"], security == "reality")
+-	if err != nil {
+-		return nil, err
+-	}
+-	if security == "reality" {
+-		if d.query["pbk"] == "" {
+-			return nil, E.New("missing REALITY public key (pbk)")
+-		}
+-		tlsOptions.Reality = &option.OutboundRealityOptions{
+-			Enabled:   true,
+-			PublicKey: d.query["pbk"],
+-			ShortID:   d.query["sid"],
+-		}
+-		if d.query["pqv"] != "" {
+-			d.warn("pqv (the ML-DSA-65 check of the REALITY server) is not supported, the server is not verified with it")
+-		}
+-	}
+-	for _, key := range []string{"ech", "pcs", "vcn", "cs"} {
+-		if d.query[key] != "" {
+-			d.warn(key, " is not supported and is ignored")
+-		}
+-	}
+-	return tlsOptions, nil
+-}
+-
+-// utlsNames are the fingerprints sing-box knows (common/tls/utls_client.go).
+-var utlsNames = map[string]bool{
+-	"chrome": true, "firefox": true, "edge": true, "safari": true, "360": true, "qq": true, "ios": true, "android": true,
+-	"random": true, "randomized": true,
+-	"chrome_psk": true, "chrome_psk_shuffle": true, "chrome_padding_psk_shuffle": true, "chrome_pq": true, "chrome_pq_psk": true,
+-}
+-
+-// utlsOptions reads a fingerprint as Xray does: any case, Chrome's when there
+-// is none, and "unsafe" for the TLS of Go with no imitation (not for REALITY,
+-// which is built on uTLS).
+-func utlsOptions(fingerprint string, reality bool) (*option.OutboundUTLSOptions, error) {
+-	fingerprint = strings.ToLower(fingerprint)
+-	switch {
+-	case fingerprint == "":
+-		fingerprint = "chrome"
+-	case fingerprint == "unsafe" && !reality:
+-		return nil, nil
+-	case !utlsNames[fingerprint]:
+-		return nil, E.New("unsupported fingerprint", shown(fingerprint))
+-	}
+-	return &option.OutboundUTLSOptions{Enabled: true, Fingerprint: fingerprint}, nil
+-}
+-
+-func (d *decoder) transport() (*option.V2RayTransportOptions, error) {
+-	if strings.EqualFold(d.query["security"], "reality") {
+-		switch strings.ToLower(d.query["type"]) {
+-		case "ws", "http", "h2", "httpupgrade":
+-			d.warn("Xray does not serve REALITY over this transport")
+-		}
+-	}
+-	if d.query["fm"] != "" {
+-		d.warn("fm (finalmask) is not supported, the connection may not work")
+-	}
+-	network := strings.ToLower(d.query["type"])
+-	switch network {
+-	case "", "tcp", "raw":
+-		if headerType := d.query["headertype"]; headerType != "" && headerType != "none" {
+-			return nil, E.New("unsupported header type of the TCP transport", shown(headerType))
+-		}
+-		return nil, nil
+-	case "ws":
+-		path, earlyData, err := splitEarlyData(d.query["path"], d.query["ed"])
+-		if err != nil {
+-			return nil, err
+-		}
+-		options := option.V2RayWebsocketOptions{Path: path, MaxEarlyData: earlyData}
+-		if earlyData > 0 {
+-			// the only form Xray speaks, unless the link names another ("eh")
+-			options.EarlyDataHeaderName = "Sec-WebSocket-Protocol"
+-			if header := d.query["eh"]; header != "" {
+-				options.EarlyDataHeaderName = header
+-			}
+-		}
+-		if host := d.query["host"]; host != "" {
+-			options.Headers = badoption.HTTPHeader{"Host": {host}}
+-		}
+-		return &option.V2RayTransportOptions{Type: C.V2RayTransportTypeWebsocket, WebsocketOptions: options}, nil
+-	case "grpc":
+-		if mode := d.query["mode"]; mode != "" && mode != "gun" {
+-			return nil, E.New("unsupported gRPC mode", shown(mode))
+-		}
+-		// Xray reads a name that starts with "/" as a whole path with its own
+-		// stream name; sing-box always appends "/Tun".
+-		if strings.HasPrefix(d.query["servicename"], "/") {
+-			return nil, E.New("a gRPC service name that is a custom path is not supported")
+-		}
+-		if d.query["authority"] != "" {
+-			d.warn("the gRPC authority is not supported and is ignored")
+-		}
+-		return &option.V2RayTransportOptions{
+-			Type:        C.V2RayTransportTypeGRPC,
+-			GRPCOptions: option.V2RayGRPCOptions{ServiceName: d.query["servicename"]},
+-		}, nil
+-	case "http", "h2":
+-		return &option.V2RayTransportOptions{
+-			Type:        C.V2RayTransportTypeHTTP,
+-			HTTPOptions: option.V2RayHTTPOptions{Host: splitList(d.query["host"]), Path: d.query["path"]},
+-		}, nil
+-	case "httpupgrade":
+-		return &option.V2RayTransportOptions{
+-			Type:               C.V2RayTransportTypeHTTPUpgrade,
+-			HTTPUpgradeOptions: option.V2RayHTTPUpgradeOptions{Host: d.query["host"], Path: d.query["path"]},
+-		}, nil
+-	case "xhttp", "splithttp":
+-		options, err := d.xhttp()
+-		if err != nil {
+-			return nil, err
+-		}
+-		return &option.V2RayTransportOptions{Type: C.V2RayTransportTypeXHTTP, XHTTPOptions: *options}, nil
+-	default:
+-		return nil, E.New("unsupported transport", shown(network))
+-	}
+-}
+-
+-// splitEarlyData takes the size of WebSocket early data from the "ed"
+-// parameter of the link or, the usual place, from "?ed=" in the path, which
+-// is not a part of the path the server sees.
+-func splitEarlyData(path string, linkValue string) (string, uint32, error) {
+-	value := linkValue
+-	if base, pathQuery, found := strings.Cut(path, "?"); found {
+-		var kept []string
+-		for _, pair := range strings.Split(pathQuery, "&") {
+-			if strings.HasPrefix(pair, "ed=") {
+-				value = pair[len("ed="):]
+-			} else if pair != "" {
+-				kept = append(kept, pair)
+-			}
+-		}
+-		path = base
+-		if len(kept) > 0 {
+-			path += "?" + strings.Join(kept, "&")
+-		}
+-	}
+-	if value == "" {
+-		return path, 0, nil
+-	}
+-	earlyData, err := strconv.ParseUint(value, 10, 32)
+-	if err != nil {
+-		// not a number is no early data, as with Xray
+-		return path, 0, nil
+-	}
+-	return path, uint32(earlyData), nil
+-}
+diff --git a/common/sharelink/link_review_test.go b/common/sharelink/link_review_test.go
+index 24d6e243b..c38ac122d 100644
+--- a/common/sharelink/link_review_test.go
++++ b/common/sharelink/link_review_test.go
+@@ -1,6 +1,7 @@
+ package sharelink
+ 
+ import (
++	"context"
+ 	"net/url"
+ 	"strings"
+ 	"testing"
+@@ -11,17 +12,22 @@ import (
+ 	"github.com/stretchr/testify/require"
+ )
+ 
++// optionsOf reads the options of a decoded outbound into the structure of its type, as
++// the configuration reader would.
++func optionsOf[T any](t *testing.T, outbound *Outbound) T {
++	t.Helper()
++	content, err := json.Marshal(outbound.options)
++	require.NoError(t, err)
++	var options T
++	require.NoError(t, json.UnmarshalContext(context.Background(), content, &options))
++	return options
++}
++
+ func tlsOf(t *testing.T, link string) *option.OutboundTLSOptions {
+ 	t.Helper()
+ 	outbound, _, err := Decode(link)
+ 	require.NoError(t, err)
+-	switch options := outbound.Options.(type) {
+-	case option.VLESSOutboundOptions:
+-		return options.TLS
+-	case option.TrojanOutboundOptions:
+-		return options.TLS
+-	}
+-	return nil
++	return optionsOf[option.OutboundTLSOptionsContainer](t, outbound).TLS
+ }
+ 
+ // Fingerprints as Xray reads them: any case, Chrome's by default, "unsafe" for
+@@ -34,16 +40,35 @@ func TestFingerprints(t *testing.T) {
+ 	require.Nil(t, tlsOf(t, base+"&fp=unsafe").UTLS)
+ 	require.Equal(t, "chrome", tlsOf(t, "trojan://p@example.org:443").UTLS.Fingerprint)
+ 	require.Equal(t, "chrome", tlsOf(t, "vless://"+testUUID+"@example.org:443?security=REALITY&pbk=K").UTLS.Fingerprint)
++	// a name only Xray knows gives the fingerprint of the same browser, with a warning
++	for link, fingerprint := range map[string]string{
++		base + "&fp=hellochrome_131":  "chrome",
++		base + "&fp=HelloFirefox_148": "firefox",
++		base + "&fp=randomizednoalpn": "randomized",
++		"vless://" + testUUID + "@h:1?security=reality&pbk=K&fp=hellosafari_26_3": "safari",
++	} {
++		outbound, warnings, err := Decode(link)
++		require.NoError(t, err, link)
++		require.Equal(t, fingerprint, optionsOf[option.OutboundTLSOptionsContainer](t, outbound).TLS.UTLS.Fingerprint, link)
++		require.Len(t, warnings, 1, link)
++		require.Contains(t, warnings[0], "has no counterpart, "+fingerprint+" is used", link)
++	}
++	options, warnings := transportOf(t, xhttpLink(`{"downloadSettings":{"address":"a","port":1,"security":"tls","tlsSettings":{"fingerprint":"hellochrome_131"}}}`, url.QueryEscape, ""))
++	require.Equal(t, "chrome", options.Download.TLS.UTLS.Fingerprint)
++	require.Len(t, warnings, 1)
++	// a name nobody knows: no imitation with TLS, as in Xray; REALITY cannot do without
++	outbound, warnings, err := Decode(base + "&fp=netscape")
++	require.NoError(t, err)
++	require.Nil(t, optionsOf[option.OutboundTLSOptionsContainer](t, outbound).TLS.UTLS)
++	require.Len(t, warnings, 1)
+ 	for _, link := range []string{
+-		base + "&fp=hellochrome_131",
+-		base + "&fp=randomizednoalpn",
+ 		"vless://" + testUUID + "@example.org:443?security=reality&pbk=K&fp=unsafe",
+-		xhttpLink(`{"downloadSettings":{"address":"a","port":1,"security":"tls","tlsSettings":{"fingerprint":"hellochrome_131"}}}`, url.QueryEscape, ""),
++		"vless://" + testUUID + "@example.org:443?security=reality&pbk=K&fp=netscape",
+ 	} {
+ 		_, _, err := Decode(link)
+ 		require.ErrorContains(t, err, "unsupported fingerprint", link)
+ 	}
+-	options, _ := transportOf(t, xhttpLink(`{"downloadSettings":{"address":"[2001:db8::1]","port":1,"network":"XHTTP","security":"TLS","tlsSettings":{"fingerprint":"Edge"},"xhttpSettings":null,"splithttpSettings":{"path":"/s"}}}`, url.QueryEscape, ""))
++	options, _ = transportOf(t, xhttpLink(`{"downloadSettings":{"address":"[2001:db8::1]","port":1,"network":"XHTTP","security":"TLS","tlsSettings":{"fingerprint":"Edge"},"xhttpSettings":null,"splithttpSettings":{"path":"/s"}}}`, url.QueryEscape, ""))
+ 	require.Equal(t, "edge", options.Download.TLS.UTLS.Fingerprint)
+ 	require.Equal(t, "2001:db8::1", options.Download.Server)
+ 	require.Equal(t, "/s", options.Download.Path)
+@@ -54,7 +79,7 @@ func TestFlows(t *testing.T) {
+ 	base := "vless://" + testUUID + "@example.org:443?security=reality&pbk=K&flow="
+ 	outbound, _, err := Decode(base + "xtls-rprx-vision-udp443")
+ 	require.NoError(t, err)
+-	require.Equal(t, "xtls-rprx-vision", outbound.Options.(option.VLESSOutboundOptions).Flow)
++	require.Equal(t, "xtls-rprx-vision", optionsOf[option.VLESSOutboundOptions](t, outbound).Flow)
+ 	for _, flow := range []string{"xtls-rprx-direct", "none", "xtls-rprx-origin"} {
+ 		_, _, err = Decode(base + flow)
+ 		require.ErrorContains(t, err, "unsupported flow", flow)
+@@ -89,12 +114,23 @@ func TestRefusedWithoutEcho(t *testing.T) {
+ 		require.NotContains(t, strings.ToLower(err.Error()), secret[:13], name)
+ 		require.NotContains(t, err.Error(), "://", name)
+ 	}
++	// what could not be read is not repeated, and no type of the program is named
++	for name, test := range map[string]struct{ link, say string }{
++		"extra that is not an object": {xhttpLink(`"text"`, url.QueryEscape, ""), "read extra: not a JSON object"},
++		"a range in extra":            {xhttpLink(`{"xPaddingBytes":"a-`+secret+`"}`, url.QueryEscape, ""), "invalid range"},
++		"a range in a parameter":      {xhttpLink(`{}`, url.QueryEscape, "&x_padding_bytes=a-"+secret), "invalid range in the link parameter x_padding_bytes"},
++	} {
++		_, _, err := Decode(test.link)
++		require.ErrorContains(t, err, test.say, name)
++		require.NotContains(t, err.Error(), secret[:13], name)
++		require.NotContains(t, err.Error(), "sharelink", name)
++	}
+ 	// a short user is Xray's "string turned into a UUID"
+ 	_, _, err := Decode("vless://my-user@h:1")
+ 	require.NoError(t, err)
+ 	// a plain word is shown
+-	_, _, err = Decode("vless://" + testUUID + "@h:1?type=kcp")
+-	require.ErrorContains(t, err, "unsupported transport: kcp")
++	_, _, err = Decode("vless://" + testUUID + "@h:1?type=tor")
++	require.ErrorContains(t, err, "unsupported transport: tor")
+ 	// a byte order mark before the link
+ 	_, _, err = Decode("\ufeffvless://" + testUUID + "@h:1")
+ 	require.NoError(t, err)
+diff --git a/common/sharelink/link_test.go b/common/sharelink/link_test.go
+index 08ffe7886..2c1eb0bed 100644
+--- a/common/sharelink/link_test.go
++++ b/common/sharelink/link_test.go
+@@ -76,7 +76,7 @@ func transportOf(t *testing.T, link string) (option.V2RayXHTTPOptions, []string)
+ 	t.Helper()
+ 	outbound, warnings, err := Decode(link)
+ 	require.NoError(t, err)
+-	transport := outbound.Options.(option.VLESSOutboundOptions).Transport
++	transport := optionsOf[option.VLESSOutboundOptions](t, outbound).Transport
+ 	require.NotNil(t, transport)
+ 	require.Equal(t, "xhttp", transport.Type)
+ 	return transport.XHTTPOptions, warnings
+@@ -218,7 +218,7 @@ func TestErrors(t *testing.T) {
+ 	for name, link := range map[string]string{
+ 		"empty":             "",
+ 		"not a link":        "hello",
+-		"scheme":            "ss://YWVzLTI1Ni1nY206cGFzcw@example.org:8388",
++		"scheme":            "gopher://example.org:70",
+ 		"no user":           "vless://example.org:443",
+ 		"empty user":        "vless://@example.org:443",
+ 		"no port":           "vless://" + testUUID + "@example.org",
+@@ -230,8 +230,9 @@ func TestErrors(t *testing.T) {
+ 		"security":          "vless://" + testUUID + "@example.org:443?security=xtls",
+ 		"reality no key":    "vless://" + testUUID + "@example.org:443?security=reality",
+ 		"kcp":               "vless://" + testUUID + "@example.org:443?type=kcp",
+-		"tcp http header":   "vless://" + testUUID + "@example.org:443?type=tcp&headerType=http",
+-		"grpc multi":        "vless://" + testUUID + "@example.org:443?type=grpc&mode=multi",
++		"tcp http header":   "vless://" + testUUID + "@example.org:443?security=tls&type=tcp&headerType=http",
++		"tcp other header":  "vless://" + testUUID + "@example.org:443?type=tcp&headerType=srtp",
++		"grpc mode":         "vless://" + testUUID + "@example.org:443?type=grpc&mode=other",
+ 		"bad escape":        "vless://" + testUUID + "@example.org:443?type=ws&path=%zz",
+ 		"extra not json":    xhttpLink(`{"xPaddingBytes":`, url.QueryEscape, ""),
+ 		"extra not object":  xhttpLink(`"text"`, url.QueryEscape, ""),
+@@ -261,7 +262,7 @@ func TestRoundTrip(t *testing.T) {
+ 	outbound, warnings, err := Decode(xhttpLink(extra, url.QueryEscape, ""))
+ 	require.NoError(t, err)
+ 	require.Empty(t, warnings)
+-	want := *outbound.Options.(option.VLESSOutboundOptions).Transport
++	want := *optionsOf[option.VLESSOutboundOptions](t, outbound).Transport
+ 	content, err := json.Marshal(want)
+ 	require.NoError(t, err)
+ 	var got option.V2RayTransportOptions
+diff --git a/common/sharelink/policy.go b/common/sharelink/policy.go
+new file mode 100644
+index 000000000..524cb8a5e
+--- /dev/null
++++ b/common/sharelink/policy.go
+@@ -0,0 +1,31 @@
++package sharelink
++
++// The policy of the decoder: what a link may ask for that sing-box does not do.
++//
++// A link is refused only when the server cannot be reached without the feature, or when
++// the outbound made of it would not work: an error means that the link, as it is, does
++// not work in sing-box. What the client alone decides (a fingerprint, a fragmenting of
++// its own packets, a multiplexing mode the server serves either way) and what only adds
++// a check (a pinned certificate, the ML-DSA check of REALITY) is a warning: the outbound
++// is made and connects.
++//
++// refusals lists every refusal by its ID with what it rests on. "lab" is the interop
++// stand against Xray-core 26.9.9 of 2026-10-08 (research_notes/r13/a1-lab.md in the
++// repository of podkop-engine's sources).
++var refusals = map[string]string{
++	"no-link-form":        "tor, ssh, shadowtls and snell are configured as outbounds: nothing generates links for them",
++	"security":            "a value of security other than none, tls and reality names a transport security sing-box does not have (xtls)",
++	"fingerprint-reality": "REALITY is built on uTLS: Xray refuses a fingerprint it does not know too",
++	"vless-encryption":    "VLESS Encryption (mlkem768x25519plus...) changes the protocol and is not in sing-box",
++	"flow":                "a flow other than xtls-rprx-vision is not in sing-box; Xray has removed the older ones",
++	"flow-transport":      "lab: with the flow over ws and grpc sing-box fails every connection itself, over httpupgrade Xray answers \"XTLS only supports TLS and REALITY directly\"; over xhttp Xray takes a flow only with VLESS Encryption; the http transport fails as ws does",
++	"flow-no-tls":         "Vision works on a TLS connection: without TLS or REALITY there is none",
++	"finalmask":           "a mask of finalmask other than fragment and noise changes what goes over the wire, and the server expects it",
++	"tcp-http-header-tls": "lab: the HTTP header of the TCP transport works as the http transport of sing-box without TLS; with TLS that transport speaks HTTP/2",
++	"tcp-header":          "a header type of the TCP transport other than none and http does not exist in Xray either",
++	"grpc-mode":           "a gRPC mode other than gun and multi does not exist in Xray either",
++	"grpc-custom-path":    "lab: sing-box makes the gRPC path /<escaped name>/Tun; a path of several segments or another stream name is not reached",
++	"quic-security":       "the packet encryption of V2Ray's QUIC transport is not in sing-box",
++	"quic-header":         "the packet headers of V2Ray's QUIC transport are not in sing-box",
++	"kcp":                 "the mKCP transport is not in sing-box",
++}
+diff --git a/common/sharelink/policy_test.go b/common/sharelink/policy_test.go
+new file mode 100644
+index 000000000..568d0cdfd
+--- /dev/null
++++ b/common/sharelink/policy_test.go
+@@ -0,0 +1,231 @@
++package sharelink
++
++import (
++	"errors"
++	"os"
++	"regexp"
++	"strings"
++	"testing"
++
++	"github.com/stretchr/testify/require"
++)
++
++// Every refusal of the decoder is a row of the policy table, and every row is used.
++func TestPolicyTable(t *testing.T) {
++	t.Parallel()
++	entries, err := os.ReadDir(".")
++	require.NoError(t, err)
++	used := make(map[string]bool)
++	pattern := regexp.MustCompile(`refuse\("([a-z0-9-]+)"`)
++	for _, entry := range entries {
++		if !strings.HasSuffix(entry.Name(), ".go") || strings.HasSuffix(entry.Name(), "_test.go") {
++			continue
++		}
++		content, err := os.ReadFile(entry.Name())
++		require.NoError(t, err)
++		for _, match := range pattern.FindAllSubmatch(content, -1) {
++			used[string(match[1])] = true
++		}
++	}
++	require.NotEmpty(t, used)
++	for id := range used {
++		require.Contains(t, refusals, id, "a refusal without a row in the policy table")
++	}
++	for id, reason := range refusals {
++		require.True(t, used[id], "the policy table has a row nothing uses: %s", id)
++		require.NotEmpty(t, reason, id)
++	}
++}
++
++func refusalID(t *testing.T, link string) string {
++	t.Helper()
++	outbound, _, err := Decode(link)
++	require.Error(t, err, link)
++	require.Nil(t, outbound, link)
++	var refusal *Refusal
++	if !errors.As(err, &refusal) {
++		return "(not a refusal) " + err.Error()
++	}
++	return refusal.ID
++}
++
++const policyBase = "vless://" + testUUID + "@example.org:443?"
++
++// What a link asks for and sing-box cannot do, where the server is not reached without
++// it: each is refused under its rule.
++func TestRefusals(t *testing.T) {
++	t.Parallel()
++	for link, id := range map[string]string{
++		"tor://example.org:9050":                                                                      "no-link-form",
++		"ssh://user:pass@example.org:22":                                                              "no-link-form",
++		"shadowtls://x@example.org:443":                                                               "no-link-form",
++		"snell://x@example.org:443":                                                                   "no-link-form",
++		policyBase + "security=xtls":                                                                  "security",
++		policyBase + "encryption=mlkem768x25519plus.native.0rtt.KEY":                                  "vless-encryption",
++		policyBase + "security=reality&pbk=K&flow=xtls-rprx-direct":                                   "flow",
++		policyBase + "security=tls&flow=xtls-rprx-vision&type=ws":                                     "flow-transport",
++		policyBase + "security=tls&flow=xtls-rprx-vision&type=grpc":                                   "flow-transport",
++		policyBase + "security=tls&flow=xtls-rprx-vision&type=http":                                   "flow-transport",
++		policyBase + "security=tls&flow=xtls-rprx-vision&type=httpupgrade":                            "flow-transport",
++		policyBase + "security=tls&flow=xtls-rprx-vision&type=xhttp":                                  "flow-transport",
++		policyBase + "security=none&flow=xtls-rprx-vision":                                            "flow-no-tls",
++		policyBase + "security=reality&pbk=K&fp=netscape":                                             "fingerprint-reality",
++		policyBase + "security=tls&fm=%7B%22tcp%22%3A%5B%7B%22type%22%3A%22header-custom%22%7D%5D%7D": "finalmask",
++		policyBase + "security=tls&fm=%7B%22udp%22%3A%5B%7B%22type%22%3A%22salamander%22%7D%5D%7D":    "finalmask",
++		policyBase + "security=tls&type=tcp&headerType=http":                                          "tcp-http-header-tls",
++		policyBase + "type=tcp&headerType=srtp":                                                       "tcp-header",
++		policyBase + "type=grpc&mode=other":                                                           "grpc-mode",
++		policyBase + "type=grpc&serviceName=%2Fa%2Fb%2FTun":                                           "grpc-custom-path",
++		policyBase + "type=grpc&serviceName=%2Fsvc%2FOther":                                           "grpc-custom-path",
++		policyBase + "type=grpc&serviceName=%2Fsvc%2FTun&mode=multi":                                  "grpc-custom-path",
++		policyBase + "type=quic&quicSecurity=aes-128-gcm&key=k":                                       "quic-security",
++		policyBase + "type=quic&headerType=wechat-video":                                              "quic-header",
++		policyBase + "type=kcp&seed=s":                                                                "kcp",
++		"trojan://p@example.org:443?type=tcp&headerType=http":                                         "tcp-http-header-tls",
++	} {
++		require.Equal(t, id, refusalID(t, link), link)
++	}
++}
++
++// What only the client decides, or what only adds a check: the outbound is made, with a
++// warning.
++func TestLeniencies(t *testing.T) {
++	t.Parallel()
++	for name, test := range map[string]struct {
++		link     string
++		want     string
++		warnings []string
++	}{
++		"a value of encryption that is not one": {
++			policyBase + "encryption=aes-128-gcm",
++			`{"type":"vless","server":"example.org","server_port":443,"uuid":"` + testUUID + `"}`,
++			[]string{"encryption has a value that is not VLESS encryption"},
++		},
++		"gRPC multi": {
++			policyBase + "type=grpc&serviceName=svc&mode=multi",
++			`{"type":"vless","server":"example.org","server_port":443,"uuid":"` + testUUID + `","transport":{"type":"grpc","service_name":"svc"}}`,
++			[]string{"the gRPC mode multi is not supported, gun is used"},
++		},
++		"gRPC custom path of the usual shape": {
++			policyBase + "type=grpc&serviceName=%2Fsvc%2FTun%7CMulti",
++			`{"type":"vless","server":"example.org","server_port":443,"uuid":"` + testUUID + `","transport":{"type":"grpc","service_name":"svc"}}`,
++			nil,
++		},
++		"the HTTP header of TCP without TLS": {
++			policyBase + "type=tcp&headerType=http&host=a.example.org,b.example.org&path=%2Fp",
++			`{"type":"vless","server":"example.org","server_port":443,"uuid":"` + testUUID + `","transport":{"type":"http","host":["a.example.org","b.example.org"],"path":"/p"}}`,
++			nil,
++		},
++		"ws without host takes the name of TLS": {
++			"vless://" + testUUID + "@192.0.2.1:443?security=tls&sni=cdn.example.org&type=ws&path=%2Fws",
++			`{"type":"vless","server":"192.0.2.1","server_port":443,"uuid":"` + testUUID + `","tls":{"enabled":true,"server_name":"cdn.example.org","utls":{"enabled":true,"fingerprint":"chrome"}},
++			"transport":{"type":"ws","path":"/ws","headers":{"Host":"cdn.example.org"}}}`,
++			nil,
++		},
++		"trojan ws without host": {
++			"trojan://p@192.0.2.1:443?sni=cdn.example.org&type=ws",
++			`{"type":"trojan","server":"192.0.2.1","server_port":443,"password":"p","tls":{"enabled":true,"server_name":"cdn.example.org","utls":{"enabled":true,"fingerprint":"chrome"}},
++			"transport":{"type":"ws","headers":{"Host":"cdn.example.org"}}}`,
++			nil,
++		},
++		"ws without TLS and host": {
++			policyBase + "type=ws&path=%2Fws",
++			`{"type":"vless","server":"example.org","server_port":443,"uuid":"` + testUUID + `","transport":{"type":"ws","path":"/ws"}}`,
++			nil,
++		},
++		"httpupgrade with early data in the path": {
++			policyBase + "type=httpupgrade&path=%2Fu%3Fed%3D2560",
++			`{"type":"vless","server":"example.org","server_port":443,"uuid":"` + testUUID + `","transport":{"type":"httpupgrade","path":"/u"}}`,
++			[]string{"early data is not supported with the httpupgrade transport"},
++		},
++		"http with a method": {
++			policyBase + "security=tls&type=h2&host=h.example.org&path=%2Fh&method=GET",
++			`{"type":"vless","server":"example.org","server_port":443,"uuid":"` + testUUID + `","tls":{"enabled":true,"utls":{"enabled":true,"fingerprint":"chrome"}},
++			"transport":{"type":"http","host":"h.example.org","path":"/h","method":"GET"}}`,
++			nil,
++		},
++		"quic": {
++			policyBase + "security=tls&type=quic&quicSecurity=none&headerType=none",
++			`{"type":"vless","server":"example.org","server_port":443,"uuid":"` + testUUID + `","tls":{"enabled":true,"utls":{"enabled":true,"fingerprint":"chrome"}},"transport":{"type":"quic"}}`,
++			nil,
++		},
++		"finalmask of the client's own": {
++			policyBase + "fm=%7B%22tcp%22%3A%5B%7B%22type%22%3A%22fragment%22%7D%5D%2C%22udp%22%3A%5B%7B%22type%22%3A%22noise%22%7D%5D%2C%22quicParams%22%3A%7B%7D%7D",
++			`{"type":"vless","server":"example.org","server_port":443,"uuid":"` + testUUID + `"}`,
++			[]string{"fm (finalmask) is not supported and is ignored"},
++		},
++		"finalmask that cannot be read": {
++			policyBase + "fm=x",
++			`{"type":"vless","server":"example.org","server_port":443,"uuid":"` + testUUID + `"}`,
++			[]string{"fm (finalmask) is not supported and cannot be read"},
++		},
++		"packet as packetaddr": {
++			policyBase + "packetEncoding=packet",
++			`{"type":"vless","server":"example.org","server_port":443,"uuid":"` + testUUID + `","packet_encoding":"packetaddr"}`,
++			nil,
++		},
++		"a pinned certificate": {
++			policyBase + "security=tls&pcs=0123abcd&vcn=example.org",
++			`{"type":"vless","server":"example.org","server_port":443,"uuid":"` + testUUID + `","tls":{"enabled":true,"utls":{"enabled":true,"fingerprint":"chrome"}}}`,
++			[]string{"the pinned certificate (pcs, pinSHA256) is not supported", "vcn is not supported and is ignored"},
++		},
++		"a pinned certificate, not verified anyway": {
++			policyBase + "security=tls&pcs=0123abcd&allowInsecure=1",
++			`{"type":"vless","server":"example.org","server_port":443,"uuid":"` + testUUID + `","tls":{"enabled":true,"insecure":true,"utls":{"enabled":true,"fingerprint":"chrome"}}}`,
++			nil,
++		},
++		"ECH configuration": {
++			policyBase + "security=tls&ech=AEX+DQBBFQAgACDcTtW6VmPQkAvAnqIbGkSmKuOO+GbBdXvKkcOIAfS0PAAEAAEAAQASY2xvdWRmbGFyZS1lY2guY29tAAA=",
++			`{"type":"vless","server":"example.org","server_port":443,"uuid":"` + testUUID + `","tls":{"enabled":true,"utls":{"enabled":true,"fingerprint":"chrome"},
++			"ech":{"enabled":true,"config":["-----BEGIN ECH CONFIGS-----","AEX+DQBBFQAgACDcTtW6VmPQkAvAnqIbGkSmKuOO+GbBdXvKkcOIAfS0PAAEAAEA","AQASY2xvdWRmbGFyZS1lY2guY29tAAA=","-----END ECH CONFIGS-----"]}}}`,
++			nil,
++		},
++		"ECH from DNS": {
++			policyBase + "security=tls&ech=ech.example.org%2Bhttps%3A%2F%2F1.1.1.1%2Fdns-query",
++			`{"type":"vless","server":"example.org","server_port":443,"uuid":"` + testUUID + `","tls":{"enabled":true,"utls":{"enabled":true,"fingerprint":"chrome"},
++			"ech":{"enabled":true,"query_server_name":"ech.example.org"}}}`,
++			[]string{"the resolver named in ech is not used"},
++		},
++		"no SNI and a certificate to trust": {
++			policyBase + "security=tls&disable_sni=1&cert=-----BEGIN%20CERTIFICATE-----%0AMIIB%0A-----END%20CERTIFICATE-----",
++			`{"type":"vless","server":"example.org","server_port":443,"uuid":"` + testUUID + `","tls":{"enabled":true,"disable_sni":true,
++			"certificate":["-----BEGIN CERTIFICATE-----","MIIB","-----END CERTIFICATE-----"],"utls":{"enabled":true,"fingerprint":"chrome"}}}`,
++			nil,
++		},
++	} {
++		content, warnings := decodeJSON(t, test.link)
++		require.JSONEq(t, test.want, content, name)
++		require.Len(t, warnings, len(test.warnings), "%s: %v", name, warnings)
++		for index, warning := range test.warnings {
++			require.Contains(t, warnings[index], warning, name)
++		}
++	}
++}
++
++// The user of a VLESS link, as Xray reads it.
++func TestVLESSUser(t *testing.T) {
++	t.Parallel()
++	for user, want := range map[string]string{
++		testUUID:                              testUUID,
++		strings.ToUpper(testUUID):             testUUID,
++		strings.ReplaceAll(testUUID, "-", ""): testUUID,
++		// dashes are optional one by one
++		"6f1c9a0e-3b524c1e9a552d4a1b0f7c11": testUUID,
++		"my-user":                           "my-user",
++		"thirty-bytes-are-the-longest-1":    "thirty-bytes-are-the-longest-1",
++	} {
++		outbound, _, err := Decode("vless://" + user + "@h:1")
++		require.NoError(t, err, user)
++		require.Equal(t, want, outbound.options.text("uuid"), user)
++	}
++	for _, user := range []string{
++		"thirty-one-bytes-are-too-many-1",
++		"6f1c9a0e-3b52-4c1e-9a55-2d4a1b0f7c1",   // 35 with a digit missing
++		"6f1c9a0e-3b52-4c1e-9a55-2d4a1b0f7cXY",  // not hexadecimal
++		"6f1c9a0e--3b52-4c1e-9a55-2d4a1b0f7c1",  // a dash too many
++		"6f1c9a0e-3b52-4c1e-9a55-2d4a1b0f7c11a", // 37
++	} {
++		_, _, err := Decode("vless://" + user + "@h:1")
++		require.ErrorContains(t, err, "not a UUID", user)
++	}
++}
+diff --git a/common/sharelink/tls.go b/common/sharelink/tls.go
+new file mode 100644
+index 000000000..ea51a72a6
+--- /dev/null
++++ b/common/sharelink/tls.go
+@@ -0,0 +1,185 @@
++package sharelink
++
++import (
++	"encoding/base64"
++	"strings"
++
++	"github.com/sagernet/sing-box/option"
++	E "github.com/sagernet/sing/common/exceptions"
++)
++
++// The fingerprints sing-box knows by these names (common/tls/utls_client.go).
++var utlsNames = map[string]bool{
++	"chrome": true, "firefox": true, "edge": true, "safari": true, "360": true, "qq": true, "ios": true, "android": true,
++	"random": true, "randomized": true,
++	"chrome_psk": true, "chrome_psk_shuffle": true, "chrome_padding_psk_shuffle": true, "chrome_pq": true, "chrome_pq_psk": true,
++}
++
++// The fingerprints only Xray knows by name (transport/internet/tls/tls.go of Xray-core
++// v26.9.30), each with the one of sing-box of the same browser. Which Client Hello a
++// client imitates is the client's own choice: the server is reached with any.
++var xrayFingerprints = []struct{ prefix, fingerprint string }{
++	{"hellochrome_", "chrome"},
++	{"hellofirefox_", "firefox"},
++	{"hellosafari_", "safari"},
++	{"helloios_", "ios"},
++	{"helloedge_", "edge"},
++	{"hello360_", "360"},
++	{"helloqq_", "qq"},
++	{"helloandroid_", "android"},
++	{"hellorandomized", "randomized"},
++	{"randomizednoalpn", "randomized"},
++}
++
++// utls reads the fingerprint of a link as Xray does: any case, Chrome's when there is
++// none, and no imitation for "unsafe" and for a name Xray does not know (not with
++// REALITY, which is built on uTLS and refuses both).
++func (d *decoder) utls(reality bool) (*option.OutboundUTLSOptions, error) {
++	return d.utlsOf(d.query["fp"], reality)
++}
++
++func (d *decoder) utlsOf(fingerprint string, reality bool) (*option.OutboundUTLSOptions, error) {
++	fingerprint = strings.ToLower(fingerprint)
++	switch {
++	case fingerprint == "":
++		fingerprint = "chrome"
++	case utlsNames[fingerprint]:
++	case (fingerprint == "unsafe" || fingerprint == "hellogolang") && !reality:
++		return nil, nil
++	default:
++		substitute := ""
++		for _, known := range xrayFingerprints {
++			if strings.HasPrefix(fingerprint, known.prefix) {
++				substitute = known.fingerprint
++				break
++			}
++		}
++		switch {
++		case substitute != "":
++			d.warn("the fingerprint", shown(fingerprint), " has no counterpart, ", substitute, " is used")
++			fingerprint = substitute
++		case reality:
++			return nil, refuse("fingerprint-reality", "unsupported fingerprint", shown(fingerprint), ", which REALITY needs")
++		default:
++			d.warn("the fingerprint", shown(fingerprint), " is unknown, no browser is imitated")
++			return nil, nil
++		}
++	}
++	return &option.OutboundUTLSOptions{Enabled: true, Fingerprint: fingerprint}, nil
++}
++
++// The parameters of TLS every scheme reads the same way.
++func (d *decoder) tlsCommon(tlsOptions *option.OutboundTLSOptions) {
++	d.reads("sni", "servername", "peer", "allowinsecure", "allow_insecure", "insecure", "skip-cert-verify",
++		"alpn", "disable_sni", "nosni", "cert", "ech", "pcs", "pinsha256", "vcn", "cs")
++	tlsOptions.Enabled = true
++	if tlsOptions.ServerName == "" {
++		tlsOptions.ServerName = d.first("sni", "servername", "peer")
++	}
++	tlsOptions.Insecure = isTrue(d.first("allowinsecure", "allow_insecure", "insecure", "skip-cert-verify"))
++	if alpn := splitList(d.query["alpn"]); len(alpn) > 0 {
++		tlsOptions.ALPN = alpn
++	}
++	tlsOptions.DisableSNI = isTrue(d.first("disable_sni", "nosni"))
++	if certificate := strings.TrimSpace(d.query["cert"]); certificate != "" {
++		// the certificate to trust, in the link itself (NekoBox, husi)
++		tlsOptions.Certificate = strings.Split(strings.ReplaceAll(certificate, "\r\n", "\n"), "\n")
++	}
++	tlsOptions.ECH = d.ech()
++	if d.first("pcs", "pinsha256") != "" && !tlsOptions.Insecure && len(tlsOptions.Certificate) == 0 {
++		// Xray and Hysteria pin the hash of a certificate, sing-box that of a public key:
++		// one cannot be made from the other
++		d.warn("the pinned certificate (pcs, pinSHA256) is not supported: the server is verified against the system roots, and one with a self-signed certificate is refused")
++	}
++	for _, key := range []string{"vcn", "cs"} {
++		if d.query[key] != "" {
++			d.warn(key, " is not supported and is ignored")
++		}
++	}
++}
++
++// ech reads the "ech" of a link: the ECH configuration list in base64 or, as Xray takes
++// it, where to ask for it: a resolver, or a name and a resolver joined with "+".
++func (d *decoder) ech() *option.OutboundECHOptions {
++	value := strings.TrimSpace(d.query["ech"])
++	if value == "" {
++		return nil
++	}
++	if strings.Contains(value, "://") {
++		echOptions := &option.OutboundECHOptions{Enabled: true}
++		if name, _, named := strings.Cut(value, "+"); named && !strings.Contains(name, "://") {
++			echOptions.QueryServerName = strings.TrimSpace(name)
++		}
++		d.warn("the resolver named in ech is not used: the ECH configuration is asked from the DNS of sing-box")
++		return echOptions
++	}
++	// form decoding has made a space of every "+"
++	value = strings.ReplaceAll(value, " ", "+")
++	var list []byte
++	for _, encoding := range []*base64.Encoding{base64.StdEncoding, base64.RawStdEncoding, base64.URLEncoding, base64.RawURLEncoding} {
++		decoded, err := encoding.DecodeString(value)
++		if err == nil {
++			list = decoded
++			break
++		}
++	}
++	if len(list) == 0 {
++		d.warn("ech is neither a configuration list in base64 nor a resolver, and is ignored")
++		return nil
++	}
++	lines := []string{"-----BEGIN ECH CONFIGS-----"}
++	encoded := base64.StdEncoding.EncodeToString(list)
++	for len(encoded) > 64 {
++		lines = append(lines, encoded[:64])
++		encoded = encoded[64:]
++	}
++	lines = append(lines, encoded, "-----END ECH CONFIGS-----")
++	return &option.OutboundECHOptions{Enabled: true, Config: lines}
++}
++
++// security reads the TLS of a link of the VLESS family (the proposal of Xray-core
++// discussion #716): "security" chooses none, TLS or REALITY.
++func (d *decoder) security(defaultSecurity string) (*option.OutboundTLSOptions, error) {
++	d.reads("security", "fp", "pbk", "sid", "pqv", "spx", "spiderx")
++	security := strings.ToLower(d.query["security"])
++	if security == "" {
++		security = defaultSecurity
++	}
++	switch security {
++	case "none":
++		return nil, nil
++	case "tls", "reality":
++	default:
++		return nil, refuse("security", "unsupported security", shown(security))
++	}
++	tlsOptions := new(option.OutboundTLSOptions)
++	d.tlsCommon(tlsOptions)
++	var err error
++	tlsOptions.UTLS, err = d.utls(security == "reality")
++	if err != nil {
++		return nil, err
++	}
++	if security == "reality" {
++		if d.query["pbk"] == "" {
++			return nil, E.New("missing REALITY public key (pbk)")
++		}
++		tlsOptions.Reality = &option.OutboundRealityOptions{
++			Enabled:   true,
++			PublicKey: d.query["pbk"],
++			ShortID:   d.query["sid"],
++		}
++		if d.query["pqv"] != "" {
++			d.warn("pqv (the ML-DSA-65 check of the REALITY server) is not supported, the server is not verified with it")
++		}
++	}
++	return tlsOptions, nil
++}
++
++// tlsAlways reads the TLS of a link whose protocol always runs over TLS or QUIC. There
++// is no fingerprint to imitate: over QUIC sing-box has none, and the schemes that carry
++// "fp" read it themselves.
++func (d *decoder) tlsAlways() *option.OutboundTLSOptions {
++	tlsOptions := new(option.OutboundTLSOptions)
++	d.tlsCommon(tlsOptions)
++	return tlsOptions
++}
+diff --git a/common/sharelink/transport.go b/common/sharelink/transport.go
+new file mode 100644
+index 000000000..114c30620
+--- /dev/null
++++ b/common/sharelink/transport.go
+@@ -0,0 +1,202 @@
++package sharelink
++
++import (
++	"strconv"
++	"strings"
++
++	C "github.com/sagernet/sing-box/constant"
++	"github.com/sagernet/sing-box/option"
++	E "github.com/sagernet/sing/common/exceptions"
++	"github.com/sagernet/sing/common/json"
++	"github.com/sagernet/sing/common/json/badoption"
++)
++
++// The settings of XHTTP a link may carry outside of "extra", added by the
++// initialization of flatKeys: they are read only with that transport, and get
++// no warning with another.
++var knownKeys = make(map[string]bool)
++
++// The masks of Xray's finalmask ("fm") that are the client's own business: the server
++// is reached without them. Every other one changes what goes over the wire, and the
++// server expects it.
++var localMasks = map[string]bool{"fragment": true, "noise": true}
++
++// finalMask reads "fm", the finalmask object of Xray.
++func (d *decoder) finalMask() error {
++	d.reads("fm")
++	content := strings.TrimSpace(d.query["fm"])
++	if content == "" {
++		return nil
++	}
++	var mask struct {
++		TCP []struct {
++			Type string `json:"type"`
++		} `json:"tcp"`
++		UDP []struct {
++			Type string `json:"type"`
++		} `json:"udp"`
++	}
++	err := json.Unmarshal([]byte(content), &mask)
++	if err != nil {
++		d.warn("fm (finalmask) is not supported and cannot be read, the connection may not work")
++		return nil
++	}
++	for _, entry := range append(mask.TCP, mask.UDP...) {
++		if !localMasks[strings.ToLower(entry.Type)] {
++			return refuse("finalmask", "fm (finalmask) asks for the mask", shown(entry.Type), ", which is not supported: the server expects it")
++		}
++	}
++	d.warn("fm (finalmask) is not supported and is ignored: what it sets is the client's own")
++	return nil
++}
++
++// transport reads the transport of a link of the VLESS family. tls tells whether the
++// link has TLS, and serverName the name it is asked by.
++func (d *decoder) transport(tlsOptions *option.OutboundTLSOptions) (*option.V2RayTransportOptions, error) {
++	d.reads("type", "host", "path", "mode", "xhttpmode", "extra", "headertype", "servicename", "authority", "ed", "eh", "method",
++		"seed", "mtu", "tti", "quicsecurity", "key")
++	network := strings.ToLower(d.query["type"])
++	if tlsOptions != nil && tlsOptions.Reality != nil {
++		switch network {
++		case "ws", "http", "h2", "httpupgrade":
++			d.warn("Xray does not serve REALITY over this transport")
++		}
++	}
++	err := d.finalMask()
++	if err != nil {
++		return nil, err
++	}
++	switch network {
++	case "", "tcp", "raw":
++		switch headerType := strings.ToLower(d.query["headertype"]); headerType {
++		case "", "none":
++			return nil, nil
++		case "http":
++			// The HTTP header of the TCP transport: a request line and headers before the
++			// stream. Without TLS the http transport of sing-box speaks the same, HTTP/1.1;
++			// with TLS it would speak HTTP/2, which is another thing.
++			if tlsOptions != nil {
++				return nil, refuse("tcp-http-header-tls", "the HTTP header of the TCP transport (headerType=http) is not supported together with TLS")
++			}
++			return &option.V2RayTransportOptions{
++				Type:        C.V2RayTransportTypeHTTP,
++				HTTPOptions: option.V2RayHTTPOptions{Host: splitList(d.query["host"]), Path: d.query["path"]},
++			}, nil
++		default:
++			return nil, refuse("tcp-header", "unsupported header type of the TCP transport", shown(headerType))
++		}
++	case "ws":
++		path, earlyData := splitEarlyData(d.query["path"], d.query["ed"])
++		options := option.V2RayWebsocketOptions{Path: path, MaxEarlyData: earlyData}
++		if earlyData > 0 {
++			// the only form Xray speaks, unless the link names another ("eh")
++			options.EarlyDataHeaderName = "Sec-WebSocket-Protocol"
++			if header := d.query["eh"]; header != "" {
++				options.EarlyDataHeaderName = header
++			}
++		}
++		host := d.query["host"]
++		if host == "" && tlsOptions != nil {
++			// as Xray does: sing-box would send the address of the server, which a
++			// reverse proxy that chooses the site by Host does not know
++			host = tlsOptions.ServerName
++		}
++		if host != "" {
++			options.Headers = badoption.HTTPHeader{"Host": {host}}
++		}
++		return &option.V2RayTransportOptions{Type: C.V2RayTransportTypeWebsocket, WebsocketOptions: options}, nil
++	case "grpc":
++		mode := strings.ToLower(d.query["mode"])
++		switch mode {
++		case "", "gun", "multi":
++		default:
++			return nil, refuse("grpc-mode", "unsupported gRPC mode", shown(mode))
++		}
++		serviceName := d.query["servicename"]
++		if strings.HasPrefix(serviceName, "/") {
++			// Xray reads a name that starts with "/" as a whole path with its own stream
++			// name (in the mode multi, the name of the other stream). sing-box makes the
++			// path "/<name>/Tun", the name being one escaped segment: only that shape
++			// can be said.
++			lastSlash := strings.LastIndexByte(serviceName, '/')
++			stream, _, _ := strings.Cut(serviceName[lastSlash+1:], "|")
++			name := strings.Trim(serviceName[:lastSlash], "/")
++			if mode == "multi" || stream != "Tun" || name == "" || strings.Contains(name, "/") {
++				return nil, refuse("grpc-custom-path", "a gRPC service name that is a custom path is supported only as /name/Tun")
++			}
++			serviceName = name
++		} else if mode == "multi" {
++			// the server answers both kinds of stream under the usual names
++			d.warn("the gRPC mode multi is not supported, gun is used")
++		}
++		if d.query["authority"] != "" {
++			d.warn("the gRPC authority is not supported and is ignored")
++		}
++		return &option.V2RayTransportOptions{
++			Type:        C.V2RayTransportTypeGRPC,
++			GRPCOptions: option.V2RayGRPCOptions{ServiceName: serviceName},
++		}, nil
++	case "http", "h2":
++		return &option.V2RayTransportOptions{
++			Type:        C.V2RayTransportTypeHTTP,
++			HTTPOptions: option.V2RayHTTPOptions{Host: splitList(d.query["host"]), Path: d.query["path"], Method: d.query["method"]},
++		}, nil
++	case "httpupgrade":
++		// Xray takes early data here as with WebSocket; sing-box has none for this
++		// transport, and the "?ed=" of the path is not a part of the path the server sees
++		path, earlyData := splitEarlyData(d.query["path"], d.query["ed"])
++		if earlyData > 0 {
++			d.warn("early data is not supported with the httpupgrade transport and is not sent")
++		}
++		return &option.V2RayTransportOptions{
++			Type:               C.V2RayTransportTypeHTTPUpgrade,
++			HTTPUpgradeOptions: option.V2RayHTTPUpgradeOptions{Host: d.query["host"], Path: path},
++		}, nil
++	case "xhttp", "splithttp":
++		options, err := d.xhttp()
++		if err != nil {
++			return nil, err
++		}
++		return &option.V2RayTransportOptions{Type: C.V2RayTransportTypeXHTTP, XHTTPOptions: *options}, nil
++	case "quic":
++		// the QUIC transport of V2Ray; its packet masks are not in sing-box
++		if security := strings.ToLower(d.query["quicsecurity"]); security != "" && security != "none" {
++			return nil, refuse("quic-security", "the encryption of the QUIC transport (quicSecurity) is not supported")
++		}
++		if headerType := strings.ToLower(d.query["headertype"]); headerType != "" && headerType != "none" {
++			return nil, refuse("quic-header", "the packet header of the QUIC transport (headerType) is not supported")
++		}
++		return &option.V2RayTransportOptions{Type: C.V2RayTransportTypeQUIC}, nil
++	case "kcp", "mkcp":
++		return nil, refuse("kcp", "the mKCP transport is not supported")
++	default:
++		return nil, E.New("unsupported transport", shown(network))
++	}
++}
++
++// splitEarlyData takes the size of WebSocket early data from the "ed"
++// parameter of the link or, the usual place, from "?ed=" in the path, which
++// is not a part of the path the server sees. Not a number is no early data, as
++// with Xray.
++func splitEarlyData(path string, linkValue string) (string, uint32) {
++	value := linkValue
++	if base, pathQuery, found := strings.Cut(path, "?"); found {
++		var kept []string
++		for _, pair := range strings.Split(pathQuery, "&") {
++			if strings.HasPrefix(pair, "ed=") {
++				value = pair[len("ed="):]
++			} else if pair != "" {
++				kept = append(kept, pair)
++			}
++		}
++		path = base
++		if len(kept) > 0 {
++			path += "?" + strings.Join(kept, "&")
++		}
++	}
++	earlyData, err := strconv.ParseUint(value, 10, 32)
++	if err != nil {
++		return path, 0
++	}
++	return path, uint32(earlyData)
++}
+diff --git a/common/sharelink/tree.go b/common/sharelink/tree.go
+new file mode 100644
+index 000000000..090d7792a
+--- /dev/null
++++ b/common/sharelink/tree.go
+@@ -0,0 +1,239 @@
++package sharelink
++
++import (
++	"bytes"
++	"strings"
++
++	E "github.com/sagernet/sing/common/exceptions"
++	"github.com/sagernet/sing/common/json"
++)
++
++// object is a JSON object that keeps the order of its keys: the options of an outbound as
++// the configuration writes them, by name. The decoder fills it by option names and not
++// through the option structures, so that its text is the same for every sing-box it is
++// built into, whatever options that one has; what an option is worth there is for the
++// configuration reader and the outbound itself to say.
++//
++// A value is another object, a list ([]any), or anything else JSON has a form for.
++type object struct {
++	keys   []string
++	values map[string]any
++}
++
++func newObject() *object {
++	return &object{values: make(map[string]any)}
++}
++
++func (o *object) get(key string) (any, bool) {
++	value, exists := o.values[key]
++	return value, exists
++}
++
++func (o *object) put(key string, value any) {
++	if _, exists := o.values[key]; !exists {
++		o.keys = append(o.keys, key)
++	}
++	o.values[key] = value
++}
++
++func (o *object) remove(key string) {
++	if _, exists := o.values[key]; !exists {
++		return
++	}
++	delete(o.values, key)
++	for index, name := range o.keys {
++		if name == key {
++			o.keys = append(o.keys[:index], o.keys[index+1:]...)
++			break
++		}
++	}
++}
++
++func (o *object) empty() bool {
++	return len(o.keys) == 0
++}
++
++// child returns the object under key, making it when there is none. A value that is not
++// an object is replaced.
++func (o *object) child(key string) *object {
++	if existing, isObject := o.values[key].(*object); isObject {
++		return existing
++	}
++	created := newObject()
++	o.put(key, created)
++	return created
++}
++
++// set puts value at a path of names separated by dots.
++func (o *object) set(path string, value any) {
++	current := o
++	for {
++		name, rest, nested := strings.Cut(path, ".")
++		if !nested {
++			current.put(name, value)
++			return
++		}
++		current = current.child(name)
++		path = rest
++	}
++}
++
++// at returns the value at a path of names separated by dots.
++func (o *object) at(path string) (any, bool) {
++	current := o
++	for {
++		name, rest, nested := strings.Cut(path, ".")
++		value, exists := current.values[name]
++		if !exists || !nested {
++			return value, exists
++		}
++		next, isObject := value.(*object)
++		if !isObject {
++			return nil, false
++		}
++		current = next
++		path = rest
++	}
++}
++
++// text returns the string at a path, empty when there is none.
++func (o *object) text(path string) string {
++	value, _ := o.at(path)
++	text, _ := value.(string)
++	return text
++}
++
++func (o *object) MarshalJSON() ([]byte, error) {
++	var buffer bytes.Buffer
++	buffer.WriteByte('{')
++	for index, key := range o.keys {
++		if index > 0 {
++			buffer.WriteByte(',')
++		}
++		name, err := json.Marshal(key)
++		if err != nil {
++			return nil, err
++		}
++		buffer.Write(name)
++		buffer.WriteByte(':')
++		value, err := json.Marshal(o.values[key])
++		if err != nil {
++			return nil, err
++		}
++		buffer.Write(value)
++	}
++	buffer.WriteByte('}')
++	return buffer.Bytes(), nil
++}
++
++// parseObject reads a JSON object, keeping the order of its keys and the text of its
++// numbers.
++func parseObject(content []byte) (*object, error) {
++	value, err := parseValue(content)
++	if err != nil {
++		return nil, err
++	}
++	parsed, isObject := value.(*object)
++	if !isObject {
++		return nil, E.New("not a JSON object")
++	}
++	return parsed, nil
++}
++
++func parseValue(content []byte) (any, error) {
++	content = bytes.TrimSpace(content)
++	if len(content) == 0 {
++		return nil, E.New("empty JSON value")
++	}
++	switch content[0] {
++	case '{':
++		decoder := json.NewDecoder(bytes.NewReader(content))
++		_, err := decoder.Token()
++		if err != nil {
++			return nil, err
++		}
++		result := newObject()
++		for decoder.More() {
++			keyToken, err := decoder.Token()
++			if err != nil {
++				return nil, err
++			}
++			key, isString := keyToken.(string)
++			if !isString {
++				return nil, E.New("invalid JSON object")
++			}
++			var raw json.RawMessage
++			err = decoder.Decode(&raw)
++			if err != nil {
++				return nil, err
++			}
++			value, err := parseValue(raw)
++			if err != nil {
++				return nil, err
++			}
++			result.put(key, value)
++		}
++		_, err = decoder.Token()
++		if err != nil {
++			return nil, err
++		}
++		if decoder.More() {
++			return nil, E.New("text after the JSON object")
++		}
++		return result, nil
++	case '[':
++		var items []json.RawMessage
++		err := json.Unmarshal(content, &items)
++		if err != nil {
++			return nil, err
++		}
++		list := make([]any, 0, len(items))
++		for _, item := range items {
++			value, err := parseValue(item)
++			if err != nil {
++				return nil, err
++			}
++			list = append(list, value)
++		}
++		return list, nil
++	case '"':
++		var text string
++		err := json.Unmarshal(content, &text)
++		if err != nil {
++			return nil, err
++		}
++		return text, nil
++	case 't', 'f':
++		var flag bool
++		err := json.Unmarshal(content, &flag)
++		if err != nil {
++			return nil, err
++		}
++		return flag, nil
++	case 'n':
++		var null any
++		err := json.Unmarshal(content, &null)
++		if err != nil {
++			return nil, err
++		}
++		return nil, nil
++	default:
++		// a number, kept as it is written
++		var number json.RawMessage
++		err := json.Unmarshal(content, &number)
++		if err != nil {
++			return nil, err
++		}
++		return number, nil
++	}
++}
++
++// objectOf turns the options of an outbound into an object, through the JSON they are
++// written as.
++func objectOf(options any) (*object, error) {
++	content, err := json.Marshal(options)
++	if err != nil {
++		return nil, err
++	}
++	return parseObject(content)
++}
+diff --git a/common/sharelink/vless.go b/common/sharelink/vless.go
+new file mode 100644
+index 000000000..1329f0674
+--- /dev/null
++++ b/common/sharelink/vless.go
+@@ -0,0 +1,130 @@
++package sharelink
++
++import (
++	"encoding/hex"
++	"strings"
++
++	"github.com/sagernet/sing-box/option"
++	E "github.com/sagernet/sing/common/exceptions"
++)
++
++// vless reads a VLESS link: "vless://uuid@host:port?parameters#name" (the proposal of
++// Xray-core discussion #716).
++func (d *decoder) vless() (any, error) {
++	d.reads("encryption", "flow", "packetencoding", "packet-encoding")
++	user, server, err := parseServer(d.body)
++	if err != nil {
++		return nil, err
++	}
++	// VLESS Encryption changes the protocol itself. Its values begin with the name of the
++	// key exchange; anything else in the parameter cannot stand for it, and Xray itself
++	// refuses such a configuration.
++	switch encryption := d.query["encryption"]; {
++	case encryption == "" || encryption == "none":
++	case strings.HasPrefix(encryption, "mlkem768x25519plus"):
++		return nil, refuse("vless-encryption", "VLESS encryption is not supported")
++	default:
++		d.warn("encryption has a value that is not VLESS encryption, it is read as none")
++	}
++	uuid, err := xrayUUID(user)
++	if err != nil {
++		return nil, err
++	}
++	flow := d.query["flow"]
++	switch flow {
++	case "", "xtls-rprx-vision":
++	case "xtls-rprx-vision-udp443":
++		// the same flow that also carries UDP to port 443, which sing-box
++		// does not single out
++		flow = "xtls-rprx-vision"
++	default:
++		return nil, refuse("flow", "unsupported flow", shown(flow))
++	}
++	options := option.VLESSOutboundOptions{
++		ServerOptions: server,
++		UUID:          uuid,
++		Flow:          flow,
++	}
++	if packetEncoding := d.first("packetencoding", "packet-encoding"); packetEncoding != "" {
++		switch packetEncoding {
++		case "none":
++			packetEncoding = ""
++		case "packet":
++			// the name NekoBox and mihomo give packetaddr
++			packetEncoding = "packetaddr"
++		}
++		options.PacketEncoding = &packetEncoding
++	}
++	options.TLS, err = d.security("none")
++	if err != nil {
++		return nil, err
++	}
++	options.Transport, err = d.transport(options.TLS)
++	if err != nil {
++		return nil, err
++	}
++	if flow != "" && options.Transport != nil {
++		// Vision works on the TLS connection itself. Over ws, grpc and http sing-box has
++		// none to give it and fails every connection; over httpupgrade and xhttp an Xray
++		// server refuses the flow (over xhttp it takes one only with VLESS Encryption).
++		return nil, refuse("flow-transport", "flow ", flow, " is not supported over the ", options.Transport.Type, " transport")
++	}
++	if flow != "" && options.TLS == nil {
++		return nil, refuse("flow-no-tls", "flow ", flow, " needs TLS or REALITY")
++	}
++	return options, nil
++}
++
++// xrayUUID reads the user of a VLESS or VMess link as Xray does (common/uuid of
++// Xray-core): a UUID in hexadecimal, with or without its dashes, or a string of up to 30
++// bytes that stands for the UUID made of it. sing-box makes the same UUID of such a
++// string but takes hexadecimal only in the usual form, so that form is what is written.
++func xrayUUID(user string) (string, error) {
++	if len(user) <= 30 {
++		return user, nil
++	}
++	if len(user) < 32 || len(user) > 36 {
++		return "", E.New("the user of the link is not a UUID")
++	}
++	text := user
++	var groups []string
++	for _, size := range []int{8, 4, 4, 4, 12} {
++		text = strings.TrimPrefix(text, "-")
++		if len(text) < size {
++			return "", E.New("the user of the link is not a UUID")
++		}
++		_, err := hex.DecodeString(text[:size])
++		if err != nil {
++			return "", E.New("the user of the link is not a UUID")
++		}
++		groups = append(groups, strings.ToLower(text[:size]))
++		text = text[size:]
++	}
++	return strings.Join(groups, "-"), nil
++}
++
++// trojan reads a Trojan link: "trojan://password@host:port?parameters#name", with TLS
++// unless the link says otherwise.
++func (d *decoder) trojan() (any, error) {
++	d.reads("flow", "encryption")
++	password, server, err := parseServer(d.body)
++	if err != nil {
++		return nil, err
++	}
++	options := option.TrojanOutboundOptions{
++		ServerOptions: server,
++		Password:      password,
++	}
++	if d.query["flow"] != "" {
++		d.warn("flow is not a setting of Trojan and is ignored")
++	}
++	options.TLS, err = d.security("tls")
++	if err != nil {
++		return nil, err
++	}
++	options.Transport, err = d.transport(options.TLS)
++	if err != nil {
++		return nil, err
++	}
++	return options, nil
++}
+diff --git a/common/sharelink/xhttp.go b/common/sharelink/xhttp.go
+index 5ebd8d142..4b27ca25f 100644
+--- a/common/sharelink/xhttp.go
++++ b/common/sharelink/xhttp.go
+@@ -146,10 +146,19 @@ func (d *decoder) readObject(name string, content []byte, target any) (map[strin
+ 	return present, nil
+ }
+ 
+-// plainJSONError drops the names of this package's types from an error of the
+-// JSON decoder.
++// plainJSONError drops from an error of the JSON decoder the names of this
++// package's types and the value it could not read: a link is a secret, and a
++// second link glued to it would be a part of that value.
+ func plainJSONError(err error) string {
+ 	message := err.Error()
++	if strings.Contains(message, "Go value of type ") {
++		return "not a JSON object"
++	}
++	for _, marker := range []string{"invalid range", "range out of bounds", "not a whole number"} {
++		if strings.Contains(message, marker) {
++			return marker
++		}
++	}
+ 	const marker = "Go struct field "
+ 	if index := strings.Index(message, marker); index >= 0 {
+ 		field := message[index+len(marker):]
+@@ -189,7 +198,7 @@ func (d *decoder) xhttp() (*option.V2RayXHTTPOptions, error) {
+ 		settings.XPaddingBytes = new(option.V2RayXHTTPRange)
+ 		err := settings.XPaddingBytes.UnmarshalJSON([]byte(strconv.Quote(d.query["x_padding_bytes"])))
+ 		if err != nil {
+-			return nil, E.Cause(err, "read x_padding_bytes")
++			return nil, E.New("invalid range in the link parameter x_padding_bytes")
+ 		}
+ 	}
+ 	err := d.flatSettings(settings, present)
+@@ -283,7 +292,7 @@ func (d *decoder) flatSettings(settings *xraySplitHTTP, present map[string]bool)
+ 			valueRange := new(option.V2RayXHTTPRange)
+ 			err := valueRange.UnmarshalJSON([]byte(strconv.Quote(text)))
+ 			if err != nil {
+-				return E.Cause(err, "read ", key)
++				return E.New("invalid range in the link parameter ", key)
+ 			}
+ 			field.Set(reflect.ValueOf(valueRange))
+ 		}
+@@ -414,7 +423,7 @@ func (d *decoder) xhttpDownload(content []byte) (*option.V2RayXHTTPDownloadOptio
+ 			Insecure:   tlsSettings.AllowInsecure,
+ 			ALPN:       badoption.Listable[string](tlsSettings.ALPN),
+ 		}
+-		options.TLS.UTLS, err = utlsOptions(tlsSettings.Fingerprint, false)
++		options.TLS.UTLS, err = d.utlsOf(tlsSettings.Fingerprint, false)
+ 		if err != nil {
+ 			return nil, E.Cause(err, name)
+ 		}
+@@ -434,7 +443,7 @@ func (d *decoder) xhttpDownload(content []byte) (*option.V2RayXHTTPDownloadOptio
+ 		if publicKey == "" {
+ 			return nil, E.New(name, ": missing REALITY public key")
+ 		}
+-		utls, err := utlsOptions(realitySettings.Fingerprint, true)
++		utls, err := d.utlsOf(realitySettings.Fingerprint, true)
+ 		if err != nil {
+ 			return nil, E.Cause(err, name)
+ 		}
+-- 
+2.53.0
+

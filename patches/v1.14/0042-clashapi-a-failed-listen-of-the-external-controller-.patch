@@ -1,0 +1,237 @@
+From f39d65c71334a1804492a47d373e7b94cce24359 Mon Sep 17 00:00:00 2001
+From: FiyeroT <me@fiyero.xyz>
+Date: Sun, 4 Oct 2026 08:49:33 +0300
+Subject: [PATCH 042/148] clashapi: a failed listen of the external controller
+ does not fail the start
+
+The Clash API carries no traffic, yet a failed listen of external_controller
+(the address taken by another program, or an address not on an interface yet
+while the router boots) failed the whole start. On OpenWrt procd restarts a
+failed service a few times and then gives up, and podkop's failsafe stops on
+that: the proxy went down for the sake of its dashboard. The error is logged
+and the listen retried in the background, 5 s at first, doubling up to a
+minute, until it succeeds or the server closes.
+---
+ experimental/clashapi/server.go             | 95 ++++++++++++++++-----
+ experimental/clashapi/server_listen_test.go | 69 +++++++++++++++
+ 2 files changed, 143 insertions(+), 21 deletions(-)
+ create mode 100644 experimental/clashapi/server_listen_test.go
+
+diff --git a/experimental/clashapi/server.go b/experimental/clashapi/server.go
+index 6623906a7..4efd6d191 100644
+--- a/experimental/clashapi/server.go
++++ b/experimental/clashapi/server.go
+@@ -9,6 +9,7 @@ import (
+ 	"os"
+ 	"runtime"
+ 	"strings"
++	"sync"
+ 	"syscall"
+ 	"time"
+ 
+@@ -21,6 +22,7 @@ import (
+ 	"github.com/sagernet/sing-box/experimental/clashmode"
+ 	"github.com/sagernet/sing-box/log"
+ 	"github.com/sagernet/sing-box/option"
++	"github.com/sagernet/sing/common"
+ 	E "github.com/sagernet/sing/common/exceptions"
+ 	"github.com/sagernet/sing/common/json"
+ 	"github.com/sagernet/sing/service"
+@@ -47,6 +49,8 @@ type Server struct {
+ 	endpoint       adapter.EndpointManager
+ 	logger         log.Logger
+ 	httpServer     *http.Server
++	closed         chan struct{}
++	closeOnce      sync.Once
+ 	trafficManager *trafficcontrol.Manager
+ 	urlTestHistory *urltest.HistoryStorage
+ 	clashMode      *clashmode.Manager
+@@ -84,6 +88,7 @@ func NewServer(ctx context.Context, logFactory log.ObservableFactory, options op
+ 			Addr:    options.ExternalController,
+ 			Handler: chiRouter,
+ 		},
++		closed:                   make(chan struct{}),
+ 		trafficManager:           trafficManager,
+ 		urlTestHistory:           urlTestHistory,
+ 		clashMode:                clashMode,
+@@ -152,33 +157,81 @@ func (s *Server) Start(stage adapter.StartStage, scope *adapter.Scope) error {
+ 	}
+ 	if s.externalController {
+ 		s.checkAndDownloadExternalUI()
+-		var (
+-			listener net.Listener
+-			err      error
+-		)
+-		for range 3 {
+-			listener, err = net.Listen("tcp", s.httpServer.Addr)
+-			if runtime.GOOS == "android" && errors.Is(err, syscall.EADDRINUSE) {
+-				time.Sleep(100 * time.Millisecond)
+-				continue
+-			}
+-			break
+-		}
++		scope.Add(s.close)
++		listener, err := s.listen()
+ 		if err != nil {
+-			return E.Cause(err, "external controller listen error")
++			// The API carries no traffic: an address taken by another program, or not
++			// yet on an interface at boot, must not stop the proxy (on a router, a failed
++			// start is retried a few times and then the service is given up).
++			s.logger.Error("external controller listen error, retrying in the background: ", err)
++			go s.listenLater(listenRetryDelay)
++			return nil
+ 		}
+-		scope.Add(s.httpServer.Close)
+-		s.logger.Info("restful api listening at ", listener.Addr())
+-		go func() {
+-			err = s.httpServer.Serve(listener)
+-			if err != nil && !errors.Is(err, http.ErrServerClosed) {
+-				s.logger.Error("external controller serve error: ", err)
+-			}
+-		}()
++		s.serve(listener)
+ 	}
+ 	return nil
+ }
+ 
++// listenRetryDelay is the first pause before the listen of the external controller is
++// retried; the pause doubles up to listenRetryMaxDelay.
++var (
++	listenRetryDelay    = 5 * time.Second
++	listenRetryMaxDelay = time.Minute
++)
++
++func (s *Server) listen() (listener net.Listener, err error) {
++	for range 3 {
++		listener, err = net.Listen("tcp", s.httpServer.Addr)
++		if runtime.GOOS == "android" && errors.Is(err, syscall.EADDRINUSE) {
++			time.Sleep(100 * time.Millisecond)
++			continue
++		}
++		break
++	}
++	return
++}
++
++func (s *Server) listenLater(delay time.Duration) {
++	for {
++		select {
++		case <-s.closed:
++			return
++		case <-time.After(delay):
++		}
++		listener, err := s.listen()
++		if err == nil {
++			select {
++			case <-s.closed:
++				// closed while it listened: the server would not take the listener
++				listener.Close()
++			default:
++				s.serve(listener)
++			}
++			return
++		}
++		s.logger.Debug("external controller listen error: ", err)
++		delay = min(delay*2, listenRetryMaxDelay)
++	}
++}
++
++func (s *Server) serve(listener net.Listener) {
++	s.logger.Info("restful api listening at ", listener.Addr())
++	go func() {
++		err := s.httpServer.Serve(listener)
++		if err != nil && !errors.Is(err, http.ErrServerClosed) {
++			s.logger.Error("external controller serve error: ", err)
++		}
++	}()
++}
++
++// close stops a listen retried in the background and the server.
++func (s *Server) close() error {
++	s.closeOnce.Do(func() { close(s.closed) })
++	return common.Close(
++		common.PtrOrNil(s.httpServer),
++	)
++}
++
+ func authentication(serverSecret string) func(next http.Handler) http.Handler {
+ 	return func(next http.Handler) http.Handler {
+ 		fn := func(w http.ResponseWriter, r *http.Request) {
+diff --git a/experimental/clashapi/server_listen_test.go b/experimental/clashapi/server_listen_test.go
+new file mode 100644
+index 000000000..a11a44f8b
+--- /dev/null
++++ b/experimental/clashapi/server_listen_test.go
+@@ -0,0 +1,69 @@
++package clashapi
++
++import (
++	"context"
++	"net"
++	"net/http"
++	"testing"
++	"time"
++
++	"github.com/sagernet/sing-box/adapter"
++	"github.com/sagernet/sing-box/log"
++
++	"github.com/stretchr/testify/require"
++)
++
++func newListenTestServer(t *testing.T, address string) *Server {
++	saved := listenRetryDelay
++	listenRetryDelay = 20 * time.Millisecond
++	t.Cleanup(func() { listenRetryDelay = saved })
++	return &Server{
++		logger: log.NewNOPFactory().NewLogger("clash-api"),
++		httpServer: &http.Server{Addr: address, Handler: http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
++			w.WriteHeader(http.StatusNoContent)
++		})},
++		closed:             make(chan struct{}),
++		externalController: true,
++	}
++}
++
++func answers(address string) bool {
++	client := &http.Client{Timeout: 200 * time.Millisecond}
++	response, err := client.Get("http://" + address + "/")
++	if err != nil {
++		return false
++	}
++	response.Body.Close()
++	return response.StatusCode == http.StatusNoContent
++}
++
++// An address taken by another program does not fail the start: the API comes up once the
++// address is free.
++func TestExternalControllerListenRetried(t *testing.T) {
++	blocker, err := net.Listen("tcp", "127.0.0.1:0")
++	require.NoError(t, err)
++	address := blocker.Addr().String()
++	server := newListenTestServer(t, address)
++	scope := adapter.NewScope(context.Background(), log.NewNOPFactory().NewLogger("scope"))
++	require.NoError(t, server.Start(adapter.StartStateStarted, scope))
++	defer scope.Close()
++
++	blocker.Close()
++	require.Eventually(t, func() bool { return answers(address) }, 5*time.Second, 20*time.Millisecond)
++}
++
++// A server whose scope is closed while it waits to retry does not listen afterwards.
++func TestExternalControllerRetryEndsOnClose(t *testing.T) {
++	blocker, err := net.Listen("tcp", "127.0.0.1:0")
++	require.NoError(t, err)
++	address := blocker.Addr().String()
++	server := newListenTestServer(t, address)
++	scope := adapter.NewScope(context.Background(), log.NewNOPFactory().NewLogger("scope"))
++	require.NoError(t, server.Start(adapter.StartStateStarted, scope))
++	require.NoError(t, scope.Close())
++
++	blocker.Close()
++	time.Sleep(200 * time.Millisecond)
++	_, err = net.DialTimeout("tcp", address, 200*time.Millisecond)
++	require.Error(t, err)
++}
+-- 
+2.53.0
+

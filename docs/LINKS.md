@@ -4,8 +4,9 @@
 принимает, какой ключ ссылки в какую опцию outbound превращается и как записать значение.
 Общее описание команды — в [README](../README.md), раздел «Ссылка в outbound».
 
-Каждая строка таблиц проверена запуском: пример из строки подан команде на сборках обеих
-линий (1.13.21 и 1.14.2), и команда дала названную опцию, предупреждение или отказ.
+Каждая строка таблиц проверена запуском: пример из строки подан команде на сборках r15 обеих
+линий (1.13.21 и 1.14.3, `podkop-engine-full`; строки ссылок `http`/`https` — и на
+`podkop-engine`), и команда дала названную опцию, предупреждение или отказ.
 
 ## Как пользоваться командой
 
@@ -45,7 +46,7 @@ sing-box tools decode-link --compact 'vless://…' # outbound одной стр�
 | `hysteria2://`, `hy2://` | hysteria2 | да | да |
 | `tuic://` | tuic | да | да |
 | `vmess://` | vmess | нет | да |
-| `http://`, `https://` | http | нет | да |
+| `http://`, `https://` | http | да (с r15) | да |
 | `hysteria://` | hysteria | нет | да |
 | `anytls://` | anytls | нет | да |
 | `naive+https://`, `naive+quic://` | naive | нет | да, где собран NaiveProxy |
@@ -466,13 +467,13 @@ JSON-форма v2rayN: `vmess://` и base64 от JSON с полями ниже.
 
 ## HTTP-прокси и общие параметры TLS
 
-Только в podkop-engine-full.
+В обоих пакетах с r15 (раньше — только в podkop-engine-full).
 
 Схемы, если в строке не сказано иное: `http`, `https`.
 
 | Ключ URL | Параметр config.json | Значения и пример |
 |---|---|---|
-| `<scheme>`<br>http | `type` | http:// → outbound http без TLS. Своих параметров у схемы нет: sni, fp и прочие дают предупреждение «… is not supported and is ignored».<br>Пример: `http://example.org:3128`<br>В outbound: `type: "http"`<br>HTTP-прокси. Есть только в podkop-engine-full. |
+| `<scheme>`<br>http | `type` | http:// → outbound http без TLS. Своих параметров у схемы нет: sni, fp и прочие дают предупреждение «… is not supported and is ignored».<br>Пример: `http://example.org:3128`<br>В outbound: `type: "http"`<br>HTTP-прокси. Есть в обоих пакетах с r15 (раньше — только в podkop-engine-full). |
 | `<scheme>`<br>https | `tls.enabled` | https:// → тот же outbound http с tls.enabled: true.<br>Пример: `https://example.org:8443`<br>В outbound: `type: "http", tls.enabled: true`<br>HTTP-прокси поверх TLS. |
 | `<user>`<br>`<password>` | `username` | «пользователь:пароль»: до первого двоеточия → username, после него → password; %-кодирование снимается.<br>Пример: `http://user:p%20ss@example.org:3128`<br>В outbound: `username: "user", password: "p ss"`<br>Вход на прокси. Форма с base64 здесь не читается. |
 | `<host>`<br>`<port>` | `server` | Имя или IP-адрес (IPv6 в скобках) → server; порт → server_port, обязателен. После порта допускается только «/»: адрес без порта или с путём — отказ http-not-a-proxy.<br>Пример: `http://192.0.2.1:3128/`<br>В outbound: `server: "192.0.2.1", server_port: 3128`<br>Порта по умолчанию нет нарочно: адрес без порта — это адрес страницы или подписки, а не прокси. |

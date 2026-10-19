@@ -1,0 +1,443 @@
+From e74709a17dc45aebda7fe78288347a7954124ad5 Mon Sep 17 00:00:00 2001
+From: FiyeroT <me@fiyero.xyz>
+Date: Mon, 5 Oct 2026 11:16:22 +0300
+Subject: [PATCH 045/148] xhttp: tests for options, configuration errors, the
+ download leg and HTTP/3; refuse VLESS flow over xhttp
+
+---
+ option/v2ray_xhttp.go               |   2 +-
+ option/v2ray_xhttp_test.go          | 125 ++++++++++++++++++++++++++++
+ protocol/vless/outbound.go          |   5 ++
+ transport/v2rayxhttp/client_test.go |  54 ++++++++++++
+ transport/v2rayxhttp/config_test.go | 110 ++++++++++++++++++++++++
+ transport/v2rayxhttp/http3_test.go  |  64 ++++++++++++++
+ 6 files changed, 359 insertions(+), 1 deletion(-)
+ create mode 100644 option/v2ray_xhttp_test.go
+ create mode 100644 transport/v2rayxhttp/config_test.go
+ create mode 100644 transport/v2rayxhttp/http3_test.go
+
+diff --git a/option/v2ray_xhttp.go b/option/v2ray_xhttp.go
+index f92409aab..242584064 100644
+--- a/option/v2ray_xhttp.go
++++ b/option/v2ray_xhttp.go
+@@ -103,7 +103,7 @@ func (r *V2RayXHTTPRange) UnmarshalJSON(content []byte) error {
+ 			From int64 `json:"from"`
+ 			To   int64 `json:"to"`
+ 		}
+-		err = json.Unmarshal(content, &value)
++		err = json.UnmarshalDisallowUnknownFields(content, &value)
+ 		from, to = value.From, value.To
+ 	default:
+ 		err = json.Unmarshal(content, &from)
+diff --git a/option/v2ray_xhttp_test.go b/option/v2ray_xhttp_test.go
+new file mode 100644
+index 000000000..c16014324
+--- /dev/null
++++ b/option/v2ray_xhttp_test.go
+@@ -0,0 +1,125 @@
++package option
++
++import (
++	"testing"
++
++	C "github.com/sagernet/sing-box/constant"
++	"github.com/sagernet/sing/common/json"
++
++	"github.com/stretchr/testify/require"
++)
++
++func TestV2RayXHTTPRange(t *testing.T) {
++	valid := map[string]V2RayXHTTPRange{
++		`"100-1000"`:           {100, 1000},
++		`"5"`:                  {5, 5},
++		`5`:                    {5, 5},
++		`""`:                   {0, 0},
++		`"-1"`:                 {-1, -1},
++		`"-5-10"`:              {-5, 10},
++		`"-20--10"`:            {-20, -10},
++		`"1000-100"`:           {100, 1000},
++		`{"from": 1, "to": 2}`: {1, 2},
++		`{"from": 9, "to": 2}`: {2, 9},
++		`{"from": 7}`:          {0, 7},
++		`"2147483647"`:         {2147483647, 2147483647},
++		`"-2147483648-0"`:      {-2147483648, 0},
++		`"0-1000"`:             {0, 1000},
++		`"10-10"`:              {10, 10},
++		`{"to": 3, "from": 3}`: {3, 3},
++		`"  "`:                 {},
++		`[1, 2]`:               {},
++		`"1-2-3"`:              {},
++		`"a-b"`:                {},
++		`"2147483648"`:         {},
++		`{"from": 1, "x": 2}`:  {},
++		`true`:                 {},
++		`1.5`:                  {},
++	}
++	invalid := map[string]bool{`"  "`: true, `[1, 2]`: true, `"1-2-3"`: true, `"a-b"`: true, `"2147483648"`: true,
++		`{"from": 1, "x": 2}`: true, `true`: true, `1.5`: true}
++	for input, expected := range valid {
++		var value V2RayXHTTPRange
++		err := json.Unmarshal([]byte(input), &value)
++		if invalid[input] {
++			require.Error(t, err, input)
++			continue
++		}
++		require.NoError(t, err, input)
++		require.Equal(t, expected, value, input)
++		output, err := json.Marshal(value)
++		require.NoError(t, err)
++		var again V2RayXHTTPRange
++		require.NoError(t, json.Unmarshal(output, &again))
++		require.Equal(t, value, again, string(output))
++	}
++}
++
++func TestV2RayXHTTPTransportOptions(t *testing.T) {
++	var options V2RayTransportOptions
++	require.NoError(t, json.Unmarshal([]byte(`{
++		"type": "xhttp",
++		"mode": "packet-up",
++		"host": "example.com",
++		"path": "/p?ed=2048",
++		"headers": {"User-Agent": "firefox"},
++		"x_padding_bytes": "100-1000",
++		"x_padding_obfs_mode": true,
++		"x_padding_placement": "header",
++		"session_placement": "header",
++		"session_key": "X-Token",
++		"session_id_table": "hex",
++		"session_id_length": "16-24",
++		"sc_max_each_post_bytes": 500000,
++		"sc_min_posts_interval_ms": "10-50",
++		"no_grpc_header": true,
++		"no_sse_header": true,
++		"sc_max_buffered_posts": 30,
++		"sc_stream_up_server_secs": "20-80",
++		"server_max_header_bytes": 8192,
++		"xmux": {"max_connections": "2-4", "h_max_request_times": "600-900", "h_keep_alive_period": 30},
++		"download": {
++			"server": "203.0.113.1",
++			"server_port": 443,
++			"tls": {"enabled": true, "server_name": "cdn.example.com"},
++			"detour": "direct",
++			"path": "/d",
++			"xmux": {"max_concurrency": "16-32"}
++		}
++	}`), &options))
++	require.Equal(t, C.V2RayTransportTypeXHTTP, options.Type)
++	xhttp := options.XHTTPOptions
++	require.Equal(t, "packet-up", xhttp.Mode)
++	require.Equal(t, V2RayXHTTPRange{100, 1000}, *xhttp.XPaddingBytes)
++	require.Equal(t, V2RayXHTTPRange{500000, 500000}, *xhttp.ScMaxEachPostBytes)
++	require.Equal(t, int64(30), xhttp.Xmux.HKeepAlivePeriod)
++	require.Equal(t, "203.0.113.1", xhttp.Download.Server)
++	require.Equal(t, "cdn.example.com", xhttp.Download.TLS.ServerName)
++	require.Equal(t, "/d", xhttp.Download.Path)
++	require.Equal(t, V2RayXHTTPRange{16, 32}, *xhttp.Download.Xmux.MaxConcurrency)
++
++	output, err := json.Marshal(options)
++	require.NoError(t, err)
++	var again V2RayTransportOptions
++	require.NoError(t, json.Unmarshal(output, &again))
++	require.Equal(t, options, again)
++}
++
++// Unknown fields are errors, as everywhere in sing-box: the fields only
++// sing-box-extended has and the names only sing-box-lx uses among them.
++func TestV2RayXHTTPUnknownFields(t *testing.T) {
++	for _, input := range []string{
++		`{"type": "xhttp", "domain_strategy": "ipv4_only"}`,
++		`{"type": "xhttp", "trusted_x_forwarded_for": ["1.1.1.1"]}`,
++		`{"type": "xhttp", "congestion_controller": "bbr"}`,
++		`{"type": "xhttp", "cwnd": 10}`,
++		`{"type": "xhttp", "session_table": "hex"}`,
++		`{"type": "xhttp", "extra": {"xPaddingBytes": "100-1000"}}`,
++		`{"type": "xhttp", "xPaddingBytes": "100-1000"}`,
++		`{"type": "xhttp", "xmux": {"maxConnections": 3}}`,
++		`{"type": "xhttp", "download": {"server": "a", "server_port": 1, "address": "b"}}`,
++	} {
++		var options V2RayTransportOptions
++		require.Error(t, json.Unmarshal([]byte(input), &options), input)
++	}
++}
+diff --git a/protocol/vless/outbound.go b/protocol/vless/outbound.go
+index c0ece0a2d..786c158fc 100644
+--- a/protocol/vless/outbound.go
++++ b/protocol/vless/outbound.go
+@@ -73,6 +73,11 @@ func NewOutbound(ctx context.Context, router adapter.Router, logger log.ContextL
+ 		}
+ 		outbound.tlsDialer = tls.NewDialer(outboundDialer, outbound.tlsConfig)
+ 	}
++	if options.Flow != "" && common.PtrValueOrDefault(options.Transport).Type == C.V2RayTransportTypeXHTTP {
++		// Vision needs the TLS connection itself; over XHTTP Xray has it only
++		// with VLESS Encryption, which sing-box does not have (podkop-engine).
++		return nil, E.New("flow ", options.Flow, " is not supported over the xhttp transport")
++	}
+ 	if options.Transport != nil {
+ 		outbound.transport, err = v2ray.NewClientTransport(ctx, outbound.dialer, outbound.serverAddr, common.PtrValueOrDefault(options.Transport), outbound.tlsConfig)
+ 		if err != nil {
+diff --git a/transport/v2rayxhttp/client_test.go b/transport/v2rayxhttp/client_test.go
+index 0dfd21bf9..efebd13f0 100644
+--- a/transport/v2rayxhttp/client_test.go
++++ b/transport/v2rayxhttp/client_test.go
+@@ -8,6 +8,7 @@ import (
+ 	"io"
+ 	"net"
+ 	"net/http"
++	"net/http/httptest"
+ 	"runtime"
+ 	"strings"
+ 	"sync"
+@@ -85,6 +86,21 @@ func echo(t *testing.T, conn net.Conn, size int) {
+ 	require.True(t, bytes.Equal(data, received), "echoed data differs")
+ }
+ 
++// settledGoroutines is the goroutine count once servers started in the
++// background have finished starting theirs.
++func settledGoroutines() int {
++	count := runtime.NumGoroutine()
++	for i := 0; i < 50; i++ {
++		time.Sleep(20 * time.Millisecond)
++		next := runtime.NumGoroutine()
++		if next == count {
++			return count
++		}
++		count = next
++	}
++	return count
++}
++
+ // waitGoroutines waits for the goroutines to come back to the count before a
+ // test, so that every request, reader and uploader a session started is known
+ // to have ended.
+@@ -392,3 +408,41 @@ func TestXHTTPSessionsLeaveNothing(t *testing.T) {
+ 		})
+ 	}
+ }
++
++// download sends the download half to another server (the same test server
++// here, on a second listener), its own TLS and pool.
++func TestXHTTPDownloadLeg(t *testing.T) {
++	for _, mode := range []string{modePacketUp, modeStreamUp} {
++		t.Run(mode, func(t *testing.T) {
++			options := option.V2RayXHTTPOptions{Mode: mode}
++			options.Path = "/x"
++			serverConfig, err := newRequestConfig(options.V2RayXHTTPBaseOptions, mode)
++			require.NoError(t, err)
++			server := newTestServer(t, serverConfig, "h2")
++			second := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++				server.count("on-second")
++				server.serveHTTP(w, r)
++			}))
++			second.EnableHTTP2 = true
++			second.StartTLS()
++			t.Cleanup(second.Close)
++			secondAddr := M.ParseSocksaddr(second.Listener.Addr().String())
++			options.Download = &option.V2RayXHTTPDownloadOptions{
++				ServerOptions:               option.ServerOptions{Server: secondAddr.AddrString(), ServerPort: secondAddr.Port},
++				OutboundTLSOptionsContainer: option.OutboundTLSOptionsContainer{TLS: &option.OutboundTLSOptions{Enabled: true, Insecure: true, ServerName: "cdn.example.com"}},
++			}
++			options.Download.Path = "/x"
++			tlsConfig, err := tls.NewClient(context.Background(), log.StdLogger(), "example.com", option.OutboundTLSOptions{Enabled: true, Insecure: true, ServerName: "example.com"})
++			require.NoError(t, err)
++			transport, err := NewClient(context.Background(), N.SystemDialer, M.ParseSocksaddr(server.server.Listener.Addr().String()), options, tlsConfig)
++			require.NoError(t, err)
++			defer transport.Close()
++			conn, err := transport.DialContext(context.Background())
++			require.NoError(t, err)
++			echo(t, conn, 128*1024)
++			conn.Close()
++			require.Equal(t, 1, server.requestCount("on-second"), "only the download goes to the second server")
++			require.Equal(t, 1, server.requestCount("download"))
++		})
++	}
++}
+diff --git a/transport/v2rayxhttp/config_test.go b/transport/v2rayxhttp/config_test.go
+new file mode 100644
+index 000000000..cdfe3f2cb
+--- /dev/null
++++ b/transport/v2rayxhttp/config_test.go
+@@ -0,0 +1,110 @@
++package v2rayxhttp
++
++import (
++	"context"
++	"testing"
++
++	"github.com/sagernet/sing-box/option"
++	"github.com/sagernet/sing/common/json/badoption"
++	M "github.com/sagernet/sing/common/metadata"
++	N "github.com/sagernet/sing/common/network"
++
++	"github.com/stretchr/testify/require"
++)
++
++func xrange(from, to int32) *option.V2RayXHTTPRange {
++	return &option.V2RayXHTTPRange{From: from, To: to}
++}
++
++// What Xray refuses, and what it panics on at a dial, fails here when the
++// client is built, which `sing-box check` does.
++func TestXHTTPConfigErrors(t *testing.T) {
++	cases := map[string]func(*option.V2RayXHTTPOptions){
++		"unknown mode": func(o *option.V2RayXHTTPOptions) { o.Mode = "stream-down" },
++		"download in stream-one": func(o *option.V2RayXHTTPOptions) {
++			o.Mode, o.Download = modeStreamOne, &option.V2RayXHTTPDownloadOptions{}
++		},
++		"download without server":    func(o *option.V2RayXHTTPOptions) { o.Download = &option.V2RayXHTTPDownloadOptions{} },
++		"host in headers":            func(o *option.V2RayXHTTPOptions) { o.Headers = badoption.HTTPHeader{"Host": {"a"}} },
++		"padding disabled":           func(o *option.V2RayXHTTPOptions) { o.XPaddingBytes = xrange(0, 100) },
++		"padding negative":           func(o *option.V2RayXHTTPOptions) { o.XPaddingBytes = xrange(-1, -1) },
++		"padding huge":               func(o *option.V2RayXHTTPOptions) { o.XPaddingBytes = xrange(100, 1<<30) },
++		"padding placement":          func(o *option.V2RayXHTTPOptions) { o.XPaddingPlacement = "body" },
++		"padding method":             func(o *option.V2RayXHTTPOptions) { o.XPaddingMethod = "random" },
++		"GET upload with auto mode":  func(o *option.V2RayXHTTPOptions) { o.UplinkHTTPMethod = "get" },
++		"data in headers, stream-up": func(o *option.V2RayXHTTPOptions) { o.Mode, o.UplinkDataPlacement = modeStreamUp, placementHeader },
++		"data in cookies, auto":      func(o *option.V2RayXHTTPOptions) { o.UplinkDataPlacement = placementCookie },
++		"data placement":             func(o *option.V2RayXHTTPOptions) { o.UplinkDataPlacement = "query" },
++		"session placement":          func(o *option.V2RayXHTTPOptions) { o.SessionPlacement = "body" },
++		"seq placement":              func(o *option.V2RayXHTTPOptions) { o.SeqPlacement = "queryInHeader" },
++		"session table too small":    func(o *option.V2RayXHTTPOptions) { o.SessionIDTable, o.SessionIDLength = "number", xrange(4, 8) },
++		"session length zero":        func(o *option.V2RayXHTTPOptions) { o.SessionIDTable, o.SessionIDLength = "hex", xrange(0, 32) },
++		"session length huge":        func(o *option.V2RayXHTTPOptions) { o.SessionIDTable, o.SessionIDLength = "hex", xrange(16, 1<<30) },
++		"session table not ASCII": func(o *option.V2RayXHTTPOptions) {
++			o.SessionIDTable, o.SessionIDLength = "абвгдежзиклмнопр", xrange(16, 16)
++		},
++		"post size negative":  func(o *option.V2RayXHTTPOptions) { o.ScMaxEachPostBytes = xrange(-1, -1) },
++		"post size from zero": func(o *option.V2RayXHTTPOptions) { o.ScMaxEachPostBytes = xrange(0, 1000) },
++		"connections and concurrency": func(o *option.V2RayXHTTPOptions) {
++			o.Xmux = &option.V2RayXHTTPXmuxOptions{MaxConnections: xrange(2, 2), MaxConcurrency: xrange(4, 4)}
++		},
++		"download padding": func(o *option.V2RayXHTTPOptions) {
++			o.Download = &option.V2RayXHTTPDownloadOptions{ServerOptions: option.ServerOptions{Server: "127.0.0.1", ServerPort: 1}}
++			o.Download.XPaddingBytes = xrange(0, 10)
++		},
++	}
++	for name, configure := range cases {
++		options := option.V2RayXHTTPOptions{}
++		configure(&options)
++		_, err := NewClient(context.Background(), N.SystemDialer, M.ParseSocksaddr("127.0.0.1:443"), options, nil)
++		require.Error(t, err, name)
++	}
++}
++
++func TestXHTTPConfigDefaults(t *testing.T) {
++	cases := map[string]func(*option.V2RayXHTTPOptions){
++		"empty":                     func(o *option.V2RayXHTTPOptions) {},
++		"zero post size is default": func(o *option.V2RayXHTTPOptions) { o.ScMaxEachPostBytes = xrange(0, 0) },
++		"negative interval":         func(o *option.V2RayXHTTPOptions) { o.ScMinPostsIntervalMs = xrange(-1, -1) },
++		"GET upload in packet-up":   func(o *option.V2RayXHTTPOptions) { o.Mode, o.UplinkHTTPMethod = modePacketUp, "GET" },
++		"server-side settings": func(o *option.V2RayXHTTPOptions) {
++			o.NoSSEHeader, o.ScMaxBufferedPosts, o.ScStreamUpServerSecs, o.ServerMaxHeaderBytes = true, 30, xrange(20, 80), 8192
++		},
++	}
++	for name, configure := range cases {
++		options := option.V2RayXHTTPOptions{}
++		configure(&options)
++		transport, err := NewClient(context.Background(), N.SystemDialer, M.ParseSocksaddr("127.0.0.1:443"), options, nil)
++		require.NoError(t, err, name)
++		transport.Close()
++	}
++	config, err := newRequestConfig(option.V2RayXHTTPBaseOptions{}, modeAuto)
++	require.NoError(t, err)
++	require.Equal(t, valueRange{100, 1000}, config.paddingBytes)
++	require.Equal(t, valueRange{1000000, 1000000}, config.maxEachPostBytes)
++	require.Equal(t, valueRange{30, 30}, config.minPostsIntervalMs)
++	require.Equal(t, xmuxConfig{maxConnections: valueRange{3, 3}, hMaxRequestTimes: valueRange{600, 900}, hMaxReusableSecs: valueRange{1800, 3000}}, config.xmux)
++	require.Equal(t, "/", config.normalizedPath())
++	// Setting any XMUX field drops all its defaults, as with Xray.
++	config, err = newRequestConfig(option.V2RayXHTTPBaseOptions{Xmux: &option.V2RayXHTTPXmuxOptions{HKeepAlivePeriod: 30}}, modeAuto)
++	require.NoError(t, err)
++	require.Equal(t, xmuxConfig{hKeepAlivePeriod: 30}, config.xmux)
++}
++
++func TestXHTTPPaths(t *testing.T) {
++	for _, c := range []struct {
++		path, placement, expected string
++	}{
++		{"", placementPath, "/"},
++		{"xhttp", placementPath, "/xhttp/"},
++		{"/xhttp", placementPath, "/xhttp/"},
++		{"/xhttp/", placementPath, "/xhttp/"},
++		{"/xhttp", placementQuery, "/xhttp"},
++		{"/xhttp?ed=2048", placementHeader, "/xhttp"},
++	} {
++		options := option.V2RayXHTTPBaseOptions{Path: c.path, SessionPlacement: c.placement, SeqPlacement: c.placement}
++		config, err := newRequestConfig(options, modeAuto)
++		require.NoError(t, err)
++		require.Equal(t, c.expected, config.normalizedPath(), c.path+" "+c.placement)
++	}
++}
+diff --git a/transport/v2rayxhttp/http3_test.go b/transport/v2rayxhttp/http3_test.go
+new file mode 100644
+index 000000000..875b9a96f
+--- /dev/null
++++ b/transport/v2rayxhttp/http3_test.go
+@@ -0,0 +1,64 @@
++//go:build with_quic
++
++package v2rayxhttp
++
++import (
++	"context"
++	"net"
++	"net/http"
++	"net/http/httptest"
++	"testing"
++
++	"github.com/sagernet/quic-go/http3"
++	"github.com/sagernet/sing-box/common/tls"
++	"github.com/sagernet/sing-box/log"
++	"github.com/sagernet/sing-box/option"
++	"github.com/sagernet/sing/common/json/badoption"
++	M "github.com/sagernet/sing/common/metadata"
++	N "github.com/sagernet/sing/common/network"
++
++	"github.com/stretchr/testify/require"
++)
++
++// tls.alpn ["h3"] selects HTTP/3, every mode over QUIC streams.
++func TestXHTTPHTTP3(t *testing.T) {
++	for _, mode := range []string{modePacketUp, modeStreamUp, modeStreamOne} {
++		t.Run(mode, func(t *testing.T) {
++			options := option.V2RayXHTTPOptions{Mode: mode}
++			options.Path = "/h3"
++			serverConfig, err := newRequestConfig(options.V2RayXHTTPBaseOptions, mode)
++			require.NoError(t, err)
++			handler := &testServer{t: t, config: serverConfig, sessions: make(map[string]*testSession), requests: make(map[string]int)}
++			// httptest only provides the certificate here.
++			certificateServer := httptest.NewUnstartedServer(nil)
++			certificateServer.StartTLS()
++			serverTLS := certificateServer.TLS.Clone()
++			certificateServer.Close()
++			serverTLS.NextProtos = []string{http3.NextProtoH3}
++			packetConn, err := net.ListenPacket("udp", "127.0.0.1:0")
++			require.NoError(t, err)
++			server := &http3.Server{Handler: http.HandlerFunc(handler.serveHTTP), TLSConfig: serverTLS}
++			go server.Serve(packetConn)
++			t.Cleanup(func() {
++				server.Close()
++				packetConn.Close()
++			})
++			tlsConfig, err := tls.NewClient(context.Background(), log.StdLogger(), "example.com", option.OutboundTLSOptions{
++				Enabled: true, Insecure: true, ServerName: "example.com", ALPN: badoption.Listable[string]{"h3"},
++			})
++			require.NoError(t, err)
++			transport, err := NewClient(context.Background(), N.SystemDialer, M.SocksaddrFromNet(packetConn.LocalAddr()), options, tlsConfig)
++			require.NoError(t, err)
++			baseline := settledGoroutines()
++			for i := 0; i < 3; i++ {
++				conn, err := transport.DialContext(context.Background())
++				require.NoError(t, err)
++				echo(t, conn, 128*1024)
++				conn.Close()
++			}
++			transport.Close()
++			waitGoroutines(t, baseline)
++			require.Zero(t, handler.requestCount("bad-padding"))
++		})
++	}
++}
+-- 
+2.53.0
+

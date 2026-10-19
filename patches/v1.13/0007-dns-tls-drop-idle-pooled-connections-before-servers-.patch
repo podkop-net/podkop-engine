@@ -1,7 +1,7 @@
 From b527d8a8f8ad4c6bd0bc5e183b6700464879f46f Mon Sep 17 00:00:00 2001
 From: FiyeroT <me@fiyero.xyz>
 Date: Tue, 29 Sep 2026 15:33:06 +0300
-Subject: [PATCH 007/126] dns/tls: drop idle pooled connections before servers
+Subject: [PATCH 007/140] dns/tls: drop idle pooled connections before servers
  close them
 
 Public DoT servers close idle connections after 10 s (Cloudflare, Quad9),

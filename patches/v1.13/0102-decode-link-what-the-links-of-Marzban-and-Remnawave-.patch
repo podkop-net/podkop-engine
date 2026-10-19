@@ -1,7 +1,7 @@
 From 8ecb461363c974966903371c76bc5d54534c4135 Mon Sep 17 00:00:00 2001
 From: FiyeroT <me@fiyero.xyz>
 Date: Thu, 8 Oct 2026 18:14:02 +0300
-Subject: [PATCH 102/126] decode-link: what the links of Marzban and Remnawave
+Subject: [PATCH 102/140] decode-link: what the links of Marzban and Remnawave
  showed
 
 The decoder was run over the links the generators of the two panels write for a matrix

@@ -1,0 +1,238 @@
+From 038f905f6a9c298f12b5eeefdf7faa0de69d9ea5 Mon Sep 17 00:00:00 2001
+From: FiyeroT <me@fiyero.xyz>
+Date: Sun, 4 Oct 2026 08:52:50 +0300
+Subject: [PATCH 043/148] rule-set: collect garbage after a load only, log
+ repeated failures sparingly
+
+A remote rule-set that never came at the start is retried every 30 s (see
+"start empty when the first download fails, retry"). Every attempt logged an
+error, 2880 a day per list that stays unreachable, and made the updater force
+a garbage collection, a full pause of the process on a router's CPU, though a
+failed or not-modified update leaves nothing to collect.
+
+The updater now collects only after an update that loaded a list. A series
+of failed updates logs its first failure as an error, then once every 10
+minutes the count with the last error, the others at debug; the success
+after them says how many there were.
+---
+ route/rule/rule_set_remote.go          |  42 +++++++++-
+ route/rule/rule_set_update_log_test.go | 101 +++++++++++++++++++++++++
+ route/rule/rule_set_updater.go         |  11 ++-
+ 3 files changed, 147 insertions(+), 7 deletions(-)
+ create mode 100644 route/rule/rule_set_update_log_test.go
+
+diff --git a/route/rule/rule_set_remote.go b/route/rule/rule_set_remote.go
+index b01a73d20..21395d399 100644
+--- a/route/rule/rule_set_remote.go
++++ b/route/rule/rule_set_remote.go
+@@ -56,6 +56,11 @@ type RemoteRuleSet struct {
+ 	pauseManager   pause.Manager
+ 	callbacks      list.List[adapter.RuleSetUpdateCallback]
+ 	refs           atomic.Int32
++	// the updater's own: whether the last fetch loaded a list, and the failed updates
++	// since the last success (see fetchFailed)
++	fetchLoaded   bool
++	failures      int
++	failureLogged time.Time
+ }
+ 
+ func NewRemoteRuleSet(ctx context.Context, logger logger.ContextLogger, tag string, options option.RuleSet) (*RemoteRuleSet, error) {
+@@ -256,13 +261,43 @@ func (s *RemoteRuleSet) loadBytes(content []byte) error {
+ 	return nil
+ }
+ 
+-func (s *RemoteRuleSet) updateOnce() {
++// updateOnce updates the rule-set and reports whether it loaded a new list.
++func (s *RemoteRuleSet) updateOnce() bool {
++	s.fetchLoaded = false
+ 	err := s.fetch(s.ctx, false)
+ 	if err != nil {
+-		s.logger.Error("fetch rule-set ", s.tag, ": ", err)
+-	} else if s.refs.Load() == 0 {
++		s.fetchFailed(err)
++		return false
++	}
++	if s.failures > 0 {
++		s.logger.Info("fetch rule-set ", s.tag, ": succeeded after ", s.failures, " failed attempts")
++		s.failures = 0
++	}
++	if s.refs.Load() == 0 {
+ 		s.dropRules()
+ 	}
++	return s.fetchLoaded
++}
++
++// ruleSetFailureLogInterval is how often a rule-set that keeps failing to update logs its
++// failures as an error.
++const ruleSetFailureLogInterval = 10 * time.Minute
++
++// fetchFailed logs a failed update: the first of a series as an error, then a count with
++// the last error once every ruleSetFailureLogInterval, the others at debug. A list that
++// never came at the start is retried every 30 s, which logged 2880 errors a day.
++func (s *RemoteRuleSet) fetchFailed(err error) {
++	s.failures++
++	switch {
++	case s.failures == 1:
++		s.failureLogged = time.Now()
++		s.logger.Error("fetch rule-set ", s.tag, ": ", err)
++	case time.Since(s.failureLogged) >= ruleSetFailureLogInterval:
++		s.failureLogged = time.Now()
++		s.logger.Error("fetch rule-set ", s.tag, ": ", s.failures, " failed attempts, the last: ", err)
++	default:
++		s.logger.Debug("fetch rule-set ", s.tag, ": ", err)
++	}
+ }
+ 
+ // A rule-set download must not hang the start (the inbounds listen only after every rule-set
+@@ -376,6 +411,7 @@ func (s *RemoteRuleSet) fetch(ctx context.Context, isStart bool) error {
+ 	if err != nil {
+ 		return err
+ 	}
++	s.fetchLoaded = true
+ 	eTagHeader := response.Header.Get("Etag")
+ 	if eTagHeader != "" {
+ 		s.lastEtag = eTagHeader
+diff --git a/route/rule/rule_set_update_log_test.go b/route/rule/rule_set_update_log_test.go
+new file mode 100644
+index 000000000..adafc6d13
+--- /dev/null
++++ b/route/rule/rule_set_update_log_test.go
+@@ -0,0 +1,101 @@
++package rule
++
++import (
++	"context"
++	"io"
++	"net/http"
++	"net/http/httptest"
++	"strings"
++	"sync"
++	"sync/atomic"
++	"testing"
++	"time"
++
++	C "github.com/sagernet/sing-box/constant"
++	"github.com/sagernet/sing-box/log"
++
++	"github.com/stretchr/testify/require"
++)
++
++type levelLog struct {
++	access sync.Mutex
++	lines  []string
++}
++
++func (l *levelLog) WriteMessage(level log.Level, message string) {
++	l.access.Lock()
++	defer l.access.Unlock()
++	name := map[log.Level]string{log.LevelError: "ERROR", log.LevelInfo: "INFO", log.LevelDebug: "DEBUG"}[level]
++	l.lines = append(l.lines, name+" "+message)
++}
++
++func (l *levelLog) take() []string {
++	l.access.Lock()
++	defer l.access.Unlock()
++	lines := l.lines
++	l.lines = nil
++	return lines
++}
++
++// A rule-set that keeps failing to update logs the first failure as an error, the next ones
++// at debug and, every ruleSetFailureLogInterval, a count; the success after them says how
++// many there were. Only an update that loaded a list reports it (the updater collects
++// garbage after one), a failed or not-modified one does not.
++func TestRemoteRuleSetUpdateFailuresLogged(t *testing.T) {
++	var mode atomic.Value
++	mode.Store("fail")
++	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		switch mode.Load().(string) {
++		case "fail":
++			w.WriteHeader(http.StatusBadGateway)
++		case "list":
++			w.Header().Set("Etag", `"v1"`)
++			io.WriteString(w, `{"version":3,"rules":[{"domain_suffix":["example.com"]}]}`)
++		case "same":
++			w.WriteHeader(http.StatusNotModified)
++		}
++	}))
++	defer server.Close()
++
++	writer := &levelLog{}
++	factory := log.NewDefaultFactory(context.Background(), log.Formatter{BaseTime: time.Now()}, io.Discard, "", writer, false)
++	factory.SetLevel(log.LevelDebug)
++	require.NoError(t, factory.Start())
++	set := newTestRuleSet(server.URL)
++	set.ctx = context.Background()
++	set.logger = factory.NewLogger("rule-set")
++	set.options.Format = C.RuleSetFormatSource
++
++	for range 3 {
++		require.False(t, set.updateOnce())
++	}
++	lines := writer.take()
++	require.Len(t, lines, 6) // each attempt also logs "updating rule-set" at debug
++	require.Equal(t, 1, countPrefix(lines, "ERROR"))
++	require.Equal(t, 5, countPrefix(lines, "DEBUG"))
++
++	set.failureLogged = time.Now().Add(-ruleSetFailureLogInterval)
++	require.False(t, set.updateOnce())
++	lines = writer.take()
++	require.Equal(t, 1, countPrefix(lines, "ERROR"))
++	require.Contains(t, strings.Join(lines, "\n"), "4 failed attempts")
++
++	mode.Store("list")
++	require.True(t, set.updateOnce())
++	require.Contains(t, strings.Join(writer.take(), "\n"), "succeeded after 4 failed attempts")
++	require.Zero(t, set.failures)
++
++	mode.Store("same")
++	require.False(t, set.updateOnce())
++	require.Zero(t, countPrefix(writer.take(), "ERROR"))
++}
++
++func countPrefix(lines []string, prefix string) int {
++	var count int
++	for _, line := range lines {
++		if strings.HasPrefix(line, prefix) {
++			count++
++		}
++	}
++	return count
++}
+diff --git a/route/rule/rule_set_updater.go b/route/rule/rule_set_updater.go
+index 2d9a9934c..f2eaa91a7 100644
+--- a/route/rule/rule_set_updater.go
++++ b/route/rule/rule_set_updater.go
+@@ -57,12 +57,14 @@ func (u *RuleSetUpdater) loopUpdate() {
+ 		case <-timer.C:
+ 		}
+ 		now := time.Now()
+-		var updated bool
++		var loaded bool
+ 		for i, ruleSet := range u.ruleSets {
+ 			if now.Before(nextUpdates[i]) {
+ 				continue
+ 			}
+-			ruleSet.updateOnce()
++			if ruleSet.updateOnce() {
++				loaded = true
++			}
+ 			nextUpdates[i] = now.Add(ruleSet.updateInterval)
+ 			if ruleSet.startedEmpty {
+ 				if ruleSet.lastUpdated.IsZero() {
+@@ -75,9 +77,10 @@ func (u *RuleSetUpdater) loopUpdate() {
+ 					notifyRuleSetRecovered(ruleSet.logger, ruleSet.tag)
+ 				}
+ 			}
+-			updated = true
+ 		}
+-		if updated {
++		// the old list is garbage once a new one is loaded; a failed or not-modified
++		// update leaves nothing to collect
++		if loaded {
+ 			runtime.GC()
+ 		}
+ 		timer.Reset(waitUntilNext(nextUpdates))
+-- 
+2.53.0
+

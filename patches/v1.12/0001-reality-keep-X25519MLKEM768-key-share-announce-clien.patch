@@ -4,7 +4,6 @@ Date: Sat, 26 Sep 2026 20:23:33 +0300
 Subject: [PATCH 1/2] reality: keep X25519MLKEM768 key share, announce client
  version 26.3.27 (1.12.x backport)
 
-Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
 ---
  common/tls/reality_client.go | 33 +++++++++++++--------------------
  1 file changed, 13 insertions(+), 20 deletions(-)

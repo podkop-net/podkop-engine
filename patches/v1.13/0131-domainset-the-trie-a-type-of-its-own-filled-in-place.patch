@@ -1,0 +1,936 @@
+From d676e23bfe8d581bb517593f10ef9814a0c7fbdb Mon Sep 17 00:00:00 2001
+From: FiyeroT <me@fiyero.xyz>
+Date: Sun, 18 Oct 2026 14:40:32 +0300
+Subject: [PATCH 131/140] domainset: the trie a type of its own, filled in
+ place
+
+domain.ReadMatcher copies the trie it is handed, growing its slices a
+chunk at a time, while the trie it reads is still held: for a rule set
+of a million names that copy was the peak of the load.
+
+common/domainset/succinct is the succinct set of sing as a type of its
+own, with sing's code to match it and to index it (common/domain,
+after openacid/succinct) copied without a change. The builder fills it
+in place; a big trie is cut down to what it holds, after the garbage of
+the build is collected. Rules read by ReadSource carry it as DomainSet
+(json:"-"), and route/rule makes a domain item of it. The matcher of
+sing stays for binary rule sets.
+
+The item of a set tells of itself what route/rule told of a domain item
+of the lists (domainset.Describe, which NewDomainItem uses too). An empty
+name in domain or domain_suffix is left to route/rule, which refuses it:
+the reader built it before.
+
+TestSetMatchesAsSing holds Match to sing's on the names of random lists,
+their subdomains, the names a suffix is cut from, capitals, names not of
+ASCII and words; the bytes of a set are sing's.
+
+A rule set of a million names (21 MB of JSON), x86, GOMAXPROCS=4: the
+peak RSS of ReadSource +92 MB before, +40-46 MB now; 300000 names +13 MB.
+---
+ common/domainset/domainset.go      |  66 +++++--
+ common/domainset/domainset_test.go |  56 +++++-
+ common/domainset/source.go         |  49 +++--
+ common/domainset/source_test.go    |  27 +--
+ common/domainset/succinct/set.go   | 301 +++++++++++++++++++++++++++++
+ common/domainset/trie.go           |  62 +++---
+ option/rule_set.go                 |   2 +
+ route/rule/rule_headless.go        |   4 +
+ route/rule/rule_item_domain.go     |  40 ++--
+ 9 files changed, 499 insertions(+), 108 deletions(-)
+ create mode 100644 common/domainset/succinct/set.go
+
+diff --git a/common/domainset/domainset.go b/common/domainset/domainset.go
+index 2f7ea927d..7cf17e0a5 100644
+--- a/common/domainset/domainset.go
++++ b/common/domainset/domainset.go
+@@ -1,7 +1,7 @@
+ // Package domainset reads lists of domains and builds of them the domain matcher of sing
+ // (common/domain), the same matcher byte for byte as domain.NewMatcher builds, with a
+ // fraction of its memory and time. It reads the rule sets of the source format, JSON, in
+-// one pass (ReadSource), and takes lists of strings (NewMatcher).
++// one pass (ReadSource), and takes lists of strings (NewSet, Encode).
+ //
+ // The rules it keeps:
+ //
+@@ -17,8 +17,9 @@
+ //     keys of a node parted by their next byte (a radix sort in the order of the trie),
+ //     so that a key is looked at once a byte. Repeated names, and a name that is a suffix
+ //     too, are dealt with as the trie is built, with no map.
+-//   - The trie is handed to sing as a rule set in the binary format carries it
+-//     (domain.ReadMatcher): the matcher is sing's own.
++//   - The trie is a type of its own (succinct.Set), sing's succinct set with sing's code
++//     to match it, filled in place: domain.ReadMatcher would copy it, and the copy and
++//     the trie it is made of were the peak of a big list.
+ //
+ // domain.NewMatcher keeps the queue of its breadth-first walk of the trie whole until the
+ // trie is built, an entry of 24 bytes for every node, and its map of names: a list of
+@@ -27,32 +28,63 @@
+ package domainset
+ 
+ import (
+-	"bytes"
++	"strings"
+ 	"unicode/utf8"
+ 
+ 	"github.com/sagernet/sing/common/domain"
+ )
+ 
+-// NewMatcher is domain.NewMatcher: the names matched as they are (domains) and with their
+-// subdomains (domainSuffix; one that begins with "." matches its subdomains only), in the
+-// legacy way of rule sets of version 1 when generateLegacy is set.
+-func NewMatcher(domains []string, domainSuffix []string, generateLegacy bool) (*domain.Matcher, error) {
+-	if len(domains) == 0 && len(domainSuffix) == 0 {
+-		// as sing has it, whatever that does with nothing to match
+-		return domain.NewMatcher(domains, domainSuffix, generateLegacy), nil
+-	}
+-	if generateLegacy || !validNames(domains, domainSuffix) {
+-		return domain.ReadMatcher(bytes.NewReader(encodeSorted(domains, domainSuffix, generateLegacy)))
++// Matcher is what a rule asks of a domain trie: domain.Matcher of sing, or a succinct.Set.
++type Matcher interface {
++	Match(domain string) bool
++}
++
++// NewSet is domain.NewMatcher of the names matched as they are (domains) and with their
++// subdomains (domainSuffix; one that begins with "." matches its subdomains only): a
++// succinct.Set with what Describe tells of the lists. Names that are not valid UTF-8 are
++// built by sing itself, which reverses such a name into bytes that depend on what is
++// around them.
++func NewSet(domains []string, domainSuffix []string) (Matcher, error) {
++	if !validNames(domains, domainSuffix) {
++		return domain.NewMatcher(domains, domainSuffix, false), nil
+ 	}
+ 	collector, err := collect(domains, domainSuffix)
+ 	if err != nil {
+ 		return nil, err
+ 	}
+-	return collector.Matcher()
++	return collector.Set(Describe(domains[:min(3, len(domains))], len(domains), domainSuffix[:min(3, len(domainSuffix))], len(domainSuffix)))
++}
++
++// Describe is what route/rule tells of a domain item of the lists: the first three names
++// of each (domains, domainSuffix), and whether there are more of them than that.
++func Describe(domains []string, domainCount int, domainSuffix []string, domainSuffixCount int) string {
++	var description string
++	if domainCount > 0 {
++		if domainCount == 1 {
++			description = "domain=" + domains[0]
++		} else if domainCount > 3 {
++			description = "domain=[" + strings.Join(domains[:3], " ") + "...]"
++		} else {
++			description = "domain=[" + strings.Join(domains, " ") + "]"
++		}
++	}
++	if domainSuffixCount > 0 {
++		if len(description) > 0 {
++			description += " "
++		}
++		if domainSuffixCount == 1 {
++			description += "domain_suffix=" + domainSuffix[0]
++		} else if domainSuffixCount > 3 {
++			description += "domain_suffix=[" + strings.Join(domainSuffix[:3], " ") + "...]"
++		} else {
++			description += "domain_suffix=[" + strings.Join(domainSuffix, " ") + "]"
++		}
++	}
++	return description
+ }
+ 
+-// Encode is the matcher of NewMatcher as domain.Matcher.Write writes it, the form a rule set
+-// in the binary format carries.
++// Encode is domain.NewMatcher(domains, domainSuffix, generateLegacy) as domain.Matcher.Write
++// writes it, the form a rule set in the binary format carries.
+ func Encode(domains []string, domainSuffix []string, generateLegacy bool) ([]byte, error) {
+ 	if generateLegacy || !validNames(domains, domainSuffix) {
+ 		return encodeSorted(domains, domainSuffix, generateLegacy), nil
+diff --git a/common/domainset/domainset_test.go b/common/domainset/domainset_test.go
+index dc88c1f17..45ded88bc 100644
+--- a/common/domainset/domainset_test.go
++++ b/common/domainset/domainset_test.go
+@@ -6,6 +6,7 @@ import (
+ 	"strings"
+ 	"testing"
+ 
++	"github.com/sagernet/sing-box/common/domainset/succinct"
+ 	"github.com/sagernet/sing/common/domain"
+ 
+ 	"github.com/stretchr/testify/require"
+@@ -63,10 +64,13 @@ func TestSameAsSing(t *testing.T) {
+ 				encoded, err := Encode(lists[0], lists[1], legacy)
+ 				require.NoError(t, err)
+ 				require.Equal(t, want, encoded, "%d names, legacy %v", count, legacy)
+-				matcher, err := NewMatcher(lists[0], lists[1], legacy)
++				if legacy {
++					continue
++				}
++				matcher, err := NewSet(lists[0], lists[1])
+ 				require.NoError(t, err)
+ 				var written bytes.Buffer
+-				require.NoError(t, matcher.Write(&written))
++				require.NoError(t, matcher.(*succinct.Set).Write(&written))
+ 				require.Equal(t, want, written.Bytes())
+ 			}
+ 		}
+@@ -139,9 +143,9 @@ func TestSameAsSingOddNames(t *testing.T) {
+ 
+ // What sing cannot build is an error here, where sing stops the process.
+ func TestRefused(t *testing.T) {
+-	_, err := NewMatcher(nil, []string{"a", ""}, false)
++	_, err := NewSet(nil, []string{"a", ""})
+ 	require.ErrorIs(t, err, ErrEmptySuffix)
+-	_, err = NewMatcher([]string{"\na"}, []string{"a"}, false)
++	_, err = NewSet([]string{"\na"}, []string{"a"})
+ 	require.ErrorIs(t, err, errSameKey)
+ }
+ 
+@@ -151,7 +155,7 @@ func BenchmarkBuild(b *testing.B) {
+ 	b.Run("domainset", func(b *testing.B) {
+ 		b.ReportAllocs()
+ 		for range b.N {
+-			if _, err := NewMatcher(nil, list, false); err != nil {
++			if _, err := NewSet(nil, list); err != nil {
+ 				b.Fatal(err)
+ 			}
+ 		}
+@@ -163,3 +167,45 @@ func BenchmarkBuild(b *testing.B) {
+ 		}
+ 	})
+ }
++
++// The set matches what the matcher of sing matches: the names of the lists, their
++// subdomains, the names a suffix is cut from, names in capitals, not of ASCII, empty,
++// words; and it tells of itself what route/rule told of a domain item.
++func TestSetMatchesAsSing(t *testing.T) {
++	random := rand.New(rand.NewSource(7))
++	for _, count := range []int{1, 2, 5, 50, 3000} {
++		for round := range 20 {
++			domains, suffixes := names(random, count), names(random, count)
++			if round%3 == 1 {
++				domains = nil
++			} else if round%3 == 2 {
++				suffixes = nil
++			}
++			matcher, err := NewSet(domains, suffixes)
++			require.NoError(t, err)
++			want := domain.NewMatcher(domains, suffixes, false)
++			var queries []string
++			for _, name := range append(append([]string(nil), domains...), suffixes...) {
++				bare := strings.TrimPrefix(name, ".")
++				queries = append(queries, name, bare, "a."+bare, "x.y."+bare, strings.ToUpper(bare), bare[1:], bare+".", "."+bare)
++				if dot := strings.IndexByte(bare, '.'); dot >= 0 {
++					queries = append(queries, bare[dot+1:], bare[dot:])
++				}
++			}
++			queries = append(queries, "", ".", "com", "рф", "localhost", "\n", "\r", "a\nb")
++			for _, query := range queries {
++				require.Equal(t, want.Match(query), matcher.Match(query), "%q in %d names", query, count)
++			}
++			require.Equal(t, Describe(domains[:min(3, len(domains))], len(domains), suffixes[:min(3, len(suffixes))], len(suffixes)),
++				matcher.(*succinct.Set).String())
++		}
++	}
++}
++
++// A trie that is not one is refused, as domain.ReadMatcher refuses it.
++func TestSetRefusesMalformed(t *testing.T) {
++	_, err := succinct.New(nil, []uint64{0b10}, []byte("ab"), "")
++	require.Error(t, err)
++	_, err = succinct.New(nil, nil, nil, "")
++	require.Error(t, err)
++}
+diff --git a/common/domainset/source.go b/common/domainset/source.go
+index 53a208778..92ccf3321 100644
+--- a/common/domainset/source.go
++++ b/common/domainset/source.go
+@@ -16,9 +16,9 @@ import (
+ // ReadSource reads a rule set of the source format, JSON, into what
+ // json.UnmarshalExtended[option.PlainRuleSetCompat] reads of it, in one pass and without
+ // a copy of the names where it can. The rules differ in one way: the names of a rule of
+-// the default type (domain, domain_suffix) come as its matcher (DomainMatcher, as a rule
+-// set of the binary format has them), not as lists of strings; the matcher is the one
+-// route/rule builds of those lists.
++// the default type (domain, domain_suffix) come as their trie (DomainSet), not as lists
++// of strings; the trie, and what it tells of itself, are what route/rule builds of those
++// lists.
+ //
+ // What it reads so is JSON of a strict shape: the object of the rule set with "version"
+ // (a digit) and "rules", nothing around it but white space. In a rule it reads the lists of
+@@ -187,6 +187,9 @@ func (r *reader) rule() (option.HeadlessRule, bool, bool) {
+ 		seen, full uint
+ 		lists      [fieldCount][]string
+ 		names      *Collector
++		// the first names of domain and domain_suffix, and how many there are
++		first  [2][]string
++		counts [2]int
+ 		// the other members, as their text
+ 		rest [][]byte
+ 	)
+@@ -216,7 +219,9 @@ func (r *reader) rule() (option.HeadlessRule, bool, bool) {
+ 					if names == nil {
+ 						names = NewCollector(r.text)
+ 					}
+-					count, ok = r.names(names, field == fieldDomainSuffix)
++					side := field - fieldDomain
++					count, ok = r.names(names, field == fieldDomainSuffix, &first[side])
++					counts[side] = count
+ 				} else {
+ 					lists[field], ok = r.strings()
+ 					count = len(lists[field])
+@@ -278,11 +283,11 @@ func (r *reader) rule() (option.HeadlessRule, bool, bool) {
+ 	fields.SourceIPCIDR = badoption.Listable[string](lists[fieldSourceIPCIDR])
+ 	fields.IPCIDR = badoption.Listable[string](lists[fieldIPCIDR])
+ 	if names != nil && names.Len() > 0 {
+-		matcher, err := names.Matcher()
++		set, err := names.Set(Describe(first[0], counts[0], first[1], counts[1]))
+ 		if err != nil {
+ 			return rule, false, false
+ 		}
+-		fields.DomainMatcher = matcher
++		fields.DomainSet = set
+ 	}
+ 	return rule, full == 0 && restEmpty, true
+ }
+@@ -337,20 +342,38 @@ func (r *reader) defaultType() bool {
+ }
+ 
+ // names reads a value of domain or domain_suffix into the collector: a string, an array
+-// of strings or null. It tells how many names it read.
+-func (r *reader) names(names *Collector, suffix bool) (int, bool) {
++// of strings or null. It tells how many names it read, and keeps the first three of them
++// for the description of the rule. An empty name is route/rule's to refuse: the rule goes
++// to sing-box.
++func (r *reader) names(names *Collector, suffix bool, first *[]string) (int, bool) {
+ 	names.Grow(r.countStrings())
+ 	count := 0
+ 	ok := r.each(func(start int, end int, plain bool) bool {
++		if start == end {
++			return false
++		}
+ 		count++
++		var err error
++		var name string
+ 		if plain {
+-			return names.Add(start, end, suffix) == nil
++			err = names.Add(start, end, suffix)
++		} else if text, unescaped := r.unescaped(start, end); unescaped {
++			err = names.AddBytes(text, suffix)
++		} else {
++			var ok bool
++			name, ok = r.unquote(start, end)
++			if !ok || name == "" {
++				return false
++			}
++			err = names.AddString(name, suffix)
+ 		}
+-		if text, ok := r.unescaped(start, end); ok {
+-			return names.AddBytes(text, suffix) == nil
++		if len(*first) < 3 {
++			if name == "" {
++				name = string(r.text[start:end])
++			}
++			*first = append(*first, name)
+ 		}
+-		value, ok := r.unquote(start, end)
+-		return ok && names.AddString(value, suffix) == nil
++		return err == nil
+ 	})
+ 	return count, ok
+ }
+diff --git a/common/domainset/source_test.go b/common/domainset/source_test.go
+index e1e5ed60e..10589b7ea 100644
+--- a/common/domainset/source_test.go
++++ b/common/domainset/source_test.go
+@@ -5,6 +5,7 @@ import (
+ 	"fmt"
+ 	"math/rand"
+ 	"reflect"
++	"slices"
+ 	"strings"
+ 	"testing"
+ 
+@@ -12,6 +13,7 @@ import (
+ 	"github.com/sagernet/sing-box/option"
+ 	"github.com/sagernet/sing/common/domain"
+ 	"github.com/sagernet/sing/common/json"
++	"github.com/sagernet/sing/common/varbin"
+ 
+ 	"github.com/stretchr/testify/require"
+ )
+@@ -213,15 +215,10 @@ func (g sourceText) set() string {
+ 	return text
+ }
+ 
+-// written is a matcher as a rule set carries it after it was read once: a matcher that
+-// domain.ReadMatcher made pads its leaves.
+-func written(t testing.TB, matcher *domain.Matcher) []byte {
++// written is a trie as a rule set carries it.
++func written(t testing.TB, matcher interface{ Write(varbin.Writer) error }) []byte {
+ 	var content bytes.Buffer
+ 	require.NoError(t, matcher.Write(&content))
+-	read, err := domain.ReadMatcher(bytes.NewReader(content.Bytes()))
+-	require.NoError(t, err)
+-	content.Reset()
+-	require.NoError(t, read.Write(&content))
+ 	return content.Bytes()
+ }
+ 
+@@ -241,7 +238,11 @@ func sameAsStock(t testing.TB, text []byte) bool {
+ 	require.Equal(t, len(stock.Options.Rules), len(fast.Options.Rules), "%s", text)
+ 	for index := range stock.Options.Rules {
+ 		mine, theirs := &fast.Options.Rules[index].DefaultOptions, &stock.Options.Rules[index].DefaultOptions
+-		if mine.DomainMatcher == nil {
++		if slices.Contains(theirs.Domain, "") || slices.Contains(theirs.DomainSuffix, "") {
++			// route/rule refuses an empty name: the rule must reach it as lists
++			require.Nil(t, mine.DomainSet, "an empty name built here:\n%s", text)
++		}
++		if mine.DomainSet == nil {
+ 			continue
+ 		}
+ 		require.True(t, len(theirs.Domain)+len(theirs.DomainSuffix) > 0, "%s", text)
+@@ -255,8 +256,10 @@ func sameAsStock(t testing.TB, text []byte) bool {
+ 			want = domain.NewMatcher(theirs.Domain, theirs.DomainSuffix, false)
+ 		}()
+ 		require.NotNil(t, want, "sing stops on these names, readSource built them:\n%s", text)
+-		require.Equal(t, written(t, want), written(t, mine.DomainMatcher), "%s", text)
+-		mine.DomainMatcher = nil
++		require.Equal(t, written(t, want), written(t, mine.DomainSet), "%s", text)
++		require.Equal(t, Describe(theirs.Domain[:min(3, len(theirs.Domain))], len(theirs.Domain),
++			theirs.DomainSuffix[:min(3, len(theirs.DomainSuffix))], len(theirs.DomainSuffix)), mine.DomainSet.String(), "%s", text)
++		mine.DomainSet = nil
+ 		theirs.Domain, theirs.DomainSuffix = nil, nil
+ 	}
+ 	require.True(t, reflect.DeepEqual(stock, fast), "%s\nsing-box: %#v\nhere: %#v", text, stock, fast)
+@@ -372,7 +375,7 @@ func BenchmarkReadSource(b *testing.B) {
+ 					b.Fatal(err)
+ 				}
+ 				rule := compat.Options.Rules[0].DefaultOptions
+-				_, err = NewMatcher(rule.Domain, rule.DomainSuffix, false)
++				_, err = NewSet(rule.Domain, rule.DomainSuffix)
+ 				if err != nil {
+ 					b.Fatal(err)
+ 				}
+@@ -382,7 +385,7 @@ func BenchmarkReadSource(b *testing.B) {
+ 			b.ReportAllocs()
+ 			for range b.N {
+ 				compat, err := ReadSource(text)
+-				if err != nil || compat.Options.Rules[0].DefaultOptions.DomainMatcher == nil {
++				if err != nil || compat.Options.Rules[0].DefaultOptions.DomainSet == nil {
+ 					b.Fatal(err)
+ 				}
+ 			}
+diff --git a/common/domainset/succinct/set.go b/common/domainset/succinct/set.go
+new file mode 100644
+index 000000000..db6d7439b
+--- /dev/null
++++ b/common/domainset/succinct/set.go
+@@ -0,0 +1,301 @@
++// Package succinct is the domain trie of sing (common/domain) as a type of its own: the
++// succinct set domain.Matcher keeps, which common/domainset builds in place where
++// domain.ReadMatcher would copy it. The matching, the indexes and the bit tricks are the
++// code of sing (common/domain/matcher.go and set.go, after github.com/openacid/succinct),
++// copied without a change of what they do; the tests of the package hold them to sing's.
++package succinct
++
++import (
++	"encoding/binary"
++	"math/bits"
++	"unicode/utf8"
++
++	E "github.com/sagernet/sing/common/exceptions"
++	"github.com/sagernet/sing/common/varbin"
++)
++
++// the labels of sing: a key that ends a suffix, and one that ends a name and its
++// subdomains
++const (
++	prefixLabel = '\r'
++	rootLabel   = '\n'
++)
++
++// Set is a domain trie: what domain.Matcher matches, of the same parts.
++type Set struct {
++	leaves, labelBitmap []uint64
++	labels              []byte
++	ranks, selects      []int32
++	description         string
++}
++
++// New makes a set of the parts of a trie as succinctSet.Write of sing writes them. The
++// slices are kept, not copied. A trie that is not one is refused, as domain.ReadMatcher
++// refuses it. The description is what String tells of the set.
++func New(leaves []uint64, labelBitmap []uint64, labels []byte, description string) (*Set, error) {
++	onesCount := 0
++	lastOneIndex := -1
++	for wordIndex, word := range labelBitmap {
++		onesCount += bits.OnesCount64(word)
++		if word != 0 {
++			lastOneIndex = wordIndex<<6 | (63 - bits.LeadingZeros64(word))
++		}
++	}
++	zerosCount := lastOneIndex + 1 - onesCount
++	if onesCount != zerosCount+1 || len(labels) != zerosCount {
++		return nil, E.New("domain: malformed succinct set")
++	}
++	leavesWordCount := (onesCount + 63) >> 6
++	if len(leaves) < leavesWordCount {
++		leaves = append(leaves, make([]uint64, leavesWordCount-len(leaves))...)
++	}
++	set := &Set{leaves: leaves, labelBitmap: labelBitmap, labels: labels, description: description}
++	set.selects, set.ranks = indexSelect32R64(labelBitmap)
++	return set, nil
++}
++
++// Match tells whether the set has the domain, as domain.Matcher.Match does.
++func (s *Set) Match(domain string) bool {
++	return s.has(reverseDomain(domain))
++}
++
++// String is the description the set was made with.
++func (s *Set) String() string {
++	return s.description
++}
++
++// Write writes the set as domain.Matcher.Write does.
++func (s *Set) Write(writer varbin.Writer) error {
++	err := writer.WriteByte(0)
++	if err != nil {
++		return err
++	}
++	err = writeUint64Slice(writer, s.leaves)
++	if err != nil {
++		return err
++	}
++	err = writeUint64Slice(writer, s.labelBitmap)
++	if err != nil {
++		return err
++	}
++	return writeByteSlice(writer, s.labels)
++}
++
++func (s *Set) has(key string) bool {
++	var nodeId, bmIdx int
++	for i := 0; i < len(key); i++ {
++		currentChar := key[i]
++		for ; ; bmIdx++ {
++			if getBit(s.labelBitmap, bmIdx) != 0 {
++				return false
++			}
++			nextLabel := s.labels[bmIdx-nodeId]
++			if nextLabel == prefixLabel {
++				return true
++			}
++			if nextLabel == rootLabel {
++				nextNodeId := countZeros(s.labelBitmap, s.ranks, bmIdx+1)
++				hasNext := getBit(s.leaves, nextNodeId) != 0
++				if currentChar == '.' && hasNext {
++					return true
++				}
++			}
++			if nextLabel == currentChar {
++				break
++			}
++		}
++		nodeId = countZeros(s.labelBitmap, s.ranks, bmIdx+1)
++		bmIdx = selectIthOne(s.labelBitmap, s.ranks, s.selects, nodeId-1) + 1
++	}
++	if getBit(s.leaves, nodeId) != 0 {
++		return true
++	}
++	for ; ; bmIdx++ {
++		if getBit(s.labelBitmap, bmIdx) != 0 {
++			return false
++		}
++		nextLabel := s.labels[bmIdx-nodeId]
++		if nextLabel == prefixLabel || nextLabel == rootLabel {
++			return true
++		}
++	}
++}
++
++func reverseDomain(domain string) string {
++	l := len(domain)
++	b := make([]byte, l)
++	for i := 0; i < l; {
++		r, n := utf8.DecodeRuneInString(domain[i:])
++		i += n
++		utf8.EncodeRune(b[l-i:], r)
++	}
++	return string(b)
++}
++
++func writeUint64Slice(writer varbin.Writer, value []uint64) error {
++	_, err := varbin.WriteUvarint(writer, uint64(len(value)))
++	if err != nil {
++		return err
++	}
++	if len(value) == 0 {
++		return nil
++	}
++	return binary.Write(writer, binary.BigEndian, value)
++}
++
++func writeByteSlice(writer varbin.Writer, value []byte) error {
++	_, err := varbin.WriteUvarint(writer, uint64(len(value)))
++	if err != nil {
++		return err
++	}
++	if len(value) == 0 {
++		return nil
++	}
++	_, err = writer.Write(value)
++	return err
++}
++
++func getBit(bm []uint64, i int) uint64 {
++	return bm[i>>6] & (1 << uint(i&63))
++}
++
++func countZeros(bm []uint64, ranks []int32, i int) int {
++	a, _ := rank64(bm, ranks, int32(i))
++	return i - int(a)
++}
++
++func selectIthOne(bm []uint64, ranks, selects []int32, i int) int {
++	a, _ := select32R64(bm, selects, ranks, int32(i))
++	return int(a)
++}
++
++func rank64(words []uint64, rindex []int32, i int32) (int32, int32) {
++	wordI := i >> 6
++	j := uint32(i & 63)
++	n := rindex[wordI]
++	w := words[wordI]
++	c1 := n + int32(bits.OnesCount64(w&mask[j]))
++	return c1, int32(w>>uint(j)) & 1
++}
++
++func indexRank64(words []uint64, opts ...bool) []int32 {
++	trailing := false
++	if len(opts) > 0 {
++		trailing = opts[0]
++	}
++	l := len(words)
++	if trailing {
++		l++
++	}
++	idx := make([]int32, l)
++	n := int32(0)
++	for i := range len(words) {
++		idx[i] = n
++		n += int32(bits.OnesCount64(words[i]))
++	}
++	if trailing {
++		idx[len(words)] = n
++	}
++	return idx
++}
++
++func select32R64(words []uint64, selectIndex, rankIndex []int32, i int32) (int32, int32) {
++	a := int32(0)
++	l := int32(len(words))
++	wordI := selectIndex[i>>5] >> 6
++	for ; rankIndex[wordI+1] <= i; wordI++ {
++	}
++	w := words[wordI]
++	ww := w
++	base := wordI << 6
++	findIth := int(i - rankIndex[wordI])
++	offset := int32(0)
++	ones := bits.OnesCount32(uint32(ww))
++	if ones <= findIth {
++		findIth -= ones
++		offset |= 32
++		ww >>= 32
++	}
++	ones = bits.OnesCount16(uint16(ww))
++	if ones <= findIth {
++		findIth -= ones
++		offset |= 16
++		ww >>= 16
++	}
++	ones = bits.OnesCount8(uint8(ww))
++	if ones <= findIth {
++		a = int32(select8Lookup[(ww>>5)&0x7f8|uint64(findIth-ones)]) + offset + 8
++	} else {
++		a = int32(select8Lookup[(ww&0xff)<<3|uint64(findIth)]) + offset
++	}
++	a += base
++	w &= rMaskUpto[a&63]
++	if w != 0 {
++		return a, base + int32(bits.TrailingZeros64(w))
++	}
++	wordI++
++	for ; wordI < l; wordI++ {
++		w = words[wordI]
++		if w != 0 {
++			return a, wordI<<6 + int32(bits.TrailingZeros64(w))
++		}
++	}
++	return a, l << 6
++}
++
++func indexSelect32R64(words []uint64) ([]int32, []int32) {
++	l := len(words) << 6
++	sidx := make([]int32, 0, len(words))
++
++	ith := -1
++	for i := range l {
++		if words[i>>6]&(1<<uint(i&63)) != 0 {
++			ith++
++			if ith&31 == 0 {
++				sidx = append(sidx, int32(i))
++			}
++		}
++	}
++
++	// clone to reduce cap to len
++	sidx = append(sidx[:0:0], sidx...)
++	return sidx, indexRank64(words, true)
++}
++
++func init() {
++	initMasks()
++	initSelectLookup()
++}
++
++var (
++	mask      [65]uint64
++	rMaskUpto [64]uint64
++)
++
++func initMasks() {
++	for i := range 65 {
++		mask[i] = (1 << uint(i)) - 1
++	}
++
++	var maskUpto [64]uint64
++	for i := range 64 {
++		maskUpto[i] = (1 << uint(i+1)) - 1
++		rMaskUpto[i] = ^maskUpto[i]
++	}
++}
++
++var select8Lookup [256 * 8]uint8
++
++func initSelectLookup() {
++	for i := range 256 {
++		w := uint8(i)
++		for j := range 8 {
++			// x-th 1 in w
++			// if x-th 1 is not found, it is 8
++			x := bits.TrailingZeros8(w)
++			w &= w - 1
++
++			select8Lookup[i*8+j] = uint8(x)
++		}
++	}
++}
+diff --git a/common/domainset/trie.go b/common/domainset/trie.go
+index 7fbca0b5b..9a8ebd621 100644
+--- a/common/domainset/trie.go
++++ b/common/domainset/trie.go
+@@ -2,14 +2,15 @@ package domainset
+ 
+ import (
+ 	"encoding/binary"
+-	"io"
++	"runtime"
++	"slices"
+ 
+-	"github.com/sagernet/sing/common/domain"
++	"github.com/sagernet/sing-box/common/domainset/succinct"
+ 	E "github.com/sagernet/sing/common/exceptions"
+ )
+ 
+ // trie is the succinct set of sing (common/domain/set.go) as its Write writes it, without
+-// the indexes ReadMatcher makes.
++// the indexes succinct.New makes.
+ type trie struct {
+ 	leaves, labelBitmap []uint64
+ 	labels              []byte
+@@ -19,16 +20,34 @@ type trie struct {
+ // counts them by their next byte.
+ const smallSpan = 24
+ 
+-// Matcher builds the matcher of the names gathered: domain.NewMatcher of sing for the
+-// same names, byte for byte. The collector is spent: its keys are let go before sing
+-// reads the trie.
+-func (c *Collector) Matcher() (*domain.Matcher, error) {
++// Set builds the trie of the names gathered: the one domain.NewMatcher of sing builds of
++// the same names, byte for byte, as a set of its own, so that it is not copied. The
++// collector is spent: its keys are let go first. The description is what the set tells
++// of itself (Describe).
++func (c *Collector) Set(description string) (*succinct.Set, error) {
+ 	built, err := c.build()
+ 	c.release()
+ 	if err != nil {
+ 		return nil, err
+ 	}
+-	return domain.ReadMatcher(built.reader())
++	// the buffers were made for the most the trie could take; a trie of names that share
++	// much takes far less, and the set is kept as long as its rule set. A big trie is
++	// made smaller by a copy, with the garbage of the build collected first, so that the
++	// copy does not come on top of it: a million names (x86) peak at +40-46 MB and keep
++	// 43 MB of heap so, at +41-44 MB and 52 MB with no copy, at +58-64 MB and 43 MB with
++	// a copy on top of the garbage.
++	if len(built.labels) > 1<<20 && cap(built.labels)-len(built.labels) > len(built.labels)/8 {
++		runtime.GC()
++	}
++	return succinct.New(fit(built.leaves), fit(built.labelBitmap), fit(built.labels), description)
++}
++
++// fit is a slice without the room it was made with beyond an eighth of what it holds.
++func fit[T any](items []T) []T {
++	if cap(items)-len(items) > len(items)/8 {
++		return slices.Clone(items)
++	}
++	return items
+ }
+ 
+ // Encode is the matcher of the names gathered as domain.Matcher.Write writes it, the form
+@@ -214,30 +233,3 @@ func (t trie) parts() ([]byte, []byte) {
+ 	head = binary.AppendUvarint(head, uint64(len(t.labels)))
+ 	return head, t.labels
+ }
+-
+-// reader hands the trie to domain.ReadMatcher without a copy of the labels.
+-func (t trie) reader() *twoParts {
+-	head, labels := t.parts()
+-	return &twoParts{head, labels}
+-}
+-
+-// twoParts reads one slice of bytes, then another.
+-type twoParts [2][]byte
+-
+-func (p *twoParts) Read(buffer []byte) (int, error) {
+-	for len(p[0]) == 0 {
+-		if len(p[1]) == 0 {
+-			return 0, io.EOF
+-		}
+-		p[0], p[1] = p[1], nil
+-	}
+-	read := copy(buffer, p[0])
+-	p[0] = p[0][read:]
+-	return read, nil
+-}
+-
+-func (p *twoParts) ReadByte() (byte, error) {
+-	var one [1]byte
+-	_, err := p.Read(one[:])
+-	return one[0], err
+-}
+diff --git a/option/rule_set.go b/option/rule_set.go
+index b06342280..9b3cdadb4 100644
+--- a/option/rule_set.go
++++ b/option/rule_set.go
+@@ -5,6 +5,7 @@ import (
+ 	"path/filepath"
+ 	"reflect"
+ 
++	"github.com/sagernet/sing-box/common/domainset/succinct"
+ 	C "github.com/sagernet/sing-box/constant"
+ 	"github.com/sagernet/sing/common"
+ 	"github.com/sagernet/sing/common/domain"
+@@ -209,6 +210,7 @@ type DefaultHeadlessRule struct {
+ 	Invert bool `json:"invert,omitempty"`
+ 
+ 	DomainMatcher *domain.Matcher `json:"-"`
++	DomainSet     *succinct.Set   `json:"-"` // domain and domain_suffix as common/domainset builds them
+ 	SourceIPSet   *netipx.IPSet   `json:"-"`
+ 	IPSet         *netipx.IPSet   `json:"-"`
+ 
+diff --git a/route/rule/rule_headless.go b/route/rule/rule_headless.go
+index c5146318b..c801b6bfa 100644
+--- a/route/rule/rule_headless.go
++++ b/route/rule/rule_headless.go
+@@ -66,6 +66,10 @@ func NewDefaultHeadlessRule(ctx context.Context, options option.DefaultHeadlessR
+ 		item := NewRawDomainItem(options.DomainMatcher)
+ 		rule.destinationAddressItems = append(rule.destinationAddressItems, item)
+ 		rule.allItems = append(rule.allItems, item)
++	} else if options.DomainSet != nil {
++		item := NewDomainSetItem(options.DomainSet)
++		rule.destinationAddressItems = append(rule.destinationAddressItems, item)
++		rule.allItems = append(rule.allItems, item)
+ 	}
+ 	if len(options.DomainKeyword) > 0 {
+ 		item := NewDomainKeywordItem(options.DomainKeyword)
+diff --git a/route/rule/rule_item_domain.go b/route/rule/rule_item_domain.go
+index 57323360d..b241c1898 100644
+--- a/route/rule/rule_item_domain.go
++++ b/route/rule/rule_item_domain.go
+@@ -6,6 +6,7 @@ import (
+ 
+ 	"github.com/sagernet/sing-box/adapter"
+ 	"github.com/sagernet/sing-box/common/domainset"
++	"github.com/sagernet/sing-box/common/domainset/succinct"
+ 	"github.com/sagernet/sing/common/domain"
+ 	E "github.com/sagernet/sing/common/exceptions"
+ )
+@@ -13,7 +14,7 @@ import (
+ var _ RuleItem = (*DomainItem)(nil)
+ 
+ type DomainItem struct {
+-	matcher     *domain.Matcher
++	matcher     domainset.Matcher
+ 	description string
+ }
+ 
+@@ -24,36 +25,15 @@ func NewDomainItem(domains []string, domainSuffixes []string) (*DomainItem, erro
+ 	if slices.Contains(domainSuffixes, "") {
+ 		return nil, E.New("domain_suffix: empty item is not allowed")
+ 	}
+-	var description string
+-	if dLen := len(domains); dLen > 0 {
+-		if dLen == 1 {
+-			description = "domain=" + domains[0]
+-		} else if dLen > 3 {
+-			description = "domain=[" + strings.Join(domains[:3], " ") + "...]"
+-		} else {
+-			description = "domain=[" + strings.Join(domains, " ") + "]"
+-		}
+-	}
+-	if dsLen := len(domainSuffixes); dsLen > 0 {
+-		if len(description) > 0 {
+-			description += " "
+-		}
+-		if dsLen == 1 {
+-			description += "domain_suffix=" + domainSuffixes[0]
+-		} else if dsLen > 3 {
+-			description += "domain_suffix=[" + strings.Join(domainSuffixes[:3], " ") + "...]"
+-		} else {
+-			description += "domain_suffix=[" + strings.Join(domainSuffixes, " ") + "]"
+-		}
+-	}
+-	// the matcher of sing built with a fraction of the memory domain.NewMatcher takes
+-	matcher, err := domainset.NewMatcher(domains, domainSuffixes, false)
++	// the trie of sing built with a fraction of the memory domain.NewMatcher takes, and
++	// the description of the lists (domainset.Describe)
++	matcher, err := domainset.NewSet(domains, domainSuffixes)
+ 	if err != nil {
+ 		return nil, err
+ 	}
+ 	return &DomainItem{
+ 		matcher,
+-		description,
++		domainset.Describe(domains[:min(3, len(domains))], len(domains), domainSuffixes[:min(3, len(domainSuffixes))], len(domainSuffixes)),
+ 	}, nil
+ }
+ 
+@@ -64,6 +44,14 @@ func NewRawDomainItem(matcher *domain.Matcher) *DomainItem {
+ 	}
+ }
+ 
++// NewDomainSetItem is the item of a trie common/domainset built of the lists of a rule.
++func NewDomainSetItem(set *succinct.Set) *DomainItem {
++	return &DomainItem{
++		set,
++		set.String(),
++	}
++}
++
+ func (r *DomainItem) Match(metadata *adapter.InboundContext) bool {
+ 	var domainHost string
+ 	if metadata.Domain != "" {
+-- 
+2.53.0
+

@@ -1,0 +1,212 @@
+From 29d4eb843b69e8a9a53cbf18bcb2c1d9563f4497 Mon Sep 17 00:00:00 2001
+From: FiyeroT <me@fiyero.xyz>
+Date: Sun, 4 Oct 2026 08:45:40 +0300
+Subject: [PATCH 040/148] urltest: the Clash API's delay test does not wait for
+ nested selections
+
+The Clash API's delay test of a group returns once the members are tested,
+without the group's selection, which may run download tests of up to 15 s per
+candidate ("the Clash API's round does not wait"). A nested urltest group
+among the members still selected inside the batch: the delay test of a
+selector holding urltest groups, as podkop's dashboard runs with a 10 s
+timeout, or of a urltest group of groups, waited for every nested download
+test, and its timeout canceled the tests of the other members.
+
+URLTestOutbounds and the round take wait: the periodic round of a group and
+the daemon keep waiting for nested selections, since the group above selects
+by the nested group's new choice; the Clash API does not, and the nested
+group selects afterwards, as its own delay test already did.
+---
+ daemon/started_service.go               |  2 +-
+ experimental/clashapi/api_meta_group.go |  2 +-
+ protocol/group/urltest.go               | 29 ++++++++++++----
+ protocol/group/urltest_download_test.go | 46 +++++++++++++++++++++++++
+ protocol/group/urltest_interval_test.go |  2 +-
+ 5 files changed, 71 insertions(+), 10 deletions(-)
+
+diff --git a/daemon/started_service.go b/daemon/started_service.go
+index f1fb0f0d8..955628546 100644
+--- a/daemon/started_service.go
++++ b/daemon/started_service.go
+@@ -734,7 +734,7 @@ func (s *StartedService) URLTest(ctx context.Context, request *URLTestRequest) (
+ 			itOutbound, _ := boxService.outboundManager.Outbound(it)
+ 			return itOutbound
+ 		}))
+-		go group.URLTestOutbounds(boxService.ctx, boxService.outboundManager, historyStorage, boxService.logFactory.Logger(), outbounds, "", 0, true)
++		go group.URLTestOutbounds(boxService.ctx, boxService.outboundManager, historyStorage, boxService.logFactory.Logger(), outbounds, "", 0, true, true)
+ 	} else {
+ 		go func() {
+ 			t, err := urltest.URLTest(boxService.ctx, "", outbound)
+diff --git a/experimental/clashapi/api_meta_group.go b/experimental/clashapi/api_meta_group.go
+index 725f37288..452f05001 100644
+--- a/experimental/clashapi/api_meta_group.go
++++ b/experimental/clashapi/api_meta_group.go
+@@ -86,7 +86,7 @@ func getGroupDelay(server *Server) func(w http.ResponseWriter, r *http.Request)
+ 				itOutbound, _ := server.outbound.Outbound(it)
+ 				return itOutbound
+ 			}))
+-			result = group.URLTestOutbounds(ctx, server.outbound, server.urlTestHistory, server.logger, outbounds, url, 0, true)
++			result = group.URLTestOutbounds(ctx, server.outbound, server.urlTestHistory, server.logger, outbounds, url, 0, true, false)
+ 		}
+ 
+ 		if err != nil {
+diff --git a/protocol/group/urltest.go b/protocol/group/urltest.go
+index 7986cd8bb..2b386380c 100644
+--- a/protocol/group/urltest.go
++++ b/protocol/group/urltest.go
+@@ -472,26 +472,28 @@ func (g *URLTestGroup) CheckOutbounds(ctx context.Context, force bool) {
+ }
+ 
+ // URLTest is the Clash API's round: it does not wait for the selection, which may run a
+-// download test.
++// download test, nor for those of the nested urltest groups.
+ func (g *URLTestGroup) URLTest(ctx context.Context) (map[string]uint16, error) {
+-	result, err := g.urlTestRound(ctx, true)
++	result, err := g.urlTestRound(ctx, true, false)
+ 	g.requestUpdateCheck()
+ 	return result, err
+ }
+ 
+ func (g *URLTestGroup) urlTest(ctx context.Context, force bool) (map[string]uint16, error) {
+-	result, err := g.urlTestRound(ctx, force)
++	result, err := g.urlTestRound(ctx, force, true)
+ 	g.performUpdateCheck()
+ 	return result, err
+ }
+ 
+ // urlTestRound tests the members, one round at a time; the selection is not part of the round.
+-func (g *URLTestGroup) urlTestRound(ctx context.Context, force bool) (map[string]uint16, error) {
++// With wait, a nested urltest group among the members selects within the round (see
++// URLTestOutbounds).
++func (g *URLTestGroup) urlTestRound(ctx context.Context, force bool, wait bool) (map[string]uint16, error) {
+ 	if g.checking.Swap(true) {
+ 		return make(map[string]uint16), nil
+ 	}
+ 	defer g.checking.Store(false)
+-	return URLTestOutbounds(ctx, g.outbound, g.history, g.logger, g.members, g.link, g.interval, force), nil
++	return URLTestOutbounds(ctx, g.outbound, g.history, g.logger, g.members, g.link, g.interval, force, wait), nil
+ }
+ 
+ type urlTestResult struct {
+@@ -507,11 +509,17 @@ type urlTestBatch struct {
+ 	batch    *batch.Batch[any]
+ 	checked  map[string]bool
+ 	groups   []adapter.OutboundGroup
++	wait     bool
+ 	access   sync.Mutex
+ 	result   map[string]uint16
+ }
+ 
+-func URLTestOutbounds(ctx context.Context, outboundManager adapter.OutboundManager, history *urltest.HistoryStorage, logger log.Logger, outbounds []adapter.Outbound, link string, interval time.Duration, force bool) map[string]uint16 {
++// URLTestOutbounds tests outbounds and, through them, the members of nested groups. A nested
++// urltest group runs its own round and then selects. With wait, the call returns after
++// that selection: a periodic round of the group above selects by the nested group's new
++// choice. Without, the selection runs after the call returns: the Clash API answers its
++// client in time, while the selection may run a download test of up to 15 s per candidate.
++func URLTestOutbounds(ctx context.Context, outboundManager adapter.OutboundManager, history *urltest.HistoryStorage, logger log.Logger, outbounds []adapter.Outbound, link string, interval time.Duration, force bool, wait bool) map[string]uint16 {
+ 	b, _ := batch.New(ctx, batch.WithConcurrencyNum[any](10))
+ 	testBatch := &urlTestBatch{
+ 		ctx:      ctx,
+@@ -520,6 +528,7 @@ func URLTestOutbounds(ctx context.Context, outboundManager adapter.OutboundManag
+ 		logger:   logger,
+ 		batch:    b,
+ 		checked:  make(map[string]bool),
++		wait:     wait,
+ 		result:   make(map[string]uint16),
+ 	}
+ 	testBatch.test(outbounds, link, interval, force)
+@@ -544,7 +553,13 @@ func (b *urlTestBatch) test(outbounds []adapter.Outbound, link string, interval
+ 			b.checked[tag] = true
+ 			b.groups = append(b.groups, nested)
+ 			b.batch.Go(tag, func() (any, error) {
+-				nestedResult, _ := nested.group.urlTest(b.ctx, force)
++				var nestedResult map[string]uint16
++				if b.wait {
++					nestedResult, _ = nested.group.urlTest(b.ctx, force)
++				} else {
++					nestedResult, _ = nested.group.urlTestRound(b.ctx, force, false)
++					nested.group.requestUpdateCheck()
++				}
+ 				b.access.Lock()
+ 				maps.Copy(b.result, nestedResult)
+ 				b.access.Unlock()
+diff --git a/protocol/group/urltest_download_test.go b/protocol/group/urltest_download_test.go
+index 49562c6b3..8e1b54149 100644
+--- a/protocol/group/urltest_download_test.go
++++ b/protocol/group/urltest_download_test.go
+@@ -13,6 +13,7 @@ import (
+ 	"time"
+ 
+ 	"github.com/sagernet/sing-box/adapter"
++	"github.com/sagernet/sing-box/adapter/outbound"
+ 	"github.com/sagernet/sing-box/common/urltest"
+ 	C "github.com/sagernet/sing-box/constant"
+ 	"github.com/sagernet/sing-box/log"
+@@ -253,6 +254,51 @@ func TestURLTestClashPathsDoNotWait(t *testing.T) {
+ 	}
+ }
+ 
++// The Clash API's delay test of a group with a nested urltest group (a selector, or a
++// urltest group of groups) does not wait for the nested group's selection either, which
++// then runs afterwards; the periodic round of the group above does wait for it.
++func TestURLTestClashPathsDoNotWaitForNested(t *testing.T) {
++	link, _ := testURL(t, 0)
++	a := newTestMember(C.TypeVLESS, "a", dialWorking)
++	_, nestedGroup := newTestURLTest(t, link, a)
++	nested := &URLTest{Adapter: outbound.NewAdapter(C.TypeURLTest, "nested", []string{N.NetworkTCP, N.NetworkUDP}, nil), group: nestedGroup}
++	manager := &testOutboundManager{members: map[string]adapter.Outbound{"a": a, "nested": nested}}
++	nestedGroup.outbound = manager
++	parent, err := NewURLTestGroup(service.ContextWithPtr(context.Background(), nestedGroup.history), manager, log.NewNOPFactory().Logger(),
++		[]adapter.Outbound{nested}, nil, link, "", time.Minute, 50, 0, false)
++	require.NoError(t, err)
++
++	nestedGroup.updateAccess.Lock() // as a download test would
++	done := make(chan struct{})
++	go func() {
++		URLTestOutbounds(context.Background(), manager, nestedGroup.history, log.NewNOPFactory().Logger(), []adapter.Outbound{nested}, link, 0, true, false)
++		_, _ = parent.URLTest(context.Background())
++		close(done)
++	}()
++	select {
++	case <-done:
++	case <-time.After(2 * time.Second):
++		t.Fatal("the Clash API paths waited for the selection of the nested group")
++	}
++
++	waited := make(chan struct{})
++	go func() {
++		_, _ = parent.urlTest(context.Background(), true)
++		close(waited)
++	}()
++	select {
++	case <-waited:
++		t.Fatal("the periodic round did not wait for the selection of the nested group")
++	case <-time.After(200 * time.Millisecond):
++	}
++	nestedGroup.updateAccess.Unlock()
++	select {
++	case <-waited:
++	case <-time.After(2 * time.Second):
++		t.Fatal("the periodic round did not end after the selection")
++	}
++}
++
+ // While the selected member has no test result (it is down) and the selection waits for a
+ // download test, connections go by the plain choice.
+ func TestURLTestDialFallsBackWhileSelectionPending(t *testing.T) {
+diff --git a/protocol/group/urltest_interval_test.go b/protocol/group/urltest_interval_test.go
+index f39aa86d0..f08618667 100644
+--- a/protocol/group/urltest_interval_test.go
++++ b/protocol/group/urltest_interval_test.go
+@@ -84,7 +84,7 @@ func TestURLTestFreshness(t *testing.T) {
+ 			member := newTestMember(C.TypeVLESS, "member", dialWorking)
+ 			history := urltest.NewHistoryStorage()
+ 			history.StoreURLTestHistory("member", &adapter.URLTestHistory{Time: time.Now().Add(-testCase.age), Delay: 10})
+-			URLTestOutbounds(context.Background(), nil, history, log.NewNOPFactory().Logger(), []adapter.Outbound{member}, link, interval, false)
++			URLTestOutbounds(context.Background(), nil, history, log.NewNOPFactory().Logger(), []adapter.Outbound{member}, link, interval, false, true)
+ 			require.Equal(t, testCase.tested, member.dials.Load() > 0)
+ 		})
+ 	}
+-- 
+2.53.0
+

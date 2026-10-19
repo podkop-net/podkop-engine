@@ -1,0 +1,257 @@
+From 5cf7af5e862f30fd94b9e67c217064102edd96af Mon Sep 17 00:00:00 2001
+From: FiyeroT <me@fiyero.xyz>
+Date: Tue, 6 Oct 2026 23:55:22 +0300
+Subject: [PATCH 081/148] route: count the refusals of a loop to the inbound
+ instead of logging each
+
+A connection that the direct outbound would dial back to the inbound it came in on is
+refused, and every refusal was an error line. What reaches the listen address of an
+inbound without being hijacked (a DNS response or anything that is not a query sent to a
+DNS inbound) usually keeps coming, and every datagram is a session of its own: a local
+sender in a loop filled the log, which on a router is a small ring buffer.
+
+The first refusal of an inbound is logged as before; while they go on, one line every
+10 seconds gives the number of refusals in between and the last one, as the DNS client
+does for a server that fails.
+---
+ route/route.go          |  9 ++++-
+ route/route_log_test.go | 86 +++++++++++++++++++++++++++++++++++++++++
+ route/route_loop_log.go | 71 ++++++++++++++++++++++++++++++++++
+ route/router.go         |  1 +
+ 4 files changed, 165 insertions(+), 2 deletions(-)
+ create mode 100644 route/route_loop_log.go
+
+diff --git a/route/route.go b/route/route.go
+index 42e93844f..ed9c6ecff 100644
+--- a/route/route.go
++++ b/route/route.go
+@@ -162,7 +162,7 @@ func (r *Router) routeConnection(ctx context.Context, conn net.Conn, metadata ad
+ 
+ 	if r.wouldLoopToInbound(&metadata, selectedOutbound) {
+ 		buf.ReleaseMulti(buffers)
+-		return E.New("refused connection to the address of inbound ", metadata.Inbound, " (", metadata.Destination, "): not hijacked, would loop")
++		return &inboundLoopError{metadata.Inbound, E.New("refused connection to the address of inbound ", metadata.Inbound, " (", metadata.Destination, "): not hijacked, would loop")}
+ 	}
+ 	for _, buffer := range buffers {
+ 		conn = bufio.NewCachedConn(conn, buffer)
+@@ -297,7 +297,7 @@ func (r *Router) routePacketConnection(ctx context.Context, conn N.PacketConn, m
+ 	}
+ 	if r.wouldLoopToInbound(&metadata, selectedOutbound) {
+ 		N.ReleaseMultiPacketBuffer(packetBuffers)
+-		return E.New("refused packet to the address of inbound ", metadata.Inbound, " (", metadata.Destination, "): not hijacked, would loop")
++		return &inboundLoopError{metadata.Inbound, E.New("refused packet to the address of inbound ", metadata.Inbound, " (", metadata.Destination, "): not hijacked, would loop")}
+ 	}
+ 	for _, buffer := range packetBuffers {
+ 		conn = bufio.NewCachedPacketConn(conn, buffer.Buffer, buffer.Destination)
+@@ -564,6 +564,11 @@ func (r *Router) logRefused(ctx context.Context, destination M.Socksaddr, err er
+ 		r.logger.WarnContext(ctx, "connection to ", destination, " refused: no fakeip record (the address was given out shortly before a crash, was flushed, or was unused for a long time); the client gets a new one when it resolves the name again")
+ 		return true
+ 	}
++	var loop *inboundLoopError
++	if errors.As(err, &loop) {
++		r.loopRefusals.refused(ctx, r.logger, loop)
++		return true
++	}
+ 	return false
+ }
+ 
+diff --git a/route/route_log_test.go b/route/route_log_test.go
+index 0faf9be42..cee65c8b6 100644
+--- a/route/route_log_test.go
++++ b/route/route_log_test.go
+@@ -11,6 +11,7 @@ import (
+ 	"time"
+ 
+ 	"github.com/sagernet/sing-box/adapter"
++	C "github.com/sagernet/sing-box/constant"
+ 	"github.com/sagernet/sing-box/log"
+ 	M "github.com/sagernet/sing/common/metadata"
+ 	N "github.com/sagernet/sing/common/network"
+@@ -78,6 +79,26 @@ type fakeDNSTransportManager struct {
+ 
+ func (m fakeDNSTransportManager) FakeIP() adapter.FakeIPTransport { return m.fakeIP }
+ 
++type fakeDNSRouter struct {
++	adapter.DNSRouter
++}
++
++func (fakeDNSRouter) LookupReverseMapping(netip.Addr) (string, bool) { return "", false }
++
++type fakeDirectOutbound struct {
++	adapter.Outbound
++}
++
++func (fakeDirectOutbound) Type() string      { return C.TypeDirect }
++func (fakeDirectOutbound) Tag() string       { return "direct-out" }
++func (fakeDirectOutbound) Network() []string { return []string{N.NetworkTCP, N.NetworkUDP} }
++
++type fakeDefaultOutboundManager struct {
++	adapter.OutboundManager
++}
++
++func (fakeDefaultOutboundManager) Default() adapter.Outbound { return fakeDirectOutbound{} }
++
+ // closedPacketConn is the connection of a refused session: the router only closes it.
+ type closedPacketConn struct {
+ 	N.PacketConn
+@@ -129,3 +150,68 @@ func TestMissingFakeIPRecordIsLoggedAsWarning(t *testing.T) {
+ 		require.Contains(t, line, "198.18.0.5:22")
+ 	}
+ }
++
++// waitLoopWindowClosed waits until the refusals of no inbound are being counted.
++func waitLoopWindowClosed(t *testing.T, router *Router) {
++	for deadline := time.Now().Add(30 * time.Second); ; time.Sleep(10 * time.Millisecond) {
++		router.loopRefusals.access.Lock()
++		open := len(router.loopRefusals.windows)
++		router.loopRefusals.access.Unlock()
++		if open == 0 {
++			return
++		}
++		require.False(t, time.Now().After(deadline), "the window stays open after the refusals stopped")
++	}
++}
++
++// The refusal of a connection that would be dialed back to its inbound is logged once,
++// then counted: one line per interval while the refusals go on.
++func TestLoopRefusalsAreCounted(t *testing.T) {
++	defer func() { loopRefusalLogInterval = 10 * time.Second }()
++	router, output := newLoggedRouter(t)
++	dnsIn := M.ParseSocksaddr("127.0.0.42:53")
++	router.inbound = fakeInboundManager{inbounds: map[string]adapter.Inbound{"dns-in": fakeListenInbound{addr: dnsIn}}}
++	router.outbound = fakeDefaultOutboundManager{}
++	router.dnsTransport = fakeDNSTransportManager{}
++	router.dns = fakeDNSRouter{}
++	metadata := adapter.InboundContext{
++		Inbound:     "dns-in",
++		Source:      M.ParseSocksaddr("127.0.0.1:40000"),
++		Destination: dnsIn,
++	}
++
++	// The counting, without the clock: the interval never ends by itself here, the test
++	// ends it by hand. The timers armed meanwhile do not fire while the test runs.
++	loopRefusalLogInterval = time.Hour
++	for range 20 {
++		routeRefused(t, router, N.NetworkUDP, metadata)
++	}
++	routeRefused(t, router, N.NetworkTCP, metadata)
++	lines := output.lines()
++	require.Len(t, lines, 1, output.String())
++	require.True(t, strings.HasPrefix(lines[0], "ERROR"), lines[0])
++	require.Contains(t, lines[0], "refused packet to the address of inbound dns-in (127.0.0.42:53): not hijacked, would loop")
++	router.loopRefusals.flush(router.logger, "dns-in")
++	lines = output.lines()
++	require.Len(t, lines, 2, output.String())
++	require.True(t, strings.HasPrefix(lines[1], "ERROR"), lines[1])
++	require.Contains(t, lines[1], "inbound dns-in: 20 more refused in 1h0m0s, the last: refused connection to the address of inbound dns-in (127.0.0.42:53)")
++	// an interval without refusals closes the window, silently
++	router.loopRefusals.flush(router.logger, "dns-in")
++	router.loopRefusals.access.Lock()
++	open := len(router.loopRefusals.windows)
++	router.loopRefusals.access.Unlock()
++	require.Zero(t, open)
++	require.Len(t, output.lines(), 2)
++
++	// The clock: refusals that come later are logged anew, the one that follows at once is
++	// counted, and the window closes by itself after an interval without refusals.
++	loopRefusalLogInterval = 2 * time.Second
++	routeRefused(t, router, N.NetworkUDP, metadata)
++	routeRefused(t, router, N.NetworkUDP, metadata)
++	require.Len(t, output.lines(), 3, output.String())
++	waitLoopWindowClosed(t, router)
++	lines = output.lines()
++	require.Len(t, lines, 4, output.String())
++	require.Contains(t, lines[3], "inbound dns-in: 1 more refused in 2s, the last: refused packet")
++}
+diff --git a/route/route_loop_log.go b/route/route_loop_log.go
+new file mode 100644
+index 000000000..9a78a78fb
+--- /dev/null
++++ b/route/route_loop_log.go
+@@ -0,0 +1,71 @@
++package route
++
++import (
++	"context"
++	"sync"
++	"time"
++
++	"github.com/sagernet/sing-box/log"
++	E "github.com/sagernet/sing/common/exceptions"
++)
++
++// inboundLoopError refuses a connection the direct outbound would dial back to the inbound
++// it came in on, see wouldLoopToInbound.
++type inboundLoopError struct {
++	inbound string
++	error
++}
++
++func (e *inboundLoopError) Unwrap() error {
++	return e.error
++}
++
++// Such refusals are logged here, by inbound. What reaches the listen address of an inbound
++// without being hijacked usually keeps coming, and every datagram is a session of its own:
++// the first refusal is logged at once, and while they go on, one line every
++// loopRefusalLogInterval counts the refusals in between and shows the last one.
++var loopRefusalLogInterval = 10 * time.Second
++
++type loopRefusalLog struct {
++	access  sync.Mutex
++	windows map[string]*loopRefusalWindow
++}
++
++type loopRefusalWindow struct {
++	count int
++	last  error
++}
++
++func (l *loopRefusalLog) refused(ctx context.Context, logger log.ContextLogger, refusal *inboundLoopError) {
++	inbound := refusal.inbound
++	l.access.Lock()
++	if l.windows == nil {
++		l.windows = make(map[string]*loopRefusalWindow)
++	}
++	window, open := l.windows[inbound]
++	if open {
++		window.count++
++		window.last = refusal
++		l.access.Unlock()
++		return
++	}
++	l.windows[inbound] = &loopRefusalWindow{}
++	l.access.Unlock()
++	logger.ErrorContext(ctx, refusal)
++	time.AfterFunc(loopRefusalLogInterval, func() { l.flush(logger, inbound) })
++}
++
++func (l *loopRefusalLog) flush(logger log.ContextLogger, inbound string) {
++	l.access.Lock()
++	window := l.windows[inbound]
++	if window.count == 0 {
++		delete(l.windows, inbound)
++		l.access.Unlock()
++		return
++	}
++	count, last := window.count, window.last
++	window.count = 0
++	l.access.Unlock()
++	logger.Error(E.Cause(last, "inbound ", inbound, ": ", count, " more refused in ", loopRefusalLogInterval, ", the last"))
++	time.AfterFunc(loopRefusalLogInterval, func() { l.flush(logger, inbound) })
++}
+diff --git a/route/router.go b/route/router.go
+index 0673ddef8..f932d068a 100644
+--- a/route/router.go
++++ b/route/router.go
+@@ -47,6 +47,7 @@ type Router struct {
+ 	pauseManager      pause.Manager
+ 	trackers          []adapter.ConnectionTracker
+ 	platformInterface adapter.PlatformInterface
++	loopRefusals      loopRefusalLog
+ }
+ 
+ func NewRouter(ctx context.Context, logFactory log.Factory, options option.RouteOptions, dnsOptions option.DNSOptions) *Router {
+-- 
+2.53.0
+

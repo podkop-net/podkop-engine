@@ -1,7 +1,7 @@
 From 4bb50e3cd2b8f331cc85762dc3d6d8463e7277e7 Mon Sep 17 00:00:00 2001
 From: FiyeroT <me@fiyero.xyz>
 Date: Sat, 3 Oct 2026 16:05:16 +0300
-Subject: [PATCH 025/126] dns/https: reset the transport on a timeout only when
+Subject: [PATCH 025/140] dns/https: reset the transport on a timeout only when
  no later query was answered
 
 A query to DoH that runs out of time reset the whole transport. On 1.14 the reset

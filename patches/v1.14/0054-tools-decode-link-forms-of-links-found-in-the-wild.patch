@@ -1,0 +1,433 @@
+From b0c70e98ae2d565b7e8c062145b1ea7b633957da Mon Sep 17 00:00:00 2001
+From: FiyeroT <me@fiyero.xyz>
+Date: Mon, 5 Oct 2026 16:53:40 +0300
+Subject: [PATCH 054/148] tools decode-link: forms of links found in the wild
+
+Checked against 257 example links of panels, clients and public lists:
+- parameter names in any case, other spellings of the insecure flag, the
+  server name and the packet encoding, the "amp;" of links copied from HTML;
+- a Trojan password with "/";
+- XHTTP settings written as parameters of the link next to or instead of
+  "extra", the mode as v2rayA names it, "extra" escaped twice;
+- whole numbers written with a fraction in ranges;
+- the name of the WebSocket early data header;
+- a warning for every parameter that is not read, and for unknown keys of
+  "xmux".
+---
+ common/sharelink/link.go      | 65 ++++++++++++++++++++----
+ common/sharelink/link_test.go | 60 ++++++++++++++++++++++
+ common/sharelink/xhttp.go     | 96 +++++++++++++++++++++++++++++++----
+ option/v2ray_xhttp.go         |  8 ++-
+ 4 files changed, 208 insertions(+), 21 deletions(-)
+
+diff --git a/common/sharelink/link.go b/common/sharelink/link.go
+index 5d6c03bc1..83ee6e8b5 100644
+--- a/common/sharelink/link.go
++++ b/common/sharelink/link.go
+@@ -9,6 +9,7 @@ package sharelink
+ 
+ import (
+ 	"net/url"
++	"sort"
+ 	"strconv"
+ 	"strings"
+ 
+@@ -76,6 +77,16 @@ func Decode(link string) (*Outbound, []string, error) {
+ 	if err != nil {
+ 		return nil, nil, err
+ 	}
++	var unknown []string
++	for key := range query {
++		if !knownKeys[key] {
++			unknown = append(unknown, key)
++		}
++	}
++	sort.Strings(unknown)
++	for _, key := range unknown {
++		d.warn(key, " is not supported and is ignored")
++	}
+ 	return &Outbound{Type: scheme, Tag: strings.TrimSpace(tag), Options: options}, d.warnings, nil
+ }
+ 
+@@ -91,6 +102,8 @@ func (d *decoder) warn(message ...any) {
+ // parseQuery splits the query of a link. "+" is a space: the generators that
+ // use form encoding (3x-ui, Marzban) write spaces that way, and those that
+ // follow the proposal escape a real "+". The first of repeated keys wins.
++// The names are lowered, as the clients differ in their case ("allowInsecure",
++// "allowinsecure"), and lose the "amp;" of a link copied out of HTML.
+ func parseQuery(rawQuery string) (map[string]string, error) {
+ 	values := make(map[string]string)
+ 	for _, pair := range strings.Split(rawQuery, "&") {
+@@ -106,6 +119,7 @@ func parseQuery(rawQuery string) (map[string]string, error) {
+ 		if err != nil {
+ 			return nil, E.New("invalid escape in link parameter ", key)
+ 		}
++		key = strings.TrimPrefix(strings.ToLower(key), "amp;")
+ 		if _, exists := values[key]; !exists {
+ 			values[key] = value
+ 		}
+@@ -113,11 +127,10 @@ func parseQuery(rawQuery string) (map[string]string, error) {
+ 	return values, nil
+ }
+ 
+-// parseServer reads "userinfo@host:port", with anything after the port ignored.
++// parseServer reads "userinfo@host:port", with anything after the port
++// ignored. The user is everything up to the last "@": a Trojan password is
++// often base64, with "/" and "=", and not always escaped.
+ func parseServer(authority string) (string, option.ServerOptions, error) {
+-	if index := strings.IndexByte(authority, '/'); index >= 0 {
+-		authority = authority[:index]
+-	}
+ 	index := strings.LastIndexByte(authority, '@')
+ 	if index < 0 {
+ 		return "", option.ServerOptions{}, E.New("missing user in the link")
+@@ -130,6 +143,9 @@ func parseServer(authority string) (string, option.ServerOptions, error) {
+ 		return "", option.ServerOptions{}, E.New("missing user in the link")
+ 	}
+ 	hostPort := authority[index+1:]
++	if slash := strings.IndexByte(hostPort, '/'); slash >= 0 {
++		hostPort = hostPort[:slash]
++	}
+ 	var host, port string
+ 	if strings.HasPrefix(hostPort, "[") {
+ 		end := strings.IndexByte(hostPort, ']')
+@@ -168,7 +184,7 @@ func (d *decoder) vless(authority string) (any, error) {
+ 		UUID:          uuid,
+ 		Flow:          d.query["flow"],
+ 	}
+-	if packetEncoding, exists := d.query["packetEncoding"]; exists && packetEncoding != "" {
++	if packetEncoding := d.first("packetencoding", "packet-encoding"); packetEncoding != "" {
+ 		if packetEncoding == "none" {
+ 			packetEncoding = ""
+ 		}
+@@ -205,6 +221,30 @@ func (d *decoder) trojan(authority string) (any, error) {
+ 	return options, nil
+ }
+ 
++// first returns the first of the link parameters that is set.
++func (d *decoder) first(keys ...string) string {
++	for _, key := range keys {
++		if value := d.query[key]; value != "" {
++			return value
++		}
++	}
++	return ""
++}
++
++// The parameters read somewhere; any other gets a warning. The settings of
++// XHTTP a link may carry outside of "extra" are added by init.
++var knownKeys = map[string]bool{
++	"type": true, "security": true, "encryption": true, "flow": true, "packetencoding": true, "packet-encoding": true,
++	"sni": true, "servername": true, "peer": true, "alpn": true, "fp": true, "pbk": true, "sid": true,
++	"allowinsecure": true, "allow_insecure": true, "insecure": true,
++	"host": true, "path": true, "mode": true, "xhttpmode": true, "extra": true, "x_padding_bytes": true,
++	"headertype": true, "servicename": true, "authority": true, "ed": true, "eh": true,
++	// have warnings of their own
++	"pqv": true, "ech": true, "pcs": true, "vcn": true, "cs": true, "fm": true,
++	// REALITY's spiderX: the path the client of Xray crawls the cover site from
++	"spx": true, "spiderx": true,
++}
++
+ func isTrue(value string) bool {
+ 	return value == "1" || strings.EqualFold(value, "true")
+ }
+@@ -233,8 +273,8 @@ func (d *decoder) security(defaultSecurity string) (*option.OutboundTLSOptions,
+ 	}
+ 	tlsOptions := &option.OutboundTLSOptions{
+ 		Enabled:    true,
+-		ServerName: d.query["sni"],
+-		Insecure:   isTrue(d.query["allowInsecure"]) || isTrue(d.query["insecure"]),
++		ServerName: d.first("sni", "servername", "peer"),
++		Insecure:   isTrue(d.first("allowinsecure", "allow_insecure", "insecure")),
+ 		ALPN:       splitList(d.query["alpn"]),
+ 	}
+ 	fingerprint := d.query["fp"]
+@@ -270,10 +310,10 @@ func (d *decoder) transport() (*option.V2RayTransportOptions, error) {
+ 	if d.query["fm"] != "" {
+ 		d.warn("fm (finalmask) is not supported, the connection may not work")
+ 	}
+-	network := d.query["type"]
++	network := strings.ToLower(d.query["type"])
+ 	switch network {
+ 	case "", "tcp", "raw":
+-		if headerType := d.query["headerType"]; headerType != "" && headerType != "none" {
++		if headerType := d.query["headertype"]; headerType != "" && headerType != "none" {
+ 			return nil, E.New("unsupported header type of the TCP transport: ", headerType)
+ 		}
+ 		return nil, nil
+@@ -284,8 +324,11 @@ func (d *decoder) transport() (*option.V2RayTransportOptions, error) {
+ 		}
+ 		options := option.V2RayWebsocketOptions{Path: path, MaxEarlyData: earlyData}
+ 		if earlyData > 0 {
+-			// the only form Xray speaks
++			// the only form Xray speaks, unless the link names another ("eh")
+ 			options.EarlyDataHeaderName = "Sec-WebSocket-Protocol"
++			if header := d.query["eh"]; header != "" {
++				options.EarlyDataHeaderName = header
++			}
+ 		}
+ 		if host := d.query["host"]; host != "" {
+ 			options.Headers = badoption.HTTPHeader{"Host": {host}}
+@@ -300,7 +343,7 @@ func (d *decoder) transport() (*option.V2RayTransportOptions, error) {
+ 		}
+ 		return &option.V2RayTransportOptions{
+ 			Type:        C.V2RayTransportTypeGRPC,
+-			GRPCOptions: option.V2RayGRPCOptions{ServiceName: d.query["serviceName"]},
++			GRPCOptions: option.V2RayGRPCOptions{ServiceName: d.query["servicename"]},
+ 		}, nil
+ 	case "http", "h2":
+ 		return &option.V2RayTransportOptions{
+diff --git a/common/sharelink/link_test.go b/common/sharelink/link_test.go
+index 4ccf8a926..0e9fd3488 100644
+--- a/common/sharelink/link_test.go
++++ b/common/sharelink/link_test.go
+@@ -287,3 +287,63 @@ func FuzzDecode(f *testing.F) {
+ 		}
+ 	})
+ }
++
++// The forms found in links in the wild: other cases and names of the
++// parameters, links copied out of HTML, settings of XHTTP outside of "extra".
++func TestFoundInTheWild(t *testing.T) {
++	t.Parallel()
++	base := "vless://" + testUUID + "@example.org:443?"
++	for name, test := range map[string]struct{ link, want string }{
++		"case and other names": {
++			base + "security=tls&allowinsecure=1&servername=s.example.org&packet-encoding=xudp&type=Tcp&headertype=none",
++			`{"type":"vless","server":"example.org","server_port":443,"uuid":"` + testUUID + `","packet_encoding":"xudp","tls":{"enabled":true,"server_name":"s.example.org","insecure":true}}`,
++		},
++		"clash names": {
++			base + "security=tls&allow_insecure=1&peer=p.example.org",
++			`{"type":"vless","server":"example.org","server_port":443,"uuid":"` + testUUID + `","tls":{"enabled":true,"server_name":"p.example.org","insecure":true}}`,
++		},
++		"copied out of HTML": {
++			base + "security=tls&amp;type=ws&amp;path=%2Fw&amp;Host=h.example.org",
++			`{"type":"vless","server":"example.org","server_port":443,"uuid":"` + testUUID + `","tls":{"enabled":true},"transport":{"type":"ws","path":"/w","headers":{"Host":"h.example.org"}}}`,
++		},
++		"password with a slash": {
++			"trojan://Km/pIG4A+j5==@example.org:443/?type=ws&path=/w&ed=2048&eh=X-Early",
++			`{"type":"trojan","server":"example.org","server_port":443,"password":"Km/pIG4A+j5==","tls":{"enabled":true},
++			"transport":{"type":"ws","path":"/w","max_early_data":2048,"early_data_header_name":"X-Early"}}`,
++		},
++		"flat xhttp settings": {
++			base + "type=xhttp&path=%2Fx&xPaddingBytes=5-9&noGRPCHeader=true&scMaxBufferedPosts=7&sessionIDKey=k&uplinkHTTPMethod=PUT",
++			`{"type":"vless","server":"example.org","server_port":443,"uuid":"` + testUUID + `","transport":{"type":"xhttp","path":"/x",
++			"x_padding_bytes":"5-9","no_grpc_header":true,"sc_max_buffered_posts":7,"session_key":"k","uplink_http_method":"PUT"}}`,
++		},
++		"extra before flat settings": {
++			base + "type=xhttp&xPaddingBytes=5-9&scMaxEachPostBytes=100&extra=" + url.QueryEscape(`{"xPaddingBytes":"1-2"}`),
++			`{"type":"vless","server":"example.org","server_port":443,"uuid":"` + testUUID + `","transport":{"type":"xhttp","x_padding_bytes":"1-2","sc_max_each_post_bytes":"100"}}`,
++		},
++		"mode of v2rayA": {
++			base + "type=xhttp&xhttpMode=stream-up",
++			`{"type":"vless","server":"example.org","server_port":443,"uuid":"` + testUUID + `","transport":{"type":"xhttp","mode":"stream-up"}}`,
++		},
++		"extra escaped twice, a number with a fraction": {
++			base + "type=xhttp&extra=" + url.QueryEscape(uriComponent(`{"scMinPostsIntervalMs":30.0,"xmux":{"maxConnections":2.0}}`)),
++			`{"type":"vless","server":"example.org","server_port":443,"uuid":"` + testUUID + `","transport":{"type":"xhttp","sc_min_posts_interval_ms":"30","xmux":{"max_connections":"2"}}}`,
++		},
++	} {
++		content, warnings := decodeJSON(t, test.link)
++		require.Empty(t, warnings, name)
++		require.JSONEq(t, test.want, content, name)
++	}
++
++	_, warnings := decodeJSON(t, base+"type=xhttp&mux=1&pinSHA256=x&spx=%2F&extra="+url.QueryEscape(`{"xmux":{"cMaxLifetimeMs":5,"maxConnections":1}}`))
++	require.Equal(t, []string{"extra.xmux: cMaxLifetimeMs is not supported and is ignored", "mux is not supported and is ignored", "pinsha256 is not supported and is ignored"}, warnings)
++
++	for name, link := range map[string]string{
++		"flat range":      base + "type=xhttp&xPaddingBytes=a-b",
++		"flat number":     base + "type=xhttp&scMaxBufferedPosts=many",
++		"fraction":        base + "type=xhttp&extra=" + url.QueryEscape(`{"scMinPostsIntervalMs":30.5}`),
++		"xmux not object": base + "type=xhttp&extra=" + url.QueryEscape(`{"xmux":[1]}`),
++	} {
++		_, _, err := Decode(link)
++		require.Error(t, err, name)
++	}
++}
+diff --git a/common/sharelink/xhttp.go b/common/sharelink/xhttp.go
+index 3e6cc9569..10778a559 100644
+--- a/common/sharelink/xhttp.go
++++ b/common/sharelink/xhttp.go
+@@ -1,8 +1,10 @@
+ package sharelink
+ 
+ import (
++	"net/url"
+ 	"reflect"
+ 	"sort"
++	"strconv"
+ 	"strings"
+ 
+ 	"github.com/sagernet/sing-box/option"
+@@ -41,7 +43,7 @@ type xraySplitHTTP struct {
+ 	ScMaxBufferedPosts   int64                   `json:"scMaxBufferedPosts"`
+ 	ScStreamUpServerSecs *option.V2RayXHTTPRange `json:"scStreamUpServerSecs"`
+ 	ServerMaxHeaderBytes int32                   `json:"serverMaxHeaderBytes"`
+-	Xmux                 *xrayXmux               `json:"xmux"`
++	Xmux                 json.RawMessage         `json:"xmux"`
+ 	DownloadSettings     json.RawMessage         `json:"downloadSettings"`
+ 	Extra                json.RawMessage         `json:"extra"`
+ 
+@@ -141,24 +143,38 @@ func (d *decoder) readObject(name string, content []byte, target any) error {
+ func (d *decoder) xhttp() (*option.V2RayXHTTPOptions, error) {
+ 	settings := new(xraySplitHTTP)
+ 	if extra := strings.TrimSpace(d.query["extra"]); extra != "" {
++		// escaped twice by some panels and clients
++		if strings.HasPrefix(extra, "%7B") || strings.HasPrefix(extra, "%7b") {
++			if decoded, err := url.QueryUnescape(extra); err == nil {
++				extra = decoded
++			}
++		}
+ 		err := d.readObject("extra", []byte(extra), settings)
+ 		if err != nil {
+ 			return nil, err
+ 		}
+ 	}
+ 	// As in Xray, these three always come from the link itself, also when the
+-	// link leaves them empty and "extra" has them.
+-	settings.Host, settings.Path, settings.Mode = d.query["host"], d.query["path"], d.query["mode"]
++	// link leaves them empty and "extra" has them. v2rayA names the mode its
++	// own way.
++	settings.Host, settings.Path, settings.Mode = d.query["host"], d.query["path"], d.first("mode", "xhttpmode")
+ 	// 3x-ui repeats the padding outside of "extra" under this name
+ 	if settings.XPaddingBytes == nil && d.query["x_padding_bytes"] != "" {
+ 		settings.XPaddingBytes = new(option.V2RayXHTTPRange)
+-		err := settings.XPaddingBytes.UnmarshalJSON([]byte(`"` + d.query["x_padding_bytes"] + `"`))
++		err := settings.XPaddingBytes.UnmarshalJSON([]byte(strconv.Quote(d.query["x_padding_bytes"])))
+ 		if err != nil {
+ 			return nil, E.Cause(err, "read x_padding_bytes")
+ 		}
+ 	}
++	err := d.flatSettings(settings)
++	if err != nil {
++		return nil, err
++	}
+ 	options := &option.V2RayXHTTPOptions{Mode: settings.Mode}
+-	options.V2RayXHTTPBaseOptions = d.xhttpBase("extra", settings)
++	options.V2RayXHTTPBaseOptions, err = d.xhttpBase("extra", settings)
++	if err != nil {
++		return nil, err
++	}
+ 	if len(settings.DownloadSettings) > 0 && string(settings.DownloadSettings) != "null" {
+ 		download, err := d.xhttpDownload(settings.DownloadSettings)
+ 		if err != nil {
+@@ -177,7 +193,61 @@ func nonZero(value *option.V2RayXHTTPRange) *option.V2RayXHTTPRange {
+ 	return value
+ }
+ 
+-func (d *decoder) xhttpBase(name string, settings *xraySplitHTTP) option.V2RayXHTTPBaseOptions {
++// flatKeys are the settings of XHTTP some generators (3x-ui's panel among
++// them) also write as parameters of the link, under Xray's names: the plain
++// values, not the objects.
++var flatKeys = func() map[string]int {
++	keys := make(map[string]int)
++	settingsType := reflect.TypeOf(xraySplitHTTP{})
++	for i := 0; i < settingsType.NumField(); i++ {
++		field := settingsType.Field(i)
++		switch field.Name {
++		case "Host", "Path", "Mode", "Extra", "ScMaxConcurrentPosts", "KeepAlivePeriod":
++			continue
++		}
++		switch field.Type.Kind() {
++		case reflect.String, reflect.Bool, reflect.Int32, reflect.Int64, reflect.Pointer:
++			key := strings.ToLower(field.Tag.Get("json"))
++			keys[key] = i
++			knownKeys[key] = true
++		}
++	}
++	return keys
++}()
++
++// flatSettings fills what "extra" has left unset from the parameters of the link.
++func (d *decoder) flatSettings(settings *xraySplitHTTP) error {
++	value := reflect.ValueOf(settings).Elem()
++	for key, index := range flatKeys {
++		text := d.query[key]
++		field := value.Field(index)
++		if text == "" || !field.IsZero() {
++			continue
++		}
++		switch field.Kind() {
++		case reflect.String:
++			field.SetString(text)
++		case reflect.Bool:
++			field.SetBool(isTrue(text))
++		case reflect.Int32, reflect.Int64:
++			number, err := strconv.ParseInt(text, 10, 32)
++			if err != nil {
++				return E.New("invalid ", key, ": ", text)
++			}
++			field.SetInt(number)
++		case reflect.Pointer:
++			valueRange := new(option.V2RayXHTTPRange)
++			err := valueRange.UnmarshalJSON([]byte(strconv.Quote(text)))
++			if err != nil {
++				return E.Cause(err, "read ", key)
++			}
++			field.Set(reflect.ValueOf(valueRange))
++		}
++	}
++	return nil
++}
++
++func (d *decoder) xhttpBase(name string, settings *xraySplitHTTP) (option.V2RayXHTTPBaseOptions, error) {
+ 	options := option.V2RayXHTTPBaseOptions{
+ 		Host:                 settings.Host,
+ 		Path:                 settings.Path,
+@@ -230,7 +300,12 @@ func (d *decoder) xhttpBase(name string, settings *xraySplitHTTP) option.V2RayXH
+ 			options.Headers = headers
+ 		}
+ 	}
+-	if xmux := settings.Xmux; xmux != nil {
++	if len(settings.Xmux) > 0 && string(settings.Xmux) != "null" {
++		xmux := new(xrayXmux)
++		err := d.readObject(name+".xmux", settings.Xmux, xmux)
++		if err != nil {
++			return options, err
++		}
+ 		xmuxOptions := option.V2RayXHTTPXmuxOptions{
+ 			MaxConcurrency:   nonZero(xmux.MaxConcurrency),
+ 			MaxConnections:   nonZero(xmux.MaxConnections),
+@@ -243,7 +318,7 @@ func (d *decoder) xhttpBase(name string, settings *xraySplitHTTP) option.V2RayXH
+ 			options.Xmux = &xmuxOptions
+ 		}
+ 	}
+-	return options
++	return options, nil
+ }
+ 
+ // xhttpDownload reads "downloadSettings": a whole stream configuration of
+@@ -344,6 +419,9 @@ func (d *decoder) xhttpDownload(content []byte) (*option.V2RayXHTTPDownloadOptio
+ 	if len(settings.DownloadSettings) > 0 && string(settings.DownloadSettings) != "null" {
+ 		d.warn(name, ": nested downloadSettings are ignored")
+ 	}
+-	options.V2RayXHTTPBaseOptions = d.xhttpBase(name+".xhttpSettings", settings)
++	options.V2RayXHTTPBaseOptions, err = d.xhttpBase(name+".xhttpSettings", settings)
++	if err != nil {
++		return nil, err
++	}
+ 	return options, nil
+ }
+diff --git a/option/v2ray_xhttp.go b/option/v2ray_xhttp.go
+index 242584064..03313d342 100644
+--- a/option/v2ray_xhttp.go
++++ b/option/v2ray_xhttp.go
+@@ -106,7 +106,13 @@ func (r *V2RayXHTTPRange) UnmarshalJSON(content []byte) error {
+ 		err = json.UnmarshalDisallowUnknownFields(content, &value)
+ 		from, to = value.From, value.To
+ 	default:
+-		err = json.Unmarshal(content, &from)
++		// some generators write whole numbers with a fraction ("30.0")
++		var number float64
++		err = json.Unmarshal(content, &number)
++		if err == nil && (number != math.Trunc(number) || math.Abs(number) > math.MaxInt32) {
++			err = E.New("not a whole number in range: ", string(content))
++		}
++		from = int64(number)
+ 		to = from
+ 	}
+ 	if err != nil {
+-- 
+2.53.0
+

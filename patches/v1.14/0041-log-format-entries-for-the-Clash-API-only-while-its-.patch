@@ -1,0 +1,189 @@
+From 0c5f73a1216066719dad6b534ed1929bd2fd950b Mon Sep 17 00:00:00 2001
+From: FiyeroT <me@fiyero.xyz>
+Date: Sun, 4 Oct 2026 08:46:58 +0300
+Subject: [PATCH 041/148] log: format entries for the Clash API only while its
+ logs are read
+
+With the Clash API's external_controller set, the log factory is observable:
+every log call, whatever its level, formatted its message and an entry for the
+observer, and sent it through a channel, even when nobody had /logs open. The
+router and DNS log several debug lines per connection and query, so on a
+router at the warn level most of the logging cost went to entries no one
+read. The factory now counts the subscriptions and skips the observer while
+there are none; /logs gets every level once subscribed, as before.
+
+BenchmarkLogBelowLevel (debug line at the warn level, x86_64, one CPU):
+
+  Clash API off                    ~40 ns/op  112 B/op  1 allocs/op
+  Clash API on, before            ~500 ns/op  308 B/op  6 allocs/op
+  Clash API on, after              ~40 ns/op  112 B/op  1 allocs/op
+  Clash API on, /logs subscribed  ~550 ns/op  308 B/op  6 allocs/op (unchanged)
+---
+ log/observable.go            | 19 +++++++++++--
+ log/observable_bench_test.go | 53 ++++++++++++++++++++++++++++++++++++
+ log/observable_test.go       | 36 ++++++++++++++++++++++++
+ 3 files changed, 105 insertions(+), 3 deletions(-)
+ create mode 100644 log/observable_bench_test.go
+ create mode 100644 log/observable_test.go
+
+diff --git a/log/observable.go b/log/observable.go
+index ab50e56be..baa0080e2 100644
+--- a/log/observable.go
++++ b/log/observable.go
+@@ -26,6 +26,7 @@ type defaultFactory struct {
+ 	platformWriters   atomic.Pointer[[]PlatformWriter]
+ 	needConsole       bool
+ 	needObservable    bool
++	subscriptions     atomic.Int32 // entries are formatted for the observer only while it has some
+ 	level             Level
+ 	subscriber        *observable.Subscriber[Entry]
+ 	observer          *observable.Observer[Entry]
+@@ -139,13 +140,25 @@ func (f *defaultFactory) NewLogger(tag string) ContextLogger {
+ }
+ 
+ func (f *defaultFactory) Subscribe() (subscription observable.Subscription[Entry], done <-chan struct{}, err error) {
+-	return f.observer.Subscribe()
++	subscription, done, err = f.observer.Subscribe()
++	if err == nil {
++		f.subscriptions.Add(1)
++	}
++	return
+ }
+ 
+ func (f *defaultFactory) UnSubscribe(sub observable.Subscription[Entry]) {
++	f.subscriptions.Add(-1)
+ 	f.observer.UnSubscribe(sub)
+ }
+ 
++// observed reports whether an entry goes to the observer: with the Clash API on, and only
++// while someone reads its logs. Formatting every entry below the level for nobody cost each
++// log call of the router and DNS some ten times the call itself.
++func (f *defaultFactory) observed() bool {
++	return f.needObservable && f.subscriptions.Load() > 0
++}
++
+ func (f *defaultFactory) output(ctx context.Context, level Level, tag string, message string, timestamp time.Time) {
+ 	if level <= f.level && (f.needConsole || level == LevelPanic || level == LevelFatal) {
+ 		formatted := f.formatter.Format(ctx, level, tag, message, timestamp)
+@@ -157,7 +170,7 @@ func (f *defaultFactory) output(ctx context.Context, level Level, tag string, me
+ 			os.Exit(1)
+ 		}
+ 	}
+-	if f.needObservable {
++	if f.observed() {
+ 		f.subscriber.Emit(Entry{level, f.formatter.FormatSimple(ctx, tag, message)})
+ 	}
+ 	platformWriters := f.loadPlatformWriters()
+@@ -179,7 +192,7 @@ type observableLogger struct {
+ func (l *observableLogger) Log(ctx context.Context, level Level, args []any) {
+ 	level = OverrideLevelFromContext(level, ctx)
+ 	platformWriters := l.loadPlatformWriters()
+-	if level > l.level && len(platformWriters) == 0 && !l.needObservable {
++	if level > l.level && len(platformWriters) == 0 && !l.observed() {
+ 		return
+ 	}
+ 	nowTime := time.Now()
+diff --git a/log/observable_bench_test.go b/log/observable_bench_test.go
+new file mode 100644
+index 000000000..e19203aef
+--- /dev/null
++++ b/log/observable_bench_test.go
+@@ -0,0 +1,53 @@
++package log
++
++import (
++	"context"
++	"testing"
++	"time"
++)
++
++// consoleWriter stands for the console sing-box writes to: anything but io.Discard.
++type consoleWriter struct{}
++
++func (consoleWriter) Write(p []byte) (int, error) { return len(p), nil }
++
++// A debug line below the warn level, as the router and DNS write for every connection and
++// query, with the Clash API on (observable) or off.
++func BenchmarkLogBelowLevel(b *testing.B) {
++	for _, testCase := range []struct {
++		name       string
++		observable bool
++		subscribe  bool
++	}{
++		{"clash api off", false, false},
++		{"clash api on", true, false},
++		{"clash api on, logs subscribed", true, true},
++	} {
++		b.Run(testCase.name, func(b *testing.B) {
++			factory := NewDefaultFactory(context.Background(), Formatter{BaseTime: time.Now()}, consoleWriter{}, "", nil, testCase.observable)
++			factory.SetLevel(LevelWarn)
++			if err := factory.Start(); err != nil {
++				b.Fatal(err)
++			}
++			defer factory.Close()
++			if testCase.subscribe {
++				subscription, _, err := factory.Subscribe()
++				if err != nil {
++					b.Fatal(err)
++				}
++				defer factory.UnSubscribe(subscription)
++				go func() {
++					for range subscription {
++					}
++				}()
++			}
++			logger := factory.NewLogger("dns")
++			ctx := context.Background()
++			b.ReportAllocs()
++			b.ResetTimer()
++			for i := 0; i < b.N; i++ {
++				logger.DebugContext(ctx, "exchanged ", "www.example.com", " IN A ", 1234, " in ", 12, "ms")
++			}
++		})
++	}
++}
+diff --git a/log/observable_test.go b/log/observable_test.go
+new file mode 100644
+index 000000000..27df2f278
+--- /dev/null
++++ b/log/observable_test.go
+@@ -0,0 +1,36 @@
++package log
++
++import (
++	"context"
++	"testing"
++	"time"
++
++	"github.com/stretchr/testify/require"
++)
++
++// Entries go to the observer while someone reads them (the Clash API's /logs), all levels
++// included; before and after, nothing is formatted for it.
++func TestObservableOnlyWhileSubscribed(t *testing.T) {
++	factory := NewDefaultFactory(context.Background(), Formatter{BaseTime: time.Now()}, consoleWriter{}, "", nil, true)
++	factory.SetLevel(LevelWarn)
++	require.NoError(t, factory.Start())
++	defer factory.Close()
++	internal := factory.(*defaultFactory)
++	logger := factory.NewLogger("dns")
++	require.False(t, internal.observed())
++
++	subscription, _, err := factory.Subscribe()
++	require.NoError(t, err)
++	require.True(t, internal.observed())
++	logger.Debug("below the level")
++	select {
++	case entry := <-subscription:
++		require.Equal(t, LevelDebug, entry.Level)
++		require.Contains(t, entry.Message, "below the level")
++	case <-time.After(2 * time.Second):
++		t.Fatal("the subscription got no entry")
++	}
++
++	factory.UnSubscribe(subscription)
++	require.False(t, internal.observed())
++}
+-- 
+2.53.0
+

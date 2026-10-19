@@ -1,0 +1,190 @@
+From 83bc25de487d3c270a74e28795f9b7ef424e7b3d Mon Sep 17 00:00:00 2001
+From: FiyeroT <me@fiyero.xyz>
+Date: Tue, 6 Oct 2026 23:38:38 +0300
+Subject: [PATCH 075/148] dns: read the provider's servers again after a miss
+ at most once in 30 s
+
+When none of the provider's servers answered and the query still had time, that is after
+a fast failure of all of them (no route, an ICMP unreachable, REFUSED), the list was
+forgotten and the next fallback query read it again: an exec of `ubus call
+network.interface dump` on the path of that query, once per failed query until the
+provider was switched off for a minute, and without that bound when the server answers
+SERVFAIL and the provider refuses.
+
+Keep the time of the last read on a miss and only mark the list stale: it is read again
+at the next use once 30 s have passed since the last read, the interval that already
+applies after ubus could not be asked. The re-read itself stays, since it is how other
+servers handed out by DHCP are noticed without a network reset. ResetFallbackProviders
+still makes the next use read the list at once.
+---
+ dns/client_fallback_exchange_test.go | 45 ++++++++++++++++++++--------
+ dns/client_fallback_provider.go      | 24 +++++++++++----
+ 2 files changed, 50 insertions(+), 19 deletions(-)
+
+diff --git a/dns/client_fallback_exchange_test.go b/dns/client_fallback_exchange_test.go
+index 8182dd6bc..504a54325 100644
+--- a/dns/client_fallback_exchange_test.go
++++ b/dns/client_fallback_exchange_test.go
+@@ -101,15 +101,6 @@ func newFallbackTest(providers ...M.Socksaddr) (*fallbackTestTransport, *fallbac
+ 	return transport, state, reads
+ }
+ 
+-// keepProviders keeps the list as it is: an answer of none of the provider's servers
+-// makes the fallback read it again, and a read cannot return the resolvers of a test
+-// (loopback addresses are left out). A read that never ends stops the others.
+-func keepProviders(state *fallbackServer) {
+-	state.providers.access.Lock()
+-	state.providers.reading = true
+-	state.providers.access.Unlock()
+-}
+-
+ func fallbackTestExchange(transport *fallbackTestTransport, state *fallbackServer) (string, error) {
+ 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+ 	defer cancel()
+@@ -295,7 +286,6 @@ func TestExchangeWithFallback(t *testing.T) {
+ 		{"a SERVFAIL of the server stays when the provider has no better answer", func(t *testing.T) {
+ 			for _, provider := range []int{mDNS.RcodeServerFailure, mDNS.RcodeRefused} {
+ 				transport, state, _ := newFallbackTest(testResolver(t, provider))
+-				keepProviders(state)
+ 				transport.serve(fallbackTestServfail)
+ 				expect(t, transport, state, "SERVFAIL", nil)
+ 				transport.serve(func(ctx context.Context, message *mDNS.Msg) (*mDNS.Msg, error) {
+@@ -309,7 +299,6 @@ func TestExchangeWithFallback(t *testing.T) {
+ 		}},
+ 		{"the provider failing twice in a row switches the fallback off", func(t *testing.T) {
+ 			transport, state, _ := newFallbackTest(testResolver(t, mDNS.RcodeRefused))
+-			keepProviders(state)
+ 			transport.serve(fallbackTestFails)
+ 			expect(t, transport, state, "", errFallbackTestServer)
+ 			if got := state.testState(); got.providerFails != 1 || got.unusable {
+@@ -330,7 +319,6 @@ func TestExchangeWithFallback(t *testing.T) {
+ 		{"an answer of the provider clears its failure count", func(t *testing.T) {
+ 			refused, good := testResolver(t, mDNS.RcodeRefused), testResolver(t, mDNS.RcodeSuccess)
+ 			transport, state, _ := newFallbackTest(refused)
+-			keepProviders(state)
+ 			transport.serve(fallbackTestFails)
+ 			setProviders := func(server M.Socksaddr) {
+ 				state.providers.access.Lock()
+@@ -350,7 +338,6 @@ func TestExchangeWithFallback(t *testing.T) {
+ 		}},
+ 		{"a server set aside is asked when the provider fails too", func(t *testing.T) {
+ 			transport, state, _ := newFallbackTest(testResolver(t, mDNS.RcodeRefused))
+-			keepProviders(state)
+ 			state.access.Lock()
+ 			state.down, state.probeEvery, state.probeAt = true, fallbackProbeFirst, time.Now().Add(fallbackProbeFirst)
+ 			state.access.Unlock()
+@@ -626,3 +613,35 @@ func TestFallbackNetworkReset(t *testing.T) {
+ 		}
+ 	})
+ }
++
++// When none of the provider's servers answers, the list is read again, since it may have
++// changed without a network reset, but not at every such query: not sooner than
++// providerRetryAfter after the last read. A network reset reads it at the next use.
++func TestProviderListRereadAfterMiss(t *testing.T) {
++	t.Parallel()
++	_, state, reads := newFallbackTest(testResolver(t, mDNS.RcodeRefused))
++	for i := 0; i < 3; i++ {
++		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
++		_, err := state.exchangeProvider(ctx, context.Background(), nil, freshTestQuery())
++		cancel()
++		if err == nil || err == errNoProviders {
++			t.Fatalf("query %d: got %v, want the refusal of the provider", i, err)
++		}
++	}
++	if reads.Load() != 0 {
++		t.Fatalf("the list was read %d times right after it was read", reads.Load())
++	}
++	state.providers.access.Lock()
++	state.providers.readAt = time.Now().Add(-providerRetryAfter - time.Second)
++	state.providers.access.Unlock()
++	state.providers.list(context.Background(), nil)
++	state.providers.list(context.Background(), nil)
++	if reads.Load() != 1 {
++		t.Fatalf("the list was read %d times %v after the last read, want 1", reads.Load(), providerRetryAfter)
++	}
++	state.providers.forget()
++	state.providers.list(context.Background(), nil)
++	if reads.Load() != 2 {
++		t.Errorf("the list was read %d times, want 2: a reset reads it at the next use", reads.Load())
++	}
++}
+diff --git a/dns/client_fallback_provider.go b/dns/client_fallback_provider.go
+index beedec8fc..7bd9cfafc 100644
+--- a/dns/client_fallback_provider.go
++++ b/dns/client_fallback_provider.go
+@@ -28,15 +28,16 @@ import (
+ // with DNS set by hand and a backup modem are other devices and are left out. The list is
+ // read at the first fallback, and again when sing-box resets the network after its
+ // default interface changed (the DNS router calls ResetFallbackProviders): another uplink,
+-// the WAN down and up, a new PPPoE session. It is also read again after all its servers
+-// missed an answer, and 30 s after ubus could not be asked.
++// the WAN down and up, a new PPPoE session. It is also read again after none of its
++// servers answered and 30 s after ubus could not be asked, in both cases not sooner than
++// 30 s after the last read: each read runs ubus.
+ //
+ // The servers are chosen by their answers, as dnsmasq does: the first fallback query goes
+ // to all of them at once, the first to answer gets the next queries alone, and all of them
+ // are asked again every 20 s or 50 queries, and as soon as it misses one.
+ 
+ const (
+-	providerRetryAfter  = 30 * time.Second // after ubus could not be asked
++	providerRetryAfter  = 30 * time.Second // between reads after ubus could not be asked or no server answered
+ 	providerMax         = 4                // servers asked at once
+ 	providerRoundEvery  = 20 * time.Second
+ 	providerRoundAfter  = 50 // queries
+@@ -63,6 +64,7 @@ type providerSet struct {
+ 	device  string // the output device the list is for
+ 	readAt  time.Time
+ 	readErr bool        // ubus could not be asked
++	stale   bool        // no server answered: the list may have changed
+ 	best    M.Socksaddr // the server that answered last, invalid when none
+ 	uses    int         // queries sent to best alone since all were asked
+ 	roundAt time.Time   // when all were asked
+@@ -115,7 +117,7 @@ func (p *providerSet) known(ctx context.Context, logger logger.ContextLogger) bo
+ }
+ 
+ func (p *providerSet) rereadDue() bool {
+-	return p.readAt.IsZero() || (p.readErr && time.Since(p.readAt) >= providerRetryAfter)
++	return p.readAt.IsZero() || ((p.readErr || p.stale) && time.Since(p.readAt) >= providerRetryAfter)
+ }
+ 
+ // list returns the provider's servers, reading them again when it is due. While another
+@@ -147,7 +149,7 @@ func (p *providerSet) refresh(logger logger.ContextLogger, device string) []M.So
+ 	defer p.access.Unlock()
+ 	p.reading = false
+ 	changed := p.readAt.IsZero() || device != p.device || !sameServers(servers, p.servers)
+-	p.servers, p.device, p.readAt, p.readErr = servers, device, time.Now(), err != nil
++	p.servers, p.device, p.readAt, p.readErr, p.stale = servers, device, time.Now(), err != nil, false
+ 	if changed {
+ 		p.best = M.Socksaddr{}
+ 		if logger != nil {
+@@ -178,6 +180,16 @@ func (p *providerSet) forget() {
+ 	p.access.Unlock()
+ }
+ 
++// noneAnswered makes a later use read the servers again: they may have changed without a
++// network reset, as when DHCP hands out other ones. Unlike forget it keeps the time of
++// the last read, so that servers that keep refusing do not run ubus at every query.
++func (p *providerSet) noneAnswered() {
++	p.access.Lock()
++	p.stale = true
++	p.best = M.Socksaddr{}
++	p.access.Unlock()
++}
++
+ func (p *providerSet) names() string {
+ 	p.access.Lock()
+ 	defer p.access.Unlock()
+@@ -329,7 +341,7 @@ func (s *fallbackServer) exchangeProvider(ctx context.Context, baseCtx context.C
+ 	}
+ 	response, err := s.exchangeAll(ctx, servers, message)
+ 	if err != nil && ctx.Err() == nil {
+-		s.providers.forget() // none answered: the servers may have changed
++		s.providers.noneAnswered()
+ 	}
+ 	return response, err
+ }
+-- 
+2.53.0
+

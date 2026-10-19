@@ -2,13 +2,13 @@
 
 Пакет ставит `/usr/bin/sing-box`, `/etc/init.d/sing-box`, `/etc/config/sing-box` — те же пути,
 что пакет `sing-box` из OpenWrt, поэтому с ним он конфликтует и заменяет его.
-Файл брать из релиза нужной версии (https://github.com/FiyeroT/podkop-engine/releases) под свою
+Файл брать из релиза нужной версии (https://github.com/podkop-net/podkop-engine/releases) под свою
 архитектуру (`opkg print-architecture` / `apk --print-arch`), например
-`podkop-engine_1.14.2-r14_openwrt_aarch64_cortex-a53.ipk`.
+`podkop-engine_1.14.3-r15_openwrt_aarch64_cortex-a53.ipk`.
 
 С r9 (1.13, 1.14) пакетов два, ставится один: `podkop-engine` — протоколы, которые использует
-podkop, и TUIC; `podkop-engine-full` — плюс все остальные выходы для «Outbound Config» (http,
-vmess, snell, tor, ssh, shadowtls, anytls, hysteria, NaiveProxy). Команды ниже одинаковы для
+podkop, TUIC и (с r15) http; `podkop-engine-full` — плюс все остальные выходы для «Outbound
+Config» (vmess, snell, tor, ssh, shadowtls, anytls, hysteria, NaiveProxy). Команды ниже одинаковы для
 обоих, меняется только имя файла, а в командах отката — имя пакета (`podkop-engine-full`
 вместо `podkop-engine`).
 
@@ -87,5 +87,5 @@ apk add sing-box '!podkop-engine'
 ## Проверка
 
 ```sh
-sing-box version     # sing-box version 1.14.2-pdk-r14 ... Tags: with_quic,with_utls,with_clash_api,podkop_slim,...
+sing-box version     # sing-box version 1.14.3-pdk-r15 ... Tags: with_quic,with_utls,with_clash_api,podkop_slim,...
 ```

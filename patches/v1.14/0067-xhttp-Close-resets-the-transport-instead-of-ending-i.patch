@@ -1,0 +1,686 @@
+From 77c85470f599770f9fda10d90823260821488d35 Mon Sep 17 00:00:00 2001
+From: FiyeroT <me@fiyero.xyz>
+Date: Tue, 6 Oct 2026 23:52:34 +0300
+Subject: [PATCH 067/148] xhttp: Close resets the transport instead of ending
+ it
+
+Client.Close marked its pools closed for good, and every dial after it failed with "use
+of closed network connection". The outbounds call Close of their transport on every
+network reset (InterfaceUpdated: a change of the default interface, its first appearance
+after a start without one, "close all connections" of the Clash API) and go on dialing
+through the same transport, as every other V2Ray transport allows. An xhttp outbound was
+dead from the first such event until a restart.
+
+Close is a reset now. It closes the pooled connections, the retired ones and the QUIC
+connections of HTTP/3 as before, for the upload pool and for a separate download pool,
+and the sessions open on them fail through them; the next dial opens a new connection.
+The failures, the backoff and the last error of the pool are forgotten with the network
+they were seen on. The connections a reset closed belong to an earlier generation of the
+pool: the errors their requests report afterwards do not count against the server, so
+they cannot start a backoff of the new connections, and such a client is not listed as
+retired again.
+
+What ends the transport is the context it was created with: once that is done the pool
+opens no connections, so the Close of an outbound that shuts down leaves nothing behind
+whatever dials race with it (sing-box cancels the context first).
+
+release looks at the removed mark under the lock of the idle timer, so that a reset
+between the two cannot leave a timer running on a closed client.
+
+A client that was shut down refuses further requests itself. A session that outlived a
+reset and sent one more upload through the client it held made the HTTP client dial and
+handshake a new connection, only to have it closed at once.
+
+Tests: a reset with sessions open, over HTTP/2, HTTP/1.1 and HTTP/3, in every mode, with
+a shared and with a separate download pool; failures reported after a reset; resets
+during dials; a dial after the context is done; a request through a closed client.
+---
+ transport/v2rayxhttp/client.go           |  27 +-
+ transport/v2rayxhttp/pool.go             |  63 ++++-
+ transport/v2rayxhttp/reset_http3_test.go |  65 +++++
+ transport/v2rayxhttp/reset_test.go       | 319 +++++++++++++++++++++++
+ 4 files changed, 453 insertions(+), 21 deletions(-)
+ create mode 100644 transport/v2rayxhttp/reset_http3_test.go
+ create mode 100644 transport/v2rayxhttp/reset_test.go
+
+diff --git a/transport/v2rayxhttp/client.go b/transport/v2rayxhttp/client.go
+index 6fbbd26b1..2c50a8dfe 100644
+--- a/transport/v2rayxhttp/client.go
++++ b/transport/v2rayxhttp/client.go
+@@ -99,7 +99,7 @@ func NewClient(ctx context.Context, outboundDialer N.Dialer, serverAddr M.Socksa
+ 			}
+ 		}
+ 	}
+-	client.upScheme, client.upPool, err = newLeg(outboundDialer, serverAddr, up, tlsConfig)
++	client.upScheme, client.upPool, err = newLeg(ctx, outboundDialer, serverAddr, up, tlsConfig)
+ 	if err != nil {
+ 		return nil, err
+ 	}
+@@ -133,7 +133,7 @@ func NewClient(ctx context.Context, outboundDialer N.Dialer, serverAddr M.Socksa
+ 			return nil, E.Cause(err, "download")
+ 		}
+ 	}
+-	client.downScheme, client.downPool, err = newLeg(downDialer, download.ServerOptions.Build(), client.down, downTLS)
++	client.downScheme, client.downPool, err = newLeg(ctx, downDialer, download.ServerOptions.Build(), client.down, downTLS)
+ 	if err != nil {
+ 		return nil, E.Cause(err, "download")
+ 	}
+@@ -165,8 +165,8 @@ func decideHTTPVersion(tlsConfig tls.Config, reality bool) string {
+ }
+ 
+ // newLeg sets up the requests of one leg: the scheme, the Host it addresses
+-// and the pool of connections to its server.
+-func newLeg(legDialer N.Dialer, serverAddr M.Socksaddr, config *requestConfig, tlsConfig tls.Config) (string, *pool, error) {
++// and the pool of connections to its server. ctx is that of the transport.
++func newLeg(ctx context.Context, legDialer N.Dialer, serverAddr M.Socksaddr, config *requestConfig, tlsConfig tls.Config) (string, *pool, error) {
+ 	if !serverAddr.IsValid() {
+ 		return "", nil, E.New("invalid server address: ", serverAddr)
+ 	}
+@@ -193,7 +193,7 @@ func newLeg(legDialer N.Dialer, serverAddr M.Socksaddr, config *requestConfig, t
+ 		if err != nil {
+ 			return "", nil, err
+ 		}
+-		pool := newPool(config.xmux, newConnection)
++		pool := newPool(ctx, config.xmux, newConnection)
+ 		pool.watched = true
+ 		return "https", pool, nil
+ 	case "1.1":
+@@ -206,7 +206,7 @@ func newLeg(legDialer N.Dialer, serverAddr M.Socksaddr, config *requestConfig, t
+ 		newConnection = func() pooledConnection {
+ 			return newHTTP1Connection(legDialer, tlsDialer, serverAddr)
+ 		}
+-		return scheme, newPool(config.xmux, newConnection), nil
++		return scheme, newPool(ctx, config.xmux, newConnection), nil
+ 	default:
+ 		tlsConfig = tlsConfig.Clone()
+ 		// Xray's TLS goes through a Chrome fingerprint by default, whose
+@@ -225,7 +225,7 @@ func newLeg(legDialer N.Dialer, serverAddr M.Socksaddr, config *requestConfig, t
+ 		newConnection = func() pooledConnection {
+ 			return newHTTP2Connection(tlsDialer, serverAddr, keepAlivePeriod)
+ 		}
+-		pool := newPool(config.xmux, newConnection)
++		pool := newPool(ctx, config.xmux, newConnection)
+ 		pool.watched = keepAlivePeriod > 0
+ 		return "https", pool, nil
+ 	}
+@@ -321,6 +321,19 @@ func (c *Client) sessionClients(s *session) (*poolClient, *poolClient, error) {
+ 	return downClient, upClient, nil
+ }
+ 
++// Close is a reset, as with the other V2Ray transports: the outbounds call it
++// whenever the network changed (InterfaceUpdated) and go on dialing through
++// the same client. It closes every pooled connection, and with them the
++// sessions open on them, and forgets the failures of the server so far; the
++// next dial opens a new connection. A dial under way during a reset fails with
++// the connection it was given, which the reset closed.
++//
++// The outbound calls the same Close when it shuts down. What ends the client
++// for good is the context it was created with: once that is done no connection
++// is opened, so a Close after it leaves nothing behind, whatever dials race
++// with it. (sing-box cancels the context before it closes the outbounds.)
++// Closed while the context lives, the client holds nothing but the idle
++// timers of the connections dialed afterwards.
+ func (c *Client) Close() error {
+ 	c.upPool.close()
+ 	if c.downPool != c.upPool {
+diff --git a/transport/v2rayxhttp/pool.go b/transport/v2rayxhttp/pool.go
+index cbf9ef134..8f064ffa5 100644
+--- a/transport/v2rayxhttp/pool.go
++++ b/transport/v2rayxhttp/pool.go
+@@ -48,6 +48,9 @@ type pooledConnection interface {
+ }
+ 
+ type pool struct {
++	// ctx is the context the transport was created with: once it is done the
++	// pool opens no connections (see Client.Close).
++	ctx           context.Context
+ 	newConnection func() pooledConnection
+ 	// watched: the connections notice a server that went silent by themselves
+ 	// (HTTP/2 pings, the idle timeout and keep-alive of QUIC) and fail the
+@@ -62,16 +65,19 @@ type pool struct {
+ 	clients []*poolClient
+ 	// retired holds the clients taken out of the pool that sessions still use,
+ 	// for close to reach them.
+-	retired  map[*poolClient]struct{}
+-	closed   bool
+-	failures int
+-	lastFail time.Time
+-	retryAt  time.Time
+-	lastErr  error
++	retired map[*poolClient]struct{}
++	// generation counts the resets (close). A client of an earlier generation
++	// was closed by one: it belongs to the network as it was before.
++	generation uint64
++	failures   int
++	lastFail   time.Time
++	retryAt    time.Time
++	lastErr    error
+ }
+ 
+-func newPool(config xmuxConfig, newConnection func() pooledConnection) *pool {
++func newPool(ctx context.Context, config xmuxConfig, newConnection func() pooledConnection) *pool {
+ 	return &pool{
++		ctx:           ctx,
+ 		newConnection: newConnection,
+ 		config:        config,
+ 		idleTimeout:   poolIdleTimeout,
+@@ -87,6 +93,8 @@ type poolClient struct {
+ 	pool       *pool
+ 	connection pooledConnection
+ 	createdAt  time.Time
++	// generation is that of the pool when the client was made.
++	generation uint64
+ 	running    atomic.Int32
+ 	// sessions counts the sessions on the client, what max_concurrency limits
+ 	// (Xray counts a session once, whatever requests it has in flight).
+@@ -96,7 +104,10 @@ type poolClient struct {
+ 	unreusableAt time.Time
+ 	broken       atomic.Bool
+ 	removed      atomic.Bool
+-	closeOnce    sync.Once
++	// closed is set once the connection is shut down: a request a session
++	// sends afterwards is refused here, before the HTTP client dials for it.
++	closed    atomic.Bool
++	closeOnce sync.Once
+ 	// idleGeneration changes whenever the client is taken, so that a check
+ 	// scheduled when it went idle knows whether it stayed idle.
+ 	idleGeneration atomic.Uint64
+@@ -124,7 +135,7 @@ func (p *pool) get(session bool) (*poolClient, error) {
+ func (p *pool) take(session bool) (*poolClient, []*poolClient, error) {
+ 	p.access.Lock()
+ 	defer p.access.Unlock()
+-	if p.closed {
++	if p.ctx.Err() != nil {
+ 		return nil, nil, net.ErrClosed
+ 	}
+ 	now := time.Now()
+@@ -217,6 +228,7 @@ func (p *pool) newClient(now time.Time) *poolClient {
+ 		pool:       p,
+ 		connection: p.newConnection(),
+ 		createdAt:  now,
++		generation: p.generation,
+ 		leftUsage:  -1,
+ 	}
+ 	if usage := p.config.cMaxReuseTimes.rand(); usage > 0 {
+@@ -241,6 +253,11 @@ func (c *poolClient) usable() bool {
+ }
+ 
+ func (c *poolClient) roundTrip(request *http.Request) (*http.Response, error) {
++	if c.closed.Load() {
++		// The HTTP clients would open a connection for the request, to have
++		// it closed at once: a handshake the server sees, for nothing.
++		return nil, net.ErrClosed
++	}
+ 	c.leftRequests.Add(-1)
+ 	response, err := c.connection.roundTrip(request)
+ 	if err != nil {
+@@ -290,6 +307,12 @@ func gracefulGoAway(err error) bool {
+ func (p *pool) noteFailure(client *poolClient, err error) {
+ 	p.access.Lock()
+ 	defer p.access.Unlock()
++	if client.generation != p.generation {
++		// A connection a reset closed fails every request it had in flight.
++		// That is the doing of the reset, not of the server, and must not
++		// hold back the connections opened since.
++		return
++	}
+ 	now := time.Now()
+ 	if now.Sub(client.createdAt) >= youngConnection || now.Sub(p.lastFail) >= failureMemory {
+ 		p.failures = 0
+@@ -309,12 +332,16 @@ func (c *poolClient) release() {
+ 	if c.running.Add(-1) > 0 {
+ 		return
+ 	}
++	generation := c.idleGeneration.Load()
++	c.timerAccess.Lock()
++	// Looked at under the lock of the timer: whoever takes the client out of
++	// the pool marks it first and stops the timer after, so that no timer is
++	// started behind its back.
+ 	if c.removed.Load() {
++		c.timerAccess.Unlock()
+ 		c.closeIfIdle()
+ 		return
+ 	}
+-	generation := c.idleGeneration.Load()
+-	c.timerAccess.Lock()
+ 	if c.idleTimer != nil {
+ 		c.idleTimer.Stop()
+ 	}
+@@ -335,7 +362,8 @@ func (p *pool) retire(client *poolClient) {
+ 			break
+ 		}
+ 	}
+-	if !p.closed {
++	// a client a reset closed meanwhile is not listed again
++	if client.generation == p.generation {
+ 		p.retireLocked(client)
+ 	}
+ 	p.access.Unlock()
+@@ -359,11 +387,14 @@ func (c *poolClient) shutdown() {
+ 		c.idleTimer = nil
+ 	}
+ 	c.timerAccess.Unlock()
++	c.closed.Store(true)
+ 	c.closeOnce.Do(c.connection.close)
+ }
+ 
+ // close closes every client, those in the pool and those retired from it that
+-// sessions still hold.
++// sessions still hold, and forgets what it held against the server: the pool
++// starts anew, with the next get opening a connection. The sessions on the
++// closed clients fail through them and let go of them as they end.
+ func (p *pool) close() {
+ 	p.access.Lock()
+ 	clients := p.clients
+@@ -372,7 +403,11 @@ func (p *pool) close() {
+ 	}
+ 	p.clients = nil
+ 	p.retired = nil
+-	p.closed = true
++	p.generation++
++	p.failures = 0
++	p.lastFail = time.Time{}
++	p.retryAt = time.Time{}
++	p.lastErr = nil
+ 	p.access.Unlock()
+ 	for _, client := range clients {
+ 		client.removed.Store(true)
+diff --git a/transport/v2rayxhttp/reset_http3_test.go b/transport/v2rayxhttp/reset_http3_test.go
+new file mode 100644
+index 000000000..a0999b795
+--- /dev/null
++++ b/transport/v2rayxhttp/reset_http3_test.go
+@@ -0,0 +1,65 @@
++//go:build with_quic
++
++package v2rayxhttp
++
++import (
++	"context"
++	"net"
++	"net/http"
++	"net/http/httptest"
++	"testing"
++
++	"github.com/sagernet/quic-go/http3"
++	"github.com/sagernet/sing-box/common/tls"
++	"github.com/sagernet/sing-box/log"
++	"github.com/sagernet/sing-box/option"
++	"github.com/sagernet/sing/common/json/badoption"
++	M "github.com/sagernet/sing/common/metadata"
++	N "github.com/sagernet/sing/common/network"
++
++	"github.com/stretchr/testify/require"
++)
++
++// newHTTP3TestPair starts an HTTP/3 test server for the options and a client
++// of it.
++func newHTTP3TestPair(t *testing.T, options option.V2RayXHTTPOptions) *Client {
++	t.Helper()
++	serverConfig, err := newRequestConfig(options.V2RayXHTTPBaseOptions, options.Mode)
++	require.NoError(t, err)
++	handler := &testServer{t: t, config: serverConfig, sessions: make(map[string]*testSession), requests: make(map[string]int)}
++	// httptest only provides the certificate here.
++	certificateServer := httptest.NewUnstartedServer(nil)
++	certificateServer.StartTLS()
++	serverTLS := certificateServer.TLS.Clone()
++	certificateServer.Close()
++	serverTLS.NextProtos = []string{http3.NextProtoH3}
++	packetConn, err := net.ListenPacket("udp", "127.0.0.1:0")
++	require.NoError(t, err)
++	server := &http3.Server{Handler: http.HandlerFunc(handler.serveHTTP), TLSConfig: serverTLS}
++	go server.Serve(packetConn)
++	t.Cleanup(func() {
++		server.Close()
++		packetConn.Close()
++	})
++	tlsConfig, err := tls.NewClient(context.Background(), log.StdLogger(), "example.com", option.OutboundTLSOptions{
++		Enabled: true, Insecure: true, ServerName: "example.com", ALPN: badoption.Listable[string]{"h3"},
++	})
++	require.NoError(t, err)
++	transport, err := NewClient(context.Background(), N.SystemDialer, M.SocksaddrFromNet(packetConn.LocalAddr()), options, tlsConfig)
++	require.NoError(t, err)
++	client := transport.(*Client)
++	t.Cleanup(func() { client.Close() })
++	return client
++}
++
++// A reset over HTTP/3: the QUIC connections of every lane are closed and the
++// next dial opens new ones.
++func TestXHTTPResetHTTP3(t *testing.T) {
++	for _, mode := range []string{modePacketUp, modeStreamUp, modeStreamOne} {
++		t.Run(mode, func(t *testing.T) {
++			options := option.V2RayXHTTPOptions{Mode: mode}
++			options.Path = "/h3"
++			testReset(t, newHTTP3TestPair(t, options))
++		})
++	}
++}
+diff --git a/transport/v2rayxhttp/reset_test.go b/transport/v2rayxhttp/reset_test.go
+new file mode 100644
+index 000000000..161f3f3c1
+--- /dev/null
++++ b/transport/v2rayxhttp/reset_test.go
+@@ -0,0 +1,319 @@
++package v2rayxhttp
++
++import (
++	"context"
++	"errors"
++	"io"
++	"net"
++	"net/http"
++	"net/http/httptest"
++	"sync"
++	"sync/atomic"
++	"testing"
++	"time"
++
++	"github.com/sagernet/sing-box/common/tls"
++	"github.com/sagernet/sing-box/log"
++	"github.com/sagernet/sing-box/option"
++	M "github.com/sagernet/sing/common/metadata"
++	N "github.com/sagernet/sing/common/network"
++
++	"github.com/stretchr/testify/require"
++)
++
++// testReset holds the contract of adapter.V2RayClientTransport for Close: it
++// is a reset. The outbounds call it whenever the network changed and go on
++// dialing through the same transport. The sessions open at the time fail with
++// their connections, the next dial opens new ones, what the closed connections
++// report afterwards is not held against the server, and nothing is left behind.
++func testReset(t *testing.T, client *Client) {
++	t.Helper()
++	baseline := settledGoroutines()
++	dial := func() net.Conn {
++		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
++		defer cancel()
++		conn, err := client.DialContext(ctx)
++		require.NoError(t, err)
++		return conn
++	}
++	// as many sessions as the pool has connections by default: two failed
++	// connections in a row are what starts a backoff
++	old := make([]net.Conn, 3)
++	for i := range old {
++		old[i] = dial()
++		echo(t, old[i], 4096)
++	}
++	require.NoError(t, client.Close())
++	for i, conn := range old {
++		done := make(chan error, 1)
++		go func() {
++			conn.Write([]byte("x"))
++			_, err := io.ReadFull(conn, make([]byte, 1))
++			done <- err
++		}()
++		select {
++		case err := <-done:
++			require.Error(t, err, "session %d went on after the reset", i)
++		case <-time.After(5 * time.Second):
++			t.Fatalf("session %d outlived the reset", i)
++		}
++	}
++	for i := 0; i < 3; i++ {
++		conn := dial()
++		echo(t, conn, 64*1024)
++		require.NoError(t, conn.Close())
++	}
++	for _, conn := range old {
++		conn.Close()
++	}
++	requireNoBackoff(t, client)
++	// any number of times, with nothing open as well
++	require.NoError(t, client.Close())
++	require.NoError(t, client.Close())
++	waitGoroutines(t, baseline)
++	conn := dial()
++	echo(t, conn, 4096)
++	require.NoError(t, conn.Close())
++	requireNoBackoff(t, client)
++	require.NoError(t, client.Close())
++	waitGoroutines(t, baseline)
++}
++
++func dialContext(t *testing.T) context.Context {
++	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
++	t.Cleanup(cancel)
++	return ctx
++}
++
++func requireNoBackoff(t *testing.T, client *Client) {
++	t.Helper()
++	for _, p := range []*pool{client.upPool, client.downPool} {
++		p.access.Lock()
++		failures, retryAt, lastErr := p.failures, p.retryAt, p.lastErr
++		p.access.Unlock()
++		require.Zero(t, failures)
++		require.True(t, retryAt.IsZero(), "the pool backs off")
++		require.NoError(t, lastErr)
++	}
++}
++
++func TestXHTTPReset(t *testing.T) {
++	cases := []struct {
++		mode    string
++		version string
++	}{
++		{modePacketUp, "h2"},
++		{modeStreamUp, "h2"},
++		{modeStreamOne, "h2"},
++		{modePacketUp, "h1-tls"},
++		{modePacketUp, "h1"},
++		{modeStreamUp, "h1"},
++	}
++	for _, c := range cases {
++		t.Run(c.mode+"/"+c.version, func(t *testing.T) {
++			client, _ := newTestPair(t, option.V2RayXHTTPOptions{Mode: c.mode}, c.version, nil)
++			testReset(t, client)
++		})
++	}
++}
++
++// newDownloadTestPair is newTestPair with the download half sent to a second
++// listener of the same test server, over a pool of its own.
++func newDownloadTestPair(t *testing.T, mode string) *Client {
++	t.Helper()
++	options := option.V2RayXHTTPOptions{Mode: mode}
++	options.Path = "/x"
++	serverConfig, err := newRequestConfig(options.V2RayXHTTPBaseOptions, mode)
++	require.NoError(t, err)
++	server := newTestServer(t, serverConfig, "h2")
++	second := httptest.NewUnstartedServer(http.HandlerFunc(server.serveHTTP))
++	second.EnableHTTP2 = true
++	second.StartTLS()
++	t.Cleanup(second.Close)
++	secondAddr := M.ParseSocksaddr(second.Listener.Addr().String())
++	options.Download = &option.V2RayXHTTPDownloadOptions{
++		ServerOptions:               option.ServerOptions{Server: secondAddr.AddrString(), ServerPort: secondAddr.Port},
++		OutboundTLSOptionsContainer: option.OutboundTLSOptionsContainer{TLS: &option.OutboundTLSOptions{Enabled: true, Insecure: true, ServerName: "cdn.example.com"}},
++	}
++	options.Download.Path = "/x"
++	tlsConfig, err := tls.NewClient(context.Background(), log.StdLogger(), "example.com", option.OutboundTLSOptions{Enabled: true, Insecure: true, ServerName: "example.com"})
++	require.NoError(t, err)
++	transport, err := NewClient(context.Background(), N.SystemDialer, M.ParseSocksaddr(server.server.Listener.Addr().String()), options, tlsConfig)
++	require.NoError(t, err)
++	client := transport.(*Client)
++	t.Cleanup(func() { client.Close() })
++	require.NotSame(t, client.upPool, client.downPool)
++	return client
++}
++
++// With download set there are two pools, and a reset is one of both.
++func TestXHTTPResetDownloadLeg(t *testing.T) {
++	for _, mode := range []string{modePacketUp, modeStreamUp} {
++		t.Run(mode, func(t *testing.T) {
++			testReset(t, newDownloadTestPair(t, mode))
++		})
++	}
++}
++
++// A reset forgets what the pool held against the server, and the failures the
++// connections it closed report later do not count against the new ones: the
++// first dial on the new network must not meet the backoff of the old one.
++func TestXHTTPResetForgetsFailures(t *testing.T) {
++	options := option.V2RayXHTTPOptions{Mode: modePacketUp}
++	options.Xmux = &option.V2RayXHTTPXmuxOptions{MaxConnections: xrange(4, 4)}
++	client, _ := newTestPair(t, options, "h2", nil)
++	held := make([]*poolClient, 4)
++	for i := range held {
++		var err error
++		held[i], err = client.upPool.get(true)
++		require.NoError(t, err)
++	}
++	unreachable := errors.New("network is unreachable")
++	held[0].fail(context.Background(), unreachable)
++	held[1].fail(context.Background(), unreachable)
++	client.upPool.access.Lock()
++	retryAt := client.upPool.retryAt
++	client.upPool.access.Unlock()
++	require.False(t, retryAt.IsZero(), "two young connections failed: the pool backs off")
++	require.NoError(t, client.Close())
++	requireNoBackoff(t, client)
++	held[2].fail(context.Background(), unreachable)
++	held[3].fail(context.Background(), unreachable)
++	requireNoBackoff(t, client)
++	conn, err := client.DialContext(dialContext(t))
++	require.NoError(t, err)
++	echo(t, conn, 4096)
++	require.NoError(t, conn.Close())
++	for _, c := range held {
++		c.endSession()
++		c.release()
++	}
++	client.upPool.access.Lock()
++	retired := len(client.upPool.retired)
++	client.upPool.access.Unlock()
++	require.Zero(t, retired, "the connections the reset closed are still listed")
++}
++
++// Resets while sessions are dialed, used and closed: nothing races, hangs or
++// stays behind, and the transport works once they are over.
++func TestXHTTPResetDuringDials(t *testing.T) {
++	for _, version := range []string{"h2", "h1"} {
++		t.Run(version, func(t *testing.T) {
++			client, _ := newTestPair(t, option.V2RayXHTTPOptions{Mode: modePacketUp}, version, nil)
++			baseline := settledGoroutines()
++			stop := make(chan struct{})
++			var wg sync.WaitGroup
++			for i := 0; i < 4; i++ {
++				wg.Add(1)
++				go func() {
++					defer wg.Done()
++					for {
++						select {
++						case <-stop:
++							return
++						default:
++						}
++						ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
++						conn, err := client.DialContext(ctx)
++						cancel()
++						if err != nil {
++							time.Sleep(time.Millisecond)
++							continue
++						}
++						// either may fail: the session may have been reset
++						conn.Write(randomBytes(1000))
++						io.ReadFull(conn, make([]byte, 1000))
++						conn.Close()
++					}
++				}()
++			}
++			for i := 0; i < 50; i++ {
++				time.Sleep(20 * time.Millisecond)
++				client.Close()
++			}
++			close(stop)
++			wg.Wait()
++			client.Close()
++			conn, err := client.DialContext(dialContext(t))
++			require.NoError(t, err)
++			echo(t, conn, 4096)
++			require.NoError(t, conn.Close())
++			client.Close()
++			waitGoroutines(t, baseline)
++		})
++	}
++}
++
++// The transport ends with the context it was created with: once that is done
++// a dial is refused, so that one racing with the last Close leaves nothing.
++func TestXHTTPDialAfterContextDone(t *testing.T) {
++	options := option.V2RayXHTTPOptions{Mode: modePacketUp}
++	_, server := newTestPair(t, options, "h2", nil)
++	tlsConfig, err := tls.NewClient(context.Background(), log.StdLogger(), "example.com", option.OutboundTLSOptions{Enabled: true, Insecure: true, ServerName: "example.com"})
++	require.NoError(t, err)
++	ctx, cancel := context.WithCancel(context.Background())
++	defer cancel()
++	transport, err := NewClient(ctx, N.SystemDialer, M.ParseSocksaddr(server.server.Listener.Addr().String()), options, tlsConfig)
++	require.NoError(t, err)
++	client := transport.(*Client)
++	baseline := settledGoroutines()
++	conn, err := client.DialContext(dialContext(t))
++	require.NoError(t, err)
++	echo(t, conn, 4096)
++	require.NoError(t, conn.Close())
++	cancel()
++	require.NoError(t, client.Close())
++	_, err = client.DialContext(dialContext(t))
++	require.ErrorIs(t, err, net.ErrClosed)
++	client.upPool.access.Lock()
++	pooled := len(client.upPool.clients)
++	client.upPool.access.Unlock()
++	require.Zero(t, pooled)
++	waitGoroutines(t, baseline)
++}
++
++// countingConnection is a pooled connection that only counts its requests.
++type countingConnection struct {
++	requests atomic.Int32
++}
++
++func (c *countingConnection) roundTrip(request *http.Request) (*http.Response, error) {
++	c.requests.Add(1)
++	return nil, errors.New("no server")
++}
++
++func (c *countingConnection) close() {}
++
++// A session that outlives a reset may send one more request through the client
++// it holds. The request is refused before it reaches the HTTP client, which
++// would dial the server for it, and says nothing about the server.
++func TestXHTTPResetRefusesRequestsOfClosedClients(t *testing.T) {
++	connection := new(countingConnection)
++	p := newPool(context.Background(), xmuxConfig{}, func() pooledConnection { return connection })
++	client, err := p.get(true)
++	require.NoError(t, err)
++	request, err := http.NewRequest(http.MethodPost, "http://example.com/", nil)
++	require.NoError(t, err)
++	_, err = client.roundTrip(request)
++	require.Error(t, err)
++	require.EqualValues(t, 1, connection.requests.Load())
++	p.close()
++	_, err = client.roundTrip(request)
++	require.ErrorIs(t, err, net.ErrClosed)
++	require.EqualValues(t, 1, connection.requests.Load(), "a request went out through a closed client")
++	client.endSession()
++	client.release()
++	// the same for a client retired in the ordinary way
++	client, err = p.get(true)
++	require.NoError(t, err)
++	client.endSession()
++	client.release()
++	p.retire(client)
++	_, err = client.roundTrip(request)
++	require.ErrorIs(t, err, net.ErrClosed)
++	require.EqualValues(t, 1, connection.requests.Load())
++	p.access.Lock()
++	failures := p.failures
++	p.access.Unlock()
++	require.Zero(t, failures)
++}
+-- 
+2.53.0
+

@@ -1,0 +1,497 @@
+From bb2649f1605148173b973f9af3cd7ac8961c513b Mon Sep 17 00:00:00 2001
+From: FiyeroT <me@fiyero.xyz>
+Date: Tue, 6 Oct 2026 23:37:26 +0300
+Subject: [PATCH 083/148] tls: name the uTLS fingerprints REALITY cannot use
+
+REALITY takes the Client Hello as the uTLS fingerprint builds it, and servers since
+Xray-core v26.9.8 pass a Client Hello without an X25519MLKEM768 key share on to their
+target. chrome, firefox, safari, random and randomized carry the share; edge, ios and qq
+carry X25519 only, so with such a server every connection ended in "reality verification
+failed" and nothing pointed at the fingerprint. android and 360 are TLS 1.2 Client
+Hellos without any key share: every connection failed with "nil KeyShareKeys", with any
+server.
+
+android and 360 are now refused when the REALITY client is created, and the error names
+the fingerprint. edge, ios and qq still work with older servers, so they are kept: the
+client warns once when it is created, and a failed verification says that the fingerprint
+may be the cause, also when it fails on a certificate of the target that this host does
+not accept. The check is in newRealityClient, which the TLS of an outbound and the xhttp
+transport both go through.
+---
+ common/tls/reality_client.go           |  56 +++-
+ common/tls/reality_fingerprint_test.go | 347 +++++++++++++++++++++++++
+ 2 files changed, 401 insertions(+), 2 deletions(-)
+ create mode 100644 common/tls/reality_fingerprint_test.go
+
+diff --git a/common/tls/reality_client.go b/common/tls/reality_client.go
+index 2135c4e06..f6ec87dee 100644
+--- a/common/tls/reality_client.go
++++ b/common/tls/reality_client.go
+@@ -48,6 +48,37 @@ type RealityClientConfig struct {
+ 	uClient   *UTLSClientConfig
+ 	publicKey []byte
+ 	shortID   [8]byte
++	// the name of a uTLS fingerprint without an X25519MLKEM768 key share, otherwise empty
++	classicFingerprint string
++}
++
++// REALITY servers since Xray-core v26.9.8 (XTLS/REALITY@8cdf7bf) take a Client Hello
++// without an X25519MLKEM768 key share for a stranger and pass it on to the target, whose
++// certificate then fails the verification. Older servers accept such a Client Hello, so
++// the fingerprints that carry only X25519 are not refused, but the cause is named.
++const realityHybridKeyShareNote = "REALITY servers since Xray-core v26.9.8 reject a Client Hello without an X25519MLKEM768 key share, use chrome, firefox, safari, random or randomized"
++
++// checkRealityFingerprint refuses the uTLS fingerprints REALITY cannot work with and
++// reports whether the named one lacks the X25519MLKEM768 key share.
++func checkRealityFingerprint(name string) (classic bool, err error) {
++	switch name {
++	case "android", "360":
++		// Client Hellos of TLS 1.2: no key share to derive the authentication key from
++		return false, E.New("uTLS fingerprint ", name, " is unsupported in reality: a TLS 1.2 Client Hello without a key share, use chrome, firefox, safari, random or randomized")
++	case "edge", "ios", "qq":
++		return true, nil
++	default:
++		return false, nil
++	}
++}
++
++// verificationFailed is the text of a failed verification; it names the fingerprint that
++// may be the cause.
++func (e *RealityClientConfig) verificationFailed() string {
++	if e.classicFingerprint == "" {
++		return "reality verification failed"
++	}
++	return "reality verification failed, possibly because of the uTLS fingerprint " + e.classicFingerprint + ": " + realityHybridKeyShareNote
+ }
+ 
+ func NewRealityClient(ctx context.Context, logger logger.ContextLogger, serverAddress string, options option.OutboundTLSOptions) (Config, error) {
+@@ -62,6 +93,11 @@ func newRealityClient(ctx context.Context, logger logger.ContextLogger, serverAd
+ 		return nil, E.New("spoof is unsupported in reality")
+ 	}
+ 
++	classicFingerprint, err := checkRealityFingerprint(options.UTLS.Fingerprint)
++	if err != nil {
++		return nil, err
++	}
++
+ 	uClient, err := newUTLSClient(ctx, logger, serverAddress, options, allowEmptyServerName)
+ 	if err != nil {
+ 		return nil, err
+@@ -83,7 +119,14 @@ func newRealityClient(ctx context.Context, logger logger.ContextLogger, serverAd
+ 		return nil, E.New("invalid short_id")
+ 	}
+ 
+-	var config Config = &RealityClientConfig{ctx, uClient.(*UTLSClientConfig), publicKey, shortID}
++	realityConfig := &RealityClientConfig{ctx: ctx, uClient: uClient.(*UTLSClientConfig), publicKey: publicKey, shortID: shortID}
++	if classicFingerprint {
++		realityConfig.classicFingerprint = options.UTLS.Fingerprint
++		if logger != nil {
++			logger.Warn("uTLS fingerprint ", options.UTLS.Fingerprint, " carries no X25519MLKEM768 key share: ", realityHybridKeyShareNote)
++		}
++	}
++	var config Config = realityConfig
+ 	if options.KernelRx || options.KernelTx {
+ 		if !C.IsLinux {
+ 			return nil, E.New("kTLS is only supported on Linux")
+@@ -222,6 +265,11 @@ func (e *RealityClientConfig) ClientHandshake(ctx context.Context, conn net.Conn
+ 
+ 	err = uConn.HandshakeContext(ctx)
+ 	if err != nil {
++		if verifier.rejected && e.classicFingerprint != "" {
++			// the server passed the connection on to its target, and the certificate of
++			// the target is not valid here: the cause is the same as below
++			return nil, E.Cause(err, e.verificationFailed())
++		}
+ 		return nil, err
+ 	}
+ 
+@@ -231,7 +279,7 @@ func (e *RealityClientConfig) ClientHandshake(ctx context.Context, conn net.Conn
+ 
+ 	if !verifier.verified {
+ 		go realityClientFallback(e.ctx, uConn, e.uClient.ServerName(), e.uClient.id)
+-		return nil, E.New("reality verification failed")
++		return nil, E.New(e.verificationFailed())
+ 	}
+ 
+ 	releaseHandshakeState(uConn)
+@@ -268,6 +316,7 @@ func (e *RealityClientConfig) Clone() Config {
+ 		e.uClient.Clone().(*UTLSClientConfig),
+ 		e.publicKey,
+ 		e.shortID,
++		e.classicFingerprint,
+ 	}
+ }
+ 
+@@ -276,6 +325,8 @@ type realityVerifier struct {
+ 	serverName string
+ 	authKey    []byte
+ 	verified   bool
++	// the certificate is not the server's and did not pass the system verification
++	rejected bool
+ }
+ 
+ func (c *realityVerifier) VerifyPeerCertificate(rawCerts [][]byte, verifiedChains [][]*x509.Certificate) error {
+@@ -297,6 +348,7 @@ func (c *realityVerifier) VerifyPeerCertificate(rawCerts [][]byte, verifiedChain
+ 		opts.Intermediates.AddCert(cert)
+ 	}
+ 	if _, err := certs[0].Verify(opts); err != nil {
++		c.rejected = true
+ 		return err
+ 	}
+ 	return nil
+diff --git a/common/tls/reality_fingerprint_test.go b/common/tls/reality_fingerprint_test.go
+new file mode 100644
+index 000000000..1d6ab8373
+--- /dev/null
++++ b/common/tls/reality_fingerprint_test.go
+@@ -0,0 +1,347 @@
++//go:build with_utls
++
++package tls
++
++import (
++	"context"
++	"crypto/ecdh"
++	"crypto/ecdsa"
++	"crypto/elliptic"
++	"crypto/rand"
++	"crypto/tls"
++	"crypto/x509"
++	"crypto/x509/pkix"
++	"encoding/base64"
++	"encoding/pem"
++	"io"
++	"math/big"
++	"net"
++	"os"
++	"path/filepath"
++	"runtime"
++	"strings"
++	"sync"
++	"testing"
++	"time"
++
++	"github.com/sagernet/sing-box/log"
++	"github.com/sagernet/sing-box/option"
++
++	"github.com/stretchr/testify/require"
++)
++
++type warnLog struct {
++	access sync.Mutex
++	lines  []string
++}
++
++func (l *warnLog) WriteMessage(level log.Level, message string) {
++	if level != log.LevelWarn {
++		return
++	}
++	l.access.Lock()
++	defer l.access.Unlock()
++	l.lines = append(l.lines, message)
++}
++
++func (l *warnLog) take() []string {
++	l.access.Lock()
++	defer l.access.Unlock()
++	lines := l.lines
++	l.lines = nil
++	return lines
++}
++
++func newWarnLogger(t *testing.T) (log.ContextLogger, *warnLog) {
++	writer := &warnLog{}
++	factory := log.NewDefaultFactory(context.Background(), log.Formatter{BaseTime: time.Now()}, io.Discard, "", writer, false)
++	factory.SetLevel(log.LevelDebug)
++	require.NoError(t, factory.Start())
++	t.Cleanup(func() { factory.Close() })
++	return factory.NewLogger("tls"), writer
++}
++
++func realityOptionsForTest(fingerprint string, reality bool) option.OutboundTLSOptions {
++	options := option.OutboundTLSOptions{
++		Enabled:    true,
++		ServerName: "example.org",
++		UTLS:       &option.OutboundUTLSOptions{Enabled: true, Fingerprint: fingerprint},
++	}
++	if reality {
++		serverKey, _ := ecdh.X25519().GenerateKey(rand.Reader)
++		options.Reality = &option.OutboundRealityOptions{
++			Enabled:   true,
++			PublicKey: base64.RawURLEncoding.EncodeToString(serverKey.PublicKey().Bytes()),
++			ShortID:   "0123456789abcdef",
++		}
++	}
++	return options
++}
++
++// The fingerprints of TLS 1.2 have no key share for REALITY to derive its key from: the
++// configuration is refused and the error names the fingerprint. Without REALITY they stay
++// usable.
++func TestRealityFingerprintWithoutKeyShareRefused(t *testing.T) {
++	for _, fingerprint := range []string{"android", "360"} {
++		t.Run(fingerprint, func(t *testing.T) {
++			logger, _ := newWarnLogger(t)
++			_, err := NewClient(context.Background(), logger, "example.org", realityOptionsForTest(fingerprint, true))
++			require.Error(t, err)
++			require.Contains(t, err.Error(), "uTLS fingerprint "+fingerprint+" ")
++			require.Contains(t, err.Error(), "reality")
++
++			_, err = NewClient(context.Background(), logger, "example.org", realityOptionsForTest(fingerprint, false))
++			require.NoError(t, err)
++		})
++	}
++}
++
++// The fingerprints with an X25519 key share only work with older REALITY servers: one
++// warning at creation names the fingerprint and the requirement. The fingerprints with the
++// hybrid key share, and any fingerprint without REALITY, warn about nothing.
++func TestRealityFingerprintWithoutHybridKeyShareWarns(t *testing.T) {
++	for _, testCase := range []struct {
++		fingerprint string
++		reality     bool
++		warns       bool
++	}{
++		{"edge", true, true},
++		{"ios", true, true},
++		{"qq", true, true},
++		{"", true, false},
++		{"chrome", true, false},
++		{"firefox", true, false},
++		{"safari", true, false},
++		{"random", true, false},
++		{"randomized", true, false},
++		{"edge", false, false},
++		{"ios", false, false},
++		{"qq", false, false},
++	} {
++		name := testCase.fingerprint
++		if name == "" {
++			name = "default"
++		}
++		if !testCase.reality {
++			name += " without reality"
++		}
++		t.Run(name, func(t *testing.T) {
++			logger, writer := newWarnLogger(t)
++			config, err := NewClient(context.Background(), logger, "example.org", realityOptionsForTest(testCase.fingerprint, testCase.reality))
++			require.NoError(t, err)
++			// a copy, which every connection of some transports takes, does not warn again
++			config.Clone()
++			lines := writer.take()
++			if !testCase.warns {
++				require.Empty(t, lines)
++				return
++			}
++			require.Len(t, lines, 1)
++			require.Contains(t, lines[0], "uTLS fingerprint "+testCase.fingerprint+" ")
++			require.Contains(t, lines[0], "X25519MLKEM768")
++			require.Contains(t, lines[0], "Xray-core v26.9.8")
++		})
++	}
++}
++
++// trustedServerCertificate is a certificate for example.org that the system verifier of
++// this process accepts: REALITY verifies the certificate of a server that did not
++// authenticate against the system roots, which a test can add to only through
++// SSL_CERT_FILE and only before their first use: a test of this package that verifies
++// against the system roots calls this first. From then on the roots of the test process
++// are this test root and the certificates of the system directories.
++var trustedServerCertificate = sync.OnceValues(func() (tls.Certificate, bool) {
++	rootKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
++	if err != nil {
++		return tls.Certificate{}, false
++	}
++	rootTemplate := &x509.Certificate{
++		SerialNumber:          big.NewInt(1),
++		Subject:               pkix.Name{CommonName: "test root"},
++		NotBefore:             time.Now().Add(-time.Hour),
++		NotAfter:              time.Now().Add(time.Hour),
++		KeyUsage:              x509.KeyUsageCertSign,
++		BasicConstraintsValid: true,
++		IsCA:                  true,
++	}
++	rootDER, err := x509.CreateCertificate(rand.Reader, rootTemplate, rootTemplate, &rootKey.PublicKey, rootKey)
++	if err != nil {
++		return tls.Certificate{}, false
++	}
++	leafKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
++	if err != nil {
++		return tls.Certificate{}, false
++	}
++	leafTemplate := &x509.Certificate{
++		SerialNumber: big.NewInt(2),
++		Subject:      pkix.Name{CommonName: "example.org"},
++		DNSNames:     []string{"example.org"},
++		NotBefore:    time.Now().Add(-time.Hour),
++		NotAfter:     time.Now().Add(time.Hour),
++		KeyUsage:     x509.KeyUsageDigitalSignature,
++		ExtKeyUsage:  []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
++	}
++	leafDER, err := x509.CreateCertificate(rand.Reader, leafTemplate, rootTemplate, &leafKey.PublicKey, rootKey)
++	if err != nil {
++		return tls.Certificate{}, false
++	}
++	leaf, err := x509.ParseCertificate(leafDER)
++	if err != nil {
++		return tls.Certificate{}, false
++	}
++
++	directory, err := os.MkdirTemp("", "reality-roots")
++	if err != nil {
++		return tls.Certificate{}, false
++	}
++	defer os.RemoveAll(directory)
++	rootsPath := filepath.Join(directory, "roots.pem")
++	err = os.WriteFile(rootsPath, pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: rootDER}), 0o600)
++	if err != nil {
++		return tls.Certificate{}, false
++	}
++	savedFile, hadFile := os.LookupEnv("SSL_CERT_FILE")
++	os.Setenv("SSL_CERT_FILE", rootsPath)
++	defer func() {
++		if hadFile {
++			os.Setenv("SSL_CERT_FILE", savedFile)
++		} else {
++			os.Unsetenv("SSL_CERT_FILE")
++		}
++	}()
++	// loads the system roots, unless something has loaded them before
++	_, err = leaf.Verify(x509.VerifyOptions{DNSName: "example.org"})
++	if err != nil {
++		return tls.Certificate{}, false
++	}
++	return tls.Certificate{Certificate: [][]byte{leafDER}, PrivateKey: leafKey, Leaf: leaf}, true
++})
++
++// plainTLSServer answers one connection as the target of a REALITY server does for a
++// client it did not recognise: a TLS handshake with its own certificate.
++func plainTLSServer(t *testing.T, conn net.Conn, certificate tls.Certificate) {
++	done := make(chan struct{})
++	go func() {
++		defer close(done)
++		defer conn.Close()
++		serverConn := tls.Server(conn, &tls.Config{
++			Certificates:           []tls.Certificate{certificate},
++			SessionTicketsDisabled: true,
++		})
++		if serverConn.Handshake() != nil {
++			return
++		}
++		io.Copy(io.Discard, serverConn)
++	}()
++	t.Cleanup(func() {
++		conn.Close()
++		<-done
++	})
++}
++
++// A server that takes the Client Hello for a stranger's hands the connection to its target,
++// and the client sees a valid certificate that is not the server's. With a fingerprint that
++// lacks the hybrid key share the error says that the fingerprint may be the cause.
++func TestRealityVerificationFailureNamesFingerprint(t *testing.T) {
++	certificate, trusted := trustedServerCertificate()
++	if !trusted {
++		if runtime.GOOS == "linux" {
++			// a skip would go unnoticed, and nothing else tests the text of this error
++			t.Fatal("the system roots of this process cannot be set: were they loaded by an earlier test?")
++		}
++		t.Skip("the system roots of this process cannot be set")
++	}
++	for _, testCase := range []struct {
++		fingerprint string
++		named       bool
++	}{
++		{"ios", true},
++		{"edge", true},
++		{"qq", true},
++		{"chrome", false},
++	} {
++		t.Run(testCase.fingerprint, func(t *testing.T) {
++			logger, _ := newWarnLogger(t)
++			config, err := NewClient(context.Background(), logger, "example.org", realityOptionsForTest(testCase.fingerprint, true))
++			require.NoError(t, err)
++			client, server := net.Pipe()
++			defer client.Close()
++			plainTLSServer(t, server, certificate)
++
++			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
++			defer cancel()
++			// a copy, as the transports that set their own ALPN make
++			_, err = ClientHandshake(ctx, client, config.Clone())
++			require.Error(t, err)
++			require.True(t, strings.HasPrefix(err.Error(), "reality verification failed"), err.Error())
++			if !testCase.named {
++				require.Equal(t, "reality verification failed", err.Error())
++				return
++			}
++			require.Contains(t, err.Error(), "uTLS fingerprint "+testCase.fingerprint+":")
++			require.Contains(t, err.Error(), "X25519MLKEM768")
++			require.Contains(t, err.Error(), "Xray-core v26.9.8")
++		})
++	}
++}
++
++// The certificate of the target may also be one this host does not accept (no CA bundle, a
++// clock that is not set yet): the handshake then fails on the certificate, and the error
++// names the fingerprint as well. Other fingerprints keep the bare error.
++func TestRealityRejectedCertificateNamesFingerprint(t *testing.T) {
++	// this test verifies against the system roots too and must not load them first
++	trustedServerCertificate()
++	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
++	require.NoError(t, err)
++	template := &x509.Certificate{
++		SerialNumber: big.NewInt(1),
++		Subject:      pkix.Name{CommonName: "example.org"},
++		DNSNames:     []string{"example.org"},
++		NotBefore:    time.Now().Add(-time.Hour),
++		NotAfter:     time.Now().Add(time.Hour),
++	}
++	der, err := x509.CreateCertificate(rand.Reader, template, template, &key.PublicKey, key)
++	require.NoError(t, err)
++	certificate := tls.Certificate{Certificate: [][]byte{der}, PrivateKey: key}
++
++	for _, testCase := range []struct {
++		fingerprint string
++		named       bool
++	}{
++		{"ios", true},
++		{"edge", true},
++		{"qq", true},
++		{"chrome", false},
++	} {
++		t.Run(testCase.fingerprint, func(t *testing.T) {
++			logger, _ := newWarnLogger(t)
++			config, err := NewClient(context.Background(), logger, "example.org", realityOptionsForTest(testCase.fingerprint, true))
++			require.NoError(t, err)
++			// a socket, not a pipe: the alert of the client and the rest of the server's
++			// flight cross on the way, and a pipe buffers neither
++			listener, err := net.Listen("tcp", "127.0.0.1:0")
++			require.NoError(t, err)
++			defer listener.Close()
++			client, err := net.Dial("tcp", listener.Addr().String())
++			require.NoError(t, err)
++			defer client.Close()
++			server, err := listener.Accept()
++			require.NoError(t, err)
++			plainTLSServer(t, server, certificate)
++
++			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
++			defer cancel()
++			_, err = ClientHandshake(ctx, client, config.Clone())
++			require.Error(t, err)
++			require.Contains(t, err.Error(), "x509: ")
++			if !testCase.named {
++				require.NotContains(t, err.Error(), "uTLS fingerprint")
++				require.NotContains(t, err.Error(), "reality verification failed")
++				return
++			}
++			require.True(t, strings.HasPrefix(err.Error(), "reality verification failed"), err.Error())
++			require.Contains(t, err.Error(), "uTLS fingerprint "+testCase.fingerprint+":")
++			require.Contains(t, err.Error(), "Xray-core v26.9.8")
++		})
++	}
++}
+-- 
+2.53.0
+

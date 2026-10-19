@@ -1,7 +1,7 @@
 From 3e2d37c057768cf970501da28f3c54cd44fa56cc Mon Sep 17 00:00:00 2001
 From: FiyeroT <me@fiyero.xyz>
 Date: Thu, 8 Oct 2026 18:37:12 +0300
-Subject: [PATCH 103/126] decode-link: what the fuzzer and the comparison with
+Subject: [PATCH 103/140] decode-link: what the fuzzer and the comparison with
  podkop's shell decoder showed
 
 - A parameter whose name grows when lowered (a letter of another alphabet after

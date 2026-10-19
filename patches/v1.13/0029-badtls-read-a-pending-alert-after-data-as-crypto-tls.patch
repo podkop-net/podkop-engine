@@ -1,7 +1,7 @@
 From 814bff97960baa0bd608a6e10b7147e390cc7f3c Mon Sep 17 00:00:00 2001
 From: FiyeroT <me@fiyero.xyz>
 Date: Sat, 3 Oct 2026 20:23:36 +0300
-Subject: [PATCH 029/126] badtls: read a pending alert after data, as
+Subject: [PATCH 029/140] badtls: read a pending alert after data, as
  crypto/tls does
 
 The check meant to read an alert record that follows the data compared the

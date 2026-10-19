@@ -1,7 +1,7 @@
 From 226fec0a20b493d318b3b2558dadb12b213ce132 Mon Sep 17 00:00:00 2001
 From: FiyeroT <me@fiyero.xyz>
 Date: Sun, 4 Oct 2026 08:49:33 +0300
-Subject: [PATCH 043/126] clashapi: a failed listen of the external controller
+Subject: [PATCH 043/140] clashapi: a failed listen of the external controller
  does not fail the start
 
 The Clash API carries no traffic, yet a failed listen of external_controller

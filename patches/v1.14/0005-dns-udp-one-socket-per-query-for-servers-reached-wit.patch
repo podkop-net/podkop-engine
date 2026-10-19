@@ -1,7 +1,7 @@
-From e4d0b1f8abf9e9e0da6f8fd3e2a46ef70d3cf2d6 Mon Sep 17 00:00:00 2001
+From 7ef35d7da6d337f4c80d117a2816511b914a1f42 Mon Sep 17 00:00:00 2001
 From: FiyeroT <me@fiyero.xyz>
 Date: Tue, 29 Sep 2026 14:31:40 +0300
-Subject: [PATCH 005/125] dns/udp: one socket per query for servers reached
+Subject: [PATCH 005/148] dns/udp: one socket per query for servers reached
  without a proxy
 
 The UDP transport sent every query through one shared socket. Public
@@ -161,10 +161,10 @@ index 000000000..fc205ec05
 +	return loaded && outbound.Type() == C.TypeDirect
 +}
 diff --git a/dns/transport/udp.go b/dns/transport/udp.go
-index 4d5370c44..ddcd012ae 100644
+index a6bcd1885..1b841dc4d 100644
 --- a/dns/transport/udp.go
 +++ b/dns/transport/udp.go
-@@ -37,6 +37,8 @@ type UDPTransport struct {
+@@ -40,6 +40,8 @@ type UDPTransport struct {
  	udpSize    atomic.Int32
  
  	multiplexer *queryMultiplexer
@@ -173,7 +173,7 @@ index 4d5370c44..ddcd012ae 100644
  }
  
  func NewUDP(ctx context.Context, logger log.ContextLogger, tag string, options option.RemoteDNSServerOptions) (adapter.DNSTransport, error) {
-@@ -51,7 +53,9 @@ func NewUDP(ctx context.Context, logger log.ContextLogger, tag string, options o
+@@ -54,7 +56,9 @@ func NewUDP(ctx context.Context, logger log.ContextLogger, tag string, options o
  	if !serverAddr.IsValid() {
  		return nil, E.New("invalid server address: ", serverAddr)
  	}
@@ -184,7 +184,7 @@ index 4d5370c44..ddcd012ae 100644
  }
  
  func NewUDPRaw(logger logger.ContextLogger, adapter dns.TransportAdapter, dialerInstance N.Dialer, serverAddr M.Socksaddr) *UDPTransport {
-@@ -93,7 +97,7 @@ func (t *UDPTransport) Reset() {
+@@ -101,7 +105,7 @@ func (t *UDPTransport) CloseIdleConnections() {
  
  func (t *UDPTransport) Exchange(ctx context.Context, message *mDNS.Msg) (*mDNS.Msg, error) {
  	t.updateUDPSize(message)
@@ -193,7 +193,7 @@ index 4d5370c44..ddcd012ae 100644
  	if err != nil {
  		return nil, err
  	}
-@@ -106,7 +110,7 @@ func (t *UDPTransport) Exchange(ctx context.Context, message *mDNS.Msg) (*mDNS.M
+@@ -114,7 +118,7 @@ func (t *UDPTransport) Exchange(ctx context.Context, message *mDNS.Msg) (*mDNS.M
  
  func (t *UDPTransport) ExchangeAsync(ctx context.Context, message *mDNS.Msg, callback func(response *mDNS.Msg, err error)) {
  	t.updateUDPSize(message)

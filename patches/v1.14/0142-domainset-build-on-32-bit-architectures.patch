@@ -1,0 +1,29 @@
+From 4f42da95ac069a36058deae6821e080a63c65cf1 Mon Sep 17 00:00:00 2001
+From: FiyeroT <me@fiyero.xyz>
+Date: Mon, 19 Oct 2026 20:40:43 +0300
+Subject: [PATCH 142/148] domainset: build on 32-bit architectures
+
+Collector.add compared an int with math.MaxUint32, a constant that does not
+fit in the int of a 32-bit target: the package, and with it every build of
+sing-box for arm, mips, mipsel and i386, did not compile. The offset is
+compared as uint64 now.
+---
+ common/domainset/collector.go | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/common/domainset/collector.go b/common/domainset/collector.go
+index 44e09d5af..8b6130641 100644
+--- a/common/domainset/collector.go
++++ b/common/domainset/collector.go
+@@ -134,7 +134,7 @@ func appendRunes[T string | []byte](own []byte, name T) []byte {
+ 
+ func (c *Collector) add(buffer int, start int, end int, suffix bool) error {
+ 	length := end - start
+-	if length > lengthMask || start > math.MaxUint32 || len(c.refs) >= math.MaxInt32 {
++	if length > lengthMask || uint64(start) > math.MaxUint32 || len(c.refs) >= math.MaxInt32 {
+ 		return errTooLong
+ 	}
+ 	kind := uint32(kindDomain)
+-- 
+2.53.0
+

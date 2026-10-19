@@ -87,14 +87,15 @@ define Package/podkop-engine/description
   Patched REALITY client (X25519MLKEM768 key share, Xray-core 26.9+ servers),
   Firefox 148 / Safari 26.3 uTLS fingerprints. Only what podkop uses: inbounds
   tproxy, direct and mixed; outbounds direct, socks, shadowsocks, trojan, vless,
-  hysteria2, tuic, selector and urltest. Other outbounds: podkop-engine-full.
+  hysteria2, tuic, selector and urltest, and http for a local HTTP proxy.
+  Other outbounds: podkop-engine-full.
   Build tags: with_quic,with_utls,with_clash_api,podkop_slim.
 endef
 
 define Package/podkop-engine-full/description
   Unofficial build of sing-box for podkop, not affiliated with the sing-box project.
   As podkop-engine, plus every other outbound for raw outbound configurations:
-  http, vmess, snell (1.14), tor, ssh, shadowtls, anytls, hysteria and NaiveProxy
+  vmess, snell (1.14), tor, ssh, shadowtls, anytls, hysteria and NaiveProxy
   (x86_64, i386_pentium4, aarch64, armv7 with VFP, mipsel_24kc/74kc, riscv64, loongarch64).
   Build tags: with_quic,with_utls,with_clash_api,podkop_slim,podkop_full
   (+ with_naive_outbound,with_musl where NaiveProxy is built).
@@ -109,6 +110,9 @@ Package/podkop-engine-full/conffiles=$(Package/podkop-engine/conffiles)
 
 # CLI `sing-box api ...` (gRPC-клиент, ~5 МБ) podkop не нужен: убираем по маске,
 # чтобы новые файлы upstream уходили тоже. Регистрацию api/snell снимает тег podkop_slim.
+# From r15 the mask matches nothing on any line: 1.12 and 1.13 have no api command, and on
+# 1.14 its files are in cmd/sing-box/cli behind the build constraint !podkop_slim. It stays
+# for an upstream that puts them back in cmd/sing-box.
 define Build/Prepare
 	$(call Build/Prepare/Default)
 	$(RM) $(PKG_BUILD_DIR)/cmd/sing-box/cmd_api*.go

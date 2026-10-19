@@ -1,0 +1,931 @@
+From bfffd967cd3954a7b28a0dd8b8171f5219051f7e Mon Sep 17 00:00:00 2001
+From: FiyeroT <me@fiyero.xyz>
+Date: Fri, 9 Oct 2026 16:15:04 +0300
+Subject: [PATCH 111/148] urltest: failures across a change of the network, a
+ monitor that sees no route
+
+What a failed dial says about a member depends on what the network did
+meanwhile:
+- "no such device" (the interface a socket is bound to was removed: a
+  PPPoE session that ended, a modem unplugged) is this host's failure,
+  as "network is unreachable" is, and waits for the network monitor;
+- a failure of a dial, of a write that carries the connect, or of a
+  confirming test that began before the network last went, came back or
+  was reset is of the network that was, and is not judged. A reset (the
+  connections closed, the outbounds told of a new default interface)
+  counts as such a change even when the monitor said nothing: Hysteria2
+  and TUIC answer every caller that waits for their connection with
+  "network changed", and the group moved to another member on that. The
+  network manager tells the groups of a reset before it ends anything:
+  the outbounds are told one after another, the members before their
+  group as a rule;
+- a connect cancelled while its caller still waits is this host's doing.
+
+Where the monitor never sees a default route (the routes are in another
+table) the pause manager reports no network for good. The report is not
+believed while some member holds a URL test result newer than it: the
+members are judged from traffic, the ticker of the group runs (the
+manager had stopped it, and a member that lost its result was never
+tested again), and a new interface forces a round. While no member has
+a result at all (sing-box started before the uplink was there, and the
+round at start failed) a group in use runs a round itself, an interval
+at most: no event would come when the uplink does.
+
+A forced round asked for as the running one ends, after that one has
+looked at the flag, is not lost.
+---
+ protocol/group/urltest.go              |  67 +++++--
+ protocol/group/urltest_failure.go      | 122 +++++++++++-
+ protocol/group/urltest_network_test.go | 163 ++++++++++++++--
+ protocol/group/urltest_review2_test.go | 245 +++++++++++++++++++++++++
+ route/network.go                       |   9 +
+ 5 files changed, 574 insertions(+), 32 deletions(-)
+ create mode 100644 protocol/group/urltest_review2_test.go
+
+diff --git a/protocol/group/urltest.go b/protocol/group/urltest.go
+index 49e521a96..294287288 100644
+--- a/protocol/group/urltest.go
++++ b/protocol/group/urltest.go
+@@ -178,12 +178,23 @@ func (s *URLTest) PerformUpdateCheck() {
+ 	s.group.requestUpdateCheck()
+ }
+ 
++// NetworkReset is called at a reset of the network before the reset ends the dials in
++// flight (podkop-engine).
++func (s *URLTest) NetworkReset() {
++	if s.group != nil {
++		s.group.networkReset()
++	}
++}
++
+ func (s *URLTest) InterfaceUpdated(ctx context.Context) {
+ 	group := s.group
+ 	if group == nil {
+ 		return
+ 	}
+-	if group.pause.IsDevicePaused() || group.pause.IsNetworkPaused() {
++	group.networkReset()
++	// asked of the group, not of the manager: the group tells a report of no network
++	// that the members have refuted (podkop-engine)
++	if group.networkPaused() {
+ 		return
+ 	}
+ 	go func() {
+@@ -221,7 +232,13 @@ func (s *URLTest) DialContext(ctx context.Context, network string, destination M
+ 		}
+ 		var handshake *handshakeConn
+ 		if N.NeedHandshakeForWrite(conn) {
+-			handshake = &handshakeConn{Conn: conn, failed: func(err error) { s.group.memberFailed(ctx, outbound, N.NetworkName(network), err, time.Time{}) }}
++			handshake = &handshakeConn{Conn: conn, failed: func(err error) {
++				// a write that carries the connect is ended by a change of the network
++				// as a dial is
++				if !s.group.networkChangedSince(start) {
++					s.group.memberFailed(ctx, outbound, N.NetworkName(network), err, time.Time{})
++				}
++			}}
+ 			conn = handshake
+ 		}
+ 		if N.NetworkName(network) == N.NetworkTCP {
+@@ -288,6 +305,7 @@ type URLTestGroup struct {
+ 	history                      *urltest.HistoryStorage
+ 	checking                     atomic.Bool
+ 	recheck                      atomic.Bool
++	lastRound                    atomic.Int64 // when the last round began, since epoch
+ 	selectedOutboundTCP          common.TypedValue[adapter.Outbound]
+ 	selectedOutboundUDP          common.TypedValue[adapter.Outbound]
+ 	interruptGroup               *interrupt.Group
+@@ -305,10 +323,15 @@ type URLTestGroup struct {
+ 	epoch                        time.Time
+ 	successes                    sync.Map // member tag → *atomic.Int64, its last successful TCP dial, since epoch
+ 	localFailures                sync.Map // member tag → a failure of this host's own network waits to be judged
+-	downloadLink                 string
+-	frozen                       common.TypedValue[map[string]time.Time] // member tag → when it last failed the download test
+-	responses                    sync.Map                                // member tag → *memberResponses
+-	responsesClosed              atomic.Bool
++	// when the network last paused or woke, and when the pause in force was reported,
++	// since epoch (networkChangedSince, networkPaused)
++	networkEvent    atomic.Int64
++	networkPauseAt  atomic.Int64
++	networkCallback *list.Element[pause.Callback]
++	downloadLink    string
++	frozen          common.TypedValue[map[string]time.Time] // member tag → when it last failed the download test
++	responses       sync.Map                                // member tag → *memberResponses
++	responsesClosed atomic.Bool
+ }
+ 
+ func NewURLTestGroup(ctx context.Context, outboundManager adapter.OutboundManager, logger log.Logger, outbounds []adapter.Outbound, fallbacks []adapter.Outbound, link string, downloadLink string, interval time.Duration, tolerance uint16, idleTimeout time.Duration, interruptExternalConnections bool) (*URLTestGroup, error) {
+@@ -328,7 +351,7 @@ func NewURLTestGroup(ctx context.Context, outboundManager adapter.OutboundManage
+ 	if history == nil {
+ 		return nil, E.New("missing URL test history storage")
+ 	}
+-	return &URLTestGroup{
++	group := &URLTestGroup{
+ 		ctx:                          ctx,
+ 		outbound:                     outboundManager,
+ 		logger:                       logger,
+@@ -346,7 +369,9 @@ func NewURLTestGroup(ctx context.Context, outboundManager adapter.OutboundManage
+ 		interruptExternalConnections: interruptExternalConnections,
+ 		epoch:                        time.Now(),
+ 		downloadLink:                 downloadLink,
+-	}, nil
++	}
++	group.watchPause(group.pause)
++	return group, nil
+ }
+ 
+ func (g *URLTestGroup) PostStart() {
+@@ -365,11 +390,13 @@ func (g *URLTestGroup) Touch() {
+ 	defer g.access.Unlock()
+ 	if g.ticker != nil {
+ 		g.lastActive.Store(time.Now())
++		g.probeUnseenNetwork()
+ 		return
+ 	}
+ 	ticker := time.NewTicker(g.interval)
+ 	g.ticker = ticker
+ 	g.pauseCallback = pause.RegisterTicker(g.pause, ticker, g.interval, nil)
++	g.keepTicking()
+ 	go g.loopCheck(ticker, g.close)
+ }
+ 
+@@ -377,6 +404,10 @@ func (g *URLTestGroup) Close() error {
+ 	g.responsesClosed.Store(true)
+ 	g.access.Lock()
+ 	defer g.access.Unlock()
++	if g.networkCallback != nil {
++		g.pause.UnregisterCallback(g.networkCallback)
++		g.networkCallback = nil
++	}
+ 	if g.ticker == nil {
+ 		return nil
+ 	}
+@@ -481,6 +512,18 @@ func (g *URLTestGroup) loopCheck(ticker *time.Ticker, closeChan <-chan struct{})
+ 	}
+ }
+ 
++// requestRecheck asks for one more forced round after the one in progress: that one
++// began before whatever forced this one (a new default interface, mostly), and its
++// results are of the old state.
++func (g *URLTestGroup) requestRecheck() {
++	g.recheck.Store(true)
++	// that round may have ended, and looked at the flag, between the caller's look at it
++	// and the statement above: then this call is the only one left to act on the flag
++	if !g.checking.Load() && g.recheck.Swap(false) && g.ctx.Err() == nil && !g.networkPaused() {
++		go g.CheckOutbounds(g.ctx, true)
++	}
++}
++
+ func (g *URLTestGroup) CheckOutbounds(ctx context.Context, force bool) {
+ 	_, _ = g.urlTest(ctx, force)
+ }
+@@ -505,14 +548,16 @@ func (g *URLTestGroup) urlTest(ctx context.Context, force bool) (map[string]uint
+ func (g *URLTestGroup) urlTestRound(ctx context.Context, force bool, wait bool) (map[string]uint16, error) {
+ 	if g.checking.Swap(true) {
+ 		if force {
+-			// the round in progress began before whatever forced this one (a new default
+-			// interface, mostly): its results are of the old state, so another follows it
+-			g.recheck.Store(true)
++			g.requestRecheck()
+ 		}
+ 		return make(map[string]uint16), nil
+ 	}
++	g.lastRound.Store(int64(time.Since(g.epoch)))
+ 	defer func() {
+ 		g.checking.Store(false)
++		g.access.Lock()
++		g.keepTicking()
++		g.access.Unlock()
+ 		if g.recheck.Swap(false) && g.ctx.Err() == nil && !g.networkPaused() {
+ 			go g.CheckOutbounds(g.ctx, true)
+ 		}
+diff --git a/protocol/group/urltest_failure.go b/protocol/group/urltest_failure.go
+index 91263ae77..30b57ce94 100644
+--- a/protocol/group/urltest_failure.go
++++ b/protocol/group/urltest_failure.go
+@@ -15,6 +15,7 @@ import (
+ 	C "github.com/sagernet/sing-box/constant"
+ 	E "github.com/sagernet/sing/common/exceptions"
+ 	N "github.com/sagernet/sing/common/network"
++	"github.com/sagernet/sing/service/pause"
+ )
+ 
+ // What the group learns from the traffic of its members (podkop-engine).
+@@ -46,9 +47,12 @@ import (
+ // Nor does a failure this host's own network caused, while that network is gone: with no
+ // default interface every dial through every member fails at once. The network monitor
+ // says so (networkPaused), but a second after the route went: until then the dials fail
+-// with "network is unreachable" (localNetworkError). Such a failure waits for the monitor
+-// (afterLocalFailure) and is judged only if the network is still said to be there: then
+-// it was the member's own way that was missing.
++// with "network is unreachable", or with "no such device" when the interface itself is
++// gone (localNetworkError). Such a failure waits for the monitor (afterLocalFailure) and
++// is judged only if the network is still said to be there: then it was the member's own
++// way that was missing. A failure of something that began before the network last went
++// or came back is of the network that was (networkChangedSince): a short outage is over
++// by the time its failures are looked at.
+ 
+ // serverOnlyDial reports whether a dial through outbound contacts only its server, so that a
+ // failed dial or handshake write is the server's.
+@@ -73,9 +77,12 @@ func (g *URLTestGroup) memberFailed(ctx context.Context, member adapter.Outbound
+ 	// counts them as closed, which suits a copy loop, not this. A timeout stays the
+ 	// member's even when it also reports itself closed: the idle and handshake timeouts of
+ 	// quic-go (Hysteria2, TUIC) match net.ErrClosed.
++	// A connect cancelled while its caller still waits was ended by this host: a reset of
++	// the network cancels the one a first write has started (tcp_fast_open). No server
++	// does that.
+ 	var netErr net.Error
+ 	timeout := errors.As(err, &netErr) && netErr.Timeout()
+-	if ctx.Err() != nil || !timeout && (errors.Is(err, net.ErrClosed) || errors.Is(err, os.ErrClosed)) {
++	if ctx.Err() != nil || !timeout && (errors.Is(err, net.ErrClosed) || errors.Is(err, os.ErrClosed) || errors.Is(err, context.Canceled)) {
+ 		return
+ 	}
+ 	tag := RealTag(g.outbound, member)
+@@ -91,6 +98,10 @@ func (g *URLTestGroup) memberFailed(ctx context.Context, member adapter.Outbound
+ // judgeFailure decides what a failure that is neither the caller's nor the network's says
+ // about the member.
+ func (g *URLTestGroup) judgeFailure(tag string, member adapter.Outbound, network string, err error, start time.Time) {
++	if !start.IsZero() && g.networkChangedSince(start) {
++		g.logger.Debug("outbound ", tag, " failed across a change of the network: ", err)
++		return
++	}
+ 	if !start.IsZero() && g.succeededSince(tag, start) {
+ 		g.logger.Debug("outbound ", tag, " failed while another connection through it succeeded: ", err)
+ 		return
+@@ -111,9 +122,12 @@ func (g *URLTestGroup) judgeFailure(tag string, member adapter.Outbound, network
+ var localFailureGrace = 3 * time.Second
+ 
+ // localNetworkError reports whether err is this host's own refusal to send: no route to
+-// the address, no interface that is up, no address to send from.
++// the address, no interface that is up, no address to send from, or no interface at all
++// where the socket is bound to one: an interface that is taken down gives the first, one
++// that is removed (a PPPoE session that ended, a modem unplugged) the last.
+ func localNetworkError(err error) bool {
+-	return errors.Is(err, syscall.ENETUNREACH) || errors.Is(err, syscall.ENETDOWN) || errors.Is(err, syscall.EADDRNOTAVAIL)
++	return errors.Is(err, syscall.ENETUNREACH) || errors.Is(err, syscall.ENETDOWN) || errors.Is(err, syscall.EADDRNOTAVAIL) ||
++		errors.Is(err, syscall.ENODEV)
+ }
+ 
+ // afterLocalFailure runs judge for a failure of this host's own network through the member
+@@ -127,7 +141,7 @@ func (g *URLTestGroup) afterLocalFailure(tag string, judge func()) {
+ 	failed := time.Now()
+ 	time.AfterFunc(localFailureGrace, func() {
+ 		g.localFailures.Delete(tag)
+-		if g.ctx.Err() != nil || g.networkPaused() || g.succeededSince(tag, failed) {
++		if g.ctx.Err() != nil || g.networkPaused() || g.networkChangedSince(failed) || g.succeededSince(tag, failed) {
+ 			return
+ 		}
+ 		history := g.history.LoadURLTestHistory(tag)
+@@ -141,8 +155,98 @@ func (g *URLTestGroup) afterLocalFailure(tag string, judge func()) {
+ // networkPaused reports whether the device sleeps or has no default interface. The ticker
+ // of the group stops for that time, and so must the judgements made from traffic: they
+ // would erase the test results of every member the group tries, one after another.
++//
++// The monitor looks for a default route in the main table. Where the routes are elsewhere
++// (another table) it reports no default interface for good while the network works. A
++// member that has passed a URL test after the report is the proof of that, and while
++// some member holds such a result the report is not believed: the members are judged as
++// if the monitor had said nothing, and the ticker of the group runs (keepTicking).
+ func (g *URLTestGroup) networkPaused() bool {
+-	return g.pause != nil && (g.pause.IsDevicePaused() || g.pause.IsNetworkPaused())
++	if g.pause == nil {
++		return false
++	}
++	if g.pause.IsDevicePaused() {
++		return true
++	}
++	if !g.pause.IsNetworkPaused() {
++		return false
++	}
++	reported := g.epoch.Add(time.Duration(g.networkPauseAt.Load()))
++	for _, member := range g.members {
++		history := g.history.LoadURLTestHistory(RealTag(g.outbound, member))
++		if history != nil && history.Time.After(reported) {
++			return false
++		}
++	}
++	return true
++}
++
++// watchPause makes the group follow a pause manager.
++func (g *URLTestGroup) watchPause(manager pause.Manager) {
++	g.pause = manager
++	if manager == nil {
++		return
++	}
++	if manager.IsDevicePaused() || manager.IsNetworkPaused() {
++		g.networkPauseAt.Store(max(int64(time.Since(g.epoch)), 1))
++	}
++	// called under the lock of the manager: nothing of it is asked there
++	g.networkCallback = manager.RegisterCallback(func(event int) {
++		now := max(int64(time.Since(g.epoch)), 1)
++		g.networkEvent.Store(now)
++		if event == pause.EventDevicePaused || event == pause.EventNetworkPause {
++			g.networkPauseAt.Store(now)
++		}
++	})
++}
++
++// keepTicking restarts the ticker of the group where the report of no network is not
++// believed (networkPaused). The manager stops the ticker of a group for as long as it
++// reports a pause; where that is for good no round would test the members again, and
++// each of them would be lost at its first failure. The caller holds the lock.
++func (g *URLTestGroup) keepTicking() {
++	if g.ticker == nil || g.pause == nil || g.pause.IsDevicePaused() || !g.pause.IsNetworkPaused() || g.networkPaused() {
++		return
++	}
++	g.ticker.Reset(g.interval)
++}
++
++// probeUnseenNetwork runs a round where the manager reports no network and no member has
++// a test result: nothing else would. Where the monitor never sees a default route and
++// sing-box started before the uplink was there, the round at start failed, the ticker
++// stays stopped (keepTicking has nothing to refute the report with), and no event comes
++// when the uplink does. A round an interval at most, and only while the group is in use;
++// while a member has a result the report stands: the rounds of a real outage would erase
++// the results it keeps. The caller holds the lock.
++func (g *URLTestGroup) probeUnseenNetwork() {
++	if g.pause == nil || g.pause.IsDevicePaused() || !g.pause.IsNetworkPaused() {
++		return
++	}
++	now, last := int64(time.Since(g.epoch)), g.lastRound.Load()
++	if now-last < int64(g.interval) {
++		return
++	}
++	for _, member := range g.members {
++		if g.history.LoadURLTestHistory(RealTag(g.outbound, member)) != nil {
++			return
++		}
++	}
++	if g.lastRound.CompareAndSwap(last, now) {
++		go g.CheckOutbounds(g.ctx, false)
++	}
++}
++
++// networkReset records a reset of the network: the connections through the members
++// were closed and their outbounds told of a new default interface, which ends their
++// dials in flight. It comes a moment after the monitor's word, or with none at all (an
++// address added on the uplink, the connections closed from the Clash API).
++func (g *URLTestGroup) networkReset() {
++	g.networkEvent.Store(max(int64(time.Since(g.epoch)), 1))
++}
++
++// networkChangedSince reports whether the network went, came back or was reset after t.
++func (g *URLTestGroup) networkChangedSince(t time.Time) bool {
++	return g.networkEvent.Load() > int64(t.Sub(g.epoch))
+ }
+ 
+ // memberSucceeded records a successful TCP dial through member.
+@@ -244,7 +348,7 @@ func (g *URLTestGroup) confirmWith(confirms *map[string]*memberConfirm, tag stri
+ 		if err == nil {
+ 			g.memberTestPassed(tag, start)
+ 		}
+-		if err == nil || g.ctx.Err() != nil || g.networkPaused() {
++		if err == nil || g.ctx.Err() != nil || g.networkPaused() || g.networkChangedSince(start) {
+ 			// a test that failed because the network went away meanwhile proves nothing
+ 			return
+ 		}
+diff --git a/protocol/group/urltest_network_test.go b/protocol/group/urltest_network_test.go
+index 0ee6fb300..db5bce793 100644
+--- a/protocol/group/urltest_network_test.go
++++ b/protocol/group/urltest_network_test.go
+@@ -5,6 +5,7 @@ import (
+ 	"errors"
+ 	"net"
+ 	"os"
++	"sync"
+ 	"sync/atomic"
+ 	"syscall"
+ 	"testing"
+@@ -14,6 +15,7 @@ import (
+ 	C "github.com/sagernet/sing-box/constant"
+ 	M "github.com/sagernet/sing/common/metadata"
+ 	N "github.com/sagernet/sing/common/network"
++	"github.com/sagernet/sing/common/x/list"
+ 	"github.com/sagernet/sing/service/pause"
+ 
+ 	"github.com/stretchr/testify/require"
+@@ -23,10 +25,41 @@ import (
+ type testPause struct {
+ 	pause.Manager
+ 	networkPaused atomic.Bool
++	access        sync.Mutex
++	callbacks     list.List[pause.Callback]
+ }
+ 
+ func (p *testPause) IsDevicePaused() bool  { return false }
+ func (p *testPause) IsNetworkPaused() bool { return p.networkPaused.Load() }
++func (p *testPause) IsPaused() bool        { return p.networkPaused.Load() }
++
++func (p *testPause) RegisterCallback(callback pause.Callback) *list.Element[pause.Callback] {
++	p.access.Lock()
++	defer p.access.Unlock()
++	return p.callbacks.PushBack(callback)
++}
++
++func (p *testPause) UnregisterCallback(element *list.Element[pause.Callback]) {
++	p.access.Lock()
++	defer p.access.Unlock()
++	p.callbacks.Remove(element)
++}
++
++// set reports the network gone or back, as the monitor does: the state, then the event.
++func (p *testPause) set(paused bool) {
++	p.access.Lock()
++	defer p.access.Unlock()
++	if p.networkPaused.Swap(paused) == paused {
++		return
++	}
++	event := pause.EventNetworkWake
++	if paused {
++		event = pause.EventNetworkPause
++	}
++	for element := p.callbacks.Front(); element != nil; element = element.Next() {
++		element.Value(event)
++	}
++}
+ 
+ // Without a default interface every dial fails at once. That is not the members' failure:
+ // their test results stay, and the group does not walk through them erasing each.
+@@ -36,8 +69,8 @@ func TestURLTestPausedNetworkKeepsResults(t *testing.T) {
+ 	second := newTestMember(C.TypeVLESS, "second", dialRefused)
+ 	urlTest, group := newTestURLTest(t, link, first, second)
+ 	paused := &testPause{}
+-	paused.networkPaused.Store(true)
+-	group.pause = paused
++	paused.set(true)
++	group.watchPause(paused)
+ 
+ 	for range 3 {
+ 		_, err := urlTest.DialContext(context.Background(), N.NetworkTCP, M.ParseSocksaddr("1.2.3.4:443"))
+@@ -50,7 +83,7 @@ func TestURLTestPausedNetworkKeepsResults(t *testing.T) {
+ 	require.Equal(t, int32(0), requests.Load())
+ 
+ 	// the network is back: the same failure is the member's again
+-	paused.networkPaused.Store(false)
++	paused.set(false)
+ 	_, err := urlTest.DialContext(context.Background(), N.NetworkTCP, M.ParseSocksaddr("1.2.3.4:443"))
+ 	require.Error(t, err)
+ 	waitSelected(t, group, "second")
+@@ -62,12 +95,12 @@ func TestURLTestConfirmDuringPauseDiscarded(t *testing.T) {
+ 	link, _ := testURL(t, 0)
+ 	paused := &testPause{}
+ 	member := newTestMember(C.TypeVLESS, "member", func(context.Context, string, M.Socksaddr) (net.Conn, error) {
+-		paused.networkPaused.Store(true) // the interface goes down under the test
++		paused.set(true) // the interface goes down under the test
+ 		return nil, syscall.ENETUNREACH
+ 	})
+ 	spare := newTestMember(C.TypeVLESS, "spare", dialWorking)
+ 	urlTest, group := newTestURLTest(t, link, member, spare)
+-	group.pause = paused
++	group.watchPause(paused)
+ 
+ 	// a failed packet dial is confirmed by a URL test of the member
+ 	_, err := urlTest.ListenPacket(context.Background(), M.ParseSocksaddr("1.2.3.4:443"))
+@@ -190,6 +223,11 @@ func dialUnreachable(context.Context, string, M.Socksaddr) (net.Conn, error) {
+ 	return nil, &net.OpError{Op: "dial", Net: "tcp", Err: os.NewSyscallError("connect", syscall.ENETUNREACH)}
+ }
+ 
++// dialNoDevice fails as a dial does when the interface its socket is bound to is gone.
++func dialNoDevice(context.Context, string, M.Socksaddr) (net.Conn, error) {
++	return nil, &net.OpError{Op: "dial", Net: "tcp", Err: os.NewSyscallError("connect", syscall.ENODEV)}
++}
++
+ func shortLocalFailureGrace(t *testing.T) {
+ 	saved := localFailureGrace
+ 	localFailureGrace = 300 * time.Millisecond
+@@ -207,13 +245,13 @@ func TestURLTestLocalNetworkErrorWaitsForMonitor(t *testing.T) {
+ 	second := newTestMember(C.TypeVLESS, "second", dialUnreachable)
+ 	urlTest, group := newTestURLTest(t, link, first, second)
+ 	paused := &testPause{}
+-	group.pause = paused
++	group.watchPause(paused)
+ 
+ 	for range 3 {
+ 		_, err := urlTest.DialContext(context.Background(), N.NetworkTCP, M.ParseSocksaddr("1.2.3.4:443"))
+ 		require.Error(t, err)
+ 	}
+-	paused.networkPaused.Store(true) // the monitor speaks
++	paused.set(true) // the monitor speaks
+ 	time.Sleep(2 * localFailureGrace)
+ 	require.NotNil(t, group.history.LoadURLTestHistory("first"))
+ 	require.NotNil(t, group.history.LoadURLTestHistory("second"))
+@@ -231,7 +269,7 @@ func TestURLTestLocalNetworkErrorOfOneMember(t *testing.T) {
+ 	first := newTestMember(C.TypeVLESS, "first", dialUnreachable)
+ 	second := newTestMember(C.TypeVLESS, "second", dialWorking)
+ 	urlTest, group := newTestURLTest(t, link, first, second)
+-	group.pause = &testPause{}
++	group.watchPause(&testPause{})
+ 
+ 	_, err := urlTest.DialContext(context.Background(), N.NetworkTCP, M.ParseSocksaddr("1.2.3.4:443"))
+ 	require.Error(t, err)
+@@ -248,7 +286,7 @@ func TestURLTestLocalNetworkErrorOutdated(t *testing.T) {
+ 	first := newTestMember(C.TypeVLESS, "first", dialUnreachable)
+ 	second := newTestMember(C.TypeVLESS, "second", dialWorking)
+ 	urlTest, group := newTestURLTest(t, link, first, second)
+-	group.pause = &testPause{}
++	group.watchPause(&testPause{})
+ 
+ 	_, err := urlTest.DialContext(context.Background(), N.NetworkTCP, M.ParseSocksaddr("1.2.3.4:443"))
+ 	require.Error(t, err)
+@@ -266,23 +304,124 @@ func TestURLTestConfirmLocalNetworkErrorWaitsForMonitor(t *testing.T) {
+ 	spare := newTestMember(C.TypeVLESS, "spare", dialWorking)
+ 	urlTest, group := newTestURLTest(t, link, member, spare)
+ 	paused := &testPause{}
+-	group.pause = paused
++	group.watchPause(paused)
+ 
+ 	// a failed packet dial is confirmed by a URL test of the member, which finds no route
+ 	_, err := urlTest.ListenPacket(context.Background(), M.ParseSocksaddr("1.2.3.4:443"))
+ 	require.Error(t, err)
+ 	waitConfirmed(t, group, "member")
+ 	require.Equal(t, int32(1), member.dials.Load())
+-	paused.networkPaused.Store(true)
++	paused.set(true)
+ 	time.Sleep(2 * localFailureGrace)
+ 	require.NotNil(t, group.history.LoadURLTestHistory("member"))
+ 	require.Equal(t, "member", group.selectedOutboundTCP.Load().Tag())
+ 
+ 	// and without the monitor's word the member is unavailable after that time
+-	paused.networkPaused.Store(false)
++	paused.set(false)
+ 	allowConfirm(group, "member", time.Now())
+ 	_, err = urlTest.ListenPacket(context.Background(), M.ParseSocksaddr("1.2.3.4:443"))
+ 	require.Error(t, err)
+ 	waitSelected(t, group, "spare")
+ 	require.Nil(t, group.history.LoadURLTestHistory("member"))
+ }
++
++// An interface that is removed, not taken down (a PPPoE session that ended, a modem that
++// was unplugged), fails the dials bound to it with "no such device": this host's failure
++// as well, which waits for the monitor.
++func TestURLTestLocalNetworkErrorOfAGoneDevice(t *testing.T) {
++	shortLocalFailureGrace(t)
++	link, requests := testURL(t, 0)
++	first := newTestMember(C.TypeVLESS, "first", dialNoDevice)
++	second := newTestMember(C.TypeVLESS, "second", dialNoDevice)
++	urlTest, group := newTestURLTest(t, link, first, second)
++	paused := &testPause{}
++	group.watchPause(paused)
++
++	for range 3 {
++		_, err := urlTest.DialContext(context.Background(), N.NetworkTCP, M.ParseSocksaddr("1.2.3.4:443"))
++		require.Error(t, err)
++	}
++	paused.set(true)
++	time.Sleep(2 * localFailureGrace)
++	require.NotNil(t, group.history.LoadURLTestHistory("first"))
++	require.NotNil(t, group.history.LoadURLTestHistory("second"))
++	require.Equal(t, "first", group.selectedOutboundTCP.Load().Tag())
++	require.Equal(t, int32(0), requests.Load())
++}
++
++// An outage shorter than the wait: the route went, the monitor said so, and the route is
++// back before the failure of the first second is looked at. It is of the network that
++// was, whatever the monitor says now.
++func TestURLTestLocalNetworkErrorAcrossAShortOutage(t *testing.T) {
++	shortLocalFailureGrace(t)
++	link, requests := testURL(t, 0)
++	first := newTestMember(C.TypeVLESS, "first", dialUnreachable)
++	second := newTestMember(C.TypeVLESS, "second", dialUnreachable)
++	urlTest, group := newTestURLTest(t, link, first, second)
++	paused := &testPause{}
++	group.watchPause(paused)
++
++	_, err := urlTest.DialContext(context.Background(), N.NetworkTCP, M.ParseSocksaddr("1.2.3.4:443"))
++	require.Error(t, err)
++	time.Sleep(localFailureGrace / 4)
++	paused.set(true)
++	time.Sleep(localFailureGrace / 4)
++	paused.set(false)
++	time.Sleep(2 * localFailureGrace)
++	require.NotNil(t, group.history.LoadURLTestHistory("first"), "judged after the outage for a failure of its beginning")
++	require.Equal(t, "first", group.selectedOutboundTCP.Load().Tag())
++	require.Equal(t, int32(0), requests.Load())
++}
++
++// A dial that was on its way when the network went and came back fails after that with
++// an error of its own kind (a timeout, a reset): of the network that was, too.
++func TestURLTestFailureAcrossANetworkChange(t *testing.T) {
++	link, requests := testURL(t, 0)
++	paused := &testPause{}
++	first := newTestMember(C.TypeVLESS, "first", func(ctx context.Context, network string, destination M.Socksaddr) (net.Conn, error) {
++		paused.set(true)
++		paused.set(false)
++		return dialRefused(ctx, network, destination)
++	})
++	second := newTestMember(C.TypeVLESS, "second", dialWorking)
++	urlTest, group := newTestURLTest(t, link, first, second)
++	group.watchPause(paused)
++
++	_, err := urlTest.DialContext(context.Background(), N.NetworkTCP, M.ParseSocksaddr("1.2.3.4:443"))
++	require.Error(t, err)
++	time.Sleep(50 * time.Millisecond)
++	require.NotNil(t, group.history.LoadURLTestHistory("first"))
++	require.Equal(t, "first", group.selectedOutboundTCP.Load().Tag())
++	require.Equal(t, int32(0), requests.Load())
++}
++
++// Where the monitor never sees a default route (the routes are in another table) it
++// reports the network gone for good. A member that passes a URL test after that report
++// shows the network is there: the members are judged from their traffic again.
++func TestURLTestMonitorThatSeesNoRoute(t *testing.T) {
++	link, _ := testURL(t, 0)
++	first := newTestMember(C.TypeVLESS, "first", dialRefused)
++	second := newTestMember(C.TypeVLESS, "second", dialWorking)
++	urlTest, group := newTestURLTest(t, link, first, second)
++	paused := &testPause{}
++	paused.set(true)
++	group.watchPause(paused)
++
++	_, err := urlTest.DialContext(context.Background(), N.NetworkTCP, M.ParseSocksaddr("1.2.3.4:443"))
++	require.Error(t, err)
++	time.Sleep(50 * time.Millisecond)
++	require.NotNil(t, group.history.LoadURLTestHistory("first"), "the report is believed until something refutes it")
++
++	// the round at start, or a test asked for by hand, passes
++	group.history.StoreURLTestHistory("second", &adapter.URLTestHistory{Time: time.Now(), Delay: 110})
++	require.False(t, group.networkPaused())
++	_, err = urlTest.DialContext(context.Background(), N.NetworkTCP, M.ParseSocksaddr("1.2.3.4:443"))
++	require.Error(t, err)
++	waitSelected(t, group, "second")
++	require.Nil(t, group.history.LoadURLTestHistory("first"))
++
++	// a report after that is believed again, until refuted again
++	paused.set(false)
++	paused.set(true)
++	require.True(t, group.networkPaused())
++}
+diff --git a/protocol/group/urltest_review2_test.go b/protocol/group/urltest_review2_test.go
+new file mode 100644
+index 000000000..37cfd2e87
+--- /dev/null
++++ b/protocol/group/urltest_review2_test.go
+@@ -0,0 +1,245 @@
++package group
++
++import (
++	"context"
++	"net"
++	"sync/atomic"
++	"syscall"
++	"testing"
++	"time"
++
++	C "github.com/sagernet/sing-box/constant"
++	E "github.com/sagernet/sing/common/exceptions"
++	M "github.com/sagernet/sing/common/metadata"
++	N "github.com/sagernet/sing/common/network"
++
++	"github.com/stretchr/testify/require"
++)
++
++// What the second review of the group showed.
++
++// A reset of the network (a new default interface, the connections closed by hand) ends
++// the dials in flight with errors of its own, and comes a moment after the monitor's
++// word, or with none. The failure is the reset's: the group stays on the member.
++func TestURLTestFailureAcrossANetworkReset(t *testing.T) {
++	// a delay that is not zero: a result of 0 ms counts as none when the group selects
++	link, requests := testURL(t, 20*time.Millisecond)
++	var (
++		urlTest *URLTest
++		reset   atomic.Bool
++	)
++	first := newTestMember(C.TypeHysteria2, "first", func(ctx context.Context, network string, destination M.Socksaddr) (net.Conn, error) {
++		if reset.CompareAndSwap(false, true) {
++			// as the outbound of a QUIC protocol answers the callers that wait for its
++			// connection when it is told of a new interface
++			urlTest.InterfaceUpdated(context.Background())
++			return nil, E.New("network changed")
++		}
++		return dialWorking(ctx, network, destination)
++	})
++	second := newTestMember(C.TypeVLESS, "second", dialWorking)
++	urlTest, group := newTestURLTest(t, link, first, second)
++
++	_, err := urlTest.DialContext(context.Background(), N.NetworkTCP, M.ParseSocksaddr("1.2.3.4:443"))
++	require.Error(t, err)
++	// the reset forces a round
++	require.Eventually(t, func() bool { return requests.Load() >= 2 && !group.checking.Load() }, 5*time.Second, 5*time.Millisecond)
++	time.Sleep(100 * time.Millisecond)
++	require.Equal(t, "first", group.selectedOutboundTCP.Load().Tag(), "the reset was taken for a failure of the member")
++	require.NotNil(t, group.history.LoadURLTestHistory("first"))
++}
++
++// A connect that is cancelled while its caller still waits (the one a first write starts
++// with tcp_fast_open, ended by a reset of the network) is not the member's failure.
++func TestURLTestCancelledConnectIgnored(t *testing.T) {
++	link, requests := testURL(t, 0)
++	first := newTestMember(C.TypeVLESS, "first", func(context.Context, string, M.Socksaddr) (net.Conn, error) {
++		return nil, &net.OpError{Op: "dial", Net: "tcp", Err: context.Canceled}
++	})
++	second := newTestMember(C.TypeVLESS, "second", dialWorking)
++	urlTest, group := newTestURLTest(t, link, first, second)
++
++	_, err := urlTest.DialContext(context.Background(), N.NetworkTCP, M.ParseSocksaddr("1.2.3.4:443"))
++	require.Error(t, err)
++	time.Sleep(50 * time.Millisecond)
++	require.NotNil(t, group.history.LoadURLTestHistory("first"))
++	require.Equal(t, "first", group.selectedOutboundTCP.Load().Tag())
++	require.Equal(t, int32(0), requests.Load())
++}
++
++// The write that carries the connect fails after the network changed under the dial: of
++// the network that was, as a failed dial is.
++func TestURLTestHandshakeWriteAcrossANetworkChange(t *testing.T) {
++	link, _ := testURL(t, 0)
++	urlTest, group := newTestURLTest(t, link, newLazyMember(t, syscall.ECONNRESET), newTestMember(C.TypeVLESS, "spare", dialWorking))
++	paused := &testPause{}
++	group.watchPause(paused)
++
++	conn, err := urlTest.DialContext(context.Background(), N.NetworkTCP, M.ParseSocksaddr("1.2.3.4:443"))
++	require.NoError(t, err)
++	paused.set(true)
++	paused.set(false)
++	writer, _ := N.UnwrapCountWriter(conn, nil) // as kickWriteHandshake does
++	_, err = writer.Write([]byte("payload"))
++	require.ErrorIs(t, err, syscall.ECONNRESET)
++	time.Sleep(50 * time.Millisecond)
++	require.Equal(t, "member", group.selectedOutboundTCP.Load().Tag())
++}
++
++// A confirming test that was on its way when the network went and came back is of the
++// network that was: the result of the member stays.
++func TestURLTestConfirmAcrossAShortOutage(t *testing.T) {
++	link, _ := testURL(t, 0)
++	paused := &testPause{}
++	member := newTestMember(C.TypeVLESS, "member", func(context.Context, string, M.Socksaddr) (net.Conn, error) {
++		paused.set(true)
++		paused.set(false)
++		return nil, syscall.ECONNREFUSED
++	})
++	spare := newTestMember(C.TypeVLESS, "spare", dialWorking)
++	urlTest, group := newTestURLTest(t, link, member, spare)
++	group.watchPause(paused)
++
++	// a failed packet dial is confirmed by a URL test of the member
++	_, err := urlTest.ListenPacket(context.Background(), M.ParseSocksaddr("1.2.3.4:443"))
++	require.Error(t, err)
++	waitConfirmed(t, group, "member")
++	require.Equal(t, int32(1), member.dials.Load())
++	require.NotNil(t, group.history.LoadURLTestHistory("member"), "a test cut by the outage erased the result")
++	require.Equal(t, "member", group.selectedOutboundTCP.Load().Tag())
++}
++
++// A confirming test that met the missing route at the beginning of an outage shorter
++// than the wait for the monitor: the route is back before the failure is looked at.
++func TestURLTestConfirmLocalNetworkErrorAcrossAShortOutage(t *testing.T) {
++	shortLocalFailureGrace(t)
++	link, _ := testURL(t, 0)
++	member := newTestMember(C.TypeVLESS, "member", dialUnreachable)
++	spare := newTestMember(C.TypeVLESS, "spare", dialWorking)
++	urlTest, group := newTestURLTest(t, link, member, spare)
++	paused := &testPause{}
++	group.watchPause(paused)
++
++	_, err := urlTest.ListenPacket(context.Background(), M.ParseSocksaddr("1.2.3.4:443"))
++	require.Error(t, err)
++	waitConfirmed(t, group, "member")
++	require.Equal(t, int32(1), member.dials.Load())
++	time.Sleep(localFailureGrace / 4)
++	paused.set(true)
++	time.Sleep(localFailureGrace / 4)
++	paused.set(false)
++	time.Sleep(2 * localFailureGrace)
++	require.NotNil(t, group.history.LoadURLTestHistory("member"), "judged after the outage for a failure of its beginning")
++	require.Equal(t, "member", group.selectedOutboundTCP.Load().Tag())
++	_, waiting := group.localFailures.Load("member")
++	require.False(t, waiting, "the failure was not looked at")
++}
++
++// A forced round that is asked for as the running one ends, after that one has looked at
++// the flag: the request is the only one left to act on it, and one round follows.
++func TestURLTestRecheckAskedAsTheRoundEnds(t *testing.T) {
++	link, _ := testURL(t, 0)
++	member := newTestMember(C.TypeVLESS, "member", dialWorking)
++	_, group := newTestURLTest(t, link, member)
++
++	group.requestRecheck()
++	require.Eventually(t, func() bool { return member.dials.Load() == 1 }, 5*time.Second, 5*time.Millisecond, "no round followed")
++	time.Sleep(300 * time.Millisecond)
++	require.Equal(t, int32(1), member.dials.Load(), "more than one round followed")
++	require.False(t, group.recheck.Load())
++}
++
++// Where the monitor never sees a default route the manager stops the ticker of the group
++// for good. Once a member has passed a URL test after the report, the group runs its
++// rounds again: without them a member that lost its result would never be tested. A
++// report that comes after that is believed again, and the rounds stop.
++func TestURLTestRoundsWhereMonitorSeesNoRoute(t *testing.T) {
++	link, requests := testURL(t, 0)
++	member := newTestMember(C.TypeVLESS, "member", dialWorking)
++	urlTest, group := newTestURLTest(t, link, member)
++	paused := &testPause{}
++	paused.set(true)
++	group.watchPause(paused)
++	group.interval = 200 * time.Millisecond
++	group.started = true
++	group.lastActive.Store(time.Now())
++	t.Cleanup(func() { group.Close() })
++
++	// the report is believed: no round, and none to try it either while the member has
++	// a result, which the rounds of a real outage would erase
++	urlTest.group.Touch()
++	time.Sleep(3 * group.interval)
++	urlTest.group.Touch()
++	time.Sleep(100 * time.Millisecond)
++	require.Equal(t, int32(0), requests.Load())
++
++	// the round at start, or a test asked for by hand, passes: the rounds go on
++	group.CheckOutbounds(context.Background(), true)
++	require.Equal(t, int32(1), requests.Load())
++	require.False(t, group.networkPaused())
++	require.Eventually(t, func() bool { return requests.Load() >= 4 }, 5*time.Second, 10*time.Millisecond, "no periodic round where the report is refuted")
++
++	// the network is seen, and then goes: that report is believed
++	require.Eventually(t, func() bool { return !group.checking.Load() }, 2*time.Second, time.Millisecond)
++	paused.set(false)
++	paused.set(true)
++	require.True(t, group.networkPaused())
++	require.Eventually(t, func() bool { return !group.checking.Load() }, 2*time.Second, 5*time.Millisecond)
++	time.Sleep(50 * time.Millisecond)
++	tested := requests.Load()
++	time.Sleep(3 * group.interval)
++	require.Equal(t, tested, requests.Load(), "rounds during a pause that nothing has refuted")
++}
++
++// A group is told of a reset of the network before the reset ends the dials in flight.
++// The outbounds are told of the new interface one after another, the members before the
++// group as a rule, and what their waiting dials say then is the reset's.
++func TestURLTestToldOfAResetFirst(t *testing.T) {
++	link, requests := testURL(t, 20*time.Millisecond)
++	var urlTest *URLTest
++	first := newTestMember(C.TypeHysteria2, "first", func(context.Context, string, M.Socksaddr) (net.Conn, error) {
++		// the network manager has told the group; this member is told next and ends
++		// the dials that wait for its connection
++		urlTest.NetworkReset()
++		return nil, E.New("network changed")
++	})
++	second := newTestMember(C.TypeVLESS, "second", dialWorking)
++	urlTest, group := newTestURLTest(t, link, first, second)
++
++	_, err := urlTest.DialContext(context.Background(), N.NetworkTCP, M.ParseSocksaddr("1.2.3.4:443"))
++	require.Error(t, err)
++	time.Sleep(100 * time.Millisecond)
++	require.Equal(t, "first", group.selectedOutboundTCP.Load().Tag(), "the reset was taken for a failure of the member")
++	require.NotNil(t, group.history.LoadURLTestHistory("first"))
++	require.Equal(t, int32(0), requests.Load())
++}
++
++// Where the monitor never sees a default route and sing-box started before the uplink was
++// there, the round at start failed: no member has a result, the ticker is stopped, and no
++// event comes when the uplink does. The group then runs a round itself, an interval at
++// most, while it is in use; the first member that passes refutes the report.
++func TestURLTestProbesWhereMonitorSeesNoRoute(t *testing.T) {
++	link, requests := testURL(t, 0)
++	member := newTestMember(C.TypeVLESS, "member", dialWorking)
++	urlTest, group := newTestURLTest(t, link, member)
++	paused := &testPause{}
++	paused.set(true)
++	group.watchPause(paused)
++	group.interval = 200 * time.Millisecond
++	group.started = true
++	group.lastActive.Store(time.Now())
++	// the round at start has just failed
++	group.lastRound.Store(int64(time.Since(group.epoch)))
++	group.history.DeleteURLTestHistory("member")
++	t.Cleanup(func() { group.Close() })
++
++	urlTest.group.Touch()
++	urlTest.group.Touch()
++	time.Sleep(50 * time.Millisecond)
++	require.Equal(t, int32(0), requests.Load(), "a round sooner than an interval after the last one")
++	time.Sleep(group.interval)
++	urlTest.group.Touch()
++	require.Eventually(t, func() bool { return requests.Load() >= 1 }, 5*time.Second, 5*time.Millisecond, "no round where no member has a result")
++	// the member has passed: the report is refuted, and the rounds go on by the ticker
++	require.Eventually(t, func() bool { return requests.Load() >= 3 }, 5*time.Second, 10*time.Millisecond)
++}
+diff --git a/route/network.go b/route/network.go
+index 53a1be8d8..e0df7bb85 100644
+--- a/route/network.go
++++ b/route/network.go
+@@ -453,6 +453,15 @@ func (r *NetworkManager) UpdateWIFIState(ctx context.Context) {
+ }
+ 
+ func (r *NetworkManager) ResetNetwork(ctx context.Context) {
++	// Those that judge their members by what a failed dial says are told first: the
++	// reset ends the dials in flight, by the closing of connections below and then
++	// outbound by outbound, and a group that learns of it only at its own turn takes
++	// what failed before that for the members' failures (podkop-engine).
++	for _, outbound := range r.outbound.Outbounds() {
++		if group, isGroup := outbound.(interface{ NetworkReset() }); isGroup {
++			group.NetworkReset()
++		}
++	}
+ 	if r.connectionManager != nil {
+ 		r.connectionManager.CloseAll()
+ 	}
+-- 
+2.53.0
+

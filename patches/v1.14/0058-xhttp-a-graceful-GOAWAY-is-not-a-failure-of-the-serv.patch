@@ -1,0 +1,47 @@
+From c5554f9ff26aecd9e25528061ceacc4271d9272b Mon Sep 17 00:00:00 2001
+From: FiyeroT <me@fiyero.xyz>
+Date: Mon, 5 Oct 2026 22:40:48 +0300
+Subject: [PATCH 058/148] xhttp: a graceful GOAWAY is not a failure of the
+ server
+
+A proxy that closes a connection after so many requests (nginx
+keepalive_requests) retires it with GOAWAY and no error. The requests it
+caught were counted against the server like resets, and after the second one
+new connections were refused for the backoff.
+---
+ transport/v2rayxhttp/pool.go | 16 ++++++++++++++++
+ 1 file changed, 16 insertions(+)
+
+diff --git a/transport/v2rayxhttp/pool.go b/transport/v2rayxhttp/pool.go
+index 550b54a54..761abf0db 100644
+--- a/transport/v2rayxhttp/pool.go
++++ b/transport/v2rayxhttp/pool.go
+@@ -264,9 +264,25 @@ func (c *poolClient) fail(ctx context.Context, err error) {
+ 	if c.broken.Swap(true) {
+ 		return
+ 	}
++	if gracefulGoAway(err) {
++		// The server retires the connection in good order, as a proxy does
++		// after so many requests: a new one is due, with nothing to hold
++		// against the server.
++		return
++	}
+ 	c.pool.noteFailure(c, err)
+ }
+ 
++// gracefulGoAway tells the error of a request that met the GOAWAY of a server
++// closing a connection without an error.
++func gracefulGoAway(err error) bool {
++	var goAway http2.GoAwayError
++	if errors.As(err, &goAway) {
++		return goAway.ErrCode == http2.ErrCodeNo
++	}
++	return err != nil && strings.Contains(err.Error(), "graceful shutdown GOAWAY")
++}
++
+ func (p *pool) noteFailure(client *poolClient, err error) {
+ 	p.access.Lock()
+ 	defer p.access.Unlock()
+-- 
+2.53.0
+

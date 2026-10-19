@@ -1,0 +1,74 @@
+From 1d47804dc7831d963936122e071573bd6619cd8b Mon Sep 17 00:00:00 2001
+From: FiyeroT <me@fiyero.xyz>
+Date: Mon, 19 Oct 2026 22:59:40 +0300
+Subject: [PATCH 148/148] rule-set: a closed rule-set does not parse or save a
+ list that came in
+
+Closing the box cancels the download of an update, but a body read to its
+end just before was parsed, saved to the cache file and announced all the
+same. A reload in the process (SIGHUP, a program that builds a new box)
+could leave up to five lists of the old box parsing next to the downloads
+of the new one, a peak of memory a small router does not have, and the old
+box wrote to its closing cache file. The fetch looks at the context of the
+rule-set before the parse and after it, and the updater tells nothing of a
+closed box.
+---
+ route/rule/rule_set_remote.go              | 9 +++++++++
+ route/rule/rule_set_remote_timeout_test.go | 1 +
+ route/rule/rule_set_updater.go             | 4 ++++
+ 3 files changed, 14 insertions(+)
+
+diff --git a/route/rule/rule_set_remote.go b/route/rule/rule_set_remote.go
+index bded68eee..ae80497d9 100644
+--- a/route/rule/rule_set_remote.go
++++ b/route/rule/rule_set_remote.go
+@@ -564,10 +564,19 @@ func (s *RemoteRuleSet) fetch(ctx context.Context, isStart bool) error {
+ 	if err != nil {
+ 		return describe(err)
+ 	}
++	// a rule-set closed while its list came in does not parse it: the parse of a big list
++	// is the most an update costs, and a box that replaces this one fetches its own
++	if s.ctx.Err() != nil {
++		return s.ctx.Err()
++	}
+ 	err = s.commitBytes(content)
+ 	if err != nil {
+ 		return E.Cause(err, "read rule-set (", describeRuleSetBody(response, int64(len(content)), content), ")")
+ 	}
++	if s.ctx.Err() != nil {
++		// closed during the parse: its cache file and the callbacks are closed too
++		return s.ctx.Err()
++	}
+ 	s.fetchLoaded = true
+ 	eTagHeader := response.Header.Get("Etag")
+ 	if eTagHeader != "" {
+diff --git a/route/rule/rule_set_remote_timeout_test.go b/route/rule/rule_set_remote_timeout_test.go
+index 5e6b9b20a..a86ced09a 100644
+--- a/route/rule/rule_set_remote_timeout_test.go
++++ b/route/rule/rule_set_remote_timeout_test.go
+@@ -15,6 +15,7 @@ import (
+ 
+ func newTestRuleSet(url string) *RemoteRuleSet {
+ 	return &RemoteRuleSet{
++		ctx:        context.Background(),
+ 		logger:     log.NewNOPFactory().NewLogger("test"),
+ 		tag:        "test",
+ 		url:        url,
+diff --git a/route/rule/rule_set_updater.go b/route/rule/rule_set_updater.go
+index 1a29a054c..59c34ac2a 100644
+--- a/route/rule/rule_set_updater.go
++++ b/route/rule/rule_set_updater.go
+@@ -112,6 +112,10 @@ func (u *RuleSetUpdater) loopUpdate() {
+ 			due = append(due, i)
+ 		}
+ 		results := u.updateAll(due)
++		if u.ctx.Err() != nil {
++			// closed during the update: nothing recovered is told of a closed box
++			return
++		}
+ 		for _, i := range due {
+ 			ruleSet := u.ruleSets[i]
+ 			if results[i].loaded {
+-- 
+2.53.0
+

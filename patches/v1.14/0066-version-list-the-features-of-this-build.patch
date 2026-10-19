@@ -1,0 +1,72 @@
+From 67652b3f82c0425b7e0ca869a74b9025942f3495 Mon Sep 17 00:00:00 2001
+From: FiyeroT <me@fiyero.xyz>
+Date: Tue, 6 Oct 2026 07:09:49 +0300
+Subject: [PATCH 066/148] version: list the features of this build
+
+"sing-box version" ends with a line "Features:" naming what the build adds
+that a configuration or a script may depend on: urltest.fallbacks,
+urltest.download_url, transport.xhttp, tools.decode-link. Whatever writes
+configurations for sing-box asks instead of guessing by the version string.
+---
+ cmd/sing-box/cmd_tools_decode_link_test.go | 12 ++++++++++++
+ cmd/sing-box/cmd_version.go                | 18 ++++++++++++++++++
+ 2 files changed, 30 insertions(+)
+
+diff --git a/cmd/sing-box/cmd_tools_decode_link_test.go b/cmd/sing-box/cmd_tools_decode_link_test.go
+index 0f560a9ac..c18423434 100644
+--- a/cmd/sing-box/cmd_tools_decode_link_test.go
++++ b/cmd/sing-box/cmd_tools_decode_link_test.go
+@@ -71,3 +71,15 @@ func TestDecodeLinkCommand(t *testing.T) {
+ 	status, _, _ := run("", link+"&extra=%7B%22xmux%22%3A%7B%22maxConnections%22%3A2%7D%7D")
+ 	require.Zero(t, status)
+ }
++
++// Scripts read the features as whole names between commas.
++func TestVersionFeatures(t *testing.T) {
++	seen := make(map[string]bool)
++	for _, feature := range versionFeatures {
++		require.NotContains(t, feature, ",")
++		require.NotContains(t, feature, " ")
++		require.False(t, seen[feature], feature)
++		seen[feature] = true
++	}
++	require.True(t, seen["tools.decode-link"])
++}
+diff --git a/cmd/sing-box/cmd_version.go b/cmd/sing-box/cmd_version.go
+index ab5ada2ed..c411767ee 100644
+--- a/cmd/sing-box/cmd_version.go
++++ b/cmd/sing-box/cmd_version.go
+@@ -4,6 +4,7 @@ import (
+ 	"os"
+ 	"runtime"
+ 	"runtime/debug"
++	"strings"
+ 
+ 	C "github.com/sagernet/sing-box/constant"
+ 
+@@ -60,5 +61,22 @@ func printVersion(cmd *cobra.Command, args []string) {
+ 		version += "CGO: disabled\n"
+ 	}
+ 
++	version += "Features: " + strings.Join(versionFeatures, ",") + "\n"
++
+ 	os.Stdout.WriteString(version)
+ }
++
++// versionFeatures names what this build adds to sing-box that a configuration
++// or a script may depend on, for those that write configurations to ask
++// ("sing-box version", the line "Features:") instead of guessing by the
++// version. A name is never removed or given another meaning.
++var versionFeatures = []string{
++	// urltest: the "fallbacks" list of an outbound group
++	"urltest.fallbacks",
++	// urltest: "download_url", the download check before a switch
++	"urltest.download_url",
++	// the xhttp client transport (V2Ray transport type "xhttp")
++	"transport.xhttp",
++	// the command "sing-box tools decode-link"
++	"tools.decode-link",
++}
+-- 
+2.53.0
+

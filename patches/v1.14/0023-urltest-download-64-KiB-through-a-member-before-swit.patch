@@ -1,7 +1,7 @@
-From fe96fc7e2228011c15d792389ab5c56db206c4f5 Mon Sep 17 00:00:00 2001
+From d08605cf0c1861db2802c06fddb61259eba39845 Mon Sep 17 00:00:00 2001
 From: FiyeroT <me@fiyero.xyz>
 Date: Sat, 3 Oct 2026 11:27:48 +0300
-Subject: [PATCH 023/125] urltest: download 64 KiB through a member before
+Subject: [PATCH 023/148] urltest: download 64 KiB through a member before
  switching to it
 
 A server behind a DPI that freezes every connection after ~16 KB passes
@@ -205,10 +205,10 @@ index 000000000..edbca6eb7
 +	}
 +}
 diff --git a/common/urltest/urltest.go b/common/urltest/urltest.go
-index 36d449579..52a614495 100644
+index 26efe39cb..76ec79d0b 100644
 --- a/common/urltest/urltest.go
 +++ b/common/urltest/urltest.go
-@@ -121,7 +121,23 @@ func urlTest(ctx context.Context, link string, detour N.Dialer) (t uint16, err e
+@@ -127,7 +127,23 @@ func urlTest(ctx context.Context, link string, detour N.Dialer) (t uint16, err e
  	if err != nil {
  		return
  	}
@@ -233,7 +233,7 @@ index 36d449579..52a614495 100644
  		Transport: &http.Transport{
  			DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
  				return instance, nil
-@@ -130,18 +146,11 @@ func urlTest(ctx context.Context, link string, detour N.Dialer) (t uint16, err e
+@@ -136,18 +152,11 @@ func urlTest(ctx context.Context, link string, detour N.Dialer) (t uint16, err e
  				Time:    ntp.TimeFuncFromContext(ctx),
  				RootCAs: adapter.RootPoolFromContext(ctx),
  			},
@@ -254,10 +254,10 @@ index 36d449579..52a614495 100644
 -	return
  }
 diff --git a/protocol/group/urltest.go b/protocol/group/urltest.go
-index 7c0d81144..07fb15f1e 100644
+index 4e2ad3ef8..b01ffe521 100644
 --- a/protocol/group/urltest.go
 +++ b/protocol/group/urltest.go
-@@ -119,8 +119,10 @@ func (s *URLTest) CheckOutbounds() {
+@@ -131,8 +131,10 @@ func (s *URLTest) CheckOutbounds() {
  	s.group.CheckOutbounds(s.ctx, true)
  }
  
@@ -269,7 +269,7 @@ index 7c0d81144..07fb15f1e 100644
  }
  
  func (s *URLTest) InterfaceUpdated(ctx context.Context) {
-@@ -152,7 +154,7 @@ func (s *URLTest) DialContext(ctx context.Context, network string, destination M
+@@ -164,7 +166,7 @@ func (s *URLTest) DialContext(ctx context.Context, network string, destination M
  	default:
  		return nil, E.Extend(N.ErrUnknownNetwork, network)
  	}
@@ -278,7 +278,7 @@ index 7c0d81144..07fb15f1e 100644
  		outbound, _ = s.group.Select(network)
  	}
  	if outbound == nil {
-@@ -177,7 +179,7 @@ func (s *URLTest) DialContext(ctx context.Context, network string, destination M
+@@ -189,7 +191,7 @@ func (s *URLTest) DialContext(ctx context.Context, network string, destination M
  func (s *URLTest) ListenPacket(ctx context.Context, destination M.Socksaddr) (net.PacketConn, error) {
  	s.group.Touch()
  	outbound := s.group.selectedOutboundUDP.Load()
@@ -287,7 +287,7 @@ index 7c0d81144..07fb15f1e 100644
  		outbound, _ = s.group.Select(N.NetworkUDP)
  	}
  	if outbound == nil {
-@@ -230,6 +232,8 @@ type URLTestGroup struct {
+@@ -242,6 +244,8 @@ type URLTestGroup struct {
  	confirms                     map[string]*memberConfirm
  	epoch                        time.Time
  	successes                    sync.Map // member tag → *atomic.Int64, its last successful TCP dial, since epoch
@@ -296,7 +296,7 @@ index 7c0d81144..07fb15f1e 100644
  }
  
  func NewURLTestGroup(ctx context.Context, outboundManager adapter.OutboundManager, logger log.Logger, outbounds []adapter.Outbound, link string, interval time.Duration, tolerance uint16, idleTimeout time.Duration, interruptExternalConnections bool) (*URLTestGroup, error) {
-@@ -264,6 +268,7 @@ func NewURLTestGroup(ctx context.Context, outboundManager adapter.OutboundManage
+@@ -276,6 +280,7 @@ func NewURLTestGroup(ctx context.Context, outboundManager adapter.OutboundManage
  		interruptGroup:               interrupt.NewGroup(),
  		interruptExternalConnections: interruptExternalConnections,
  		epoch:                        time.Now(),
@@ -304,7 +304,7 @@ index 7c0d81144..07fb15f1e 100644
  	}, nil
  }
  
-@@ -306,6 +311,11 @@ func (g *URLTestGroup) Close() error {
+@@ -318,6 +323,11 @@ func (g *URLTestGroup) Close() error {
  }
  
  func (g *URLTestGroup) Select(network string) (adapter.Outbound, bool) {
@@ -316,7 +316,7 @@ index 7c0d81144..07fb15f1e 100644
  	var minDelay uint16
  	var minOutbound adapter.Outbound
  	var selected adapter.Outbound
-@@ -316,7 +326,8 @@ func (g *URLTestGroup) Select(network string) (adapter.Outbound, bool) {
+@@ -328,7 +338,8 @@ func (g *URLTestGroup) Select(network string) (adapter.Outbound, bool) {
  		selected = g.selectedOutboundUDP.Load()
  	}
  	if selected != nil {
@@ -326,7 +326,7 @@ index 7c0d81144..07fb15f1e 100644
  			minOutbound = selected
  			minDelay = history.Delay
  		}
-@@ -325,8 +336,9 @@ func (g *URLTestGroup) Select(network string) (adapter.Outbound, bool) {
+@@ -337,8 +348,9 @@ func (g *URLTestGroup) Select(network string) (adapter.Outbound, bool) {
  		if !common.Contains(detour.Network(), network) {
  			continue
  		}
@@ -338,7 +338,7 @@ index 7c0d81144..07fb15f1e 100644
  			continue
  		}
  		if minDelay == 0 || minDelay > history.Delay+g.tolerance {
-@@ -376,18 +388,27 @@ func (g *URLTestGroup) CheckOutbounds(ctx context.Context, force bool) {
+@@ -388,18 +400,27 @@ func (g *URLTestGroup) CheckOutbounds(ctx context.Context, force bool) {
  	_, _ = g.urlTest(ctx, force)
  }
  
@@ -370,7 +370,7 @@ index 7c0d81144..07fb15f1e 100644
  }
  
  type urlTestResult struct {
-@@ -491,9 +512,14 @@ func (b *urlTestBatch) test(outbounds []adapter.Outbound, link string, interval
+@@ -503,12 +524,17 @@ func (b *urlTestBatch) test(outbounds []adapter.Outbound, link string, interval
  func (g *URLTestGroup) performUpdateCheck() {
  	g.updateAccess.Lock()
  	defer g.updateAccess.Unlock()
@@ -379,21 +379,24 @@ index 7c0d81144..07fb15f1e 100644
 +
 +// updateSelection is performUpdateCheck under its lock.
 +func (g *URLTestGroup) updateSelection() {
- 	var updated bool
+ 	var (
+ 		updated  bool
+ 		selected bool
+ 	)
  	// the selection is read by every dial, which may run while it changes: stored atomically
 -	if outbound, exists := g.Select(N.NetworkTCP); outbound != nil {
 +	if outbound, exists := g.selectTested(); outbound != nil {
- 		if selected := g.selectedOutboundTCP.Load(); selected == nil || (exists && outbound != selected) {
- 			if selected != nil {
+ 		if current := g.selectedOutboundTCP.Load(); current == nil || (exists && outbound != current) {
+ 			if current != nil {
  				updated = true
-@@ -502,7 +528,7 @@ func (g *URLTestGroup) performUpdateCheck() {
- 			g.selectedOutboundTCP.Store(outbound)
+@@ -518,7 +544,7 @@ func (g *URLTestGroup) performUpdateCheck() {
+ 			selected = true
  		}
  	}
 -	if outbound, exists := g.Select(N.NetworkUDP); outbound != nil {
 +	if outbound, exists := g.selectUDP(); outbound != nil {
- 		if selected := g.selectedOutboundUDP.Load(); selected == nil || (exists && outbound != selected) {
- 			if selected != nil {
+ 		if current := g.selectedOutboundUDP.Load(); current == nil || (exists && outbound != current) {
+ 			if current != nil {
  				updated = true
 diff --git a/protocol/group/urltest_download.go b/protocol/group/urltest_download.go
 new file mode 100644

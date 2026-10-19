@@ -1,7 +1,7 @@
 From 7241a22603afa2e8bd4f88cf00fe16138f2ec6ad Mon Sep 17 00:00:00 2001
 From: FiyeroT <me@fiyero.xyz>
 Date: Sat, 10 Oct 2026 11:56:33 +0300
-Subject: [PATCH 119/126] dns/https: ask a query again when the server closes
+Subject: [PATCH 119/140] dns/https: ask a query again when the server closes
  the connection without a GOAWAY
 
 Quad9 closes its HTTP/2 connections without a GOAWAY, busy ones too: from the lab host

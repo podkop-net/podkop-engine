@@ -1,0 +1,208 @@
+From 69e5322b047b37fc46060651c9bd1f12f3910932 Mon Sep 17 00:00:00 2001
+From: FiyeroT <me@fiyero.xyz>
+Date: Sat, 17 Oct 2026 01:46:45 +0300
+Subject: [PATCH 131/148] log: a platform writer may name its level and ask for
+ no colours
+
+A platform writer was handed every entry, whatever the level of the log, so
+each entry below the level was formatted only for the writer to drop it: an
+embedding program that keeps the lines of its level paid for every debug line
+of the router and DNS. Two optional interfaces let a writer say what it takes:
+PlatformWriterLevel (Level: entries above it are neither formatted nor given)
+and PlatformWriterColors (DisableColors: the message without escape codes).
+A writer with neither is handed every entry with colours, as before.
+
+Benchmark, a debug line below the warn level: a writer without a level
+215 ns and 6 allocations a call, a writer at warn 33 ns and 1.
+---
+ log/observable.go            | 37 +++++++++++++++++++++++++++-------
+ log/observable_bench_test.go | 23 +++++++++++++++++----
+ log/observable_test.go       | 39 ++++++++++++++++++++++++++++++++++++
+ log/platform.go              | 26 ++++++++++++++++++++++++
+ 4 files changed, 114 insertions(+), 11 deletions(-)
+
+diff --git a/log/observable.go b/log/observable.go
+index baa0080e2..c6c592984 100644
+--- a/log/observable.go
++++ b/log/observable.go
+@@ -173,13 +173,37 @@ func (f *defaultFactory) output(ctx context.Context, level Level, tag string, me
+ 	if f.observed() {
+ 		f.subscriber.Emit(Entry{level, f.formatter.FormatSimple(ctx, tag, message)})
+ 	}
+-	platformWriters := f.loadPlatformWriters()
+-	if len(platformWriters) > 0 {
+-		platformMessage := f.platformFormatter.Format(ctx, level, tag, message, timestamp)
+-		for _, platformWriter := range platformWriters {
+-			platformWriter.WriteMessage(level, platformMessage)
++	// formatted once for the writers that want colours and once for those that do not,
++	// and only when one of them takes the level
++	var coloured, plain string
++	for _, platformWriter := range f.loadPlatformWriters() {
++		if !platformTakes(platformWriter, level) {
++			continue
++		}
++		if platformPlain(platformWriter) {
++			if plain == "" {
++				formatter := f.platformFormatter
++				formatter.DisableColors = true
++				plain = formatter.Format(ctx, level, tag, message, timestamp)
++			}
++			platformWriter.WriteMessage(level, plain)
++		} else {
++			if coloured == "" {
++				coloured = f.platformFormatter.Format(ctx, level, tag, message, timestamp)
++			}
++			platformWriter.WriteMessage(level, coloured)
++		}
++	}
++}
++
++// platformWants tells whether a platform writer takes an entry of the level.
++func (f *defaultFactory) platformWants(level Level) bool {
++	for _, platformWriter := range f.loadPlatformWriters() {
++		if platformTakes(platformWriter, level) {
++			return true
+ 		}
+ 	}
++	return false
+ }
+ 
+ var _ ContextLogger = (*observableLogger)(nil)
+@@ -191,8 +215,7 @@ type observableLogger struct {
+ 
+ func (l *observableLogger) Log(ctx context.Context, level Level, args []any) {
+ 	level = OverrideLevelFromContext(level, ctx)
+-	platformWriters := l.loadPlatformWriters()
+-	if level > l.level && len(platformWriters) == 0 && !l.observed() {
++	if level > l.level && !l.platformWants(level) && !l.observed() {
+ 		return
+ 	}
+ 	nowTime := time.Now()
+diff --git a/log/observable_bench_test.go b/log/observable_bench_test.go
+index e19203aef..5c0b3e563 100644
+--- a/log/observable_bench_test.go
++++ b/log/observable_bench_test.go
+@@ -11,6 +11,18 @@ type consoleWriter struct{}
+ 
+ func (consoleWriter) Write(p []byte) (int, error) { return len(p), nil }
+ 
++// platformWriter stands for the writer of an app or of a program that embeds sing-box:
++// one that takes every level, and one with a level of its own that wants no colours.
++type platformWriter struct{}
++
++func (platformWriter) WriteMessage(level Level, message string) {}
++
++type leveledPlatformWriter struct{ level Level }
++
++func (leveledPlatformWriter) WriteMessage(level Level, message string) {}
++func (w leveledPlatformWriter) Level() Level                           { return w.level }
++func (leveledPlatformWriter) DisableColors() bool                      { return true }
++
+ // A debug line below the warn level, as the router and DNS write for every connection and
+ // query, with the Clash API on (observable) or off.
+ func BenchmarkLogBelowLevel(b *testing.B) {
+@@ -18,13 +30,16 @@ func BenchmarkLogBelowLevel(b *testing.B) {
+ 		name       string
+ 		observable bool
+ 		subscribe  bool
++		platform   PlatformWriter
+ 	}{
+-		{"clash api off", false, false},
+-		{"clash api on", true, false},
+-		{"clash api on, logs subscribed", true, true},
++		{"clash api off", false, false, nil},
++		{"clash api on", true, false, nil},
++		{"clash api on, logs subscribed", true, true, nil},
++		{"platform writer without a level", false, false, platformWriter{}},
++		{"platform writer at warn", false, false, leveledPlatformWriter{LevelWarn}},
+ 	} {
+ 		b.Run(testCase.name, func(b *testing.B) {
+-			factory := NewDefaultFactory(context.Background(), Formatter{BaseTime: time.Now()}, consoleWriter{}, "", nil, testCase.observable)
++			factory := NewDefaultFactory(context.Background(), Formatter{BaseTime: time.Now()}, consoleWriter{}, "", testCase.platform, testCase.observable)
+ 			factory.SetLevel(LevelWarn)
+ 			if err := factory.Start(); err != nil {
+ 				b.Fatal(err)
+diff --git a/log/observable_test.go b/log/observable_test.go
+index 27df2f278..5b7238407 100644
+--- a/log/observable_test.go
++++ b/log/observable_test.go
+@@ -34,3 +34,42 @@ func TestObservableOnlyWhileSubscribed(t *testing.T) {
+ 	factory.UnSubscribe(subscription)
+ 	require.False(t, internal.observed())
+ }
++
++// recordingWriter keeps what a platform writer is given.
++type recordingWriter struct {
++	level    Level
++	messages *[]string
++}
++
++func (w recordingWriter) WriteMessage(level Level, message string) {
++	*w.messages = append(*w.messages, FormatLevel(level)+" "+message)
++}
++
++type leveledRecordingWriter struct{ recordingWriter }
++
++func (w leveledRecordingWriter) Level() Level      { return w.level }
++func (leveledRecordingWriter) DisableColors() bool { return true }
++
++// A platform writer with a level is given the entries of its level and below, without
++// colours; one without a level is given every entry, whatever the level of the log.
++func TestPlatformWriterLevel(t *testing.T) {
++	var leveled, every []string
++	factory := NewDefaultFactory(context.Background(), Formatter{BaseTime: time.Now()}, consoleWriter{}, "", leveledRecordingWriter{recordingWriter{level: LevelWarn, messages: &leveled}}, false)
++	factory.SetLevel(LevelError)
++	require.NoError(t, factory.Start())
++	defer factory.Close()
++	logger := factory.NewLogger("dns")
++	logger.Debug("debug line")
++	logger.Warn("warn line")
++	require.Len(t, leveled, 1)
++	require.Contains(t, leveled[0], "warn line")
++	require.NotContains(t, leveled[0], "\x1b[")
++
++	factory.AttachPlatformWriter(recordingWriter{messages: &every})
++	logger.Debug("second debug line")
++	logger.Warn("second warn line")
++	require.Len(t, leveled, 2)
++	require.Len(t, every, 2)
++	require.Contains(t, every[0], "second debug line")
++	require.Contains(t, every[1], "\x1b[", "a writer that does not ask otherwise gets the colours")
++}
+diff --git a/log/platform.go b/log/platform.go
+index a8881d4cc..c49a2fd43 100644
+--- a/log/platform.go
++++ b/log/platform.go
+@@ -3,3 +3,29 @@ package log
+ type PlatformWriter interface {
+ 	WriteMessage(level Level, message string)
+ }
++
++// PlatformWriterLevel is a PlatformWriter that takes the entries of its level and below
++// only: an entry above it is not formatted for it. A writer without a level takes every
++// entry, whatever the level of the log.
++type PlatformWriterLevel interface {
++	PlatformWriter
++	Level() Level
++}
++
++// PlatformWriterColors is a PlatformWriter that may ask for its messages without the
++// colours of a terminal.
++type PlatformWriterColors interface {
++	PlatformWriter
++	DisableColors() bool
++}
++
++// platformTakes tells whether a platform writer takes an entry of the level.
++func platformTakes(writer PlatformWriter, level Level) bool {
++	leveled, hasLevel := writer.(PlatformWriterLevel)
++	return !hasLevel || level <= leveled.Level()
++}
++
++func platformPlain(writer PlatformWriter) bool {
++	colors, hasColors := writer.(PlatformWriterColors)
++	return hasColors && colors.DisableColors()
++}
+-- 
+2.53.0
+

@@ -1,0 +1,124 @@
+From 374bee2c1af1046f02061eda10572e33ac499d93 Mon Sep 17 00:00:00 2001
+From: FiyeroT <me@fiyero.xyz>
+Date: Tue, 6 Oct 2026 01:08:07 +0300
+Subject: [PATCH 060/148] xhttp: no post interval for a range from zero; tests
+ for rotation and deadlines
+
+A range of sc_min_posts_interval_ms that starts at zero means no waiting
+between posts, as with Xray; a wait was drawn from it. Tests: a pooled
+connection past h_max_reusable_secs takes no new sessions and keeps its own;
+deadlines report that they are not supported.
+---
+ transport/v2rayxhttp/conn.go        |  4 ++
+ transport/v2rayxhttp/review_test.go | 61 +++++++++++++++++++++++++++++
+ transport/v2rayxhttp/upload.go      |  3 +-
+ 3 files changed, 67 insertions(+), 1 deletion(-)
+
+diff --git a/transport/v2rayxhttp/conn.go b/transport/v2rayxhttp/conn.go
+index 1a84c1f76..465f65fae 100644
+--- a/transport/v2rayxhttp/conn.go
++++ b/transport/v2rayxhttp/conn.go
+@@ -198,6 +198,10 @@ func (s *session) startDownload(client *poolClient, request *http.Request) {
+ 
+ // startStreamUpload sends the request whose body streams the upload
+ // (stream-up). Its response carries only the server's keep-alive padding.
++//
++// Unlike Xray's client, which does not look at the answer to this request, a
++// failure or an error status ends the session: without its upload it could
++// only wait.
+ func (s *session) startStreamUpload(client *poolClient, request *http.Request) {
+ 	go func() {
+ 		// the server ends its answer once it has read the upload to its end
+diff --git a/transport/v2rayxhttp/review_test.go b/transport/v2rayxhttp/review_test.go
+index 40b1dcc1b..7feccc002 100644
+--- a/transport/v2rayxhttp/review_test.go
++++ b/transport/v2rayxhttp/review_test.go
+@@ -5,6 +5,7 @@ import (
+ 	"math"
+ 	"net"
+ 	"net/http"
++	"os"
+ 	"testing"
+ 	"time"
+ 
+@@ -272,3 +273,63 @@ func TestXHTTPBackoffKeepsWorkingConnections(t *testing.T) {
+ 	client.upPool.access.Unlock()
+ 	require.Equal(t, 1, clients, "no new connection during the backoff")
+ }
++
++// A pooled connection is not given new sessions past h_max_reusable_secs; the
++// sessions it has go on.
++func TestXHTTPRotationByTime(t *testing.T) {
++	for _, mode := range []string{modePacketUp, modeStreamUp, modeStreamOne} {
++		t.Run(mode, func(t *testing.T) {
++			options := option.V2RayXHTTPOptions{Mode: mode}
++			options.Xmux = &option.V2RayXHTTPXmuxOptions{MaxConnections: xrange(1, 1), HMaxReusableSecs: xrange(1, 1)}
++			client, server := newTestPair(t, options, "h2", nil)
++			held, err := client.DialContext(context.Background())
++			require.NoError(t, err)
++			defer held.Close()
++			echo(t, held, 1000)
++			second, err := client.DialContext(context.Background())
++			require.NoError(t, err)
++			echo(t, second, 1000)
++			second.Close()
++			require.Equal(t, 1, server.connections(), "one connection while it may be reused")
++			time.Sleep(1200 * time.Millisecond)
++			third, err := client.DialContext(context.Background())
++			require.NoError(t, err)
++			defer third.Close()
++			echo(t, third, 1000)
++			require.Equal(t, 2, server.connections(), "a new connection after the time is up")
++			// the session opened before goes on, uploads included
++			echo(t, held, 100000)
++			echo(t, third, 100000)
++		})
++	}
++}
++
++// Deadlines are not supported, and say so: sing-box then arranges for its own
++// (a deadline that silently did nothing would leave reads without one).
++func TestXHTTPDeadlines(t *testing.T) {
++	client, _ := newTestPair(t, option.V2RayXHTTPOptions{Mode: modePacketUp}, "h2", nil)
++	conn, err := client.DialContext(context.Background())
++	require.NoError(t, err)
++	defer conn.Close()
++	require.ErrorIs(t, conn.SetDeadline(time.Now().Add(time.Second)), os.ErrInvalid)
++	require.ErrorIs(t, conn.SetReadDeadline(time.Now().Add(time.Second)), os.ErrInvalid)
++	require.ErrorIs(t, conn.SetWriteDeadline(time.Now().Add(time.Second)), os.ErrInvalid)
++	require.True(t, conn.(*session).NeedAdditionalReadDeadline())
++	echo(t, conn, 1000)
++}
++
++// A range of post intervals that starts at zero means no waiting, as with Xray.
++func TestXHTTPPostIntervalFromZero(t *testing.T) {
++	options := option.V2RayXHTTPOptions{Mode: modePacketUp}
++	options.ScMinPostsIntervalMs = xrange(0, 400)
++	client, server := newTestPair(t, options, "h2", nil)
++	conn, err := client.DialContext(context.Background())
++	require.NoError(t, err)
++	defer conn.Close()
++	start := time.Now()
++	for i := 0; i < 10; i++ {
++		echo(t, conn, 10)
++	}
++	require.Less(t, time.Since(start), time.Second, "ten posts, none waited for")
++	require.GreaterOrEqual(t, server.requestCount("packet"), 10)
++}
+diff --git a/transport/v2rayxhttp/upload.go b/transport/v2rayxhttp/upload.go
+index 97cae29c6..051f3c42e 100644
+--- a/transport/v2rayxhttp/upload.go
++++ b/transport/v2rayxhttp/upload.go
+@@ -178,7 +178,8 @@ func (u *uploader) run() {
+ 			continue
+ 		}
+ 		notify(u.writable)
+-		if interval := u.client.up.minPostsIntervalMs.rand(); interval > 0 {
++		// As with Xray, a range that starts at zero means no waiting at all.
++		if interval := u.client.up.minPostsIntervalMs.rand(); interval > 0 && u.client.up.minPostsIntervalMs.from > 0 {
+ 			wait := time.Duration(interval)*time.Millisecond - time.Since(lastPost)
+ 			if wait > 0 {
+ 				timer := time.NewTimer(wait)
+-- 
+2.53.0
+

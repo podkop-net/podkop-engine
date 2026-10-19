@@ -1,0 +1,303 @@
+From 07e2b9a02074caa16bbc7b23085b79454c7490da Mon Sep 17 00:00:00 2001
+From: FiyeroT <me@fiyero.xyz>
+Date: Thu, 8 Oct 2026 16:33:14 +0300
+Subject: [PATCH 090/148] urltest: keep the test results through a network
+ pause, test again after a busy round
+
+Three things went wrong around a change of the default interface.
+
+While there is no default interface every dial fails at once. The group's
+ticker stops for that time, but the judgements made from traffic did not:
+each member the group tried lost its test result in turn. They now stop
+too, and a confirming test that fails because the network went away under
+it is discarded.
+
+A forced round that met a running one was dropped, so the results of the
+old interface stayed until the next interval. It is now remembered and one
+more round follows the running one, however many were asked for.
+
+A member that failed the download test was frozen as of the end of the
+test, so a URL test that passed meanwhile (the forced round, whose network
+change also cut the download) did not count as newer. It is frozen as of
+the start of the test.
+---
+ protocol/group/urltest.go              |  13 +-
+ protocol/group/urltest_download.go     |   6 +-
+ protocol/group/urltest_failure.go      |  17 ++-
+ protocol/group/urltest_network_test.go | 161 +++++++++++++++++++++++++
+ 4 files changed, 194 insertions(+), 3 deletions(-)
+ create mode 100644 protocol/group/urltest_network_test.go
+
+diff --git a/protocol/group/urltest.go b/protocol/group/urltest.go
+index d41ac17a1..7b3a89414 100644
+--- a/protocol/group/urltest.go
++++ b/protocol/group/urltest.go
+@@ -282,6 +282,7 @@ type URLTestGroup struct {
+ 	idleTimeout                  time.Duration
+ 	history                      *urltest.HistoryStorage
+ 	checking                     atomic.Bool
++	recheck                      atomic.Bool
+ 	selectedOutboundTCP          common.TypedValue[adapter.Outbound]
+ 	selectedOutboundUDP          common.TypedValue[adapter.Outbound]
+ 	interruptGroup               *interrupt.Group
+@@ -497,9 +498,19 @@ func (g *URLTestGroup) urlTest(ctx context.Context, force bool) (map[string]uint
+ // URLTestOutbounds).
+ func (g *URLTestGroup) urlTestRound(ctx context.Context, force bool, wait bool) (map[string]uint16, error) {
+ 	if g.checking.Swap(true) {
++		if force {
++			// the round in progress began before whatever forced this one (a new default
++			// interface, mostly): its results are of the old state, so another follows it
++			g.recheck.Store(true)
++		}
+ 		return make(map[string]uint16), nil
+ 	}
+-	defer g.checking.Store(false)
++	defer func() {
++		g.checking.Store(false)
++		if g.recheck.Swap(false) && g.ctx.Err() == nil && !g.networkPaused() {
++			go g.CheckOutbounds(g.ctx, true)
++		}
++	}()
+ 	return URLTestOutbounds(ctx, g.outbound, g.history, g.logger, g.members, g.link, g.interval, force, wait), nil
+ }
+ 
+diff --git a/protocol/group/urltest_download.go b/protocol/group/urltest_download.go
+index fa39caef3..ce6b3ebf5 100644
+--- a/protocol/group/urltest_download.go
++++ b/protocol/group/urltest_download.go
+@@ -94,11 +94,15 @@ func (g *URLTestGroup) selectTested() (adapter.Outbound, bool) {
+ 			// made it a candidate again: it is tested, or it would keep out, by the
+ 			// tolerance, a member that has recovered meanwhile
+ 		}
++		start := time.Now()
+ 		if !g.downloadStopped(tag, candidate) {
+ 			g.setFrozen(tag, time.Time{})
+ 			return candidate, true
+ 		}
+-		g.setFrozen(tag, time.Now())
++		// frozen as of the start of the test: a URL test that passed while the download
++		// ran (the round forced by a network change, which also cut this download) is a
++		// newer result and brings the member back
++		g.setFrozen(tag, start)
+ 		tried[tag] = true
+ 	}
+ 	if current != nil && g.history.LoadURLTestHistory(RealTag(g.outbound, current)) != nil {
+diff --git a/protocol/group/urltest_failure.go b/protocol/group/urltest_failure.go
+index e959faedf..42ee1a0d4 100644
+--- a/protocol/group/urltest_failure.go
++++ b/protocol/group/urltest_failure.go
+@@ -57,6 +57,10 @@ func serverOnlyDial(outbound adapter.Outbound) bool {
+ // memberFailed judges a failed dial through member, begun at start, or a failed handshake
+ // write (start is zero).
+ func (g *URLTestGroup) memberFailed(ctx context.Context, member adapter.Outbound, network string, err error, start time.Time) {
++	if g.networkPaused() {
++		// without a network every dial fails at once: that says nothing about the member
++		return
++	}
+ 	// A reset, an EOF, a closed pipe or a timeout are the member's: E.IsClosedOrCanceled
+ 	// counts them as closed, which suits a copy loop, not this. A timeout stays the
+ 	// member's even when it also reports itself closed: the idle and handshake timeouts of
+@@ -82,6 +86,13 @@ func (g *URLTestGroup) memberFailed(ctx context.Context, member adapter.Outbound
+ 	g.requestUpdateCheck()
+ }
+ 
++// networkPaused reports whether the device sleeps or has no default interface. The ticker
++// of the group stops for that time, and so must the judgements made from traffic: they
++// would erase the test results of every member the group tries, one after another.
++func (g *URLTestGroup) networkPaused() bool {
++	return g.pause != nil && (g.pause.IsDevicePaused() || g.pause.IsNetworkPaused())
++}
++
+ // memberSucceeded records a successful TCP dial through member.
+ func (g *URLTestGroup) memberSucceeded(member adapter.Outbound) {
+ 	tag := RealTag(g.outbound, member)
+@@ -144,6 +155,9 @@ func (g *URLTestGroup) confirmUnanswered(tag string, member adapter.Outbound) bo
+ }
+ 
+ func (g *URLTestGroup) confirmWith(confirms *map[string]*memberConfirm, tag string, member adapter.Outbound) bool {
++	if g.networkPaused() {
++		return false
++	}
+ 	now := time.Now()
+ 	g.confirmAccess.Lock()
+ 	if *confirms == nil {
+@@ -178,7 +192,8 @@ func (g *URLTestGroup) confirmWith(confirms *map[string]*memberConfirm, tag stri
+ 		if err == nil {
+ 			g.memberTestPassed(tag, start)
+ 		}
+-		if err == nil || g.ctx.Err() != nil {
++		if err == nil || g.ctx.Err() != nil || g.networkPaused() {
++			// a test that failed because the network went away meanwhile proves nothing
+ 			return
+ 		}
+ 		g.logger.Info("outbound ", tag, " unavailable: ", err)
+diff --git a/protocol/group/urltest_network_test.go b/protocol/group/urltest_network_test.go
+new file mode 100644
+index 000000000..e56baa17e
+--- /dev/null
++++ b/protocol/group/urltest_network_test.go
+@@ -0,0 +1,161 @@
++package group
++
++import (
++	"context"
++	"net"
++	"sync/atomic"
++	"syscall"
++	"testing"
++	"time"
++
++	"github.com/sagernet/sing-box/adapter"
++	C "github.com/sagernet/sing-box/constant"
++	M "github.com/sagernet/sing/common/metadata"
++	N "github.com/sagernet/sing/common/network"
++	"github.com/sagernet/sing/service/pause"
++
++	"github.com/stretchr/testify/require"
++)
++
++// testPause is a pause manager whose network state the test sets.
++type testPause struct {
++	pause.Manager
++	networkPaused atomic.Bool
++}
++
++func (p *testPause) IsDevicePaused() bool  { return false }
++func (p *testPause) IsNetworkPaused() bool { return p.networkPaused.Load() }
++
++// Without a default interface every dial fails at once. That is not the members' failure:
++// their test results stay, and the group does not walk through them erasing each.
++func TestURLTestPausedNetworkKeepsResults(t *testing.T) {
++	link, requests := testURL(t, 0)
++	first := newTestMember(C.TypeVLESS, "first", dialRefused)
++	second := newTestMember(C.TypeVLESS, "second", dialRefused)
++	urlTest, group := newTestURLTest(t, link, first, second)
++	paused := &testPause{}
++	paused.networkPaused.Store(true)
++	group.pause = paused
++
++	for range 3 {
++		_, err := urlTest.DialContext(context.Background(), N.NetworkTCP, M.ParseSocksaddr("1.2.3.4:443"))
++		require.Error(t, err)
++	}
++	time.Sleep(50 * time.Millisecond)
++	require.NotNil(t, group.history.LoadURLTestHistory("first"))
++	require.NotNil(t, group.history.LoadURLTestHistory("second"))
++	require.Equal(t, "first", group.selectedOutboundTCP.Load().Tag())
++	require.Equal(t, int32(0), requests.Load())
++
++	// the network is back: the same failure is the member's again
++	paused.networkPaused.Store(false)
++	_, err := urlTest.DialContext(context.Background(), N.NetworkTCP, M.ParseSocksaddr("1.2.3.4:443"))
++	require.Error(t, err)
++	waitSelected(t, group, "second")
++	require.Nil(t, group.history.LoadURLTestHistory("first"))
++}
++
++// A confirming test that fails because the network went away while it ran is discarded.
++func TestURLTestConfirmDuringPauseDiscarded(t *testing.T) {
++	link, _ := testURL(t, 0)
++	paused := &testPause{}
++	member := newTestMember(C.TypeVLESS, "member", func(context.Context, string, M.Socksaddr) (net.Conn, error) {
++		paused.networkPaused.Store(true) // the interface goes down under the test
++		return nil, syscall.ENETUNREACH
++	})
++	spare := newTestMember(C.TypeVLESS, "spare", dialWorking)
++	urlTest, group := newTestURLTest(t, link, member, spare)
++	group.pause = paused
++
++	// a failed packet dial is confirmed by a URL test of the member
++	_, err := urlTest.ListenPacket(context.Background(), M.ParseSocksaddr("1.2.3.4:443"))
++	require.Error(t, err)
++	waitConfirmed(t, group, "member")
++	require.Equal(t, int32(1), member.dials.Load())
++	require.NotNil(t, group.history.LoadURLTestHistory("member"), "a test cut by the pause erased the result")
++	require.Equal(t, "member", group.selectedOutboundTCP.Load().Tag())
++}
++
++// A forced round asked for while another one runs is not lost: one more round follows the
++// running one, however many times it was asked for. A new default interface forces a round;
++// the one in progress tested the old state.
++func TestURLTestForcedRoundFollowsBusyRound(t *testing.T) {
++	link, _ := testURL(t, 0)
++	release := make(chan struct{})
++	var blocked atomic.Bool
++	member := newTestMember(C.TypeVLESS, "member", func(ctx context.Context, network string, destination M.Socksaddr) (net.Conn, error) {
++		if blocked.CompareAndSwap(false, true) {
++			<-release
++		}
++		return dialWorking(ctx, network, destination)
++	})
++	_, group := newTestURLTest(t, link, member)
++
++	go group.CheckOutbounds(context.Background(), true)
++	require.Eventually(t, func() bool { return member.dials.Load() == 1 }, 2*time.Second, 5*time.Millisecond)
++	for range 5 {
++		group.CheckOutbounds(context.Background(), true) // returns at once: a round is running
++	}
++	require.Equal(t, int32(1), member.dials.Load())
++	close(release)
++	require.Eventually(t, func() bool { return member.dials.Load() == 2 }, 5*time.Second, 5*time.Millisecond, "no round followed the busy one")
++	time.Sleep(300 * time.Millisecond)
++	require.Equal(t, int32(2), member.dials.Load(), "more than one round followed")
++	require.Eventually(t, func() bool { return !group.checking.Load() }, 2*time.Second, 5*time.Millisecond)
++}
++
++// A round that is not forced and meets a running one asks for nothing.
++func TestURLTestPlainRoundDoesNotQueue(t *testing.T) {
++	link, _ := testURL(t, 0)
++	release := make(chan struct{})
++	var blocked atomic.Bool
++	member := newTestMember(C.TypeVLESS, "member", func(ctx context.Context, network string, destination M.Socksaddr) (net.Conn, error) {
++		if blocked.CompareAndSwap(false, true) {
++			<-release
++		}
++		return dialWorking(ctx, network, destination)
++	})
++	_, group := newTestURLTest(t, link, member)
++
++	go group.CheckOutbounds(context.Background(), true)
++	require.Eventually(t, func() bool { return member.dials.Load() == 1 }, 2*time.Second, 5*time.Millisecond)
++	group.CheckOutbounds(context.Background(), false)
++	close(release)
++	time.Sleep(300 * time.Millisecond)
++	require.Equal(t, int32(1), member.dials.Load())
++}
++
++// A member is frozen as of the start of its download test: a URL test that passed while the
++// download ran is a newer result, so the next selection tries the member again instead of
++// keeping it out until the round after.
++func TestURLTestFrozenAsOfDownloadStart(t *testing.T) {
++	shortDownloadTimeout(t)
++	full := newDownloadServer(t, "full")
++	frozen := newDownloadServer(t, "stall")
++	var aDead atomic.Bool
++	a := newTestMember(C.TypeVLESS, "a", func(ctx context.Context, network string, destination M.Socksaddr) (net.Conn, error) {
++		if aDead.Load() {
++			return nil, syscall.ECONNREFUSED
++		}
++		return dialTo(full)(ctx, network, destination)
++	})
++	b := newTestMember(C.TypeVLESS, "b", dialTo(frozen))
++	c := newTestMember(C.TypeVLESS, "c", dialTo(full))
++	urlTest, group := newTestURLTest(t, full.URL, a, b, c)
++	group.downloadLink = full.URL
++
++	aDead.Store(true)
++	// a URL test of b passes while its download test (300 ms) is running
++	go func() {
++		require.Eventually(t, func() bool { return frozen.gets.Load() == 1 }, 2*time.Second, time.Millisecond)
++		time.Sleep(50 * time.Millisecond)
++		group.history.StoreURLTestHistory("b", &adapter.URLTestHistory{Time: time.Now(), Delay: 110})
++	}()
++	_, err := urlTest.DialContext(context.Background(), N.NetworkTCP, M.ParseSocksaddr("1.2.3.4:443"))
++	require.Error(t, err)
++	waitSelected(t, group, "c")
++	require.Equal(t, int32(1), frozen.gets.Load())
++
++	group.performUpdateCheck()
++	require.Equal(t, int32(2), frozen.gets.Load(), "the result that came during the download test did not count as newer")
++}
+-- 
+2.53.0
+

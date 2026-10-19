@@ -1,7 +1,7 @@
-From 0f7f8b2b8f82b8a7c7ae32683b5bdd3d6e3b29df Mon Sep 17 00:00:00 2001
+From 6c1719db806563aa9cbe69c9083d492c4252659b Mon Sep 17 00:00:00 2001
 From: FiyeroT <me@fiyero.xyz>
 Date: Sat, 3 Oct 2026 06:19:26 +0300
-Subject: [PATCH 021/125] urltest: test each member every interval, not every
+Subject: [PATCH 021/148] urltest: test each member every interval, not every
  other one
 
 A member is skipped in a round when its test result is younger than the
@@ -22,10 +22,10 @@ result comes from another group within this round.
  create mode 100644 protocol/group/urltest_interval_test.go
 
 diff --git a/protocol/group/urltest.go b/protocol/group/urltest.go
-index 1bb6b1136..43f42a4dd 100644
+index bc50ab70d..e1875c779 100644
 --- a/protocol/group/urltest.go
 +++ b/protocol/group/urltest.go
-@@ -444,8 +444,12 @@ func (b *urlTestBatch) test(outbounds []adapter.Outbound, link string, interval
+@@ -455,8 +455,12 @@ func (b *urlTestBatch) test(outbounds []adapter.Outbound, link string, interval
  				return member
  			})), link, interval, force)
  		default:

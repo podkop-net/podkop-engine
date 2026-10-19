@@ -1,0 +1,1921 @@
+From 17250df5e448c7934f9affd7ffb2cf73f28b13c7 Mon Sep 17 00:00:00 2001
+From: FiyeroT <me@fiyero.xyz>
+Date: Sun, 18 Oct 2026 12:02:13 +0300
+Subject: [PATCH 129/140] domainset: read rule sets of the source format in one
+ pass, build the trie by radix
+
+The domain lists of a rule set are now one module, common/domainset:
+
+- ReadSource reads a rule set of the source format into what
+  json.UnmarshalExtended[option.PlainRuleSetCompat] reads of it, in one
+  pass, without a copy of the names. The names of a default rule come as
+  its matcher (DomainMatcher, as from a binary rule set); the other
+  fields of a rule go to sing-box's own decoding as a small object.
+  Input of any other shape (comments, logical rules, keys in other
+  letters or twice, values of other shapes) and any error are left to
+  sing-box, rule by rule or whole, so the result and the errors are
+  sing-box's own. Local and remote rule sets use it.
+- Collector keeps a key as where its name is in the text, read from its
+  end; only names with escapes or not of ASCII are copied.
+- The trie is built a level at a time, the keys of a node parted by
+  their next byte (a radix sort in the order of the trie): no sort by
+  comparison, no map; repeated names and names that are suffixes too are
+  dealt with on the way. Byte for byte domain.NewMatcher's trie.
+- Where sing stops the process (an empty suffix, a domain and a suffix
+  of the same key) the builder returns an error.
+
+TestReadSourceSameAsStock compares 100000 random rule sets with
+sing-box's decoding (37438 of them read here, the rest left to it);
+FuzzReadSource ran 22.6 million inputs. A rule set of 100000 varied
+names: 390 ms and 277 MB allocated with sing's decoding and matcher,
+24 ms and 23 MB here; 300000 names: 870 ms and 862 MB, 130-170 ms and
+72 MB.
+---
+ common/domainset/collector.go      | 148 ++++++++
+ common/domainset/domainset.go      | 197 ++++-------
+ common/domainset/domainset_test.go |  71 +++-
+ common/domainset/legacy.go         | 141 ++++++++
+ common/domainset/source.go         | 524 +++++++++++++++++++++++++++++
+ common/domainset/source_test.go    | 391 +++++++++++++++++++++
+ common/domainset/trie.go           | 231 +++++++++++++
+ common/srs/binary.go               |   7 +-
+ route/rule/rule_set_local.go       |   4 +-
+ route/rule/rule_set_remote.go      |   4 +-
+ 10 files changed, 1580 insertions(+), 138 deletions(-)
+ create mode 100644 common/domainset/collector.go
+ create mode 100644 common/domainset/legacy.go
+ create mode 100644 common/domainset/source.go
+ create mode 100644 common/domainset/source_test.go
+ create mode 100644 common/domainset/trie.go
+
+diff --git a/common/domainset/collector.go b/common/domainset/collector.go
+new file mode 100644
+index 000000000..c5cf1c16f
+--- /dev/null
++++ b/common/domainset/collector.go
+@@ -0,0 +1,148 @@
++package domainset
++
++import (
++	"math"
++	"unicode/utf8"
++
++	E "github.com/sagernet/sing/common/exceptions"
++)
++
++// The kinds of keys, as domain.NewMatcher of sing makes them of a name.
++const (
++	// a name matched as it is: the key is the name reversed
++	kindDomain = iota
++	// a suffix that matches the name and its subdomains: the name reversed, then rootLabel
++	kindRoot
++	// a suffix that begins with ".", its subdomains only: the name reversed, then
++	// prefixLabel
++	kindPrefix
++)
++
++// How a ref packs the length of a name, its kind and the buffer it is in.
++const (
++	lengthBits = 29
++	lengthMask = 1<<lengthBits - 1
++	kindShift  = lengthBits
++	ownShift   = 31
++)
++
++var (
++	// ErrEmptySuffix is an empty name in a list of suffixes: sing has no key for it (its
++	// domain.NewMatcher stops the process with an index out of range).
++	ErrEmptySuffix = E.New("an empty domain suffix")
++	// errSameKey is a name and a suffix that make the same key: a name that begins with
++	// "\n" or "\r" and a suffix without it. sing's trie cannot hold one key twice (its
++	// domain.NewMatcher stops the process with an index out of range).
++	errSameKey = E.New("a domain and a domain suffix that make the same key")
++	errTooLong = E.New("a list of domains too long to build")
++	errNotUTF8 = E.New("a domain that is not valid UTF-8")
++)
++
++// ref is a key of the trie: a name of length bytes at offset in one of the buffers of the
++// collector, read from its end, and the label its kind adds after it.
++type ref struct {
++	offset uint32
++	// the length of the name (low 29 bits), its kind (2 bits), the buffer (the top bit)
++	info uint32
++}
++
++func (r ref) length() int {
++	return int(r.info & lengthMask)
++}
++
++func (r ref) kind() uint32 {
++	return r.info >> kindShift & 3
++}
++
++// Collector gathers the names of a domain matcher and builds it. A name is not copied: a
++// key is where its name is, in the text the collector was made with (Add), read from its
++// end. A name that is not there, or is not ASCII, is copied once into a buffer of the
++// collector (AddString), with the bytes of each rune put in reverse order, so that it too
++// is read from its end into its runes reversed, as reverseDomain of sing reverses a name.
++type Collector struct {
++	buffers [2][]byte
++	refs    []ref
++	// the bytes of all keys, labels included: the most labels the trie can have
++	keyBytes int
++}
++
++// NewCollector makes a collector of names found in text.
++func NewCollector(text []byte) *Collector {
++	return &Collector{buffers: [2][]byte{text, nil}}
++}
++
++// Len is the number of names gathered, repeated ones included.
++func (c *Collector) Len() int {
++	return len(c.refs)
++}
++
++// Add takes text[start:end] as a name, a domain or a suffix. The name must be ASCII: the
++// caller checks it.
++func (c *Collector) Add(start int, end int, suffix bool) error {
++	return c.add(0, start, end, suffix)
++}
++
++// AddString takes a name that is not in the text, a domain or a suffix. It must be valid
++// UTF-8: sing reverses a name that is not into bytes that depend on what is around them.
++func (c *Collector) AddString(name string, suffix bool) error {
++	if !utf8.ValidString(name) {
++		return errNotUTF8
++	}
++	start := len(c.buffers[1])
++	c.buffers[1] = appendRunes(c.buffers[1], name)
++	return c.add(1, start, len(c.buffers[1]), suffix)
++}
++
++// AddBytes is AddString of a name in bytes, which are copied.
++func (c *Collector) AddBytes(name []byte, suffix bool) error {
++	if !utf8.Valid(name) {
++		return errNotUTF8
++	}
++	start := len(c.buffers[1])
++	c.buffers[1] = appendRunes(c.buffers[1], name)
++	return c.add(1, start, len(c.buffers[1]), suffix)
++}
++
++// appendRunes appends a name of valid UTF-8 with the bytes of each of its runes in reverse
++// order: read from its end, it is the name with its runes reversed.
++func appendRunes[T string | []byte](own []byte, name T) []byte {
++	for index := 0; index < len(name); {
++		size := 1
++		switch first := name[index]; {
++		case first < utf8.RuneSelf:
++		case first < 0xe0:
++			size = 2
++		case first < 0xf0:
++			size = 3
++		default:
++			size = 4
++		}
++		for back := size - 1; back >= 0; back-- {
++			own = append(own, name[index+back])
++		}
++		index += size
++	}
++	return own
++}
++
++func (c *Collector) add(buffer int, start int, end int, suffix bool) error {
++	length := end - start
++	if length > lengthMask || start > math.MaxUint32 || len(c.refs) >= math.MaxInt32 {
++		return errTooLong
++	}
++	kind := uint32(kindDomain)
++	if suffix {
++		if length == 0 {
++			return ErrEmptySuffix
++		}
++		if c.buffers[buffer][start] == '.' {
++			kind = kindPrefix
++		} else {
++			kind = kindRoot
++		}
++		c.keyBytes++
++	}
++	c.keyBytes += length
++	c.refs = append(c.refs, ref{uint32(start), uint32(length) | kind<<kindShift | uint32(buffer)<<ownShift})
++	return nil
++}
+diff --git a/common/domainset/domainset.go b/common/domainset/domainset.go
+index 2fd7bd154..2f7ea927d 100644
+--- a/common/domainset/domainset.go
++++ b/common/domainset/domainset.go
+@@ -1,30 +1,36 @@
+-// Package domainset builds the domain matcher of sing (common/domain) with far less memory
+-// than domain.NewMatcher: the matcher is the same, bit for bit.
++// Package domainset reads lists of domains and builds of them the domain matcher of sing
++// (common/domain), the same matcher byte for byte as domain.NewMatcher builds, with a
++// fraction of its memory and time. It reads the rule sets of the source format, JSON, in
++// one pass (ReadSource), and takes lists of strings (NewMatcher).
++//
++// The rules it keeps:
++//
++//   - What it builds is what sing-box builds of the same input: the same matcher, byte for
++//     byte, and the same rules around it. Input it cannot read so is left to the code of
++//     sing-box (ReadSource), or refused with the reason (NewMatcher): it never guesses.
++//     Where sing stops the process (an empty suffix, a name and a suffix of the same key)
++//     it gives an error instead.
++//   - A name is not copied: a key of the trie is where the name is in the text it was
++//     read from, read from its end. Only a name written with escapes, or not ASCII, is
++//     copied, once.
++//   - The keys are not sorted by comparing them: the trie is built a level at a time, the
++//     keys of a node parted by their next byte (a radix sort in the order of the trie),
++//     so that a key is looked at once a byte. Repeated names, and a name that is a suffix
++//     too, are dealt with as the trie is built, with no map.
++//   - The trie is handed to sing as a rule set in the binary format carries it
++//     (domain.ReadMatcher): the matcher is sing's own.
+ //
+ // domain.NewMatcher keeps the queue of its breadth-first walk of the trie whole until the
+-// trie is built, an entry of 24 bytes for every node, and the queue grows by doubling: a
+-// list of 100000 varied names, about two million nodes, takes it to the peak of a hundred
+-// megabytes and more, which a router with 128 MB does not have (D28 of the podkop 0.8
+-// review). Here the walk keeps one level of the trie and the next, at most an entry a
+-// name each, and the trie is handed to sing in the form a rule set in the binary format
+-// carries it (domain.ReadMatcher).
++// trie is built, an entry of 24 bytes for every node, and its map of names: a list of
++// 100000 varied names, about two million nodes, takes it to a peak of a hundred
++// megabytes and more, which a router with 128 MB does not have.
+ package domainset
+ 
+ import (
+ 	"bytes"
+-	"encoding/binary"
+-	"slices"
+ 	"unicode/utf8"
+ 
+ 	"github.com/sagernet/sing/common/domain"
+-	"github.com/sagernet/sing/common/varbin"
+-)
+-
+-// the labels of sing (common/domain/matcher.go): a key that ends a suffix, and one that
+-// ends a name and its subdomains
+-const (
+-	prefixLabel = '\r'
+-	rootLabel   = '\n'
+ )
+ 
+ // NewMatcher is domain.NewMatcher: the names matched as they are (domains) and with their
+@@ -35,134 +41,63 @@ func NewMatcher(domains []string, domainSuffix []string, generateLegacy bool) (*
+ 		// as sing has it, whatever that does with nothing to match
+ 		return domain.NewMatcher(domains, domainSuffix, generateLegacy), nil
+ 	}
+-	return domain.ReadMatcher(bytes.NewReader(Encode(domains, domainSuffix, generateLegacy)))
++	if generateLegacy || !validNames(domains, domainSuffix) {
++		return domain.ReadMatcher(bytes.NewReader(encodeSorted(domains, domainSuffix, generateLegacy)))
++	}
++	collector, err := collect(domains, domainSuffix)
++	if err != nil {
++		return nil, err
++	}
++	return collector.Matcher()
+ }
+ 
+ // Encode is the matcher of NewMatcher as domain.Matcher.Write writes it, the form a rule set
+ // in the binary format carries.
+-func Encode(domains []string, domainSuffix []string, generateLegacy bool) []byte {
+-	return Build(keys(domains, domainSuffix, generateLegacy))
++func Encode(domains []string, domainSuffix []string, generateLegacy bool) ([]byte, error) {
++	if generateLegacy || !validNames(domains, domainSuffix) {
++		return encodeSorted(domains, domainSuffix, generateLegacy), nil
++	}
++	collector, err := collect(domains, domainSuffix)
++	if err != nil {
++		return nil, err
++	}
++	return collector.Encode()
+ }
+ 
+-// keys are the keys of the trie, as domain.NewMatcher makes them: a name reversed, with a
+-// label for how it matches, each once, in order. A name of domains that is a suffix too is
+-// the suffix only, as there.
+-func keys(domains []string, domainSuffix []string, generateLegacy bool) []string {
+-	seen := make(map[string]bool, len(domainSuffix)+len(domains))
+-	list := make([]string, 0, len(domains)+len(domainSuffix))
+-	for _, name := range domainSuffix {
+-		if seen[name] {
+-			continue
++func collect(domains []string, domainSuffix []string) (*Collector, error) {
++	size := 0
++	for _, list := range [][]string{domains, domainSuffix} {
++		for _, name := range list {
++			size += len(name)
+ 		}
+-		seen[name] = true
+-		switch {
+-		case name[0] == '.':
+-			list = append(list, reverse(string(prefixLabel)+name))
+-		case generateLegacy:
+-			list = append(list, reverse(name))
+-			suffix := "." + name
+-			if !seen[suffix] {
+-				seen[suffix] = true
+-				list = append(list, reverse(string(prefixLabel)+suffix))
+-			}
+-		default:
+-			list = append(list, reverse(string(rootLabel)+name))
++	}
++	collector := NewCollector(nil)
++	collector.buffers[1] = make([]byte, 0, size)
++	collector.refs = make([]ref, 0, len(domains)+len(domainSuffix))
++	for _, name := range domainSuffix {
++		err := collector.AddString(name, true)
++		if err != nil {
++			return nil, err
+ 		}
+ 	}
+ 	for _, name := range domains {
+-		if seen[name] {
+-			continue
++		err := collector.AddString(name, false)
++		if err != nil {
++			return nil, err
+ 		}
+-		seen[name] = true
+-		list = append(list, reverse(name))
+ 	}
+-	// the map is no longer needed: a big list should not keep it while the trie is built
+-	seen = nil
+-	slices.Sort(list)
+-	return list
++	return collector, nil
+ }
+ 
+-// reverse is reverseDomain of sing: the runes in the other order.
+-func reverse(name string) string {
+-	length := len(name)
+-	reversed := make([]byte, length)
+-	for index := 0; index < length; {
+-		character, size := utf8.DecodeRuneInString(name[index:])
+-		index += size
+-		utf8.EncodeRune(reversed[length-index:], character)
+-	}
+-	return string(reversed)
+-}
+-
+-// span is a node of the trie as the walk sees it: the keys from start to end that share
+-// their first column bytes.
+-type span struct {
+-	start, end, column int32
+-}
+-
+-// Build makes the succinct set of sorted keys, the trie of newSuccinctSet of sing, written
+-// as succinctSet.Write writes it. The walk goes a level at a time: the nodes of a level
+-// are a span each, and a level has at most as many nodes as there are keys.
+-func Build(keys []string) []byte {
+-	var (
+-		leaves, labelBitmap []uint64
+-		labels              []byte
+-	)
+-	setBit := func(words *[]uint64, index int) {
+-		for index>>6 >= len(*words) {
+-			*words = append(*words, 0)
+-		}
+-		(*words)[index>>6] |= 1 << uint(index&63)
+-	}
+-	bit := 0
+-	node := 0
+-	level := []span{{0, int32(len(keys)), 0}}
+-	var next []span
+-	for len(level) > 0 {
+-		next = next[:0]
+-		for _, item := range level {
+-			start := int(item.start)
+-			column := int(item.column)
+-			if column == len(keys[start]) {
+-				// a key ends here: a leaf
+-				start++
+-				setBit(&leaves, node)
++// validNames tells that every name is valid UTF-8. sing reverses a name that is not into
++// bytes that depend on what is around them; such a list is built the way sing builds it.
++func validNames(lists ...[]string) bool {
++	for _, list := range lists {
++		for _, name := range list {
++			if !utf8.ValidString(name) {
++				return false
+ 			}
+-			for index := start; index < int(item.end); {
+-				first := index
+-				for index < int(item.end) && keys[index][column] == keys[first][column] {
+-					index++
+-				}
+-				next = append(next, span{int32(first), int32(index), int32(column + 1)})
+-				labels = append(labels, keys[first][column])
+-				// a zero bit for each label
+-				bit++
+-			}
+-			setBit(&labelBitmap, bit)
+-			bit++
+-			node++
+ 		}
+-		level, next = next, level
+-	}
+-	var content bytes.Buffer
+-	content.Grow(16 + 8*(len(leaves)+len(labelBitmap)) + len(labels))
+-	content.WriteByte(0)
+-	writeWords(&content, leaves)
+-	writeWords(&content, labelBitmap)
+-	writeLength(&content, len(labels))
+-	content.Write(labels)
+-	return content.Bytes()
+-}
+-
+-func writeLength(content *bytes.Buffer, length int) {
+-	_, _ = varbin.WriteUvarint(content, uint64(length))
+-}
+-
+-func writeWords(content *bytes.Buffer, words []uint64) {
+-	writeLength(content, len(words))
+-	var word [8]byte
+-	for _, value := range words {
+-		binary.BigEndian.PutUint64(word[:], value)
+-		content.Write(word[:])
+ 	}
++	return true
+ }
+diff --git a/common/domainset/domainset_test.go b/common/domainset/domainset_test.go
+index 1ef5d465d..dc88c1f17 100644
+--- a/common/domainset/domainset_test.go
++++ b/common/domainset/domainset_test.go
+@@ -60,7 +60,9 @@ func TestSameAsSing(t *testing.T) {
+ 			suffixes = append(suffixes, "."+strings.TrimPrefix(domains[0], "."))
+ 			for _, lists := range [][2][]string{{domains, suffixes}, {domains, nil}, {nil, suffixes}} {
+ 				want := singBytes(t, lists[0], lists[1], legacy)
+-				require.Equal(t, want, Encode(lists[0], lists[1], legacy), "%d names, legacy %v", count, legacy)
++				encoded, err := Encode(lists[0], lists[1], legacy)
++				require.NoError(t, err)
++				require.Equal(t, want, encoded, "%d names, legacy %v", count, legacy)
+ 				matcher, err := NewMatcher(lists[0], lists[1], legacy)
+ 				require.NoError(t, err)
+ 				var written bytes.Buffer
+@@ -74,10 +76,75 @@ func TestSameAsSing(t *testing.T) {
+ 		{{"example.com"}, nil}, {nil, {"example.com"}}, {nil, {".example.com"}},
+ 		{{"a.b.c", "b.c"}, {"c", ".b.c"}}, {{"x"}, {"x"}},
+ 	} {
+-		require.Equal(t, singBytes(t, lists[0], lists[1], false), Encode(lists[0], lists[1], false), "%v", lists)
++		encoded, err := Encode(lists[0], lists[1], false)
++		require.NoError(t, err)
++		require.Equal(t, singBytes(t, lists[0], lists[1], false), encoded, "%v", lists)
+ 	}
+ }
+ 
++// Names sing takes that a list of a rule set hardly has: empty, in capitals, with the
++// labels of the trie inside them, of one byte, a name that is a suffix of another in
++// every way; and names that are not valid UTF-8, which go the way sing builds them.
++func TestSameAsSingOddNames(t *testing.T) {
++	for _, lists := range [][2][]string{
++		{{""}, nil},
++		{{"", "a"}, {"a"}},
++		{{"Example.COM", "example.com"}, {"EXAMPLE.com"}},
++		{{"a\nb", "a\rb", "\nx"}, {"b\ra", ".\n"}},
++		{{"a", "b", "c"}, {"a", ".a", "b"}},
++		{{".a", "a."}, {".a", "a."}},
++		{{"x.y.z", "y.z", "z"}, {"y.z", ".z", "x.y.z"}},
++		{{"ab\xffcd"}, {"ef\xfegh"}},
++		{{"пример.рф", "例子.测试"}, {".рф", "测试"}},
++	} {
++		encoded, err := Encode(lists[0], lists[1], false)
++		require.NoError(t, err)
++		require.Equal(t, singBytes(t, lists[0], lists[1], false), encoded, "%q", lists)
++	}
++	random := rand.New(rand.NewSource(3))
++	alphabet := []string{"a", "b", ".", "\n", "\r", "я", "-"}
++	for range 2000 {
++		var lists [2][]string
++		for side := range lists {
++			for range random.Intn(8) {
++				var name strings.Builder
++				for range random.Intn(6) {
++					name.WriteString(alphabet[random.Intn(len(alphabet))])
++				}
++				lists[side] = append(lists[side], name.String())
++			}
++		}
++		if len(lists[0])+len(lists[1]) == 0 {
++			continue
++		}
++		var want []byte
++		func() {
++			defer func() {
++				if recover() != nil {
++					want = nil
++				}
++			}()
++			want = singBytes(t, lists[0], lists[1], false)
++		}()
++		encoded, err := Encode(lists[0], lists[1], false)
++		if want == nil {
++			// sing stops the process: an empty suffix, a name and a suffix of one key
++			require.Error(t, err, "%q", lists)
++			continue
++		}
++		require.NoError(t, err, "%q", lists)
++		require.Equal(t, want, encoded, "%q", lists)
++	}
++}
++
++// What sing cannot build is an error here, where sing stops the process.
++func TestRefused(t *testing.T) {
++	_, err := NewMatcher(nil, []string{"a", ""}, false)
++	require.ErrorIs(t, err, ErrEmptySuffix)
++	_, err = NewMatcher([]string{"\na"}, []string{"a"}, false)
++	require.ErrorIs(t, err, errSameKey)
++}
++
+ // What a list of 100000 names of no pattern costs to build: here and in sing.
+ func BenchmarkBuild(b *testing.B) {
+ 	list := names(rand.New(rand.NewSource(2)), 100000)
+diff --git a/common/domainset/legacy.go b/common/domainset/legacy.go
+new file mode 100644
+index 000000000..40448f46e
+--- /dev/null
++++ b/common/domainset/legacy.go
+@@ -0,0 +1,141 @@
++package domainset
++
++import (
++	"bytes"
++	"encoding/binary"
++	"slices"
++	"unicode/utf8"
++
++	"github.com/sagernet/sing/common/varbin"
++)
++
++// the labels of sing (common/domain/matcher.go): a key that ends a suffix, and one that
++// ends a name and its subdomains
++const (
++	prefixLabel = '\r'
++	rootLabel   = '\n'
++)
++
++// encodeSorted builds the matcher the way sing does, its keys made into strings, kept in a
++// map and sorted: for the legacy way of rule sets of version 1 (a suffix is two keys,
++// one of them for a name that is not in the list) and for names that are not valid UTF-8.
++// Only the walk of the trie is the lean one of Collector.build, one level at a time.
++func encodeSorted(domains []string, domainSuffix []string, generateLegacy bool) []byte {
++	return buildSorted(keys(domains, domainSuffix, generateLegacy))
++}
++
++// keys are the keys of the trie, as domain.NewMatcher makes them: a name reversed, with a
++// label for how it matches, each once, in order. A name of domains that is a suffix too is
++// the suffix only, as there.
++func keys(domains []string, domainSuffix []string, generateLegacy bool) []string {
++	seen := make(map[string]bool, len(domainSuffix)+len(domains))
++	list := make([]string, 0, len(domains)+len(domainSuffix))
++	for _, name := range domainSuffix {
++		if seen[name] {
++			continue
++		}
++		seen[name] = true
++		switch {
++		case name[0] == '.':
++			list = append(list, reverse(string(prefixLabel)+name))
++		case generateLegacy:
++			list = append(list, reverse(name))
++			suffix := "." + name
++			if !seen[suffix] {
++				seen[suffix] = true
++				list = append(list, reverse(string(prefixLabel)+suffix))
++			}
++		default:
++			list = append(list, reverse(string(rootLabel)+name))
++		}
++	}
++	for _, name := range domains {
++		if seen[name] {
++			continue
++		}
++		seen[name] = true
++		list = append(list, reverse(name))
++	}
++	// the map is no longer needed: a big list should not keep it while the trie is built
++	seen = nil
++	slices.Sort(list)
++	return list
++}
++
++// reverse is reverseDomain of sing: the runes in the other order.
++func reverse(name string) string {
++	length := len(name)
++	reversed := make([]byte, length)
++	for index := 0; index < length; {
++		character, size := utf8.DecodeRuneInString(name[index:])
++		index += size
++		utf8.EncodeRune(reversed[length-index:], character)
++	}
++	return string(reversed)
++}
++
++// sortedSpan is a node of the trie as buildSorted sees it: the keys from start to end
++// that share their first column bytes.
++type sortedSpan struct {
++	start, end, column int32
++}
++
++// buildSorted makes the succinct set of sorted keys, the trie of newSuccinctSet of sing,
++// written as succinctSet.Write writes it.
++func buildSorted(keys []string) []byte {
++	var (
++		leaves, labelBitmap []uint64
++		labels              []byte
++	)
++	bit := 0
++	node := 0
++	level := []sortedSpan{{0, int32(len(keys)), 0}}
++	var next []sortedSpan
++	for len(level) > 0 {
++		next = next[:0]
++		for _, item := range level {
++			start := int(item.start)
++			column := int(item.column)
++			if column == len(keys[start]) {
++				// a key ends here: a leaf
++				start++
++				setBit(&leaves, node)
++			}
++			for index := start; index < int(item.end); {
++				first := index
++				for index < int(item.end) && keys[index][column] == keys[first][column] {
++					index++
++				}
++				next = append(next, sortedSpan{int32(first), int32(index), int32(column + 1)})
++				labels = append(labels, keys[first][column])
++				// a zero bit for each label
++				bit++
++			}
++			setBit(&labelBitmap, bit)
++			bit++
++			node++
++		}
++		level, next = next, level
++	}
++	var content bytes.Buffer
++	content.Grow(16 + 8*(len(leaves)+len(labelBitmap)) + len(labels))
++	content.WriteByte(0)
++	writeWords(&content, leaves)
++	writeWords(&content, labelBitmap)
++	writeLength(&content, len(labels))
++	content.Write(labels)
++	return content.Bytes()
++}
++
++func writeLength(content *bytes.Buffer, length int) {
++	_, _ = varbin.WriteUvarint(content, uint64(length))
++}
++
++func writeWords(content *bytes.Buffer, words []uint64) {
++	writeLength(content, len(words))
++	var word [8]byte
++	for _, value := range words {
++		binary.BigEndian.PutUint64(word[:], value)
++		content.Write(word[:])
++	}
++}
+diff --git a/common/domainset/source.go b/common/domainset/source.go
+new file mode 100644
+index 000000000..b6c3e01e3
+--- /dev/null
++++ b/common/domainset/source.go
+@@ -0,0 +1,524 @@
++package domainset
++
++import (
++	"bytes"
++	"context"
++	"strings"
++	"unicode/utf8"
++
++	C "github.com/sagernet/sing-box/constant"
++	"github.com/sagernet/sing-box/option"
++	"github.com/sagernet/sing/common/json"
++	"github.com/sagernet/sing/common/json/badjson"
++	"github.com/sagernet/sing/common/json/badoption"
++)
++
++// ReadSource reads a rule set of the source format, JSON, into what
++// json.UnmarshalExtended[option.PlainRuleSetCompat] reads of it, in one pass and without
++// a copy of the names where it can. The rules differ in one way: the names of a rule of
++// the default type (domain, domain_suffix) come as its matcher (DomainMatcher, as a rule
++// set of the binary format has them), not as lists of strings; the matcher is the one
++// route/rule builds of those lists.
++//
++// What it reads so is JSON of a strict shape: the object of the rule set with "version"
++// (a digit) and "rules", nothing around it but white space. In a rule it reads the lists of
++// strings itself (domain, domain_suffix, domain_keyword, domain_regex, source_ip_cidr,
++// ip_cidr, each a string, an array of strings or null), and hands the other fields to
++// sing-box as a small object. Anything else (comments, a logical rule, a field written in
++// other letters, a key twice, a value of another shape) goes to sing-box: a rule alone,
++// when the shape of the set is as above, or the whole text. So does any error: the error
++// is then sing-box's own.
++func ReadSource(content []byte) (option.PlainRuleSetCompat, error) {
++	compat, ok := readSource(content)
++	if ok {
++		return compat, nil
++	}
++	return json.UnmarshalExtended[option.PlainRuleSetCompat](content)
++}
++
++// the lists of strings of a default rule read here, in the order of their bit in a mask
++const (
++	fieldDomain = iota
++	fieldDomainSuffix
++	fieldDomainKeyword
++	fieldDomainRegex
++	fieldSourceIPCIDR
++	fieldIPCIDR
++	fieldCount
++)
++
++var (
++	fieldNames = [fieldCount]string{"domain", "domain_suffix", "domain_keyword", "domain_regex", "source_ip_cidr", "ip_cidr"}
++	// the keys whose other spellings are sing-box's to read
++	foldNames = append(fieldNames[:], "type")
++)
++
++// reader is the text of a rule set and where it is read.
++type reader struct {
++	text []byte
++	at   int
++}
++
++func readSource(text []byte) (option.PlainRuleSetCompat, bool) {
++	var compat option.PlainRuleSetCompat
++	r := reader{text: text}
++	r.space()
++	begin := r.at
++	if !r.take('{') {
++		return compat, false
++	}
++	var (
++		haveVersion, haveRules bool
++		rules                  []option.HeadlessRule
++		empty                  = true
++	)
++	r.space()
++	if !r.take('}') {
++		for {
++			key, plain, ok := r.key()
++			if !ok || !plain {
++				return compat, false
++			}
++			switch key {
++			case "version":
++				if haveVersion {
++					return compat, false
++				}
++				haveVersion = true
++				compat.Version, ok = r.version()
++			case "rules":
++				if haveRules {
++					return compat, false
++				}
++				haveRules = true
++				rules, empty, ok = r.rules()
++			default:
++				// any other key, of other letters too, is sing-box's to tell
++				return compat, false
++			}
++			if !ok {
++				return compat, false
++			}
++			r.space()
++			if r.take(',') {
++				r.space()
++				continue
++			}
++			if r.take('}') {
++				break
++			}
++			return compat, false
++		}
++	}
++	end := r.at
++	r.space()
++	if r.at != len(text) || !haveVersion {
++		return compat, false
++	}
++	// rules that are all empty (no rule, or rules whose values are all empty arrays and
++	// objects) are dropped by badjson before sing-box reads them: there are none
++	if !empty {
++		compat.Options.Rules = rules
++	}
++	compat.RawMessage = text[begin:end]
++	return compat, true
++}
++
++// version reads the version of the rule set: one digit of a version sing-box knows.
++func (r *reader) version() (uint8, bool) {
++	if r.at+1 >= len(r.text) {
++		return 0, false
++	}
++	digit := r.text[r.at]
++	if digit < '1' || digit > '0'+C.RuleSetVersionCurrent {
++		return 0, false
++	}
++	switch r.text[r.at+1] {
++	case ' ', '\t', '\n', '\r', ',', '}':
++	default:
++		return 0, false
++	}
++	r.at++
++	return digit - '0', true
++}
++
++// rules reads the array of rules, and whether every rule is empty as badjson sees it.
++func (r *reader) rules() ([]option.HeadlessRule, bool, bool) {
++	if !r.take('[') {
++		return nil, false, false
++	}
++	var rules []option.HeadlessRule
++	empty := true
++	r.space()
++	if r.take(']') {
++		return nil, true, true
++	}
++	for {
++		rule, ruleEmpty, ok := r.rule()
++		if !ok {
++			return nil, false, false
++		}
++		rules = append(rules, rule)
++		empty = empty && ruleEmpty
++		r.space()
++		if r.take(',') {
++			r.space()
++			continue
++		}
++		if r.take(']') {
++			return rules, empty, true
++		}
++		return nil, false, false
++	}
++}
++
++// rule reads a rule: the lists of strings of a default rule here, the rest by sing-box.
++// It also tells whether badjson takes the rule for empty.
++func (r *reader) rule() (option.HeadlessRule, bool, bool) {
++	var rule option.HeadlessRule
++	begin := r.at
++	if !r.take('{') {
++		return rule, false, false
++	}
++	var (
++		// the rule goes to sing-box whole
++		whole bool
++		// the fields read here, and the ones of them that are not empty arrays
++		seen, full uint
++		lists      [fieldCount][]string
++		names      *Collector
++		// the other members, as their text
++		rest [][]byte
++	)
++	r.space()
++	if !r.take('}') {
++		for {
++			memberStart := r.at
++			key, plain, ok := r.key()
++			if !ok {
++				return rule, false, false
++			}
++			valueStart := r.at
++			field := fieldIndex(key)
++			switch {
++			case whole:
++			case !plain:
++				whole = true
++			case field >= 0:
++				if seen&(1<<field) != 0 {
++					// a key twice: badjson keeps the last value
++					whole = true
++					break
++				}
++				seen |= 1 << field
++				var count int
++				if field == fieldDomain || field == fieldDomainSuffix {
++					if names == nil {
++						names = NewCollector(r.text)
++					}
++					count, ok = r.names(names, field == fieldDomainSuffix)
++				} else {
++					lists[field], ok = r.strings()
++					count = len(lists[field])
++				}
++				if !ok {
++					// a value of another shape
++					whole = true
++					r.at = valueStart
++					break
++				}
++				if count > 0 || r.text[valueStart] != '[' {
++					full |= 1 << field
++				}
++			case foldsTo(key):
++				// "Domain", "TYPE": decoding matches fields in any letters
++				whole = true
++			case key == "type":
++				if !r.defaultType() {
++					whole = true
++				}
++				r.at = valueStart
++			}
++			if whole || field < 0 {
++				if !r.skipValue() || r.at == valueStart {
++					return rule, false, false
++				}
++				if !whole {
++					rest = append(rest, r.text[memberStart:r.at])
++				}
++			}
++			r.space()
++			if r.take(',') {
++				r.space()
++				continue
++			}
++			if r.take('}') {
++				break
++			}
++			return rule, false, false
++		}
++	}
++	if whole {
++		rule, empty, err := sourceRule(r.text[begin:r.at])
++		return rule, empty, err == nil
++	}
++	restEmpty := true
++	if len(rest) == 0 {
++		rule.Type = C.RuleTypeDefault
++	} else {
++		var err error
++		rule, restEmpty, err = sourceRule(append(append([]byte{'{'}, bytes.Join(rest, []byte{','})...), '}'))
++		if err != nil || rule.Type != C.RuleTypeDefault {
++			return rule, false, false
++		}
++	}
++	fields := &rule.DefaultOptions
++	fields.DomainKeyword = badoption.Listable[string](lists[fieldDomainKeyword])
++	fields.DomainRegex = badoption.Listable[string](lists[fieldDomainRegex])
++	fields.SourceIPCIDR = badoption.Listable[string](lists[fieldSourceIPCIDR])
++	fields.IPCIDR = badoption.Listable[string](lists[fieldIPCIDR])
++	if names != nil && names.Len() > 0 {
++		matcher, err := names.Matcher()
++		if err != nil {
++			return rule, false, false
++		}
++		fields.DomainMatcher = matcher
++	}
++	return rule, full == 0 && restEmpty, true
++}
++
++// sourceRule reads a rule as sing-box reads one of the rules of a set: badjson takes the
++// rule apart, writes it again without its empty values, and the rule reads that. It also
++// tells whether badjson takes the rule for empty.
++func sourceRule(text []byte) (option.HeadlessRule, bool, error) {
++	var rule option.HeadlessRule
++	var object badjson.JSONObject
++	err := object.UnmarshalJSONContext(context.Background(), text)
++	if err != nil {
++		return rule, false, err
++	}
++	written, err := object.MarshalJSONContext(context.Background())
++	if err != nil {
++		return rule, false, err
++	}
++	err = rule.UnmarshalJSON(written)
++	return rule, object.IsEmpty(), err
++}
++
++func fieldIndex(key string) int {
++	for index, name := range fieldNames {
++		if key == name {
++			return index
++		}
++	}
++	return -1
++}
++
++// foldsTo tells a key that is not one of the fields read here, nor "type", but which the
++// decoding of sing-box matches with one of them, as it matches keys in any letters.
++func foldsTo(key string) bool {
++	for _, name := range foldNames {
++		if key != name && strings.EqualFold(key, name) {
++			return true
++		}
++	}
++	return false
++}
++
++// defaultType tells that the value of "type" is "default" or "": a default rule, whose
++// type sing-box reads with the rest.
++func (r *reader) defaultType() bool {
++	start, end, plain, ok := r.str()
++	if !ok || !plain {
++		return false
++	}
++	value := string(r.text[start:end])
++	return value == "" || value == C.RuleTypeDefault
++}
++
++// names reads a value of domain or domain_suffix into the collector: a string, an array
++// of strings or null. It tells how many names it read.
++func (r *reader) names(names *Collector, suffix bool) (int, bool) {
++	count := 0
++	ok := r.each(func(start int, end int, plain bool) bool {
++		count++
++		if plain {
++			return names.Add(start, end, suffix) == nil
++		}
++		if text, ok := r.unescaped(start, end); ok {
++			return names.AddBytes(text, suffix) == nil
++		}
++		value, ok := r.unquote(start, end)
++		return ok && names.AddString(value, suffix) == nil
++	})
++	return count, ok
++}
++
++// strings reads a value of one of the other lists: a string, an array of strings or null.
++func (r *reader) strings() ([]string, bool) {
++	var list []string
++	ok := r.each(func(start int, end int, plain bool) bool {
++		if plain {
++			list = append(list, string(r.text[start:end]))
++			return true
++		}
++		if text, ok := r.unescaped(start, end); ok {
++			list = append(list, string(text))
++			return true
++		}
++		value, ok := r.unquote(start, end)
++		list = append(list, value)
++		return ok
++	})
++	return list, ok
++}
++
++// each reads a string, an array of strings or null, and hands each string to take: where
++// its text is, and whether that text is the string as it is (ASCII, no escape).
++func (r *reader) each(take func(start int, end int, plain bool) bool) bool {
++	if r.at >= len(r.text) {
++		return false
++	}
++	switch r.text[r.at] {
++	case '"':
++		start, end, plain, ok := r.str()
++		return ok && take(start, end, plain)
++	case 'n':
++		if bytes.HasPrefix(r.text[r.at:], []byte("null")) {
++			r.at += 4
++			return true
++		}
++		return false
++	case '[':
++		r.at++
++		r.space()
++		if r.take(']') {
++			return true
++		}
++		for {
++			start, end, plain, ok := r.str()
++			if !ok || !take(start, end, plain) {
++				return false
++			}
++			r.space()
++			if r.take(',') {
++				r.space()
++				continue
++			}
++			return r.take(']')
++		}
++	}
++	return false
++}
++
++// unescaped is the text of a string that has no escape and is valid UTF-8: the string
++// sing-box reads of it, as it is.
++func (r *reader) unescaped(start int, end int) ([]byte, bool) {
++	text := r.text[start:end]
++	return text, bytes.IndexByte(text, '\\') < 0 && utf8.Valid(text)
++}
++
++// unquote is the string sing-box reads of the text of a string between its quotes:
++// escapes undone, bytes that are not UTF-8 replaced by U+FFFD.
++func (r *reader) unquote(start int, end int) (string, bool) {
++	var value string
++	err := json.Unmarshal(r.text[start-1:end+1], &value)
++	return value, err == nil
++}
++
++// key reads a key and the colon after it. It tells whether the key is as it is written
++// (ASCII, no escape); one that is not is read only to be skipped.
++func (r *reader) key() (string, bool, bool) {
++	start, end, plain, ok := r.str()
++	if !ok {
++		return "", false, false
++	}
++	r.space()
++	if !r.take(':') {
++		return "", false, false
++	}
++	r.space()
++	return string(r.text[start:end]), plain, true
++}
++
++// str reads a string: where its text is between the quotes, and whether that text is the
++// string as it is (ASCII, no escape). A string with a control character is no JSON.
++func (r *reader) str() (int, int, bool, bool) {
++	if r.at >= len(r.text) || r.text[r.at] != '"' {
++		return 0, 0, false, false
++	}
++	start := r.at + 1
++	plain := true
++	for index := start; index < len(r.text); index++ {
++		character := r.text[index]
++		switch {
++		case character == '"':
++			r.at = index + 1
++			return start, index, plain, true
++		case character == '\\':
++			plain = false
++			index++
++		case character < 0x20:
++			return 0, 0, false, false
++		case character >= 0x80:
++			plain = false
++		}
++	}
++	return 0, 0, false, false
++}
++
++// skipValue goes past a value, for sing-box to read: it only finds its end. A comment
++// stops it: sing-box's decoding takes comments out first.
++func (r *reader) skipValue() bool {
++	depth := 0
++	for r.at < len(r.text) {
++		switch r.text[r.at] {
++		case '"':
++			if _, _, _, ok := r.str(); !ok {
++				return false
++			}
++			if depth == 0 {
++				return true
++			}
++			continue
++		case '[', '{':
++			depth++
++		case ']', '}':
++			if depth == 0 {
++				return true
++			}
++			depth--
++			if depth == 0 {
++				r.at++
++				return true
++			}
++		case ',', ' ', '\t', '\n', '\r':
++			if depth == 0 {
++				return true
++			}
++		case '/', '#':
++			return false
++		}
++		r.at++
++	}
++	return depth == 0
++}
++
++func (r *reader) space() {
++	for r.at < len(r.text) {
++		switch r.text[r.at] {
++		case ' ', '\t', '\n', '\r':
++			r.at++
++		default:
++			return
++		}
++	}
++}
++
++func (r *reader) take(character byte) bool {
++	if r.at < len(r.text) && r.text[r.at] == character {
++		r.at++
++		return true
++	}
++	return false
++}
+diff --git a/common/domainset/source_test.go b/common/domainset/source_test.go
+new file mode 100644
+index 000000000..e1e5ed60e
+--- /dev/null
++++ b/common/domainset/source_test.go
+@@ -0,0 +1,391 @@
++package domainset
++
++import (
++	"bytes"
++	"fmt"
++	"math/rand"
++	"reflect"
++	"strings"
++	"testing"
++
++	C "github.com/sagernet/sing-box/constant"
++	"github.com/sagernet/sing-box/option"
++	"github.com/sagernet/sing/common/domain"
++	"github.com/sagernet/sing/common/json"
++
++	"github.com/stretchr/testify/require"
++)
++
++// sourceText makes the text of rule sets of the source format of every shape sing-box
++// reads, and of shapes it does not: white space of all kinds, a string or an array or
++// null or an empty array, escapes, names not of ASCII and bytes not of UTF-8, the other
++// fields of a rule, logical rules, keys in other letters or twice, unknown keys,
++// comments, trailing commas, versions it does not know.
++type sourceText struct {
++	random *rand.Rand
++	// names: how many names a list has at most
++	names int
++}
++
++func (g sourceText) one(choices ...string) string {
++	return choices[g.random.Intn(len(choices))]
++}
++
++func (g sourceText) space() string {
++	if g.random.Intn(3) > 0 {
++		return g.one("", " ")
++	}
++	return g.one("\n", "\t", "\r\n  ", "  ")
++}
++
++func (g sourceText) name() string {
++	switch g.random.Intn(30) {
++	case 0:
++		return ""
++	case 1:
++		return "Пример.РФ"
++	case 2:
++		return "Example.COM"
++	case 3:
++		return ".example.com"
++	case 4:
++		return "a\nb"
++	}
++	letters := "abcdefghijklmnopqrstuvwxyz0123456789-"
++	var name strings.Builder
++	if g.random.Intn(8) == 0 {
++		name.WriteByte('.')
++	}
++	for range 1 + g.random.Intn(2) {
++		for range 1 + g.random.Intn(6) {
++			name.WriteByte(letters[g.random.Intn(len(letters))])
++		}
++		name.WriteByte('.')
++	}
++	name.WriteString(g.one("com", "net", "ru", "io", "co.uk", "рф"))
++	return name.String()
++}
++
++// quote writes a string as JSON, now and then with escapes or bytes JSON does not have.
++func (g sourceText) quote(value string) string {
++	switch g.random.Intn(40) {
++	case 0:
++		return `"` + strings.ReplaceAll(value, "a", `a`) + `"`
++	case 1:
++		return `"` + strings.ReplaceAll(value, ".", `\/.`) + `"`
++	case 2:
++		return "\"" + value + "\xff\""
++	case 3:
++		return "\"" + value + "\x01\""
++	}
++	quoted, _ := json.Marshal(value)
++	return string(quoted)
++}
++
++func (g sourceText) list(name func() string) string {
++	switch g.random.Intn(12) {
++	case 0:
++		return "null"
++	case 1:
++		return "[]"
++	case 2:
++		return g.quote(name())
++	case 3:
++		return "[" + g.quote(name()) + ", null]"
++	case 4:
++		return "[[]]"
++	case 5:
++		return "42"
++	}
++	count := 1 + g.random.Intn(g.names)
++	items := make([]string, count)
++	for index := range items {
++		items[index] = g.quote(name())
++	}
++	separator := ","
++	if g.random.Intn(2) == 0 {
++		separator = "," + g.space()
++	}
++	return "[" + g.space() + strings.Join(items, separator) + g.space() + "]"
++}
++
++func (g sourceText) member(key string, value string) string {
++	return g.quote(key) + g.space() + ":" + g.space() + value
++}
++
++func (g sourceText) rule(depth int) string {
++	var members []string
++	add := func(key string, value string) {
++		members = append(members, g.member(key, value))
++	}
++	cidr := func() string { return g.one("10.0.0.0/8", "192.0.2.1", "2001:db8::/32", "bad") }
++	word := func() string { return g.one("ex", "ample", "^a.*$", "q") }
++	for range 1 + g.random.Intn(4) {
++		switch g.random.Intn(22) {
++		case 0, 1, 2:
++			add("domain_suffix", g.list(g.name))
++		case 3, 4:
++			add("domain", g.list(g.name))
++		case 5:
++			add("domain_keyword", g.list(word))
++		case 6:
++			add("domain_regex", g.list(word))
++		case 7:
++			add("ip_cidr", g.list(cidr))
++		case 8:
++			add("source_ip_cidr", g.list(cidr))
++		case 9:
++			add("port", g.one("80", "[80, 443]", "[]", `"x"`))
++		case 10:
++			add("network", g.one(`"tcp"`, `["udp"]`, `"bad"`))
++		case 11:
++			add("invert", g.one("true", "false"))
++		case 12:
++			add("query_type", g.one(`["A", "AAAA"]`, `"HTTPS"`))
++		case 13:
++			add("type", g.one(`"default"`, `""`, `"bad"`, `"logical"`))
++		case 14:
++			add(g.one("Domain_Suffix", "DOMAIN", "Type", "domain_ſuffix"), g.list(g.name))
++		case 15:
++			add(g.one("foo", "domain suffix"), `"x"`)
++		case 16:
++			add("network_interface_address", g.one("{}", `{"wifi": []}`, `{"wifi": ["10.0.0.0/8"]}`))
++		case 17:
++			add("port_range", g.one(`["1000:2000"]`, "[]", "null"))
++		case 18:
++			if depth < 2 {
++				return "{" + g.space() + strings.Join([]string{
++					g.member("type", `"logical"`), g.member("mode", g.one(`"and"`, `"or"`)),
++					g.member("rules", "["+g.rule(depth+1)+","+g.space()+g.rule(depth+1)+"]"),
++				}, ",") + "}"
++			}
++		case 19:
++			if len(members) > 0 {
++				// a key twice
++				members = append(members, members[0])
++			}
++		case 20:
++			add("domain_suffix", g.list(g.name))
++			members = append(members, g.one("/* a */ ", "// a\n", "# a\n")+members[len(members)-1])
++		case 21:
++			add("domain_suffix", `"domain.ru"`)
++		}
++	}
++	g.random.Shuffle(len(members), func(i, j int) { members[i], members[j] = members[j], members[i] })
++	text := "{" + g.space() + strings.Join(members, ","+g.space()) + g.space()
++	if g.random.Intn(30) == 0 {
++		text += ","
++	}
++	return text + "}"
++}
++
++func (g sourceText) set() string {
++	var members []string
++	switch g.random.Intn(20) {
++	case 0:
++	case 1:
++		members = append(members, g.member("version", g.one("0", "9", "3.0", `"3"`, "1e0", "-1", "33")))
++	case 2:
++		members = append(members, g.member("Version", "3"))
++	default:
++		members = append(members, g.member("version", fmt.Sprint(1+g.random.Intn(C.RuleSetVersionCurrent))))
++	}
++	switch g.random.Intn(15) {
++	case 0:
++	case 1:
++		members = append(members, g.member("rules", g.one("[]", "null", "{}", "[{}]", `[{"domain": []}, {}]`)))
++	default:
++		count := g.random.Intn(4)
++		rules := make([]string, count)
++		for index := range rules {
++			rules[index] = g.rule(0)
++		}
++		members = append(members, g.member("rules", "["+g.space()+strings.Join(rules, ","+g.space())+g.space()+"]"))
++	}
++	if g.random.Intn(30) == 0 {
++		members = append(members, g.member("extra", "1"))
++	}
++	g.random.Shuffle(len(members), func(i, j int) { members[i], members[j] = members[j], members[i] })
++	text := g.space() + "{" + g.space() + strings.Join(members, ","+g.space()) + g.space() + "}" + g.space()
++	if g.random.Intn(40) == 0 {
++		text = "// a rule set\n" + text
++	}
++	return text
++}
++
++// written is a matcher as a rule set carries it after it was read once: a matcher that
++// domain.ReadMatcher made pads its leaves.
++func written(t testing.TB, matcher *domain.Matcher) []byte {
++	var content bytes.Buffer
++	require.NoError(t, matcher.Write(&content))
++	read, err := domain.ReadMatcher(bytes.NewReader(content.Bytes()))
++	require.NoError(t, err)
++	content.Reset()
++	require.NoError(t, read.Write(&content))
++	return content.Bytes()
++}
++
++// sameAsStock checks one text: what readSource reads of it is what sing-box reads, its
++// matchers the ones route/rule builds; text sing-box refuses is not read here. It tells
++// whether readSource read the text.
++func sameAsStock(t testing.TB, text []byte) bool {
++	stock, stockErr := json.UnmarshalExtended[option.PlainRuleSetCompat](text)
++	fast, ok := readSource(text)
++	if stockErr != nil {
++		require.False(t, ok, "sing-box refuses it (%v), readSource read it:\n%s", stockErr, text)
++		return false
++	}
++	if !ok {
++		return false
++	}
++	require.Equal(t, len(stock.Options.Rules), len(fast.Options.Rules), "%s", text)
++	for index := range stock.Options.Rules {
++		mine, theirs := &fast.Options.Rules[index].DefaultOptions, &stock.Options.Rules[index].DefaultOptions
++		if mine.DomainMatcher == nil {
++			continue
++		}
++		require.True(t, len(theirs.Domain)+len(theirs.DomainSuffix) > 0, "%s", text)
++		var want *domain.Matcher
++		func() {
++			defer func() {
++				if recover() != nil {
++					want = nil
++				}
++			}()
++			want = domain.NewMatcher(theirs.Domain, theirs.DomainSuffix, false)
++		}()
++		require.NotNil(t, want, "sing stops on these names, readSource built them:\n%s", text)
++		require.Equal(t, written(t, want), written(t, mine.DomainMatcher), "%s", text)
++		mine.DomainMatcher = nil
++		theirs.Domain, theirs.DomainSuffix = nil, nil
++	}
++	require.True(t, reflect.DeepEqual(stock, fast), "%s\nsing-box: %#v\nhere: %#v", text, stock, fast)
++	return true
++}
++
++// What the source format reads here is what sing-box reads, for a hundred thousand rule
++// sets of every shape; and ReadSource gives what sing-box gives for each of them, an error
++// included.
++func TestReadSourceSameAsStock(t *testing.T) {
++	random := rand.New(rand.NewSource(4))
++	read := 0
++	const sets = 100000
++	for index := range sets {
++		g := sourceText{random: random, names: 4}
++		if index%100 == 0 {
++			g.names = 200
++		}
++		text := []byte(g.set())
++		if sameAsStock(t, text) {
++			read++
++		}
++		if index%10 == 0 {
++			stock, stockErr := json.UnmarshalExtended[option.PlainRuleSetCompat](text)
++			mine, err := ReadSource(text)
++			if stockErr != nil {
++				require.EqualError(t, err, stockErr.Error())
++			} else {
++				require.NoError(t, err)
++				require.Equal(t, len(stock.Options.Rules), len(mine.Options.Rules))
++			}
++		}
++	}
++	t.Logf("read here: %d of %d", read, sets)
++	// the shapes a list of podkop and of the lists published as rule sets have are read
++	// here, not left to sing-box
++	require.Greater(t, read, sets/4)
++}
++
++// Rule sets as they are written in the wild are read here.
++func TestReadSourceShapes(t *testing.T) {
++	for _, text := range []string{
++		`{"version": 3, "rules": [{"domain_suffix": ["example.com", "example.org"]}]}`,
++		"{\n  \"version\": 2,\n  \"rules\": [\n    {\n      \"domain_suffix\": [\n        \"a.ru\",\n        \"b.ru\"\n      ]\n    }\n  ]\n}\n",
++		`{"version":1,"rules":[{"domain":["a.com"],"domain_suffix":[".b.com"],"domain_keyword":["k"],"domain_regex":["^r$"]},{"ip_cidr":["10.0.0.0/8"]}]}`,
++		`{"version": 3, "rules": [{"domain_suffix": "one.example", "port": [80, 443], "invert": true}]}`,
++		`{"rules": [{"type": "default", "domain": "x.example"}], "version": 3}`,
++		`{"version": 3}`,
++		`{"version": 3, "rules": []}`,
++		`{"version": 3, "rules": [{"domain": "x"}, {"type": "logical", "mode": "and", "rules": [{"domain": "y"}, {"port": 80}]}]}`,
++	} {
++		require.True(t, sameAsStock(t, []byte(text)), "not read here:\n%s", text)
++	}
++	for _, text := range []string{
++		// comments, a version that is not a digit, a key in other letters: sing-box's
++		`// a set` + "\n" + `{"version": 3, "rules": []}`,
++		`{"version": "3", "rules": []}`,
++		`{"version": 3, "Rules": []}`,
++		`{"version": 3, "rules": [{"domain": "x"},]}`,
++	} {
++		require.False(t, sameAsStock(t, []byte(text)), "read here:\n%s", text)
++	}
++}
++
++func FuzzReadSource(f *testing.F) {
++	random := rand.New(rand.NewSource(5))
++	for range 200 {
++		f.Add([]byte(sourceText{random: random, names: 3}.set()))
++	}
++	f.Fuzz(func(t *testing.T, text []byte) {
++		sameAsStock(t, text)
++	})
++}
++
++// sourceList is a rule set of count varied names as one list of domain_suffix, the way
++// podkop writes its lists.
++func sourceList(count int) []byte {
++	list := names(rand.New(rand.NewSource(6)), count)
++	var text bytes.Buffer
++	text.WriteString(`{"version": 3, "rules": [{"domain_suffix": [`)
++	for index, name := range list {
++		if index > 0 {
++			text.WriteByte(',')
++		}
++		quoted, _ := json.Marshal(name)
++		text.Write(quoted)
++	}
++	text.WriteString("]}]}")
++	return text.Bytes()
++}
++
++// What reading a rule set of 100000 names and building its matcher costs: sing-box with
++// the matcher of sing, sing-box with the builder of this package, and ReadSource.
++func BenchmarkReadSource(b *testing.B) {
++	for _, count := range []int{100000, 300000} {
++		text := sourceList(count)
++		b.Run(fmt.Sprint(count, "/sing"), func(b *testing.B) {
++			b.ReportAllocs()
++			for range b.N {
++				compat, err := json.UnmarshalExtended[option.PlainRuleSetCompat](text)
++				if err != nil {
++					b.Fatal(err)
++				}
++				rule := compat.Options.Rules[0].DefaultOptions
++				domain.NewMatcher(rule.Domain, rule.DomainSuffix, false)
++			}
++		})
++		b.Run(fmt.Sprint(count, "/stock-json"), func(b *testing.B) {
++			b.ReportAllocs()
++			for range b.N {
++				compat, err := json.UnmarshalExtended[option.PlainRuleSetCompat](text)
++				if err != nil {
++					b.Fatal(err)
++				}
++				rule := compat.Options.Rules[0].DefaultOptions
++				_, err = NewMatcher(rule.Domain, rule.DomainSuffix, false)
++				if err != nil {
++					b.Fatal(err)
++				}
++			}
++		})
++		b.Run(fmt.Sprint(count, "/ReadSource"), func(b *testing.B) {
++			b.ReportAllocs()
++			for range b.N {
++				compat, err := ReadSource(text)
++				if err != nil || compat.Options.Rules[0].DefaultOptions.DomainMatcher == nil {
++					b.Fatal(err)
++				}
++			}
++		})
++	}
++}
+diff --git a/common/domainset/trie.go b/common/domainset/trie.go
+new file mode 100644
+index 000000000..a49ee804f
+--- /dev/null
++++ b/common/domainset/trie.go
+@@ -0,0 +1,231 @@
++package domainset
++
++import (
++	"encoding/binary"
++	"io"
++
++	"github.com/sagernet/sing/common/domain"
++	E "github.com/sagernet/sing/common/exceptions"
++)
++
++// trie is the succinct set of sing (common/domain/set.go) as its Write writes it, without
++// the indexes ReadMatcher makes.
++type trie struct {
++	leaves, labelBitmap []uint64
++	labels              []byte
++}
++
++// span is a node of the trie as the build sees it: the keys at start to end of a level,
++// which share their first bytes, as many as the level is deep.
++type span struct {
++	start, end int32
++}
++
++// smallSpan is the most keys a node parts by sorting them in place; a node of more keys
++// counts them by their next byte.
++const smallSpan = 24
++
++// Matcher builds the matcher of the names gathered: domain.NewMatcher of sing for the
++// same names, byte for byte.
++func (c *Collector) Matcher() (*domain.Matcher, error) {
++	built, err := c.build()
++	if err != nil {
++		return nil, err
++	}
++	return domain.ReadMatcher(built.reader())
++}
++
++// Encode is the matcher of the names gathered as domain.Matcher.Write writes it, the form
++// a rule set in the binary format carries.
++func (c *Collector) Encode() ([]byte, error) {
++	built, err := c.build()
++	if err != nil {
++		return nil, err
++	}
++	head, labels := built.parts()
++	return append(head, labels...), nil
++}
++
++// build makes the trie newSuccinctSet of sing makes of the sorted keys. The keys are not
++// sorted first: the trie is built a level at a time, in the order of sing's walk, and
++// the keys of each node are parted by their byte at the depth of the level into the
++// nodes of the next one (a radix sort, done in the order of the trie). The keys of a
++// node that end at it are its leaf: one key, however many times it was gathered; a name
++// that is also a suffix is the suffix only, as the map of domain.NewMatcher has it.
++func (c *Collector) build() (trie, error) {
++	count := len(c.refs)
++	if count == 0 {
++		return trie{}, E.New("no domain to build")
++	}
++	buffers := &c.buffers
++	// the labels of the trie are no more than the bytes of its keys: the buffers are made
++	// once, of that size
++	most := c.keyBytes
++	built := trie{
++		labels:      make([]byte, 0, most),
++		leaves:      make([]uint64, 0, most/64+1),
++		labelBitmap: make([]uint64, 0, (2*most+1)/64+1),
++	}
++	from, to := c.refs, make([]ref, count)
++	level, next := make([]span, 1, count), make([]span, 0, count)
++	level[0] = span{0, int32(count)}
++	var scratch []uint16
++	node, bit := 0, 0
++	for column := 0; len(level) > 0; column++ {
++		next = next[:0]
++		for _, item := range level {
++			start, end := int(item.start), int(item.end)
++			var enderDomain, enderSuffix, sameName bool
++			// the keys of the node, by their next byte, into to[start:end]: first the ones
++			// that end here (bucket 0), then the others in the order of their byte
++			// (bucket 1 + the byte)
++			look := func(key ref) int {
++				length := key.length()
++				kind := key.kind()
++				if column < length {
++					return 1 + int(buffers[key.info>>ownShift][int(key.offset)+length-1-column])
++				}
++				if column == length && kind != kindDomain {
++					// a suffix as long as the node is deep: its name is the one of the node
++					sameName = true
++					if kind == kindPrefix {
++						return 1 + '\r'
++					}
++					return 1 + '\n'
++				}
++				if kind == kindDomain {
++					enderDomain = true
++				} else {
++					enderSuffix = true
++				}
++				return 0
++			}
++			size := end - start
++			switch {
++			case size == 1:
++				key := from[start]
++				if bucket := look(key); bucket != 0 {
++					to[start] = key
++					next = append(next, span{int32(start), int32(end)})
++					built.labels = append(built.labels, byte(bucket-1))
++					bit++
++				}
++			case size <= smallSpan:
++				var buckets [smallSpan]uint16
++				for index := start; index < end; index++ {
++					key := from[index]
++					bucket := uint16(look(key))
++					place := index - start
++					for place > 0 && buckets[place-1] > bucket {
++						buckets[place] = buckets[place-1]
++						to[start+place] = to[start+place-1]
++						place--
++					}
++					buckets[place] = bucket
++					to[start+place] = key
++				}
++				for place := 0; place < size; {
++					bucket := buckets[place]
++					first := place
++					for place < size && buckets[place] == bucket {
++						place++
++					}
++					if bucket == 0 {
++						continue
++					}
++					next = append(next, span{int32(start + first), int32(start + place)})
++					built.labels = append(built.labels, byte(bucket-1))
++					bit++
++				}
++			default:
++				if scratch == nil {
++					scratch = make([]uint16, count)
++				}
++				var counts, places [257]int32
++				for index := start; index < end; index++ {
++					bucket := look(from[index])
++					scratch[index] = uint16(bucket)
++					counts[bucket]++
++				}
++				place := int32(start)
++				for bucket := range counts {
++					places[bucket] = place
++					place += counts[bucket]
++				}
++				for index := start; index < end; index++ {
++					bucket := scratch[index]
++					to[places[bucket]] = from[index]
++					places[bucket]++
++				}
++				for bucket := 1; bucket < len(counts); bucket++ {
++					if counts[bucket] == 0 {
++						continue
++					}
++					next = append(next, span{places[bucket] - counts[bucket], places[bucket]})
++					built.labels = append(built.labels, byte(bucket-1))
++					bit++
++				}
++			}
++			if enderDomain && enderSuffix {
++				return trie{}, errSameKey
++			}
++			if enderSuffix || enderDomain && !sameName {
++				setBit(&built.leaves, node)
++			}
++			setBit(&built.labelBitmap, bit)
++			bit++
++			node++
++		}
++		level, next = next, level
++		from, to = to, from
++	}
++	return built, nil
++}
++
++func setBit(words *[]uint64, index int) {
++	for index>>6 >= len(*words) {
++		*words = append(*words, 0)
++	}
++	(*words)[index>>6] |= 1 << uint(index&63)
++}
++
++// parts are the trie as succinctSet.Write writes it: all but the labels, then the labels.
++func (t trie) parts() ([]byte, []byte) {
++	head := make([]byte, 0, 1+3*binary.MaxVarintLen64+8*(len(t.leaves)+len(t.labelBitmap)))
++	head = append(head, 0)
++	for _, words := range [][]uint64{t.leaves, t.labelBitmap} {
++		head = binary.AppendUvarint(head, uint64(len(words)))
++		for _, word := range words {
++			head = binary.BigEndian.AppendUint64(head, word)
++		}
++	}
++	head = binary.AppendUvarint(head, uint64(len(t.labels)))
++	return head, t.labels
++}
++
++// reader hands the trie to domain.ReadMatcher without a copy of the labels.
++func (t trie) reader() *twoParts {
++	head, labels := t.parts()
++	return &twoParts{head, labels}
++}
++
++// twoParts reads one slice of bytes, then another.
++type twoParts [2][]byte
++
++func (p *twoParts) Read(buffer []byte) (int, error) {
++	for len(p[0]) == 0 {
++		if len(p[1]) == 0 {
++			return 0, io.EOF
++		}
++		p[0], p[1] = p[1], nil
++	}
++	read := copy(buffer, p[0])
++	p[0] = p[0][read:]
++	return read, nil
++}
++
++func (p *twoParts) ReadByte() (byte, error) {
++	var one [1]byte
++	_, err := p.Read(one[:])
++	return one[0], err
++}
+diff --git a/common/srs/binary.go b/common/srs/binary.go
+index 01bd5a838..f1a4228d8 100644
+--- a/common/srs/binary.go
++++ b/common/srs/binary.go
+@@ -326,7 +326,12 @@ func writeDefaultRule(writer varbin.Writer, rule option.DefaultHeadlessRule, gen
+ 			return err
+ 		}
+ 		// what domain.NewMatcher(...).Write writes, built with a fraction of its memory
+-		_, err = writer.Write(domainset.Encode(rule.Domain, rule.DomainSuffix, generateVersion == C.RuleSetVersion1))
++		var matcher []byte
++		matcher, err = domainset.Encode(rule.Domain, rule.DomainSuffix, generateVersion == C.RuleSetVersion1)
++		if err != nil {
++			return err
++		}
++		_, err = writer.Write(matcher)
+ 		if err != nil {
+ 			return err
+ 		}
+diff --git a/route/rule/rule_set_local.go b/route/rule/rule_set_local.go
+index fbb975c1b..a124ee28f 100644
+--- a/route/rule/rule_set_local.go
++++ b/route/rule/rule_set_local.go
+@@ -10,13 +10,13 @@ import (
+ 
+ 	"github.com/sagernet/fswatch"
+ 	"github.com/sagernet/sing-box/adapter"
++	"github.com/sagernet/sing-box/common/domainset"
+ 	"github.com/sagernet/sing-box/common/srs"
+ 	C "github.com/sagernet/sing-box/constant"
+ 	"github.com/sagernet/sing-box/option"
+ 	"github.com/sagernet/sing/common"
+ 	E "github.com/sagernet/sing/common/exceptions"
+ 	F "github.com/sagernet/sing/common/format"
+-	"github.com/sagernet/sing/common/json"
+ 	"github.com/sagernet/sing/common/logger"
+ 	"github.com/sagernet/sing/common/x/list"
+ 	"github.com/sagernet/sing/service/filemanager"
+@@ -120,7 +120,7 @@ func (s *LocalRuleSet) reloadFile(path string) error {
+ 		if err != nil {
+ 			return err
+ 		}
+-		ruleSet, err = json.UnmarshalExtended[option.PlainRuleSetCompat](content)
++		ruleSet, err = domainset.ReadSource(content)
+ 		if err != nil {
+ 			return err
+ 		}
+diff --git a/route/rule/rule_set_remote.go b/route/rule/rule_set_remote.go
+index 85e2c1f77..7c4ff57c7 100644
+--- a/route/rule/rule_set_remote.go
++++ b/route/rule/rule_set_remote.go
+@@ -19,6 +19,7 @@ import (
+ 	"unicode/utf8"
+ 
+ 	"github.com/sagernet/sing-box/adapter"
++	"github.com/sagernet/sing-box/common/domainset"
+ 	"github.com/sagernet/sing-box/common/interrupt"
+ 	"github.com/sagernet/sing-box/common/srs"
+ 	C "github.com/sagernet/sing-box/constant"
+@@ -26,7 +27,6 @@ import (
+ 	"github.com/sagernet/sing/common"
+ 	E "github.com/sagernet/sing/common/exceptions"
+ 	F "github.com/sagernet/sing/common/format"
+-	"github.com/sagernet/sing/common/json"
+ 	"github.com/sagernet/sing/common/logger"
+ 	M "github.com/sagernet/sing/common/metadata"
+ 	N "github.com/sagernet/sing/common/network"
+@@ -195,7 +195,7 @@ func (s *RemoteRuleSet) loadBytes(content []byte) error {
+ 	)
+ 	switch s.options.Format {
+ 	case C.RuleSetFormatSource:
+-		ruleSet, err = json.UnmarshalExtended[option.PlainRuleSetCompat](content)
++		ruleSet, err = domainset.ReadSource(content)
+ 		if err != nil {
+ 			return err
+ 		}
+-- 
+2.53.0
+

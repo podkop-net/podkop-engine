@@ -1,0 +1,1724 @@
+From 8e3416fdcffa4e9bd3125e721a103a7c4485c176 Mon Sep 17 00:00:00 2001
+From: FiyeroT <me@fiyero.xyz>
+Date: Mon, 19 Oct 2026 00:30:53 +0300
+Subject: [PATCH 140/148] cmd/sing-box: the command line in an importable
+ package, cli
+
+The commands of sing-box were package main: no other program could run
+them. They are now package cli (cmd/sing-box/cli), with Main and
+Command; cmd/sing-box keeps a main that calls cli.Main, so the program
+is built from the same path as before, and the completions are written
+from cli.Command.
+
+A program that embeds sing-box (podkop) runs the same commands under the
+name sing-box beside commands of its own.
+
+The client of the API service (cmd_api*.go, gRPC, about 5 MB) is left out
+of a build with the tag podkop_slim: a module build cannot remove the
+files, as the package of podkop-engine did. A build without the tag
+keeps it.
+---
+ cmd/sing-box/{ => cli}/cmd.go                 |  2 +-
+ cmd/sing-box/{ => cli}/cmd_api.go             |  4 +++-
+ cmd/sing-box/{ => cli}/cmd_api_connection.go  |  4 +++-
+ .../{ => cli}/cmd_api_connection_close.go     |  4 +++-
+ .../{ => cli}/cmd_api_connection_list.go      |  4 +++-
+ .../{ => cli}/cmd_api_connection_show.go      |  4 +++-
+ cmd/sing-box/{ => cli}/cmd_api_group.go       |  4 +++-
+ cmd/sing-box/{ => cli}/cmd_api_group_list.go  |  4 +++-
+ .../{ => cli}/cmd_api_group_select.go         |  4 +++-
+ cmd/sing-box/{ => cli}/cmd_api_group_show.go  |  4 +++-
+ .../{ => cli}/cmd_api_group_urltest.go        |  4 +++-
+ cmd/sing-box/{ => cli}/cmd_api_logs.go        |  4 +++-
+ cmd/sing-box/{ => cli}/cmd_api_mode.go        |  4 +++-
+ cmd/sing-box/{ => cli}/cmd_api_mode_list.go   |  4 +++-
+ cmd/sing-box/{ => cli}/cmd_api_mode_set.go    |  4 +++-
+ .../{ => cli}/cmd_api_networkquality.go       |  4 +++-
+ cmd/sing-box/{ => cli}/cmd_api_openconnect.go |  4 +++-
+ .../{ => cli}/cmd_api_openconnect_auth.go     |  4 +++-
+ .../cmd_api_openconnect_auth_browser.go       |  4 +++-
+ .../{ => cli}/cmd_api_openconnect_cancel.go   |  4 +++-
+ .../{ => cli}/cmd_api_openconnect_openvpn.go  |  4 +++-
+ .../{ => cli}/cmd_api_openconnect_status.go   |  4 +++-
+ cmd/sing-box/{ => cli}/cmd_api_openvpn.go     |  4 +++-
+ .../{ => cli}/cmd_api_openvpn_auth.go         |  4 +++-
+ .../{ => cli}/cmd_api_openvpn_cancel.go       |  4 +++-
+ .../{ => cli}/cmd_api_openvpn_status.go       |  4 +++-
+ cmd/sing-box/{ => cli}/cmd_api_outbounds.go   |  4 +++-
+ cmd/sing-box/{ => cli}/cmd_api_output.go      |  4 +++-
+ cmd/sing-box/{ => cli}/cmd_api_status.go      |  4 +++-
+ cmd/sing-box/{ => cli}/cmd_api_stun.go        |  4 +++-
+ cmd/sing-box/{ => cli}/cmd_api_tailscale.go   |  4 +++-
+ .../cmd_api_tailscale_certificate.go          |  4 +++-
+ .../cmd_api_tailscale_certificate_export.go   |  4 +++-
+ .../cmd_api_tailscale_certificate_list.go     |  4 +++-
+ .../{ => cli}/cmd_api_tailscale_exit_node.go  |  4 +++-
+ .../cmd_api_tailscale_exit_node_clear.go      |  4 +++-
+ .../cmd_api_tailscale_exit_node_list.go       |  4 +++-
+ .../cmd_api_tailscale_exit_node_set.go        |  4 +++-
+ .../{ => cli}/cmd_api_tailscale_logout.go     |  4 +++-
+ .../{ => cli}/cmd_api_tailscale_peer.go       |  4 +++-
+ .../{ => cli}/cmd_api_tailscale_peer_list.go  |  4 +++-
+ .../{ => cli}/cmd_api_tailscale_peer_show.go  |  4 +++-
+ .../{ => cli}/cmd_api_tailscale_ping.go       |  4 +++-
+ .../{ => cli}/cmd_api_tailscale_ssh.go        |  4 +++-
+ .../{ => cli}/cmd_api_tailscale_ssh_unix.go   |  4 ++--
+ .../cmd_api_tailscale_ssh_windows.go          |  4 +++-
+ .../{ => cli}/cmd_api_tailscale_status.go     |  4 +++-
+ .../{ => cli}/cmd_api_tailscale_taildrop.go   |  4 +++-
+ .../cmd_api_tailscale_taildrop_delete.go      |  4 +++-
+ .../cmd_api_tailscale_taildrop_get.go         |  4 +++-
+ .../cmd_api_tailscale_taildrop_list.go        |  4 +++-
+ .../cmd_api_tailscale_taildrop_send.go        |  4 +++-
+ .../cmd_api_tailscale_taildrop_targets.go     |  4 +++-
+ cmd/sing-box/{ => cli}/cmd_api_usbip.go       |  4 +++-
+ cmd/sing-box/{ => cli}/cmd_api_usbip_local.go |  4 ++--
+ cmd/sing-box/{ => cli}/cmd_api_usbip_share.go |  4 ++--
+ .../{ => cli}/cmd_api_usbip_status.go         |  4 +++-
+ cmd/sing-box/{ => cli}/cmd_api_usbip_stub.go  |  4 ++--
+ cmd/sing-box/{ => cli}/cmd_api_version.go     |  4 +++-
+ cmd/sing-box/{ => cli}/cmd_check.go           |  2 +-
+ cmd/sing-box/{ => cli}/cmd_format.go          |  2 +-
+ cmd/sing-box/{ => cli}/cmd_generate.go        |  2 +-
+ cmd/sing-box/{ => cli}/cmd_generate_ech.go    |  2 +-
+ cmd/sing-box/{ => cli}/cmd_generate_tls.go    |  2 +-
+ cmd/sing-box/{ => cli}/cmd_generate_vapid.go  |  2 +-
+ .../{ => cli}/cmd_generate_wireguard.go       |  2 +-
+ cmd/sing-box/{ => cli}/cmd_geoip.go           |  2 +-
+ cmd/sing-box/{ => cli}/cmd_geoip_export.go    |  2 +-
+ cmd/sing-box/{ => cli}/cmd_geoip_list.go      |  2 +-
+ cmd/sing-box/{ => cli}/cmd_geoip_lookup.go    |  2 +-
+ cmd/sing-box/{ => cli}/cmd_geosite.go         |  2 +-
+ cmd/sing-box/{ => cli}/cmd_geosite_export.go  |  2 +-
+ cmd/sing-box/{ => cli}/cmd_geosite_list.go    |  2 +-
+ cmd/sing-box/{ => cli}/cmd_geosite_lookup.go  |  2 +-
+ cmd/sing-box/{ => cli}/cmd_geosite_matcher.go |  2 +-
+ cmd/sing-box/{ => cli}/cmd_merge.go           |  2 +-
+ cmd/sing-box/{ => cli}/cmd_netns_holder.go    |  2 +-
+ cmd/sing-box/{ => cli}/cmd_rule_set.go        |  2 +-
+ .../{ => cli}/cmd_rule_set_compile.go         |  2 +-
+ .../{ => cli}/cmd_rule_set_convert.go         |  2 +-
+ .../{ => cli}/cmd_rule_set_decompile.go       |  2 +-
+ cmd/sing-box/{ => cli}/cmd_rule_set_format.go |  2 +-
+ cmd/sing-box/{ => cli}/cmd_rule_set_match.go  |  2 +-
+ cmd/sing-box/{ => cli}/cmd_rule_set_merge.go  |  2 +-
+ .../{ => cli}/cmd_rule_set_upgrade.go         |  2 +-
+ cmd/sing-box/{ => cli}/cmd_run.go             |  2 +-
+ .../{ => cli}/cmd_run_userns_linux.go         |  2 +-
+ .../{ => cli}/cmd_run_userns_other.go         |  2 +-
+ cmd/sing-box/{ => cli}/cmd_schema.go          |  2 +-
+ cmd/sing-box/{ => cli}/cmd_tools.go           |  2 +-
+ cmd/sing-box/{ => cli}/cmd_tools_connect.go   |  2 +-
+ .../{ => cli}/cmd_tools_decode_link.go        |  2 +-
+ .../{ => cli}/cmd_tools_decode_link_test.go   |  2 +-
+ cmd/sing-box/{ => cli}/cmd_tools_fetch.go     |  2 +-
+ .../{ => cli}/cmd_tools_fetch_http3.go        |  2 +-
+ .../{ => cli}/cmd_tools_fetch_http3_stub.go   |  2 +-
+ .../{ => cli}/cmd_tools_networkquality.go     |  2 +-
+ cmd/sing-box/{ => cli}/cmd_tools_stun.go      |  2 +-
+ cmd/sing-box/{ => cli}/cmd_tools_synctime.go  |  2 +-
+ cmd/sing-box/{ => cli}/cmd_version.go         |  2 +-
+ cmd/sing-box/cli/main.go                      | 20 +++++++++++++++++++
+ cmd/sing-box/generate_completions.go          |  6 +++++-
+ cmd/sing-box/main.go                          |  6 ++----
+ 103 files changed, 239 insertions(+), 109 deletions(-)
+ rename cmd/sing-box/{ => cli}/cmd.go (99%)
+ rename cmd/sing-box/{ => cli}/cmd_api.go (98%)
+ rename cmd/sing-box/{ => cli}/cmd_api_connection.go (95%)
+ rename cmd/sing-box/{ => cli}/cmd_api_connection_close.go (97%)
+ rename cmd/sing-box/{ => cli}/cmd_api_connection_list.go (99%)
+ rename cmd/sing-box/{ => cli}/cmd_api_connection_show.go (98%)
+ rename cmd/sing-box/{ => cli}/cmd_api_group.go (93%)
+ rename cmd/sing-box/{ => cli}/cmd_api_group_list.go (95%)
+ rename cmd/sing-box/{ => cli}/cmd_api_group_select.go (95%)
+ rename cmd/sing-box/{ => cli}/cmd_api_group_show.go (96%)
+ rename cmd/sing-box/{ => cli}/cmd_api_group_urltest.go (95%)
+ rename cmd/sing-box/{ => cli}/cmd_api_logs.go (98%)
+ rename cmd/sing-box/{ => cli}/cmd_api_mode.go (95%)
+ rename cmd/sing-box/{ => cli}/cmd_api_mode_list.go (96%)
+ rename cmd/sing-box/{ => cli}/cmd_api_mode_set.go (95%)
+ rename cmd/sing-box/{ => cli}/cmd_api_networkquality.go (99%)
+ rename cmd/sing-box/{ => cli}/cmd_api_openconnect.go (97%)
+ rename cmd/sing-box/{ => cli}/cmd_api_openconnect_auth.go (99%)
+ rename cmd/sing-box/{ => cli}/cmd_api_openconnect_auth_browser.go (99%)
+ rename cmd/sing-box/{ => cli}/cmd_api_openconnect_cancel.go (97%)
+ rename cmd/sing-box/{ => cli}/cmd_api_openconnect_openvpn.go (99%)
+ rename cmd/sing-box/{ => cli}/cmd_api_openconnect_status.go (98%)
+ rename cmd/sing-box/{ => cli}/cmd_api_openvpn.go (97%)
+ rename cmd/sing-box/{ => cli}/cmd_api_openvpn_auth.go (99%)
+ rename cmd/sing-box/{ => cli}/cmd_api_openvpn_cancel.go (97%)
+ rename cmd/sing-box/{ => cli}/cmd_api_openvpn_status.go (98%)
+ rename cmd/sing-box/{ => cli}/cmd_api_outbounds.go (96%)
+ rename cmd/sing-box/{ => cli}/cmd_api_output.go (98%)
+ rename cmd/sing-box/{ => cli}/cmd_api_status.go (98%)
+ rename cmd/sing-box/{ => cli}/cmd_api_stun.go (98%)
+ rename cmd/sing-box/{ => cli}/cmd_api_tailscale.go (98%)
+ rename cmd/sing-box/{ => cli}/cmd_api_tailscale_certificate.go (91%)
+ rename cmd/sing-box/{ => cli}/cmd_api_tailscale_certificate_export.go (98%)
+ rename cmd/sing-box/{ => cli}/cmd_api_tailscale_certificate_list.go (95%)
+ rename cmd/sing-box/{ => cli}/cmd_api_tailscale_exit_node.go (96%)
+ rename cmd/sing-box/{ => cli}/cmd_api_tailscale_exit_node_clear.go (95%)
+ rename cmd/sing-box/{ => cli}/cmd_api_tailscale_exit_node_list.go (97%)
+ rename cmd/sing-box/{ => cli}/cmd_api_tailscale_exit_node_set.go (96%)
+ rename cmd/sing-box/{ => cli}/cmd_api_tailscale_logout.go (95%)
+ rename cmd/sing-box/{ => cli}/cmd_api_tailscale_peer.go (99%)
+ rename cmd/sing-box/{ => cli}/cmd_api_tailscale_peer_list.go (96%)
+ rename cmd/sing-box/{ => cli}/cmd_api_tailscale_peer_show.go (98%)
+ rename cmd/sing-box/{ => cli}/cmd_api_tailscale_ping.go (99%)
+ rename cmd/sing-box/{ => cli}/cmd_api_tailscale_ssh.go (98%)
+ rename cmd/sing-box/{ => cli}/cmd_api_tailscale_ssh_unix.go (73%)
+ rename cmd/sing-box/{ => cli}/cmd_api_tailscale_ssh_windows.go (90%)
+ rename cmd/sing-box/{ => cli}/cmd_api_tailscale_status.go (97%)
+ rename cmd/sing-box/{ => cli}/cmd_api_tailscale_taildrop.go (97%)
+ rename cmd/sing-box/{ => cli}/cmd_api_tailscale_taildrop_delete.go (95%)
+ rename cmd/sing-box/{ => cli}/cmd_api_tailscale_taildrop_get.go (98%)
+ rename cmd/sing-box/{ => cli}/cmd_api_tailscale_taildrop_list.go (97%)
+ rename cmd/sing-box/{ => cli}/cmd_api_tailscale_taildrop_send.go (99%)
+ rename cmd/sing-box/{ => cli}/cmd_api_tailscale_taildrop_targets.go (97%)
+ rename cmd/sing-box/{ => cli}/cmd_api_usbip.go (98%)
+ rename cmd/sing-box/{ => cli}/cmd_api_usbip_local.go (98%)
+ rename cmd/sing-box/{ => cli}/cmd_api_usbip_share.go (99%)
+ rename cmd/sing-box/{ => cli}/cmd_api_usbip_status.go (98%)
+ rename cmd/sing-box/{ => cli}/cmd_api_usbip_stub.go (83%)
+ rename cmd/sing-box/{ => cli}/cmd_api_version.go (96%)
+ rename cmd/sing-box/{ => cli}/cmd_check.go (98%)
+ rename cmd/sing-box/{ => cli}/cmd_format.go (99%)
+ rename cmd/sing-box/{ => cli}/cmd_generate.go (99%)
+ rename cmd/sing-box/{ => cli}/cmd_generate_ech.go (98%)
+ rename cmd/sing-box/{ => cli}/cmd_generate_tls.go (98%)
+ rename cmd/sing-box/{ => cli}/cmd_generate_vapid.go (98%)
+ rename cmd/sing-box/{ => cli}/cmd_generate_wireguard.go (99%)
+ rename cmd/sing-box/{ => cli}/cmd_geoip.go (98%)
+ rename cmd/sing-box/{ => cli}/cmd_geoip_export.go (99%)
+ rename cmd/sing-box/{ => cli}/cmd_geoip_list.go (97%)
+ rename cmd/sing-box/{ => cli}/cmd_geoip_lookup.go (98%)
+ rename cmd/sing-box/{ => cli}/cmd_geosite.go (98%)
+ rename cmd/sing-box/{ => cli}/cmd_geosite_export.go (99%)
+ rename cmd/sing-box/{ => cli}/cmd_geosite_list.go (98%)
+ rename cmd/sing-box/{ => cli}/cmd_geosite_lookup.go (99%)
+ rename cmd/sing-box/{ => cli}/cmd_geosite_matcher.go (98%)
+ rename cmd/sing-box/{ => cli}/cmd_merge.go (99%)
+ rename cmd/sing-box/{ => cli}/cmd_netns_holder.go (96%)
+ rename cmd/sing-box/{ => cli}/cmd_rule_set.go (93%)
+ rename cmd/sing-box/{ => cli}/cmd_rule_set_compile.go (99%)
+ rename cmd/sing-box/{ => cli}/cmd_rule_set_convert.go (99%)
+ rename cmd/sing-box/{ => cli}/cmd_rule_set_decompile.go (99%)
+ rename cmd/sing-box/{ => cli}/cmd_rule_set_format.go (99%)
+ rename cmd/sing-box/{ => cli}/cmd_rule_set_match.go (99%)
+ rename cmd/sing-box/{ => cli}/cmd_rule_set_merge.go (99%)
+ rename cmd/sing-box/{ => cli}/cmd_rule_set_upgrade.go (99%)
+ rename cmd/sing-box/{ => cli}/cmd_run.go (99%)
+ rename cmd/sing-box/{ => cli}/cmd_run_userns_linux.go (99%)
+ rename cmd/sing-box/{ => cli}/cmd_run_userns_other.go (93%)
+ rename cmd/sing-box/{ => cli}/cmd_schema.go (98%)
+ rename cmd/sing-box/{ => cli}/cmd_tools.go (99%)
+ rename cmd/sing-box/{ => cli}/cmd_tools_connect.go (99%)
+ rename cmd/sing-box/{ => cli}/cmd_tools_decode_link.go (99%)
+ rename cmd/sing-box/{ => cli}/cmd_tools_decode_link_test.go (99%)
+ rename cmd/sing-box/{ => cli}/cmd_tools_fetch.go (99%)
+ rename cmd/sing-box/{ => cli}/cmd_tools_fetch_http3.go (98%)
+ rename cmd/sing-box/{ => cli}/cmd_tools_fetch_http3_stub.go (94%)
+ rename cmd/sing-box/{ => cli}/cmd_tools_networkquality.go (99%)
+ rename cmd/sing-box/{ => cli}/cmd_tools_stun.go (99%)
+ rename cmd/sing-box/{ => cli}/cmd_tools_synctime.go (99%)
+ rename cmd/sing-box/{ => cli}/cmd_version.go (99%)
+ create mode 100644 cmd/sing-box/cli/main.go
+
+diff --git a/cmd/sing-box/cmd.go b/cmd/sing-box/cli/cmd.go
+similarity index 99%
+rename from cmd/sing-box/cmd.go
+rename to cmd/sing-box/cli/cmd.go
+index e635f5c0f..51ee32aa7 100644
+--- a/cmd/sing-box/cmd.go
++++ b/cmd/sing-box/cli/cmd.go
+@@ -1,4 +1,4 @@
+-package main
++package cli
+ 
+ import (
+ 	"context"
+diff --git a/cmd/sing-box/cmd_api.go b/cmd/sing-box/cli/cmd_api.go
+similarity index 98%
+rename from cmd/sing-box/cmd_api.go
+rename to cmd/sing-box/cli/cmd_api.go
+index dea0073dd..cf2d37d31 100644
+--- a/cmd/sing-box/cmd_api.go
++++ b/cmd/sing-box/cli/cmd_api.go
+@@ -1,4 +1,6 @@
+-package main
++//go:build !podkop_slim
++
++package cli
+ 
+ import (
+ 	"os"
+diff --git a/cmd/sing-box/cmd_api_connection.go b/cmd/sing-box/cli/cmd_api_connection.go
+similarity index 95%
+rename from cmd/sing-box/cmd_api_connection.go
+rename to cmd/sing-box/cli/cmd_api_connection.go
+index 80b1f7d47..255afa051 100644
+--- a/cmd/sing-box/cmd_api_connection.go
++++ b/cmd/sing-box/cli/cmd_api_connection.go
+@@ -1,4 +1,6 @@
+-package main
++//go:build !podkop_slim
++
++package cli
+ 
+ import (
+ 	"time"
+diff --git a/cmd/sing-box/cmd_api_connection_close.go b/cmd/sing-box/cli/cmd_api_connection_close.go
+similarity index 97%
+rename from cmd/sing-box/cmd_api_connection_close.go
+rename to cmd/sing-box/cli/cmd_api_connection_close.go
+index 892a05508..56d7a4d53 100644
+--- a/cmd/sing-box/cmd_api_connection_close.go
++++ b/cmd/sing-box/cli/cmd_api_connection_close.go
+@@ -1,4 +1,6 @@
+-package main
++//go:build !podkop_slim
++
++package cli
+ 
+ import (
+ 	"github.com/sagernet/sing-box/daemon"
+diff --git a/cmd/sing-box/cmd_api_connection_list.go b/cmd/sing-box/cli/cmd_api_connection_list.go
+similarity index 99%
+rename from cmd/sing-box/cmd_api_connection_list.go
+rename to cmd/sing-box/cli/cmd_api_connection_list.go
+index 28595701c..47df48cfb 100644
+--- a/cmd/sing-box/cmd_api_connection_list.go
++++ b/cmd/sing-box/cli/cmd_api_connection_list.go
+@@ -1,4 +1,6 @@
+-package main
++//go:build !podkop_slim
++
++package cli
+ 
+ import (
+ 	"slices"
+diff --git a/cmd/sing-box/cmd_api_connection_show.go b/cmd/sing-box/cli/cmd_api_connection_show.go
+similarity index 98%
+rename from cmd/sing-box/cmd_api_connection_show.go
+rename to cmd/sing-box/cli/cmd_api_connection_show.go
+index 1bffe3d4f..6c6a21a74 100644
+--- a/cmd/sing-box/cmd_api_connection_show.go
++++ b/cmd/sing-box/cli/cmd_api_connection_show.go
+@@ -1,4 +1,6 @@
+-package main
++//go:build !podkop_slim
++
++package cli
+ 
+ import (
+ 	"strings"
+diff --git a/cmd/sing-box/cmd_api_group.go b/cmd/sing-box/cli/cmd_api_group.go
+similarity index 93%
+rename from cmd/sing-box/cmd_api_group.go
+rename to cmd/sing-box/cli/cmd_api_group.go
+index 6e0b63f28..306a52654 100644
+--- a/cmd/sing-box/cmd_api_group.go
++++ b/cmd/sing-box/cli/cmd_api_group.go
+@@ -1,4 +1,6 @@
+-package main
++//go:build !podkop_slim
++
++package cli
+ 
+ import (
+ 	"github.com/sagernet/sing-box/daemon"
+diff --git a/cmd/sing-box/cmd_api_group_list.go b/cmd/sing-box/cli/cmd_api_group_list.go
+similarity index 95%
+rename from cmd/sing-box/cmd_api_group_list.go
+rename to cmd/sing-box/cli/cmd_api_group_list.go
+index 2366623e9..07af09fad 100644
+--- a/cmd/sing-box/cmd_api_group_list.go
++++ b/cmd/sing-box/cli/cmd_api_group_list.go
+@@ -1,4 +1,6 @@
+-package main
++//go:build !podkop_slim
++
++package cli
+ 
+ import (
+ 	"github.com/spf13/cobra"
+diff --git a/cmd/sing-box/cmd_api_group_select.go b/cmd/sing-box/cli/cmd_api_group_select.go
+similarity index 95%
+rename from cmd/sing-box/cmd_api_group_select.go
+rename to cmd/sing-box/cli/cmd_api_group_select.go
+index 7ea725c8c..3e700972f 100644
+--- a/cmd/sing-box/cmd_api_group_select.go
++++ b/cmd/sing-box/cli/cmd_api_group_select.go
+@@ -1,4 +1,6 @@
+-package main
++//go:build !podkop_slim
++
++package cli
+ 
+ import (
+ 	"github.com/sagernet/sing-box/daemon"
+diff --git a/cmd/sing-box/cmd_api_group_show.go b/cmd/sing-box/cli/cmd_api_group_show.go
+similarity index 96%
+rename from cmd/sing-box/cmd_api_group_show.go
+rename to cmd/sing-box/cli/cmd_api_group_show.go
+index 86de1fea3..6fc370da2 100644
+--- a/cmd/sing-box/cmd_api_group_show.go
++++ b/cmd/sing-box/cli/cmd_api_group_show.go
+@@ -1,4 +1,6 @@
+-package main
++//go:build !podkop_slim
++
++package cli
+ 
+ import (
+ 	E "github.com/sagernet/sing/common/exceptions"
+diff --git a/cmd/sing-box/cmd_api_group_urltest.go b/cmd/sing-box/cli/cmd_api_group_urltest.go
+similarity index 95%
+rename from cmd/sing-box/cmd_api_group_urltest.go
+rename to cmd/sing-box/cli/cmd_api_group_urltest.go
+index 2dbc59fbc..000926b30 100644
+--- a/cmd/sing-box/cmd_api_group_urltest.go
++++ b/cmd/sing-box/cli/cmd_api_group_urltest.go
+@@ -1,4 +1,6 @@
+-package main
++//go:build !podkop_slim
++
++package cli
+ 
+ import (
+ 	"github.com/sagernet/sing-box/daemon"
+diff --git a/cmd/sing-box/cmd_api_logs.go b/cmd/sing-box/cli/cmd_api_logs.go
+similarity index 98%
+rename from cmd/sing-box/cmd_api_logs.go
+rename to cmd/sing-box/cli/cmd_api_logs.go
+index 5e196c90b..c3f2852d9 100644
+--- a/cmd/sing-box/cmd_api_logs.go
++++ b/cmd/sing-box/cli/cmd_api_logs.go
+@@ -1,4 +1,6 @@
+-package main
++//go:build !podkop_slim
++
++package cli
+ 
+ import (
+ 	"os"
+diff --git a/cmd/sing-box/cmd_api_mode.go b/cmd/sing-box/cli/cmd_api_mode.go
+similarity index 95%
+rename from cmd/sing-box/cmd_api_mode.go
+rename to cmd/sing-box/cli/cmd_api_mode.go
+index e8b4da638..64a40f894 100644
+--- a/cmd/sing-box/cmd_api_mode.go
++++ b/cmd/sing-box/cli/cmd_api_mode.go
+@@ -1,4 +1,6 @@
+-package main
++//go:build !podkop_slim
++
++package cli
+ 
+ import (
+ 	"os"
+diff --git a/cmd/sing-box/cmd_api_mode_list.go b/cmd/sing-box/cli/cmd_api_mode_list.go
+similarity index 96%
+rename from cmd/sing-box/cmd_api_mode_list.go
+rename to cmd/sing-box/cli/cmd_api_mode_list.go
+index 17badee43..f3f63f346 100644
+--- a/cmd/sing-box/cmd_api_mode_list.go
++++ b/cmd/sing-box/cli/cmd_api_mode_list.go
+@@ -1,4 +1,6 @@
+-package main
++//go:build !podkop_slim
++
++package cli
+ 
+ import (
+ 	"os"
+diff --git a/cmd/sing-box/cmd_api_mode_set.go b/cmd/sing-box/cli/cmd_api_mode_set.go
+similarity index 95%
+rename from cmd/sing-box/cmd_api_mode_set.go
+rename to cmd/sing-box/cli/cmd_api_mode_set.go
+index 025e3b31f..3adf893be 100644
+--- a/cmd/sing-box/cmd_api_mode_set.go
++++ b/cmd/sing-box/cli/cmd_api_mode_set.go
+@@ -1,4 +1,6 @@
+-package main
++//go:build !podkop_slim
++
++package cli
+ 
+ import (
+ 	"github.com/sagernet/sing-box/daemon"
+diff --git a/cmd/sing-box/cmd_api_networkquality.go b/cmd/sing-box/cli/cmd_api_networkquality.go
+similarity index 99%
+rename from cmd/sing-box/cmd_api_networkquality.go
+rename to cmd/sing-box/cli/cmd_api_networkquality.go
+index f0b69bb2e..34455fc7b 100644
+--- a/cmd/sing-box/cmd_api_networkquality.go
++++ b/cmd/sing-box/cli/cmd_api_networkquality.go
+@@ -1,4 +1,6 @@
+-package main
++//go:build !podkop_slim
++
++package cli
+ 
+ import (
+ 	"fmt"
+diff --git a/cmd/sing-box/cmd_api_openconnect.go b/cmd/sing-box/cli/cmd_api_openconnect.go
+similarity index 97%
+rename from cmd/sing-box/cmd_api_openconnect.go
+rename to cmd/sing-box/cli/cmd_api_openconnect.go
+index 041b5faf8..b67fc60ff 100644
+--- a/cmd/sing-box/cmd_api_openconnect.go
++++ b/cmd/sing-box/cli/cmd_api_openconnect.go
+@@ -1,4 +1,6 @@
+-package main
++//go:build !podkop_slim
++
++package cli
+ 
+ import (
+ 	"context"
+diff --git a/cmd/sing-box/cmd_api_openconnect_auth.go b/cmd/sing-box/cli/cmd_api_openconnect_auth.go
+similarity index 99%
+rename from cmd/sing-box/cmd_api_openconnect_auth.go
+rename to cmd/sing-box/cli/cmd_api_openconnect_auth.go
+index 12c67a5ae..45334c733 100644
+--- a/cmd/sing-box/cmd_api_openconnect_auth.go
++++ b/cmd/sing-box/cli/cmd_api_openconnect_auth.go
+@@ -1,4 +1,6 @@
+-package main
++//go:build !podkop_slim
++
++package cli
+ 
+ import (
+ 	"context"
+diff --git a/cmd/sing-box/cmd_api_openconnect_auth_browser.go b/cmd/sing-box/cli/cmd_api_openconnect_auth_browser.go
+similarity index 99%
+rename from cmd/sing-box/cmd_api_openconnect_auth_browser.go
+rename to cmd/sing-box/cli/cmd_api_openconnect_auth_browser.go
+index 67a52049a..204de3da5 100644
+--- a/cmd/sing-box/cmd_api_openconnect_auth_browser.go
++++ b/cmd/sing-box/cli/cmd_api_openconnect_auth_browser.go
+@@ -1,4 +1,6 @@
+-package main
++//go:build !podkop_slim
++
++package cli
+ 
+ import (
+ 	"context"
+diff --git a/cmd/sing-box/cmd_api_openconnect_cancel.go b/cmd/sing-box/cli/cmd_api_openconnect_cancel.go
+similarity index 97%
+rename from cmd/sing-box/cmd_api_openconnect_cancel.go
+rename to cmd/sing-box/cli/cmd_api_openconnect_cancel.go
+index a09b3769a..2f57558c3 100644
+--- a/cmd/sing-box/cmd_api_openconnect_cancel.go
++++ b/cmd/sing-box/cli/cmd_api_openconnect_cancel.go
+@@ -1,4 +1,6 @@
+-package main
++//go:build !podkop_slim
++
++package cli
+ 
+ import (
+ 	"context"
+diff --git a/cmd/sing-box/cmd_api_openconnect_openvpn.go b/cmd/sing-box/cli/cmd_api_openconnect_openvpn.go
+similarity index 99%
+rename from cmd/sing-box/cmd_api_openconnect_openvpn.go
+rename to cmd/sing-box/cli/cmd_api_openconnect_openvpn.go
+index 260b98b2f..d02ffb1a9 100644
+--- a/cmd/sing-box/cmd_api_openconnect_openvpn.go
++++ b/cmd/sing-box/cli/cmd_api_openconnect_openvpn.go
+@@ -1,4 +1,6 @@
+-package main
++//go:build !podkop_slim
++
++package cli
+ 
+ import (
+ 	"context"
+diff --git a/cmd/sing-box/cmd_api_openconnect_status.go b/cmd/sing-box/cli/cmd_api_openconnect_status.go
+similarity index 98%
+rename from cmd/sing-box/cmd_api_openconnect_status.go
+rename to cmd/sing-box/cli/cmd_api_openconnect_status.go
+index 912c97184..3296d666b 100644
+--- a/cmd/sing-box/cmd_api_openconnect_status.go
++++ b/cmd/sing-box/cli/cmd_api_openconnect_status.go
+@@ -1,4 +1,6 @@
+-package main
++//go:build !podkop_slim
++
++package cli
+ 
+ import (
+ 	"context"
+diff --git a/cmd/sing-box/cmd_api_openvpn.go b/cmd/sing-box/cli/cmd_api_openvpn.go
+similarity index 97%
+rename from cmd/sing-box/cmd_api_openvpn.go
+rename to cmd/sing-box/cli/cmd_api_openvpn.go
+index e9fc20369..f419a730e 100644
+--- a/cmd/sing-box/cmd_api_openvpn.go
++++ b/cmd/sing-box/cli/cmd_api_openvpn.go
+@@ -1,4 +1,6 @@
+-package main
++//go:build !podkop_slim
++
++package cli
+ 
+ import (
+ 	"context"
+diff --git a/cmd/sing-box/cmd_api_openvpn_auth.go b/cmd/sing-box/cli/cmd_api_openvpn_auth.go
+similarity index 99%
+rename from cmd/sing-box/cmd_api_openvpn_auth.go
+rename to cmd/sing-box/cli/cmd_api_openvpn_auth.go
+index f97555118..0531a3b3c 100644
+--- a/cmd/sing-box/cmd_api_openvpn_auth.go
++++ b/cmd/sing-box/cli/cmd_api_openvpn_auth.go
+@@ -1,4 +1,6 @@
+-package main
++//go:build !podkop_slim
++
++package cli
+ 
+ import (
+ 	"context"
+diff --git a/cmd/sing-box/cmd_api_openvpn_cancel.go b/cmd/sing-box/cli/cmd_api_openvpn_cancel.go
+similarity index 97%
+rename from cmd/sing-box/cmd_api_openvpn_cancel.go
+rename to cmd/sing-box/cli/cmd_api_openvpn_cancel.go
+index db0ab0814..4979e0d0a 100644
+--- a/cmd/sing-box/cmd_api_openvpn_cancel.go
++++ b/cmd/sing-box/cli/cmd_api_openvpn_cancel.go
+@@ -1,4 +1,6 @@
+-package main
++//go:build !podkop_slim
++
++package cli
+ 
+ import (
+ 	"context"
+diff --git a/cmd/sing-box/cmd_api_openvpn_status.go b/cmd/sing-box/cli/cmd_api_openvpn_status.go
+similarity index 98%
+rename from cmd/sing-box/cmd_api_openvpn_status.go
+rename to cmd/sing-box/cli/cmd_api_openvpn_status.go
+index 735aa047e..2f5c23858 100644
+--- a/cmd/sing-box/cmd_api_openvpn_status.go
++++ b/cmd/sing-box/cli/cmd_api_openvpn_status.go
+@@ -1,4 +1,6 @@
+-package main
++//go:build !podkop_slim
++
++package cli
+ 
+ import (
+ 	"context"
+diff --git a/cmd/sing-box/cmd_api_outbounds.go b/cmd/sing-box/cli/cmd_api_outbounds.go
+similarity index 96%
+rename from cmd/sing-box/cmd_api_outbounds.go
+rename to cmd/sing-box/cli/cmd_api_outbounds.go
+index b8840fdc3..f3b32d1c4 100644
+--- a/cmd/sing-box/cmd_api_outbounds.go
++++ b/cmd/sing-box/cli/cmd_api_outbounds.go
+@@ -1,4 +1,6 @@
+-package main
++//go:build !podkop_slim
++
++package cli
+ 
+ import (
+ 	F "github.com/sagernet/sing/common/format"
+diff --git a/cmd/sing-box/cmd_api_output.go b/cmd/sing-box/cli/cmd_api_output.go
+similarity index 98%
+rename from cmd/sing-box/cmd_api_output.go
+rename to cmd/sing-box/cli/cmd_api_output.go
+index f56dca30d..7edc8d1da 100644
+--- a/cmd/sing-box/cmd_api_output.go
++++ b/cmd/sing-box/cli/cmd_api_output.go
+@@ -1,4 +1,6 @@
+-package main
++//go:build !podkop_slim
++
++package cli
+ 
+ import (
+ 	"os"
+diff --git a/cmd/sing-box/cmd_api_status.go b/cmd/sing-box/cli/cmd_api_status.go
+similarity index 98%
+rename from cmd/sing-box/cmd_api_status.go
+rename to cmd/sing-box/cli/cmd_api_status.go
+index 2ac0c0d55..5419e9a40 100644
+--- a/cmd/sing-box/cmd_api_status.go
++++ b/cmd/sing-box/cli/cmd_api_status.go
+@@ -1,4 +1,6 @@
+-package main
++//go:build !podkop_slim
++
++package cli
+ 
+ import (
+ 	"context"
+diff --git a/cmd/sing-box/cmd_api_stun.go b/cmd/sing-box/cli/cmd_api_stun.go
+similarity index 98%
+rename from cmd/sing-box/cmd_api_stun.go
+rename to cmd/sing-box/cli/cmd_api_stun.go
+index 0fd54bdde..16ec91c05 100644
+--- a/cmd/sing-box/cmd_api_stun.go
++++ b/cmd/sing-box/cli/cmd_api_stun.go
+@@ -1,4 +1,6 @@
+-package main
++//go:build !podkop_slim
++
++package cli
+ 
+ import (
+ 	"fmt"
+diff --git a/cmd/sing-box/cmd_api_tailscale.go b/cmd/sing-box/cli/cmd_api_tailscale.go
+similarity index 98%
+rename from cmd/sing-box/cmd_api_tailscale.go
+rename to cmd/sing-box/cli/cmd_api_tailscale.go
+index 2511c2831..2be5fa105 100644
+--- a/cmd/sing-box/cmd_api_tailscale.go
++++ b/cmd/sing-box/cli/cmd_api_tailscale.go
+@@ -1,4 +1,6 @@
+-package main
++//go:build !podkop_slim
++
++package cli
+ 
+ import (
+ 	"context"
+diff --git a/cmd/sing-box/cmd_api_tailscale_certificate.go b/cmd/sing-box/cli/cmd_api_tailscale_certificate.go
+similarity index 91%
+rename from cmd/sing-box/cmd_api_tailscale_certificate.go
+rename to cmd/sing-box/cli/cmd_api_tailscale_certificate.go
+index 7fda2ae89..007b58075 100644
+--- a/cmd/sing-box/cmd_api_tailscale_certificate.go
++++ b/cmd/sing-box/cli/cmd_api_tailscale_certificate.go
+@@ -1,4 +1,6 @@
+-package main
++//go:build !podkop_slim
++
++package cli
+ 
+ import (
+ 	"github.com/spf13/cobra"
+diff --git a/cmd/sing-box/cmd_api_tailscale_certificate_export.go b/cmd/sing-box/cli/cmd_api_tailscale_certificate_export.go
+similarity index 98%
+rename from cmd/sing-box/cmd_api_tailscale_certificate_export.go
+rename to cmd/sing-box/cli/cmd_api_tailscale_certificate_export.go
+index 57369b9fb..14afefdae 100644
+--- a/cmd/sing-box/cmd_api_tailscale_certificate_export.go
++++ b/cmd/sing-box/cli/cmd_api_tailscale_certificate_export.go
+@@ -1,4 +1,6 @@
+-package main
++//go:build !podkop_slim
++
++package cli
+ 
+ import (
+ 	"os"
+diff --git a/cmd/sing-box/cmd_api_tailscale_certificate_list.go b/cmd/sing-box/cli/cmd_api_tailscale_certificate_list.go
+similarity index 95%
+rename from cmd/sing-box/cmd_api_tailscale_certificate_list.go
+rename to cmd/sing-box/cli/cmd_api_tailscale_certificate_list.go
+index b9e507e76..6ff1183a2 100644
+--- a/cmd/sing-box/cmd_api_tailscale_certificate_list.go
++++ b/cmd/sing-box/cli/cmd_api_tailscale_certificate_list.go
+@@ -1,4 +1,6 @@
+-package main
++//go:build !podkop_slim
++
++package cli
+ 
+ import (
+ 	"github.com/spf13/cobra"
+diff --git a/cmd/sing-box/cmd_api_tailscale_exit_node.go b/cmd/sing-box/cli/cmd_api_tailscale_exit_node.go
+similarity index 96%
+rename from cmd/sing-box/cmd_api_tailscale_exit_node.go
+rename to cmd/sing-box/cli/cmd_api_tailscale_exit_node.go
+index d056a6488..143507588 100644
+--- a/cmd/sing-box/cmd_api_tailscale_exit_node.go
++++ b/cmd/sing-box/cli/cmd_api_tailscale_exit_node.go
+@@ -1,4 +1,6 @@
+-package main
++//go:build !podkop_slim
++
++package cli
+ 
+ import (
+ 	"os"
+diff --git a/cmd/sing-box/cmd_api_tailscale_exit_node_clear.go b/cmd/sing-box/cli/cmd_api_tailscale_exit_node_clear.go
+similarity index 95%
+rename from cmd/sing-box/cmd_api_tailscale_exit_node_clear.go
+rename to cmd/sing-box/cli/cmd_api_tailscale_exit_node_clear.go
+index 276a76dc4..efce64799 100644
+--- a/cmd/sing-box/cmd_api_tailscale_exit_node_clear.go
++++ b/cmd/sing-box/cli/cmd_api_tailscale_exit_node_clear.go
+@@ -1,4 +1,6 @@
+-package main
++//go:build !podkop_slim
++
++package cli
+ 
+ import (
+ 	"github.com/sagernet/sing-box/daemon"
+diff --git a/cmd/sing-box/cmd_api_tailscale_exit_node_list.go b/cmd/sing-box/cli/cmd_api_tailscale_exit_node_list.go
+similarity index 97%
+rename from cmd/sing-box/cmd_api_tailscale_exit_node_list.go
+rename to cmd/sing-box/cli/cmd_api_tailscale_exit_node_list.go
+index 6c1b21981..d93dfeaed 100644
+--- a/cmd/sing-box/cmd_api_tailscale_exit_node_list.go
++++ b/cmd/sing-box/cli/cmd_api_tailscale_exit_node_list.go
+@@ -1,4 +1,6 @@
+-package main
++//go:build !podkop_slim
++
++package cli
+ 
+ import (
+ 	"github.com/sagernet/sing/common"
+diff --git a/cmd/sing-box/cmd_api_tailscale_exit_node_set.go b/cmd/sing-box/cli/cmd_api_tailscale_exit_node_set.go
+similarity index 96%
+rename from cmd/sing-box/cmd_api_tailscale_exit_node_set.go
+rename to cmd/sing-box/cli/cmd_api_tailscale_exit_node_set.go
+index 29d4c74b0..ee4c50303 100644
+--- a/cmd/sing-box/cmd_api_tailscale_exit_node_set.go
++++ b/cmd/sing-box/cli/cmd_api_tailscale_exit_node_set.go
+@@ -1,4 +1,6 @@
+-package main
++//go:build !podkop_slim
++
++package cli
+ 
+ import (
+ 	"github.com/sagernet/sing-box/daemon"
+diff --git a/cmd/sing-box/cmd_api_tailscale_logout.go b/cmd/sing-box/cli/cmd_api_tailscale_logout.go
+similarity index 95%
+rename from cmd/sing-box/cmd_api_tailscale_logout.go
+rename to cmd/sing-box/cli/cmd_api_tailscale_logout.go
+index cfab0a4ae..1ad1c599a 100644
+--- a/cmd/sing-box/cmd_api_tailscale_logout.go
++++ b/cmd/sing-box/cli/cmd_api_tailscale_logout.go
+@@ -1,4 +1,6 @@
+-package main
++//go:build !podkop_slim
++
++package cli
+ 
+ import (
+ 	"github.com/sagernet/sing-box/daemon"
+diff --git a/cmd/sing-box/cmd_api_tailscale_peer.go b/cmd/sing-box/cli/cmd_api_tailscale_peer.go
+similarity index 99%
+rename from cmd/sing-box/cmd_api_tailscale_peer.go
+rename to cmd/sing-box/cli/cmd_api_tailscale_peer.go
+index 43cc0c1df..221a999b3 100644
+--- a/cmd/sing-box/cmd_api_tailscale_peer.go
++++ b/cmd/sing-box/cli/cmd_api_tailscale_peer.go
+@@ -1,4 +1,6 @@
+-package main
++//go:build !podkop_slim
++
++package cli
+ 
+ import (
+ 	"net/netip"
+diff --git a/cmd/sing-box/cmd_api_tailscale_peer_list.go b/cmd/sing-box/cli/cmd_api_tailscale_peer_list.go
+similarity index 96%
+rename from cmd/sing-box/cmd_api_tailscale_peer_list.go
+rename to cmd/sing-box/cli/cmd_api_tailscale_peer_list.go
+index eadbeb5b9..43052459f 100644
+--- a/cmd/sing-box/cmd_api_tailscale_peer_list.go
++++ b/cmd/sing-box/cli/cmd_api_tailscale_peer_list.go
+@@ -1,4 +1,6 @@
+-package main
++//go:build !podkop_slim
++
++package cli
+ 
+ import (
+ 	"github.com/spf13/cobra"
+diff --git a/cmd/sing-box/cmd_api_tailscale_peer_show.go b/cmd/sing-box/cli/cmd_api_tailscale_peer_show.go
+similarity index 98%
+rename from cmd/sing-box/cmd_api_tailscale_peer_show.go
+rename to cmd/sing-box/cli/cmd_api_tailscale_peer_show.go
+index 4aefa6a99..1e59a2391 100644
+--- a/cmd/sing-box/cmd_api_tailscale_peer_show.go
++++ b/cmd/sing-box/cli/cmd_api_tailscale_peer_show.go
+@@ -1,4 +1,6 @@
+-package main
++//go:build !podkop_slim
++
++package cli
+ 
+ import (
+ 	"strings"
+diff --git a/cmd/sing-box/cmd_api_tailscale_ping.go b/cmd/sing-box/cli/cmd_api_tailscale_ping.go
+similarity index 99%
+rename from cmd/sing-box/cmd_api_tailscale_ping.go
+rename to cmd/sing-box/cli/cmd_api_tailscale_ping.go
+index be717d7ba..24676ecc3 100644
+--- a/cmd/sing-box/cmd_api_tailscale_ping.go
++++ b/cmd/sing-box/cli/cmd_api_tailscale_ping.go
+@@ -1,4 +1,6 @@
+-package main
++//go:build !podkop_slim
++
++package cli
+ 
+ import (
+ 	"os"
+diff --git a/cmd/sing-box/cmd_api_tailscale_ssh.go b/cmd/sing-box/cli/cmd_api_tailscale_ssh.go
+similarity index 98%
+rename from cmd/sing-box/cmd_api_tailscale_ssh.go
+rename to cmd/sing-box/cli/cmd_api_tailscale_ssh.go
+index f6bbcc460..23c731f0b 100644
+--- a/cmd/sing-box/cmd_api_tailscale_ssh.go
++++ b/cmd/sing-box/cli/cmd_api_tailscale_ssh.go
+@@ -1,4 +1,6 @@
+-package main
++//go:build !podkop_slim
++
++package cli
+ 
+ import (
+ 	"os/exec"
+diff --git a/cmd/sing-box/cmd_api_tailscale_ssh_unix.go b/cmd/sing-box/cli/cmd_api_tailscale_ssh_unix.go
+similarity index 73%
+rename from cmd/sing-box/cmd_api_tailscale_ssh_unix.go
+rename to cmd/sing-box/cli/cmd_api_tailscale_ssh_unix.go
+index 509d49b7e..8264658b4 100644
+--- a/cmd/sing-box/cmd_api_tailscale_ssh_unix.go
++++ b/cmd/sing-box/cli/cmd_api_tailscale_ssh_unix.go
+@@ -1,6 +1,6 @@
+-//go:build !windows
++//go:build !podkop_slim && !windows
+ 
+-package main
++package cli
+ 
+ import (
+ 	"os"
+diff --git a/cmd/sing-box/cmd_api_tailscale_ssh_windows.go b/cmd/sing-box/cli/cmd_api_tailscale_ssh_windows.go
+similarity index 90%
+rename from cmd/sing-box/cmd_api_tailscale_ssh_windows.go
+rename to cmd/sing-box/cli/cmd_api_tailscale_ssh_windows.go
+index d7e24e686..be263022e 100644
+--- a/cmd/sing-box/cmd_api_tailscale_ssh_windows.go
++++ b/cmd/sing-box/cli/cmd_api_tailscale_ssh_windows.go
+@@ -1,4 +1,6 @@
+-package main
++//go:build !podkop_slim
++
++package cli
+ 
+ import (
+ 	"errors"
+diff --git a/cmd/sing-box/cmd_api_tailscale_status.go b/cmd/sing-box/cli/cmd_api_tailscale_status.go
+similarity index 97%
+rename from cmd/sing-box/cmd_api_tailscale_status.go
+rename to cmd/sing-box/cli/cmd_api_tailscale_status.go
+index 619904844..4f9cbad0d 100644
+--- a/cmd/sing-box/cmd_api_tailscale_status.go
++++ b/cmd/sing-box/cli/cmd_api_tailscale_status.go
+@@ -1,4 +1,6 @@
+-package main
++//go:build !podkop_slim
++
++package cli
+ 
+ import (
+ 	"os"
+diff --git a/cmd/sing-box/cmd_api_tailscale_taildrop.go b/cmd/sing-box/cli/cmd_api_tailscale_taildrop.go
+similarity index 97%
+rename from cmd/sing-box/cmd_api_tailscale_taildrop.go
+rename to cmd/sing-box/cli/cmd_api_tailscale_taildrop.go
+index a3f794b3a..ad9f2e8ba 100644
+--- a/cmd/sing-box/cmd_api_tailscale_taildrop.go
++++ b/cmd/sing-box/cli/cmd_api_tailscale_taildrop.go
+@@ -1,4 +1,6 @@
+-package main
++//go:build !podkop_slim
++
++package cli
+ 
+ import (
+ 	"context"
+diff --git a/cmd/sing-box/cmd_api_tailscale_taildrop_delete.go b/cmd/sing-box/cli/cmd_api_tailscale_taildrop_delete.go
+similarity index 95%
+rename from cmd/sing-box/cmd_api_tailscale_taildrop_delete.go
+rename to cmd/sing-box/cli/cmd_api_tailscale_taildrop_delete.go
+index 4c51c1dd1..aa84fdb2d 100644
+--- a/cmd/sing-box/cmd_api_tailscale_taildrop_delete.go
++++ b/cmd/sing-box/cli/cmd_api_tailscale_taildrop_delete.go
+@@ -1,4 +1,6 @@
+-package main
++//go:build !podkop_slim
++
++package cli
+ 
+ import (
+ 	"github.com/sagernet/sing-box/daemon"
+diff --git a/cmd/sing-box/cmd_api_tailscale_taildrop_get.go b/cmd/sing-box/cli/cmd_api_tailscale_taildrop_get.go
+similarity index 98%
+rename from cmd/sing-box/cmd_api_tailscale_taildrop_get.go
+rename to cmd/sing-box/cli/cmd_api_tailscale_taildrop_get.go
+index 88aa2f04b..672cb4778 100644
+--- a/cmd/sing-box/cmd_api_tailscale_taildrop_get.go
++++ b/cmd/sing-box/cli/cmd_api_tailscale_taildrop_get.go
+@@ -1,4 +1,6 @@
+-package main
++//go:build !podkop_slim
++
++package cli
+ 
+ import (
+ 	"io"
+diff --git a/cmd/sing-box/cmd_api_tailscale_taildrop_list.go b/cmd/sing-box/cli/cmd_api_tailscale_taildrop_list.go
+similarity index 97%
+rename from cmd/sing-box/cmd_api_tailscale_taildrop_list.go
+rename to cmd/sing-box/cli/cmd_api_tailscale_taildrop_list.go
+index e51d66f4e..38a8e2ecc 100644
+--- a/cmd/sing-box/cmd_api_tailscale_taildrop_list.go
++++ b/cmd/sing-box/cli/cmd_api_tailscale_taildrop_list.go
+@@ -1,4 +1,6 @@
+-package main
++//go:build !podkop_slim
++
++package cli
+ 
+ import (
+ 	"github.com/spf13/cobra"
+diff --git a/cmd/sing-box/cmd_api_tailscale_taildrop_send.go b/cmd/sing-box/cli/cmd_api_tailscale_taildrop_send.go
+similarity index 99%
+rename from cmd/sing-box/cmd_api_tailscale_taildrop_send.go
+rename to cmd/sing-box/cli/cmd_api_tailscale_taildrop_send.go
+index 022833d25..dbf7cfbfe 100644
+--- a/cmd/sing-box/cmd_api_tailscale_taildrop_send.go
++++ b/cmd/sing-box/cli/cmd_api_tailscale_taildrop_send.go
+@@ -1,4 +1,6 @@
+-package main
++//go:build !podkop_slim
++
++package cli
+ 
+ import (
+ 	"io"
+diff --git a/cmd/sing-box/cmd_api_tailscale_taildrop_targets.go b/cmd/sing-box/cli/cmd_api_tailscale_taildrop_targets.go
+similarity index 97%
+rename from cmd/sing-box/cmd_api_tailscale_taildrop_targets.go
+rename to cmd/sing-box/cli/cmd_api_tailscale_taildrop_targets.go
+index 4014470fc..ed5430831 100644
+--- a/cmd/sing-box/cmd_api_tailscale_taildrop_targets.go
++++ b/cmd/sing-box/cli/cmd_api_tailscale_taildrop_targets.go
+@@ -1,4 +1,6 @@
+-package main
++//go:build !podkop_slim
++
++package cli
+ 
+ import (
+ 	E "github.com/sagernet/sing/common/exceptions"
+diff --git a/cmd/sing-box/cmd_api_usbip.go b/cmd/sing-box/cli/cmd_api_usbip.go
+similarity index 98%
+rename from cmd/sing-box/cmd_api_usbip.go
+rename to cmd/sing-box/cli/cmd_api_usbip.go
+index 1deab7f3c..b9d3a46fc 100644
+--- a/cmd/sing-box/cmd_api_usbip.go
++++ b/cmd/sing-box/cli/cmd_api_usbip.go
+@@ -1,4 +1,6 @@
+-package main
++//go:build !podkop_slim
++
++package cli
+ 
+ import (
+ 	"github.com/spf13/cobra"
+diff --git a/cmd/sing-box/cmd_api_usbip_local.go b/cmd/sing-box/cli/cmd_api_usbip_local.go
+similarity index 98%
+rename from cmd/sing-box/cmd_api_usbip_local.go
+rename to cmd/sing-box/cli/cmd_api_usbip_local.go
+index 1fd884bb6..facc2541b 100644
+--- a/cmd/sing-box/cmd_api_usbip_local.go
++++ b/cmd/sing-box/cli/cmd_api_usbip_local.go
+@@ -1,6 +1,6 @@
+-//go:build with_usbip && (linux || (darwin && cgo) || windows)
++//go:build !podkop_slim && with_usbip && (linux || (darwin && cgo) || windows)
+ 
+-package main
++package cli
+ 
+ import (
+ 	"cmp"
+diff --git a/cmd/sing-box/cmd_api_usbip_share.go b/cmd/sing-box/cli/cmd_api_usbip_share.go
+similarity index 99%
+rename from cmd/sing-box/cmd_api_usbip_share.go
+rename to cmd/sing-box/cli/cmd_api_usbip_share.go
+index 23b9c115f..bb9f396c9 100644
+--- a/cmd/sing-box/cmd_api_usbip_share.go
++++ b/cmd/sing-box/cli/cmd_api_usbip_share.go
+@@ -1,6 +1,6 @@
+-//go:build with_usbip && (linux || (darwin && cgo) || windows)
++//go:build !podkop_slim && with_usbip && (linux || (darwin && cgo) || windows)
+ 
+-package main
++package cli
+ 
+ import (
+ 	"context"
+diff --git a/cmd/sing-box/cmd_api_usbip_status.go b/cmd/sing-box/cli/cmd_api_usbip_status.go
+similarity index 98%
+rename from cmd/sing-box/cmd_api_usbip_status.go
+rename to cmd/sing-box/cli/cmd_api_usbip_status.go
+index 9ba93f55e..ed6293a5e 100644
+--- a/cmd/sing-box/cmd_api_usbip_status.go
++++ b/cmd/sing-box/cli/cmd_api_usbip_status.go
+@@ -1,4 +1,6 @@
+-package main
++//go:build !podkop_slim
++
++package cli
+ 
+ import (
+ 	"context"
+diff --git a/cmd/sing-box/cmd_api_usbip_stub.go b/cmd/sing-box/cli/cmd_api_usbip_stub.go
+similarity index 83%
+rename from cmd/sing-box/cmd_api_usbip_stub.go
+rename to cmd/sing-box/cli/cmd_api_usbip_stub.go
+index 32f61760f..030e64fa2 100644
+--- a/cmd/sing-box/cmd_api_usbip_stub.go
++++ b/cmd/sing-box/cli/cmd_api_usbip_stub.go
+@@ -1,6 +1,6 @@
+-//go:build !with_usbip || !(linux || (darwin && cgo) || windows)
++//go:build !podkop_slim && (!with_usbip || !(linux || (darwin && cgo) || windows))
+ 
+-package main
++package cli
+ 
+ import (
+ 	E "github.com/sagernet/sing/common/exceptions"
+diff --git a/cmd/sing-box/cmd_api_version.go b/cmd/sing-box/cli/cmd_api_version.go
+similarity index 96%
+rename from cmd/sing-box/cmd_api_version.go
+rename to cmd/sing-box/cli/cmd_api_version.go
+index 4615435a5..95a2a1086 100644
+--- a/cmd/sing-box/cmd_api_version.go
++++ b/cmd/sing-box/cli/cmd_api_version.go
+@@ -1,4 +1,6 @@
+-package main
++//go:build !podkop_slim
++
++package cli
+ 
+ import (
+ 	"os"
+diff --git a/cmd/sing-box/cmd_check.go b/cmd/sing-box/cli/cmd_check.go
+similarity index 98%
+rename from cmd/sing-box/cmd_check.go
+rename to cmd/sing-box/cli/cmd_check.go
+index 5bd1093f0..8170b8a4a 100644
+--- a/cmd/sing-box/cmd_check.go
++++ b/cmd/sing-box/cli/cmd_check.go
+@@ -1,4 +1,4 @@
+-package main
++package cli
+ 
+ import (
+ 	"context"
+diff --git a/cmd/sing-box/cmd_format.go b/cmd/sing-box/cli/cmd_format.go
+similarity index 99%
+rename from cmd/sing-box/cmd_format.go
+rename to cmd/sing-box/cli/cmd_format.go
+index a8ecb6ab7..f29205ca9 100644
+--- a/cmd/sing-box/cmd_format.go
++++ b/cmd/sing-box/cli/cmd_format.go
+@@ -1,4 +1,4 @@
+-package main
++package cli
+ 
+ import (
+ 	"bytes"
+diff --git a/cmd/sing-box/cmd_generate.go b/cmd/sing-box/cli/cmd_generate.go
+similarity index 99%
+rename from cmd/sing-box/cmd_generate.go
+rename to cmd/sing-box/cli/cmd_generate.go
+index 74d64c559..208b1e194 100644
+--- a/cmd/sing-box/cmd_generate.go
++++ b/cmd/sing-box/cli/cmd_generate.go
+@@ -1,4 +1,4 @@
+-package main
++package cli
+ 
+ import (
+ 	"crypto/rand"
+diff --git a/cmd/sing-box/cmd_generate_ech.go b/cmd/sing-box/cli/cmd_generate_ech.go
+similarity index 98%
+rename from cmd/sing-box/cmd_generate_ech.go
+rename to cmd/sing-box/cli/cmd_generate_ech.go
+index 7942d588b..3ae6daeb0 100644
+--- a/cmd/sing-box/cmd_generate_ech.go
++++ b/cmd/sing-box/cli/cmd_generate_ech.go
+@@ -1,4 +1,4 @@
+-package main
++package cli
+ 
+ import (
+ 	"os"
+diff --git a/cmd/sing-box/cmd_generate_tls.go b/cmd/sing-box/cli/cmd_generate_tls.go
+similarity index 98%
+rename from cmd/sing-box/cmd_generate_tls.go
+rename to cmd/sing-box/cli/cmd_generate_tls.go
+index 4cd4060d1..860eb1c36 100644
+--- a/cmd/sing-box/cmd_generate_tls.go
++++ b/cmd/sing-box/cli/cmd_generate_tls.go
+@@ -1,4 +1,4 @@
+-package main
++package cli
+ 
+ import (
+ 	"os"
+diff --git a/cmd/sing-box/cmd_generate_vapid.go b/cmd/sing-box/cli/cmd_generate_vapid.go
+similarity index 98%
+rename from cmd/sing-box/cmd_generate_vapid.go
+rename to cmd/sing-box/cli/cmd_generate_vapid.go
+index e83e6d805..678753eed 100644
+--- a/cmd/sing-box/cmd_generate_vapid.go
++++ b/cmd/sing-box/cli/cmd_generate_vapid.go
+@@ -1,6 +1,6 @@
+ //go:build go1.20
+ 
+-package main
++package cli
+ 
+ import (
+ 	"crypto/ecdh"
+diff --git a/cmd/sing-box/cmd_generate_wireguard.go b/cmd/sing-box/cli/cmd_generate_wireguard.go
+similarity index 99%
+rename from cmd/sing-box/cmd_generate_wireguard.go
+rename to cmd/sing-box/cli/cmd_generate_wireguard.go
+index 087e74b27..9198b2a0a 100644
+--- a/cmd/sing-box/cmd_generate_wireguard.go
++++ b/cmd/sing-box/cli/cmd_generate_wireguard.go
+@@ -1,4 +1,4 @@
+-package main
++package cli
+ 
+ import (
+ 	"encoding/base64"
+diff --git a/cmd/sing-box/cmd_geoip.go b/cmd/sing-box/cli/cmd_geoip.go
+similarity index 98%
+rename from cmd/sing-box/cmd_geoip.go
+rename to cmd/sing-box/cli/cmd_geoip.go
+index dbbbff135..491efdb40 100644
+--- a/cmd/sing-box/cmd_geoip.go
++++ b/cmd/sing-box/cli/cmd_geoip.go
+@@ -1,4 +1,4 @@
+-package main
++package cli
+ 
+ import (
+ 	"github.com/sagernet/sing-box/log"
+diff --git a/cmd/sing-box/cmd_geoip_export.go b/cmd/sing-box/cli/cmd_geoip_export.go
+similarity index 99%
+rename from cmd/sing-box/cmd_geoip_export.go
+rename to cmd/sing-box/cli/cmd_geoip_export.go
+index 6f59b4d53..00258875f 100644
+--- a/cmd/sing-box/cmd_geoip_export.go
++++ b/cmd/sing-box/cli/cmd_geoip_export.go
+@@ -1,4 +1,4 @@
+-package main
++package cli
+ 
+ import (
+ 	"io"
+diff --git a/cmd/sing-box/cmd_geoip_list.go b/cmd/sing-box/cli/cmd_geoip_list.go
+similarity index 97%
+rename from cmd/sing-box/cmd_geoip_list.go
+rename to cmd/sing-box/cli/cmd_geoip_list.go
+index 54dd426ea..ab32c6a66 100644
+--- a/cmd/sing-box/cmd_geoip_list.go
++++ b/cmd/sing-box/cli/cmd_geoip_list.go
+@@ -1,4 +1,4 @@
+-package main
++package cli
+ 
+ import (
+ 	"os"
+diff --git a/cmd/sing-box/cmd_geoip_lookup.go b/cmd/sing-box/cli/cmd_geoip_lookup.go
+similarity index 98%
+rename from cmd/sing-box/cmd_geoip_lookup.go
+rename to cmd/sing-box/cli/cmd_geoip_lookup.go
+index d5157bb40..aa6357795 100644
+--- a/cmd/sing-box/cmd_geoip_lookup.go
++++ b/cmd/sing-box/cli/cmd_geoip_lookup.go
+@@ -1,4 +1,4 @@
+-package main
++package cli
+ 
+ import (
+ 	"net/netip"
+diff --git a/cmd/sing-box/cmd_geosite.go b/cmd/sing-box/cli/cmd_geosite.go
+similarity index 98%
+rename from cmd/sing-box/cmd_geosite.go
+rename to cmd/sing-box/cli/cmd_geosite.go
+index 95db93579..fd6e57a0e 100644
+--- a/cmd/sing-box/cmd_geosite.go
++++ b/cmd/sing-box/cli/cmd_geosite.go
+@@ -1,4 +1,4 @@
+-package main
++package cli
+ 
+ import (
+ 	"github.com/sagernet/sing-box/common/geosite"
+diff --git a/cmd/sing-box/cmd_geosite_export.go b/cmd/sing-box/cli/cmd_geosite_export.go
+similarity index 99%
+rename from cmd/sing-box/cmd_geosite_export.go
+rename to cmd/sing-box/cli/cmd_geosite_export.go
+index 573cc1dfe..07b5b106e 100644
+--- a/cmd/sing-box/cmd_geosite_export.go
++++ b/cmd/sing-box/cli/cmd_geosite_export.go
+@@ -1,4 +1,4 @@
+-package main
++package cli
+ 
+ import (
+ 	"io"
+diff --git a/cmd/sing-box/cmd_geosite_list.go b/cmd/sing-box/cli/cmd_geosite_list.go
+similarity index 98%
+rename from cmd/sing-box/cmd_geosite_list.go
+rename to cmd/sing-box/cli/cmd_geosite_list.go
+index cedb7adfd..e82a47b4f 100644
+--- a/cmd/sing-box/cmd_geosite_list.go
++++ b/cmd/sing-box/cli/cmd_geosite_list.go
+@@ -1,4 +1,4 @@
+-package main
++package cli
+ 
+ import (
+ 	"os"
+diff --git a/cmd/sing-box/cmd_geosite_lookup.go b/cmd/sing-box/cli/cmd_geosite_lookup.go
+similarity index 99%
+rename from cmd/sing-box/cmd_geosite_lookup.go
+rename to cmd/sing-box/cli/cmd_geosite_lookup.go
+index f648ce62a..a6daed6c3 100644
+--- a/cmd/sing-box/cmd_geosite_lookup.go
++++ b/cmd/sing-box/cli/cmd_geosite_lookup.go
+@@ -1,4 +1,4 @@
+-package main
++package cli
+ 
+ import (
+ 	"os"
+diff --git a/cmd/sing-box/cmd_geosite_matcher.go b/cmd/sing-box/cli/cmd_geosite_matcher.go
+similarity index 98%
+rename from cmd/sing-box/cmd_geosite_matcher.go
+rename to cmd/sing-box/cli/cmd_geosite_matcher.go
+index 791dba249..3832559ed 100644
+--- a/cmd/sing-box/cmd_geosite_matcher.go
++++ b/cmd/sing-box/cli/cmd_geosite_matcher.go
+@@ -1,4 +1,4 @@
+-package main
++package cli
+ 
+ import (
+ 	"regexp"
+diff --git a/cmd/sing-box/cmd_merge.go b/cmd/sing-box/cli/cmd_merge.go
+similarity index 99%
+rename from cmd/sing-box/cmd_merge.go
+rename to cmd/sing-box/cli/cmd_merge.go
+index 6ca9a15a1..59b73d457 100644
+--- a/cmd/sing-box/cmd_merge.go
++++ b/cmd/sing-box/cli/cmd_merge.go
+@@ -1,4 +1,4 @@
+-package main
++package cli
+ 
+ import (
+ 	"bytes"
+diff --git a/cmd/sing-box/cmd_netns_holder.go b/cmd/sing-box/cli/cmd_netns_holder.go
+similarity index 96%
+rename from cmd/sing-box/cmd_netns_holder.go
+rename to cmd/sing-box/cli/cmd_netns_holder.go
+index 5851567cc..4104e4c7b 100644
+--- a/cmd/sing-box/cmd_netns_holder.go
++++ b/cmd/sing-box/cli/cmd_netns_holder.go
+@@ -1,4 +1,4 @@
+-package main
++package cli
+ 
+ import (
+ 	"github.com/sagernet/sing-box/common/netns"
+diff --git a/cmd/sing-box/cmd_rule_set.go b/cmd/sing-box/cli/cmd_rule_set.go
+similarity index 93%
+rename from cmd/sing-box/cmd_rule_set.go
+rename to cmd/sing-box/cli/cmd_rule_set.go
+index 242ea8b66..b7d251fb2 100644
+--- a/cmd/sing-box/cmd_rule_set.go
++++ b/cmd/sing-box/cli/cmd_rule_set.go
+@@ -1,4 +1,4 @@
+-package main
++package cli
+ 
+ import (
+ 	"github.com/spf13/cobra"
+diff --git a/cmd/sing-box/cmd_rule_set_compile.go b/cmd/sing-box/cli/cmd_rule_set_compile.go
+similarity index 99%
+rename from cmd/sing-box/cmd_rule_set_compile.go
+rename to cmd/sing-box/cli/cmd_rule_set_compile.go
+index e2cbefc7b..4ac45fbfa 100644
+--- a/cmd/sing-box/cmd_rule_set_compile.go
++++ b/cmd/sing-box/cli/cmd_rule_set_compile.go
+@@ -1,4 +1,4 @@
+-package main
++package cli
+ 
+ import (
+ 	"io"
+diff --git a/cmd/sing-box/cmd_rule_set_convert.go b/cmd/sing-box/cli/cmd_rule_set_convert.go
+similarity index 99%
+rename from cmd/sing-box/cmd_rule_set_convert.go
+rename to cmd/sing-box/cli/cmd_rule_set_convert.go
+index f4f8d2cac..2ca705d0c 100644
+--- a/cmd/sing-box/cmd_rule_set_convert.go
++++ b/cmd/sing-box/cli/cmd_rule_set_convert.go
+@@ -1,4 +1,4 @@
+-package main
++package cli
+ 
+ import (
+ 	"io"
+diff --git a/cmd/sing-box/cmd_rule_set_decompile.go b/cmd/sing-box/cli/cmd_rule_set_decompile.go
+similarity index 99%
+rename from cmd/sing-box/cmd_rule_set_decompile.go
+rename to cmd/sing-box/cli/cmd_rule_set_decompile.go
+index 6fc43d42a..88c0c6dda 100644
+--- a/cmd/sing-box/cmd_rule_set_decompile.go
++++ b/cmd/sing-box/cli/cmd_rule_set_decompile.go
+@@ -1,4 +1,4 @@
+-package main
++package cli
+ 
+ import (
+ 	"io"
+diff --git a/cmd/sing-box/cmd_rule_set_format.go b/cmd/sing-box/cli/cmd_rule_set_format.go
+similarity index 99%
+rename from cmd/sing-box/cmd_rule_set_format.go
+rename to cmd/sing-box/cli/cmd_rule_set_format.go
+index 6276204c4..851e0d809 100644
+--- a/cmd/sing-box/cmd_rule_set_format.go
++++ b/cmd/sing-box/cli/cmd_rule_set_format.go
+@@ -1,4 +1,4 @@
+-package main
++package cli
+ 
+ import (
+ 	"bytes"
+diff --git a/cmd/sing-box/cmd_rule_set_match.go b/cmd/sing-box/cli/cmd_rule_set_match.go
+similarity index 99%
+rename from cmd/sing-box/cmd_rule_set_match.go
+rename to cmd/sing-box/cli/cmd_rule_set_match.go
+index e3dc19b8f..596d08b03 100644
+--- a/cmd/sing-box/cmd_rule_set_match.go
++++ b/cmd/sing-box/cli/cmd_rule_set_match.go
+@@ -1,4 +1,4 @@
+-package main
++package cli
+ 
+ import (
+ 	"bytes"
+diff --git a/cmd/sing-box/cmd_rule_set_merge.go b/cmd/sing-box/cli/cmd_rule_set_merge.go
+similarity index 99%
+rename from cmd/sing-box/cmd_rule_set_merge.go
+rename to cmd/sing-box/cli/cmd_rule_set_merge.go
+index 7c8f7a535..e858725fd 100644
+--- a/cmd/sing-box/cmd_rule_set_merge.go
++++ b/cmd/sing-box/cli/cmd_rule_set_merge.go
+@@ -1,4 +1,4 @@
+-package main
++package cli
+ 
+ import (
+ 	"bytes"
+diff --git a/cmd/sing-box/cmd_rule_set_upgrade.go b/cmd/sing-box/cli/cmd_rule_set_upgrade.go
+similarity index 99%
+rename from cmd/sing-box/cmd_rule_set_upgrade.go
+rename to cmd/sing-box/cli/cmd_rule_set_upgrade.go
+index 3d77a1d2d..f817b359d 100644
+--- a/cmd/sing-box/cmd_rule_set_upgrade.go
++++ b/cmd/sing-box/cli/cmd_rule_set_upgrade.go
+@@ -1,4 +1,4 @@
+-package main
++package cli
+ 
+ import (
+ 	"bytes"
+diff --git a/cmd/sing-box/cmd_run.go b/cmd/sing-box/cli/cmd_run.go
+similarity index 99%
+rename from cmd/sing-box/cmd_run.go
+rename to cmd/sing-box/cli/cmd_run.go
+index fecd99a0c..3ebcfaa79 100644
+--- a/cmd/sing-box/cmd_run.go
++++ b/cmd/sing-box/cli/cmd_run.go
+@@ -1,4 +1,4 @@
+-package main
++package cli
+ 
+ import (
+ 	"context"
+diff --git a/cmd/sing-box/cmd_run_userns_linux.go b/cmd/sing-box/cli/cmd_run_userns_linux.go
+similarity index 99%
+rename from cmd/sing-box/cmd_run_userns_linux.go
+rename to cmd/sing-box/cli/cmd_run_userns_linux.go
+index aacd39cdc..615e6ced1 100644
+--- a/cmd/sing-box/cmd_run_userns_linux.go
++++ b/cmd/sing-box/cli/cmd_run_userns_linux.go
+@@ -1,4 +1,4 @@
+-package main
++package cli
+ 
+ import (
+ 	"bytes"
+diff --git a/cmd/sing-box/cmd_run_userns_other.go b/cmd/sing-box/cli/cmd_run_userns_other.go
+similarity index 93%
+rename from cmd/sing-box/cmd_run_userns_other.go
+rename to cmd/sing-box/cli/cmd_run_userns_other.go
+index cb0301bcc..b0e0e3520 100644
+--- a/cmd/sing-box/cmd_run_userns_other.go
++++ b/cmd/sing-box/cli/cmd_run_userns_other.go
+@@ -1,6 +1,6 @@
+ //go:build !linux
+ 
+-package main
++package cli
+ 
+ import "github.com/sagernet/sing-box/option"
+ 
+diff --git a/cmd/sing-box/cmd_schema.go b/cmd/sing-box/cli/cmd_schema.go
+similarity index 98%
+rename from cmd/sing-box/cmd_schema.go
+rename to cmd/sing-box/cli/cmd_schema.go
+index 73538125b..473d6b813 100644
+--- a/cmd/sing-box/cmd_schema.go
++++ b/cmd/sing-box/cli/cmd_schema.go
+@@ -1,4 +1,4 @@
+-package main
++package cli
+ 
+ import (
+ 	"context"
+diff --git a/cmd/sing-box/cmd_tools.go b/cmd/sing-box/cli/cmd_tools.go
+similarity index 99%
+rename from cmd/sing-box/cmd_tools.go
+rename to cmd/sing-box/cli/cmd_tools.go
+index 3c60a49a1..7e98643e4 100644
+--- a/cmd/sing-box/cmd_tools.go
++++ b/cmd/sing-box/cli/cmd_tools.go
+@@ -1,4 +1,4 @@
+-package main
++package cli
+ 
+ import (
+ 	"errors"
+diff --git a/cmd/sing-box/cmd_tools_connect.go b/cmd/sing-box/cli/cmd_tools_connect.go
+similarity index 99%
+rename from cmd/sing-box/cmd_tools_connect.go
+rename to cmd/sing-box/cli/cmd_tools_connect.go
+index d352d533e..72f32510b 100644
+--- a/cmd/sing-box/cmd_tools_connect.go
++++ b/cmd/sing-box/cli/cmd_tools_connect.go
+@@ -1,4 +1,4 @@
+-package main
++package cli
+ 
+ import (
+ 	"context"
+diff --git a/cmd/sing-box/cmd_tools_decode_link.go b/cmd/sing-box/cli/cmd_tools_decode_link.go
+similarity index 99%
+rename from cmd/sing-box/cmd_tools_decode_link.go
+rename to cmd/sing-box/cli/cmd_tools_decode_link.go
+index caf40ed90..b5ba422bc 100644
+--- a/cmd/sing-box/cmd_tools_decode_link.go
++++ b/cmd/sing-box/cli/cmd_tools_decode_link.go
+@@ -1,4 +1,4 @@
+-package main
++package cli
+ 
+ import (
+ 	"bufio"
+diff --git a/cmd/sing-box/cmd_tools_decode_link_test.go b/cmd/sing-box/cli/cmd_tools_decode_link_test.go
+similarity index 99%
+rename from cmd/sing-box/cmd_tools_decode_link_test.go
+rename to cmd/sing-box/cli/cmd_tools_decode_link_test.go
+index 75ea65fb5..85af692f8 100644
+--- a/cmd/sing-box/cmd_tools_decode_link_test.go
++++ b/cmd/sing-box/cli/cmd_tools_decode_link_test.go
+@@ -1,4 +1,4 @@
+-package main
++package cli
+ 
+ import (
+ 	"bytes"
+diff --git a/cmd/sing-box/cmd_tools_fetch.go b/cmd/sing-box/cli/cmd_tools_fetch.go
+similarity index 99%
+rename from cmd/sing-box/cmd_tools_fetch.go
+rename to cmd/sing-box/cli/cmd_tools_fetch.go
+index 5ee3b8751..60ee39304 100644
+--- a/cmd/sing-box/cmd_tools_fetch.go
++++ b/cmd/sing-box/cli/cmd_tools_fetch.go
+@@ -1,4 +1,4 @@
+-package main
++package cli
+ 
+ import (
+ 	"context"
+diff --git a/cmd/sing-box/cmd_tools_fetch_http3.go b/cmd/sing-box/cli/cmd_tools_fetch_http3.go
+similarity index 98%
+rename from cmd/sing-box/cmd_tools_fetch_http3.go
+rename to cmd/sing-box/cli/cmd_tools_fetch_http3.go
+index f87450b56..1188fbdbe 100644
+--- a/cmd/sing-box/cmd_tools_fetch_http3.go
++++ b/cmd/sing-box/cli/cmd_tools_fetch_http3.go
+@@ -1,6 +1,6 @@
+ //go:build with_quic
+ 
+-package main
++package cli
+ 
+ import (
+ 	"context"
+diff --git a/cmd/sing-box/cmd_tools_fetch_http3_stub.go b/cmd/sing-box/cli/cmd_tools_fetch_http3_stub.go
+similarity index 94%
+rename from cmd/sing-box/cmd_tools_fetch_http3_stub.go
+rename to cmd/sing-box/cli/cmd_tools_fetch_http3_stub.go
+index ae13f54c4..a3040eb51 100644
+--- a/cmd/sing-box/cmd_tools_fetch_http3_stub.go
++++ b/cmd/sing-box/cli/cmd_tools_fetch_http3_stub.go
+@@ -1,6 +1,6 @@
+ //go:build !with_quic
+ 
+-package main
++package cli
+ 
+ import (
+ 	"net/url"
+diff --git a/cmd/sing-box/cmd_tools_networkquality.go b/cmd/sing-box/cli/cmd_tools_networkquality.go
+similarity index 99%
+rename from cmd/sing-box/cmd_tools_networkquality.go
+rename to cmd/sing-box/cli/cmd_tools_networkquality.go
+index 5f63571de..b39de0ed3 100644
+--- a/cmd/sing-box/cmd_tools_networkquality.go
++++ b/cmd/sing-box/cli/cmd_tools_networkquality.go
+@@ -1,4 +1,4 @@
+-package main
++package cli
+ 
+ import (
+ 	"fmt"
+diff --git a/cmd/sing-box/cmd_tools_stun.go b/cmd/sing-box/cli/cmd_tools_stun.go
+similarity index 99%
+rename from cmd/sing-box/cmd_tools_stun.go
+rename to cmd/sing-box/cli/cmd_tools_stun.go
+index f13086caa..3a35e55d2 100644
+--- a/cmd/sing-box/cmd_tools_stun.go
++++ b/cmd/sing-box/cli/cmd_tools_stun.go
+@@ -1,4 +1,4 @@
+-package main
++package cli
+ 
+ import (
+ 	"fmt"
+diff --git a/cmd/sing-box/cmd_tools_synctime.go b/cmd/sing-box/cli/cmd_tools_synctime.go
+similarity index 99%
+rename from cmd/sing-box/cmd_tools_synctime.go
+rename to cmd/sing-box/cli/cmd_tools_synctime.go
+index 09d487ef9..59ed30159 100644
+--- a/cmd/sing-box/cmd_tools_synctime.go
++++ b/cmd/sing-box/cli/cmd_tools_synctime.go
+@@ -1,4 +1,4 @@
+-package main
++package cli
+ 
+ import (
+ 	"context"
+diff --git a/cmd/sing-box/cmd_version.go b/cmd/sing-box/cli/cmd_version.go
+similarity index 99%
+rename from cmd/sing-box/cmd_version.go
+rename to cmd/sing-box/cli/cmd_version.go
+index b8ac1e4b7..8911a2ebf 100644
+--- a/cmd/sing-box/cmd_version.go
++++ b/cmd/sing-box/cli/cmd_version.go
+@@ -1,4 +1,4 @@
+-package main
++package cli
+ 
+ import (
+ 	"os"
+diff --git a/cmd/sing-box/cli/main.go b/cmd/sing-box/cli/main.go
+new file mode 100644
+index 000000000..c580d0de3
+--- /dev/null
++++ b/cmd/sing-box/cli/main.go
+@@ -0,0 +1,20 @@
++package cli
++
++import (
++	"github.com/sagernet/sing-box/log"
++
++	"github.com/spf13/cobra"
++)
++
++// Main runs the command line of sing-box, as the program cmd/sing-box does.
++func Main() {
++	if err := mainCommand.Execute(); err != nil {
++		log.Fatal(err)
++	}
++}
++
++// Command is the root command of sing-box, for a program that runs sing-box under a name
++// of its own beside commands of its own.
++func Command() *cobra.Command {
++	return mainCommand
++}
+diff --git a/cmd/sing-box/generate_completions.go b/cmd/sing-box/generate_completions.go
+index 6ab0cade9..ca37b8d41 100644
+--- a/cmd/sing-box/generate_completions.go
++++ b/cmd/sing-box/generate_completions.go
+@@ -2,7 +2,10 @@
+ 
+ package main
+ 
+-import "github.com/sagernet/sing-box/log"
++import (
++	"github.com/sagernet/sing-box/cmd/sing-box/cli"
++	"github.com/sagernet/sing-box/log"
++)
+ 
+ func main() {
+ 	err := generateCompletions()
+@@ -12,6 +15,7 @@ func main() {
+ }
+ 
+ func generateCompletions() error {
++	mainCommand := cli.Command()
+ 	err := mainCommand.GenBashCompletionFile("release/completions/sing-box.bash")
+ 	if err != nil {
+ 		return err
+diff --git a/cmd/sing-box/main.go b/cmd/sing-box/main.go
+index fd55c7d31..994859130 100644
+--- a/cmd/sing-box/main.go
++++ b/cmd/sing-box/main.go
+@@ -2,10 +2,8 @@
+ 
+ package main
+ 
+-import "github.com/sagernet/sing-box/log"
++import "github.com/sagernet/sing-box/cmd/sing-box/cli"
+ 
+ func main() {
+-	if err := mainCommand.Execute(); err != nil {
+-		log.Fatal(err)
+-	}
++	cli.Main()
+ }
+-- 
+2.53.0
+

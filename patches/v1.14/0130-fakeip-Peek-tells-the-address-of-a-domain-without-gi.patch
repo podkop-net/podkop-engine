@@ -1,0 +1,77 @@
+From c2de5a7d9240779f4155e5be59bfb3c0b361886b Mon Sep 17 00:00:00 2001
+From: FiyeroT <me@fiyero.xyz>
+Date: Tue, 13 Oct 2026 17:08:29 +0300
+Subject: [PATCH 130/148] fakeip: Peek tells the address of a domain without
+ giving it one
+
+Create gives an address to a domain that has none, and counts as a use of the
+record. Who only asks whether a domain was ever looked up needs neither: Peek
+returns the address a domain has, if it has one.
+---
+ dns/transport/fakeip/store.go      | 21 +++++++++++++++++++++
+ dns/transport/fakeip/store_test.go | 17 +++++++++++++++++
+ 2 files changed, 38 insertions(+)
+
+diff --git a/dns/transport/fakeip/store.go b/dns/transport/fakeip/store.go
+index ad3f301f8..8ffdd731e 100644
+--- a/dns/transport/fakeip/store.go
++++ b/dns/transport/fakeip/store.go
+@@ -589,6 +589,27 @@ func (s *Store) Create(domain string, isIPv6 bool) (netip.Addr, error) {
+ 	}
+ }
+ 
++// Peek returns the address a domain has, if it has one. Unlike Create it gives no address
++// to a domain that has none, and it does not count as a use of the record: it is for
++// those who ask whether a domain was ever looked up, not for those who look it up.
++func (s *Store) Peek(domain string, isIPv6 bool) (netip.Addr, bool) {
++	p := s.pool4
++	if isIPv6 {
++		p = s.pool6
++	}
++	if p == nil {
++		return netip.Addr{}, false
++	}
++	domain = strings.ToLower(domain)
++	s.access.RLock()
++	defer s.access.RUnlock()
++	r := p.byName[domain]
++	if r == nil {
++		return netip.Addr{}, false
++	}
++	return p.address(r.offset), true
++}
++
+ const (
+ 	needNothing = iota
+ 	needReserve // the saved reserve is used up
+diff --git a/dns/transport/fakeip/store_test.go b/dns/transport/fakeip/store_test.go
+index 9d22fe6e1..4c9775ba0 100644
+--- a/dns/transport/fakeip/store_test.go
++++ b/dns/transport/fakeip/store_test.go
+@@ -233,6 +233,23 @@ func TestCreateAndLookup(t *testing.T) {
+ 	}
+ }
+ 
++// Peek tells the address of a domain that has one and gives none to a domain that has not.
++func TestPeek(t *testing.T) {
++	t.Parallel()
++	store := newTestStore(t, nil, "198.18.0.0/15", "")
++	_, known := store.Peek("example.com", false)
++	require.False(t, known)
++	_, known = store.Peek("example.com", false)
++	require.False(t, known, "the first Peek gave the domain an address")
++	first := mustCreate(t, store, "example.com")
++	seen, known := store.Peek("Example.COM", false)
++	require.True(t, known)
++	require.Equal(t, first, seen)
++	_, known = store.Peek("example.com", true)
++	require.False(t, known, "no IPv6 range, no IPv6 address")
++	require.Equal(t, address("198.18.0.3"), mustCreate(t, store, "example.org"), "a Peek took an address")
++}
++
+ func TestMissingRange(t *testing.T) {
+ 	t.Parallel()
+ 	store := newTestStore(t, nil, "198.18.0.0/15", "")
+-- 
+2.53.0
+

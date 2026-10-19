@@ -1,0 +1,46 @@
+From f694245f8ab6b8d9303adf032aeb4fbc366a1ed9 Mon Sep 17 00:00:00 2001
+From: FiyeroT <me@fiyero.xyz>
+Date: Mon, 19 Oct 2026 22:59:58 +0300
+Subject: [PATCH 140/140] rule-set: a closed rule-set does not parse or save a
+ list that came in
+
+Closing the box cancels the download of an update, but a body read to its
+end just before was parsed and saved to the cache file all the same. A
+reload in the process (SIGHUP) could leave lists of the old box parsing next
+to the downloads of the new one, a peak of memory a small router does not
+have, and the old box wrote to its closing cache file. The fetch looks at
+the context of the rule-set before the parse and after it.
+---
+ route/rule/rule_set_remote.go | 10 ++++++++++
+ 1 file changed, 10 insertions(+)
+
+diff --git a/route/rule/rule_set_remote.go b/route/rule/rule_set_remote.go
+index e86fc5115..57fb69dbe 100644
+--- a/route/rule/rule_set_remote.go
++++ b/route/rule/rule_set_remote.go
+@@ -519,12 +519,22 @@ func (s *RemoteRuleSet) fetch(ctx context.Context, startContext *adapter.HTTPSta
+ 		response.Body.Close()
+ 		return describe(err)
+ 	}
++	// a rule-set closed while its list came in does not parse it: the parse of a big list
++	// is the most an update costs, and a box that replaces this one fetches its own
++	if s.ctx.Err() != nil {
++		response.Body.Close()
++		return s.ctx.Err()
++	}
+ 	err = s.loadBytes(content)
+ 	if err != nil {
+ 		response.Body.Close()
+ 		return E.Cause(err, "read rule-set (", describeRuleSetBody(response, int64(len(content)), content), ")")
+ 	}
+ 	response.Body.Close()
++	if s.ctx.Err() != nil {
++		// closed during the parse: its cache file is closed too
++		return s.ctx.Err()
++	}
+ 	s.fetchLoaded = true
+ 	eTagHeader := response.Header.Get("Etag")
+ 	if eTagHeader != "" {
+-- 
+2.53.0
+

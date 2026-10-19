@@ -1,0 +1,328 @@
+From 07c69f3164f5a8c33e1879046dd4e1ef852d26fa Mon Sep 17 00:00:00 2001
+From: FiyeroT <me@fiyero.xyz>
+Date: Sat, 17 Oct 2026 08:07:38 +0300
+Subject: [PATCH 133/148] rule-set: format text, a list of domains and IP CIDRs
+ as plain text
+
+Many sites publish their lists as plain text, a domain or an address a line,
+with no rule-set around them. The format text takes such a list as a rule-set,
+local or remote: a domain matches itself and its subdomains (domain_suffix),
+an address or CIDR matches by destination (ip_cidr); "#" and "//" begin
+comments. A domain needs a dot or a leading dot (".ru"): a word alone is text.
+A list with no item is an error, so a page served in place of the list (a
+block page, a captive portal) does not replace it; the lines left out are
+counted in the log of a remote set. The rules are the ones of any rule-set:
+only the way the list is written differs (common/ruletext).
+---
+ common/ruletext/ruletext.go              | 136 +++++++++++++++++++++++
+ common/ruletext/ruletext_test.go         |  29 +++++
+ constant/rule.go                         |   3 +
+ option/rule_set.go                       |   4 +-
+ route/rule/rule_set_local.go             |  11 +-
+ route/rule/rule_set_remote.go            |  10 ++
+ route/rule/rule_set_remote_start_test.go |  20 ++++
+ 7 files changed, 210 insertions(+), 3 deletions(-)
+ create mode 100644 common/ruletext/ruletext.go
+ create mode 100644 common/ruletext/ruletext_test.go
+
+diff --git a/common/ruletext/ruletext.go b/common/ruletext/ruletext.go
+new file mode 100644
+index 000000000..0cbf99da6
+--- /dev/null
++++ b/common/ruletext/ruletext.go
+@@ -0,0 +1,136 @@
++// Package ruletext reads rule-sets written as plain text (format "text"): the lists of
++// domains and addresses many sites publish, one item a line, with no rule-set around
++// them. Each item becomes a rule of the set: a domain matches itself and its subdomains
++// (domain_suffix), an IP address or CIDR matches by destination (ip_cidr). The set is
++// matched as any other: the text is only how it is written.
++package ruletext
++
++import (
++	"bytes"
++	"net/netip"
++	"strings"
++
++	C "github.com/sagernet/sing-box/constant"
++	"github.com/sagernet/sing-box/option"
++	E "github.com/sagernet/sing/common/exceptions"
++	"github.com/sagernet/sing/common/json/badoption"
++)
++
++// Skipped is what a list had that is neither a domain nor an IP address or CIDR.
++type Skipped struct {
++	// Count is how many lines were left out.
++	Count int
++	// First is the first of them, cut to 64 bytes.
++	First string
++}
++
++// Read returns the rule-set of a list written as text, and what it left out. An item is
++// a line; "#" and "//" begin a comment that runs to the end of the line, and spaces
++// around the item are dropped. A domain has a dot in it, or begins with one (".ru", a
++// top-level domain): a word alone is taken for text, not for a name. It may begin with
++// "." or "+." (a suffix either way) and is taken in lower case. A list without a single
++// item is an error: a page served in place of the list (a block page, a captive
++// portal) is no list, and a line of it is no item.
++func Read(content []byte) (option.PlainRuleSetCompat, Skipped, error) {
++	var (
++		domains  []string
++		prefixes []string
++		skipped  Skipped
++	)
++	seenDomains := make(map[string]bool)
++	seenPrefixes := make(map[string]bool)
++	for len(content) > 0 {
++		var line []byte
++		end := bytes.IndexByte(content, '\n')
++		if end < 0 {
++			line, content = content, nil
++		} else {
++			line, content = content[:end], content[end+1:]
++		}
++		if comment := bytes.IndexByte(line, '#'); comment >= 0 {
++			line = line[:comment]
++		}
++		if comment := bytes.Index(line, []byte("//")); comment >= 0 {
++			line = line[:comment]
++		}
++		item := string(bytes.TrimSpace(line))
++		if item == "" {
++			continue
++		}
++		if prefix, isPrefix := parsePrefix(item); isPrefix {
++			text := prefix.String()
++			if !seenPrefixes[text] {
++				seenPrefixes[text] = true
++				prefixes = append(prefixes, text)
++			}
++			continue
++		}
++		if domain, isDomain := parseDomain(item); isDomain {
++			if !seenDomains[domain] {
++				seenDomains[domain] = true
++				domains = append(domains, domain)
++			}
++			continue
++		}
++		if skipped.Count == 0 {
++			skipped.First = item
++			if len(skipped.First) > 64 {
++				skipped.First = skipped.First[:64]
++			}
++		}
++		skipped.Count++
++	}
++	if len(domains) == 0 && len(prefixes) == 0 {
++		if skipped.Count > 0 {
++			return option.PlainRuleSetCompat{}, skipped, E.New("no domain and no IP CIDR in the list, the first line: ", skipped.First)
++		}
++		return option.PlainRuleSetCompat{}, skipped, E.New("no domain and no IP CIDR in the list")
++	}
++	var rules []option.HeadlessRule
++	if len(domains) > 0 {
++		rules = append(rules, option.HeadlessRule{Type: C.RuleTypeDefault, DefaultOptions: option.DefaultHeadlessRule{DomainSuffix: badoption.Listable[string](domains)}})
++	}
++	if len(prefixes) > 0 {
++		rules = append(rules, option.HeadlessRule{Type: C.RuleTypeDefault, DefaultOptions: option.DefaultHeadlessRule{IPCIDR: badoption.Listable[string](prefixes)}})
++	}
++	return option.PlainRuleSetCompat{Version: C.RuleSetVersionCurrent, Options: option.PlainRuleSet{Rules: rules}}, skipped, nil
++}
++
++func parsePrefix(item string) (netip.Prefix, bool) {
++	if strings.Contains(item, "/") {
++		prefix, err := netip.ParsePrefix(item)
++		if err != nil {
++			return netip.Prefix{}, false
++		}
++		return prefix.Masked(), true
++	}
++	address, err := netip.ParseAddr(item)
++	if err != nil {
++		return netip.Prefix{}, false
++	}
++	address = address.Unmap()
++	return netip.PrefixFrom(address, address.BitLen()), true
++}
++
++// parseDomain takes a name of letters, digits, "-" and "_", labels joined by dots, none
++// empty and none longer than 63 bytes; a name of one label only as an explicit suffix.
++func parseDomain(item string) (string, bool) {
++	suffix := strings.HasPrefix(item, ".") || strings.HasPrefix(item, "+.")
++	item = strings.TrimPrefix(strings.TrimPrefix(item, "+"), ".")
++	item = strings.TrimSuffix(strings.ToLower(item), ".")
++	if item == "" || len(item) > 253 || !suffix && !strings.Contains(item, ".") {
++		return "", false
++	}
++	for _, label := range strings.Split(item, ".") {
++		if label == "" || len(label) > 63 || label[0] == '-' || label[len(label)-1] == '-' {
++			return "", false
++		}
++		for index := 0; index < len(label); index++ {
++			character := label[index]
++			if !(character >= 'a' && character <= 'z' || character >= '0' && character <= '9' || character == '-' || character == '_') {
++				return "", false
++			}
++		}
++	}
++	return item, true
++}
+diff --git a/common/ruletext/ruletext_test.go b/common/ruletext/ruletext_test.go
+new file mode 100644
+index 000000000..09b83f123
+--- /dev/null
++++ b/common/ruletext/ruletext_test.go
+@@ -0,0 +1,29 @@
++package ruletext
++
++import (
++	"testing"
++
++	"github.com/stretchr/testify/require"
++)
++
++func TestRead(t *testing.T) {
++	t.Parallel()
++	ruleSet, skipped, err := Read([]byte("# a list\nexample.com\n.Sub.Example.ORG\n+.x.example\n  .ru  \n10.0.0.0/8\n192.0.2.1 # one address\n2001:db8::/32 // addresses\nnot a domain\nwords\nexample.com\nlast.example"))
++	require.NoError(t, err)
++	require.Len(t, ruleSet.Options.Rules, 2)
++	require.Equal(t, []string{"example.com", "sub.example.org", "x.example", "ru", "last.example"}, []string(ruleSet.Options.Rules[0].DefaultOptions.DomainSuffix))
++	require.Equal(t, []string{"10.0.0.0/8", "192.0.2.1/32", "2001:db8::/32"}, []string(ruleSet.Options.Rules[1].DefaultOptions.IPCIDR))
++	require.Equal(t, Skipped{Count: 2, First: "not a domain"}, skipped)
++
++	// the last line without a line end is read; a list of names alone has one rule
++	ruleSet, _, err = Read([]byte("only.example"))
++	require.NoError(t, err)
++	require.Len(t, ruleSet.Options.Rules, 1)
++
++	// a page served in place of the list is no list
++	_, skipped, err = Read([]byte("<html><body>\nAccess to this resource is blocked\nForbidden\n</body></html>\n"))
++	require.Error(t, err)
++	require.Equal(t, 4, skipped.Count)
++	_, _, err = Read([]byte("\n# nothing\n"))
++	require.Error(t, err)
++}
+diff --git a/constant/rule.go b/constant/rule.go
+index 251ed4e9a..d404fa75b 100644
+--- a/constant/rule.go
++++ b/constant/rule.go
+@@ -16,6 +16,9 @@ const (
+ 	RuleSetTypeRemote   = "remote"
+ 	RuleSetFormatSource = "source"
+ 	RuleSetFormatBinary = "binary"
++	// RuleSetFormatText is a list written as plain text, a domain or an IP CIDR a line
++	// (common/ruletext).
++	RuleSetFormatText = "text"
+ )
+ 
+ const RuleSetTagPlaceholder = "{tag}"
+diff --git a/option/rule_set.go b/option/rule_set.go
+index e4ce66bbc..48544035b 100644
+--- a/option/rule_set.go
++++ b/option/rule_set.go
+@@ -96,7 +96,7 @@ func (r *RuleSet) UnmarshalJSON(bytes []byte) error {
+ 		switch r.Format {
+ 		case "":
+ 			return E.New("missing format")
+-		case C.RuleSetFormatSource, C.RuleSetFormatBinary:
++		case C.RuleSetFormatSource, C.RuleSetFormatBinary, C.RuleSetFormatText:
+ 		default:
+ 			return E.New("unknown rule-set format: " + r.Format)
+ 		}
+@@ -144,7 +144,7 @@ func (r RuleSet) DescribeSchema(builder schema.Builder) (*schema.Node, error) {
+ 			return nil, err
+ 		}
+ 		tagNode := schema.ListableOf(schema.StringNode())
+-		formatNode := schema.StringEnum(C.RuleSetFormatSource, C.RuleSetFormatBinary)
++		formatNode := schema.StringEnum(C.RuleSetFormatSource, C.RuleSetFormatBinary, C.RuleSetFormatText)
+ 
+ 		inlineVariant := schema.StrictObject()
+ 		inlineVariant.Properties.Put("type", schema.StringEnum(C.RuleSetTypeInline, ""))
+diff --git a/route/rule/rule_set_local.go b/route/rule/rule_set_local.go
+index 10d73fea3..4fbc0db81 100644
+--- a/route/rule/rule_set_local.go
++++ b/route/rule/rule_set_local.go
+@@ -10,6 +10,7 @@ import (
+ 	"github.com/sagernet/fswatch"
+ 	"github.com/sagernet/sing-box/adapter"
+ 	"github.com/sagernet/sing-box/common/domainset"
++	"github.com/sagernet/sing-box/common/ruletext"
+ 	"github.com/sagernet/sing-box/common/srs"
+ 	C "github.com/sagernet/sing-box/constant"
+ 	"github.com/sagernet/sing-box/option"
+@@ -134,7 +135,15 @@ func (s *LocalRuleSet) reloadFile(path string) error {
+ 		if err != nil {
+ 			return err
+ 		}
+-	default:
++	case C.RuleSetFormatText:
++		content, err := filemanager.ReadFile(s.ctx, path)
++		if err != nil {
++			return err
++		}
++		ruleSet, _, err = ruletext.Read(content)
++		if err != nil {
++			return err
++		}
+ 		return E.New("unknown rule-set format: ", s.fileFormat)
+ 	}
+ 	plainRuleSet, err := ruleSet.Upgrade()
+diff --git a/route/rule/rule_set_remote.go b/route/rule/rule_set_remote.go
+index 6eae6a939..bded68eee 100644
+--- a/route/rule/rule_set_remote.go
++++ b/route/rule/rule_set_remote.go
+@@ -21,6 +21,7 @@ import (
+ 	"github.com/sagernet/sing-box/adapter"
+ 	"github.com/sagernet/sing-box/common/domainset"
+ 	"github.com/sagernet/sing-box/common/interrupt"
++	"github.com/sagernet/sing-box/common/ruletext"
+ 	"github.com/sagernet/sing-box/common/srs"
+ 	C "github.com/sagernet/sing-box/constant"
+ 	"github.com/sagernet/sing-box/experimental/deprecated"
+@@ -278,6 +279,15 @@ func (s *RemoteRuleSet) commitBytes(content []byte) error {
+ 		if err != nil {
+ 			return err
+ 		}
++	case C.RuleSetFormatText:
++		var skipped ruletext.Skipped
++		ruleSet, skipped, err = ruletext.Read(content)
++		if err != nil {
++			return err
++		}
++		if skipped.Count > 0 {
++			s.logger.Warn("rule-set ", s.tag, ": ", skipped.Count, " line(s) are neither a domain nor an IP CIDR and are left out, the first: ", logText(E.New(skipped.First)))
++		}
+ 	default:
+ 		return E.New("unknown rule-set format: ", s.options.Format)
+ 	}
+diff --git a/route/rule/rule_set_remote_start_test.go b/route/rule/rule_set_remote_start_test.go
+index ecc125947..08fbe9cec 100644
+--- a/route/rule/rule_set_remote_start_test.go
++++ b/route/rule/rule_set_remote_start_test.go
+@@ -78,3 +78,23 @@ func TestRemoteRuleSetCallbackAfterCache(t *testing.T) {
+ 	require.NoError(t, set.fetch(context.Background(), false))
+ 	require.Equal(t, string(content), string(seen))
+ }
++
++// A list written as text is downloaded and matched as any rule-set; a page served in its
++// place is refused, and the rules it had stay.
++func TestRemoteRuleSetText(t *testing.T) {
++	var body atomic.Value
++	body.Store("example.com\n10.0.0.0/8\n")
++	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		w.Write([]byte(body.Load().(string)))
++	}))
++	defer server.Close()
++	set := newTestRuleSet(server.URL)
++	set.ctx = context.Background()
++	set.options.Format = C.RuleSetFormatText
++	require.NoError(t, set.fetch(context.Background(), false))
++	require.True(t, set.Match(&adapter.InboundContext{Domain: "www.example.com"}))
++	require.False(t, set.Match(&adapter.InboundContext{Domain: "example.org"}))
++	body.Store("<html><body>\nAccess to this resource is blocked\n</body></html>\n")
++	require.Error(t, set.fetch(context.Background(), false))
++	require.True(t, set.Match(&adapter.InboundContext{Domain: "www.example.com"}))
++}
+-- 
+2.53.0
+

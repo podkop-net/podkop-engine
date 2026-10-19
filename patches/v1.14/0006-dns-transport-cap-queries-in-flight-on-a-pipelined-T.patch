@@ -1,7 +1,7 @@
-From 473932919d6c5f8dd04cd806db03e85c6a8eb424 Mon Sep 17 00:00:00 2001
+From fe9cd4e9c500c0d83b46a65c14fd081025502c95 Mon Sep 17 00:00:00 2001
 From: FiyeroT <me@fiyero.xyz>
 Date: Tue, 29 Sep 2026 15:33:06 +0300
-Subject: [PATCH 006/125] dns/transport: cap queries in flight on a pipelined
+Subject: [PATCH 006/148] dns/transport: cap queries in flight on a pipelined
  TCP/TLS connection
 
 Yandex DNS over TLS resets a connection that carries more than about 20
@@ -18,10 +18,10 @@ other public servers are unaffected.
  1 file changed, 15 insertions(+)
 
 diff --git a/dns/transport/multiplexer.go b/dns/transport/multiplexer.go
-index 6b275ae9d..c9e7241ba 100644
+index 1b6e88c86..47e6613b0 100644
 --- a/dns/transport/multiplexer.go
 +++ b/dns/transport/multiplexer.go
-@@ -137,9 +137,24 @@ func (m *queryMultiplexer) dispatch(ctx context.Context, message *mDNS.Msg, call
+@@ -155,9 +155,24 @@ func (m *queryMultiplexer) dispatch(ctx context.Context, message *mDNS.Msg, call
  		go m.exchangeSingle(ctx, message, callback)
  		return
  	}

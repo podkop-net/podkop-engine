@@ -1,0 +1,94 @@
+From 556585dca9c4d89114db8cfa134ef0f7bd5df03e Mon Sep 17 00:00:00 2001
+From: FiyeroT <me@fiyero.xyz>
+Date: Mon, 19 Oct 2026 21:48:14 +0300
+Subject: [PATCH 138/140] include: the http outbound in podkop-engine, not only
+ in podkop-engine-full
+
+podkop writes no http outbound itself, but a local HTTP proxy set as a raw
+outbound (opera-proxy on 127.0.0.1:18080, say) is a common configuration
+that the slim build refused. The outbound costs 4-11 KB of a gzipped package
+(0-64 KB of the binary, page alignment), measured on five architectures.
+---
+ include/podkop_full.go      | 2 --
+ include/podkop_full_stub.go | 1 -
+ include/podkop_test.go      | 2 +-
+ include/registry.go         | 4 ++++
+ 4 files changed, 5 insertions(+), 4 deletions(-)
+
+diff --git a/include/podkop_full.go b/include/podkop_full.go
+index f210b096d..25266920a 100644
+--- a/include/podkop_full.go
++++ b/include/podkop_full.go
+@@ -5,7 +5,6 @@ package include
+ import (
+ 	"github.com/sagernet/sing-box/adapter/outbound"
+ 	"github.com/sagernet/sing-box/protocol/anytls"
+-	"github.com/sagernet/sing-box/protocol/http"
+ 	"github.com/sagernet/sing-box/protocol/shadowtls"
+ 	"github.com/sagernet/sing-box/protocol/ssh"
+ 	"github.com/sagernet/sing-box/protocol/tor"
+@@ -17,7 +16,6 @@ import (
+ // (podkop-engine-full). The naive outbound also needs with_naive_outbound.
+ 
+ func registerFullOutbounds(registry *outbound.Registry) {
+-	http.RegisterOutbound(registry)
+ 	vmess.RegisterOutbound(registry)
+ 	registerNaiveOutbound(registry)
+ 	tor.RegisterOutbound(registry)
+diff --git a/include/podkop_full_stub.go b/include/podkop_full_stub.go
+index 0d7630da7..2182ca6c5 100644
+--- a/include/podkop_full_stub.go
++++ b/include/podkop_full_stub.go
+@@ -10,7 +10,6 @@ import (
+ const notIncludedFull = notIncludedSlim + ", install podkop-engine-full or rebuild with -tags podkop_full"
+ 
+ func registerFullOutbounds(registry *outbound.Registry) {
+-	stubOutbound(registry, C.TypeHTTP, notIncludedFull)
+ 	stubOutbound(registry, C.TypeVMess, notIncludedFull)
+ 	stubOutbound(registry, C.TypeNaive, notIncludedFull)
+ 	stubOutbound(registry, C.TypeTor, notIncludedFull)
+diff --git a/include/podkop_test.go b/include/podkop_test.go
+index aae247c80..6977368dd 100644
+--- a/include/podkop_test.go
++++ b/include/podkop_test.go
+@@ -59,6 +59,7 @@ func TestPodkopConfigurationLoads(t *testing.T) {
+ 			{"type": "hysteria2", "tag": "hy2-out", ` + testServerTLS + `, "password": "p"},
+ 			{"type": "tuic", "tag": "tuic-out", ` + testServerTLS + `, ` + testUUID + `},
+ 			{"type": "selector", "tag": "select", "outbounds": ["direct-out", "vless-out"]},
++			{"type": "http", "tag": "http-out", ` + testServer + `},
+ 			{"type": "urltest", "tag": "auto", "outbounds": ["vless-out", "hy2-out"]}
+ 		]
+ 	}`)
+@@ -87,7 +88,6 @@ func TestPodkopSlimStubs(t *testing.T) {
+ // (a real constructor may still reject the test options, but never with a stub message).
+ func TestPodkopFullOutbounds(t *testing.T) {
+ 	for _, outbound := range []string{
+-		`{"type": "http", ` + testServer + `}`,
+ 		`{"type": "vmess", ` + testServer + `, ` + testUUID + `}`,
+ 		`{"type": "naive", ` + testServerTLS + `, "username": "u", "password": "p"}`,
+ 		`{"type": "tor"}`,
+diff --git a/include/registry.go b/include/registry.go
+index 2da0e7b3d..b3d3139b1 100644
+--- a/include/registry.go
++++ b/include/registry.go
+@@ -19,6 +19,7 @@ import (
+ 	"github.com/sagernet/sing-box/option"
+ 	"github.com/sagernet/sing-box/protocol/direct"
+ 	"github.com/sagernet/sing-box/protocol/group"
++	"github.com/sagernet/sing-box/protocol/http"
+ 	"github.com/sagernet/sing-box/protocol/mixed"
+ 	"github.com/sagernet/sing-box/protocol/redirect"
+ 	"github.com/sagernet/sing-box/protocol/shadowsocks"
+@@ -58,6 +59,9 @@ func OutboundRegistry() *outbound.Registry {
+ 	shadowsocks.RegisterOutbound(registry)
+ 	trojan.RegisterOutbound(registry)
+ 	vless.RegisterOutbound(registry)
++	// podkop writes no http outbound itself, but a local HTTP proxy (opera-proxy and the
++	// like) set as a raw outbound is common, and it costs a few kilobytes
++	http.RegisterOutbound(registry)
+ 	registerFullOutbounds(registry)
+ 
+ 	registerQUICOutbounds(registry)
+-- 
+2.53.0
+

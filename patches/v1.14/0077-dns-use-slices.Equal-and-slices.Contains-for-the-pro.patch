@@ -1,0 +1,73 @@
+From 9788c6ba1dd34eeb7ec40b6424dd5711939faadb Mon Sep 17 00:00:00 2001
+From: FiyeroT <me@fiyero.xyz>
+Date: Tue, 6 Oct 2026 23:41:11 +0300
+Subject: [PATCH 077/148] dns: use slices.Equal and slices.Contains for the
+ provider's servers
+
+sameServers and containsServer were the two functions of the standard library written
+out; M.Socksaddr is comparable and was compared with == there. No change of behaviour.
+---
+ dns/client_fallback_provider.go | 26 +++-----------------------
+ 1 file changed, 3 insertions(+), 23 deletions(-)
+
+diff --git a/dns/client_fallback_provider.go b/dns/client_fallback_provider.go
+index 7bd9cfafc..636efd2d8 100644
+--- a/dns/client_fallback_provider.go
++++ b/dns/client_fallback_provider.go
+@@ -6,6 +6,7 @@ import (
+ 	"net"
+ 	"net/netip"
+ 	"os/exec"
++	"slices"
+ 	"strings"
+ 	"sync"
+ 	"time"
+@@ -148,7 +149,7 @@ func (p *providerSet) refresh(logger logger.ContextLogger, device string) []M.So
+ 	p.access.Lock()
+ 	defer p.access.Unlock()
+ 	p.reading = false
+-	changed := p.readAt.IsZero() || device != p.device || !sameServers(servers, p.servers)
++	changed := p.readAt.IsZero() || device != p.device || !slices.Equal(servers, p.servers)
+ 	p.servers, p.device, p.readAt, p.readErr, p.stale = servers, device, time.Now(), err != nil, false
+ 	if changed {
+ 		p.best = M.Socksaddr{}
+@@ -200,7 +201,7 @@ func (p *providerSet) names() string {
+ func (p *providerSet) pick(servers []M.Socksaddr) (M.Socksaddr, bool) {
+ 	p.access.Lock()
+ 	defer p.access.Unlock()
+-	if !p.best.IsValid() || p.uses >= providerRoundAfter || time.Since(p.roundAt) >= providerRoundEvery || !containsServer(servers, p.best) {
++	if !p.best.IsValid() || p.uses >= providerRoundAfter || time.Since(p.roundAt) >= providerRoundEvery || !slices.Contains(servers, p.best) {
+ 		return M.Socksaddr{}, false
+ 	}
+ 	p.uses++
+@@ -410,27 +411,6 @@ func (s *fallbackServer) providersFor(servers []M.Socksaddr) []M.Socksaddr {
+ 	return others
+ }
+ 
+-func sameServers(a, b []M.Socksaddr) bool {
+-	if len(a) != len(b) {
+-		return false
+-	}
+-	for i := range a {
+-		if a[i] != b[i] {
+-			return false
+-		}
+-	}
+-	return true
+-}
+-
+-func containsServer(servers []M.Socksaddr, server M.Socksaddr) bool {
+-	for _, candidate := range servers {
+-		if candidate == server {
+-			return true
+-		}
+-	}
+-	return false
+-}
+-
+ func joinServers(servers []M.Socksaddr) string {
+ 	names := make([]string, 0, len(servers))
+ 	for _, server := range servers {
+-- 
+2.53.0
+

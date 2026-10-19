@@ -1,0 +1,217 @@
+From 947b2f0e9ae5ef51f7211b994452b4ceceb65b6f Mon Sep 17 00:00:00 2001
+From: FiyeroT <me@fiyero.xyz>
+Date: Tue, 13 Oct 2026 06:22:38 +0300
+Subject: [PATCH 129/148] route: remote rule-sets can be updated on request
+
+RuleSetUpdater.UpdateNow updates every remote rule-set at once, whatever its
+update_interval, and returns how many there are, how many got a new list and
+how many failed. The update runs in the updater's own goroutine, where the
+scheduled ones run, so nothing of a rule-set is touched from two places; the
+next scheduled update of each rule-set is counted from the forced one.
+Router.UpdateRuleSets is how an embedder reaches it.
+
+A caller that gives up, and an updater that is closed, let the call go.
+---
+ route/router.go                     |  9 ++++
+ route/rule/rule_set_updater.go      | 48 +++++++++++++++++++-
+ route/rule/rule_set_updater_test.go | 69 +++++++++++++++++++++++++++++
+ 3 files changed, 125 insertions(+), 1 deletion(-)
+ create mode 100644 route/rule/rule_set_updater_test.go
+
+diff --git a/route/router.go b/route/router.go
+index 14cf72f98..d2d27aeef 100644
+--- a/route/router.go
++++ b/route/router.go
+@@ -234,6 +234,15 @@ func (r *Router) RuleSet(tag string) (adapter.RuleSet, bool) {
+ 	return ruleSet, loaded
+ }
+ 
++// UpdateRuleSets updates the remote rule-sets now instead of at their update_interval and
++// returns what that came to. With no remote rule-set there is nothing to do.
++func (r *Router) UpdateRuleSets(ctx context.Context) (R.RuleSetUpdateSummary, error) {
++	if r.ruleSetUpdater == nil {
++		return R.RuleSetUpdateSummary{}, nil
++	}
++	return r.ruleSetUpdater.UpdateNow(ctx)
++}
++
+ func (r *Router) Rules() []adapter.Rule {
+ 	return r.rules
+ }
+diff --git a/route/rule/rule_set_updater.go b/route/rule/rule_set_updater.go
+index f2eaa91a7..8dfa00068 100644
+--- a/route/rule/rule_set_updater.go
++++ b/route/rule/rule_set_updater.go
+@@ -12,6 +12,18 @@ type RuleSetUpdater struct {
+ 	ctx      context.Context
+ 	cancel   context.CancelFunc
+ 	ruleSets []*RemoteRuleSet
++	// requests are updates asked for now, each with where to answer
++	requests chan chan RuleSetUpdateSummary
++}
++
++// RuleSetUpdateSummary is what an update of the remote rule-sets came to.
++type RuleSetUpdateSummary struct {
++	// Total is the number of remote rule-sets.
++	Total int
++	// Loaded is how many of them got a new list.
++	Loaded int
++	// Failed is how many could not be downloaded or read.
++	Failed int
+ }
+ 
+ func NewRuleSetUpdater(ctx context.Context, ruleSets []adapter.RuleSet) *RuleSetUpdater {
+@@ -30,6 +42,7 @@ func NewRuleSetUpdater(ctx context.Context, ruleSets []adapter.RuleSet) *RuleSet
+ 		ctx:      ctx,
+ 		cancel:   cancel,
+ 		ruleSets: remoteRuleSets,
++		requests: make(chan chan RuleSetUpdateSummary),
+ 	}
+ }
+ 
+@@ -42,6 +55,28 @@ func (u *RuleSetUpdater) Close() error {
+ 	return nil
+ }
+ 
++// UpdateNow updates every remote rule-set at once, whatever its update_interval, and
++// returns what that came to. The update runs where the scheduled ones run, one rule-set
++// after another; the next scheduled update of each is counted from now.
++func (u *RuleSetUpdater) UpdateNow(ctx context.Context) (RuleSetUpdateSummary, error) {
++	reply := make(chan RuleSetUpdateSummary, 1)
++	select {
++	case u.requests <- reply:
++	case <-u.ctx.Done():
++		return RuleSetUpdateSummary{}, u.ctx.Err()
++	case <-ctx.Done():
++		return RuleSetUpdateSummary{}, ctx.Err()
++	}
++	select {
++	case summary := <-reply:
++		return summary, nil
++	case <-u.ctx.Done():
++		return RuleSetUpdateSummary{}, u.ctx.Err()
++	case <-ctx.Done():
++		return RuleSetUpdateSummary{}, ctx.Err()
++	}
++}
++
+ func (u *RuleSetUpdater) loopUpdate() {
+ 	nextUpdates := make([]time.Time, len(u.ruleSets))
+ 	retryDelays := make([]time.Duration, len(u.ruleSets))
+@@ -51,19 +86,27 @@ func (u *RuleSetUpdater) loopUpdate() {
+ 	timer := time.NewTimer(0)
+ 	defer timer.Stop()
+ 	for {
++		// an update asked for now takes every rule-set, due or not
++		var reply chan RuleSetUpdateSummary
+ 		select {
+ 		case <-u.ctx.Done():
+ 			return
+ 		case <-timer.C:
++		case reply = <-u.requests:
+ 		}
+ 		now := time.Now()
+ 		var loaded bool
++		summary := RuleSetUpdateSummary{Total: len(u.ruleSets)}
+ 		for i, ruleSet := range u.ruleSets {
+-			if now.Before(nextUpdates[i]) {
++			if reply == nil && now.Before(nextUpdates[i]) {
+ 				continue
+ 			}
++			failures := ruleSet.failures
+ 			if ruleSet.updateOnce() {
+ 				loaded = true
++				summary.Loaded++
++			} else if ruleSet.failures > failures {
++				summary.Failed++
+ 			}
+ 			nextUpdates[i] = now.Add(ruleSet.updateInterval)
+ 			if ruleSet.startedEmpty {
+@@ -78,6 +121,9 @@ func (u *RuleSetUpdater) loopUpdate() {
+ 				}
+ 			}
+ 		}
++		if reply != nil {
++			reply <- summary
++		}
+ 		// the old list is garbage once a new one is loaded; a failed or not-modified
+ 		// update leaves nothing to collect
+ 		if loaded {
+diff --git a/route/rule/rule_set_updater_test.go b/route/rule/rule_set_updater_test.go
+new file mode 100644
+index 000000000..63e8b198d
+--- /dev/null
++++ b/route/rule/rule_set_updater_test.go
+@@ -0,0 +1,69 @@
++package rule
++
++import (
++	"context"
++	"io"
++	"net/http"
++	"net/http/httptest"
++	"sync/atomic"
++	"testing"
++	"time"
++
++	"github.com/sagernet/sing-box/adapter"
++	C "github.com/sagernet/sing-box/constant"
++
++	"github.com/stretchr/testify/require"
++)
++
++// An update asked for now takes every remote rule-set, due or not, and tells how many
++// got a new list and how many failed; a scheduled update is not made earlier by it.
++func TestRuleSetUpdaterUpdateNow(t *testing.T) {
++	var served atomic.Int32
++	good := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		served.Add(1)
++		io.WriteString(w, testSourceSet)
++	}))
++	defer good.Close()
++	bad := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		http.Error(w, "gone", http.StatusNotFound)
++	}))
++	defer bad.Close()
++
++	ctx, cancel := context.WithCancel(context.Background())
++	defer cancel()
++	sets := make([]adapter.RuleSet, 2)
++	for index, url := range []string{good.URL, bad.URL} {
++		set := newTestRuleSet(url)
++		set.ctx = ctx
++		set.options.Format = C.RuleSetFormatSource
++		// downloaded a moment ago: not due for an hour
++		set.updateInterval = time.Hour
++		set.lastUpdated = time.Now()
++		sets[index] = set
++	}
++	updater := NewRuleSetUpdater(ctx, sets)
++	updater.Start()
++
++	time.Sleep(100 * time.Millisecond)
++	require.Zero(t, served.Load(), "a rule-set that is not due was updated by the schedule")
++	for round := int32(1); round <= 2; round++ {
++		summary, err := updater.UpdateNow(ctx)
++		require.NoError(t, err)
++		require.Equal(t, RuleSetUpdateSummary{Total: 2, Loaded: 1, Failed: 1}, summary)
++		require.Equal(t, round, served.Load())
++	}
++	time.Sleep(100 * time.Millisecond)
++	require.EqualValues(t, 2, served.Load(), "the update asked for was followed by one more")
++
++	// one that waits is let go when the caller gives up, and when the updater is closed
++	short, stop := context.WithTimeout(context.Background(), 50*time.Millisecond)
++	defer stop()
++	require.NoError(t, updater.Close())
++	_, err := updater.UpdateNow(short)
++	require.Error(t, err)
++}
++
++// With no remote rule-set there is no updater, and nothing to wait for.
++func TestRuleSetUpdaterWithoutRemoteRuleSets(t *testing.T) {
++	require.Nil(t, NewRuleSetUpdater(context.Background(), nil))
++}
+-- 
+2.53.0
+

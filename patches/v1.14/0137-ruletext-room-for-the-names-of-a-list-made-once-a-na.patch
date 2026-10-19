@@ -1,0 +1,28 @@
+From d3f9a488d0242523cd12d4776f7943cd5eadfe39 Mon Sep 17 00:00:00 2001
+From: FiyeroT <me@fiyero.xyz>
+Date: Sun, 18 Oct 2026 14:22:57 +0300
+Subject: [PATCH 137/148] ruletext: room for the names of a list made once, a
+ name a line at most
+
+---
+ common/ruletext/ruletext.go | 4 ++++
+ 1 file changed, 4 insertions(+)
+
+diff --git a/common/ruletext/ruletext.go b/common/ruletext/ruletext.go
+index 9c60204b2..c3a60b642 100644
+--- a/common/ruletext/ruletext.go
++++ b/common/ruletext/ruletext.go
+@@ -53,6 +53,10 @@ func read(content []byte, build bool) (option.PlainRuleSetCompat, Skipped, error
+ 		domains  int
+ 	)
+ 	names := domainset.NewCollector(content)
++	if build {
++		// a name a line at most: room made once
++		names.Grow(bytes.Count(content, []byte{'\n'}) + 1)
++	}
+ 	seenPrefixes := make(map[string]bool)
+ 	for offset := 0; offset < len(content); {
+ 		lineStart := offset
+-- 
+2.53.0
+

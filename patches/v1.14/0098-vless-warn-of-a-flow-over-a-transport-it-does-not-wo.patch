@@ -1,0 +1,46 @@
+From 87f5058a81bb94033fa1bf7b6f4622259ae37161 Mon Sep 17 00:00:00 2001
+From: FiyeroT <me@fiyero.xyz>
+Date: Thu, 8 Oct 2026 17:43:29 +0300
+Subject: [PATCH 098/148] vless: warn of a flow over a transport it does not
+ work over
+
+With a flow, the outbound was refused over xhttp only. Over ws, grpc and http it
+starts and fails every connection ("initialize vision: not a valid supported TLS
+connection"), with nothing that points at the configuration; over httpupgrade an Xray
+server refuses the flow. One warning at start names the cause. It is not an error: a
+configuration with such an outbound starts today and must go on starting.
+---
+ protocol/vless/outbound.go | 17 +++++++++++++----
+ 1 file changed, 13 insertions(+), 4 deletions(-)
+
+diff --git a/protocol/vless/outbound.go b/protocol/vless/outbound.go
+index 786c158fc..bf11ff178 100644
+--- a/protocol/vless/outbound.go
++++ b/protocol/vless/outbound.go
+@@ -73,10 +73,19 @@ func NewOutbound(ctx context.Context, router adapter.Router, logger log.ContextL
+ 		}
+ 		outbound.tlsDialer = tls.NewDialer(outboundDialer, outbound.tlsConfig)
+ 	}
+-	if options.Flow != "" && common.PtrValueOrDefault(options.Transport).Type == C.V2RayTransportTypeXHTTP {
+-		// Vision needs the TLS connection itself; over XHTTP Xray has it only
+-		// with VLESS Encryption, which sing-box does not have (podkop-engine).
+-		return nil, E.New("flow ", options.Flow, " is not supported over the xhttp transport")
++	if options.Flow != "" {
++		switch transportType := common.PtrValueOrDefault(options.Transport).Type; transportType {
++		case C.V2RayTransportTypeXHTTP:
++			// Vision needs the TLS connection itself; over XHTTP Xray has it only
++			// with VLESS Encryption, which sing-box does not have (podkop-engine).
++			return nil, E.New("flow ", options.Flow, " is not supported over the xhttp transport")
++		case C.V2RayTransportTypeWebsocket, C.V2RayTransportTypeGRPC, C.V2RayTransportTypeHTTP:
++			// Not an error: a configuration with such an outbound starts today, with
++			// this one outbound dead, and must go on starting (podkop-engine).
++			logger.Warn("flow ", options.Flow, " does not work over the ", transportType, " transport: it needs the TLS connection itself, every connection of this outbound will fail")
++		case C.V2RayTransportTypeHTTPUpgrade:
++			logger.Warn("flow ", options.Flow, " over the httpupgrade transport is refused by Xray servers")
++		}
+ 	}
+ 	if options.Transport != nil {
+ 		outbound.transport, err = v2ray.NewClientTransport(ctx, outbound.dialer, outbound.serverAddr, common.PtrValueOrDefault(options.Transport), outbound.tlsConfig)
+-- 
+2.53.0
+

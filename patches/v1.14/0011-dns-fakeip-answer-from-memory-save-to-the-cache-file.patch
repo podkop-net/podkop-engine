@@ -1,7 +1,7 @@
-From a1130ddded3189dba22ca083aafaf351fb832c9d Mon Sep 17 00:00:00 2001
+From 016104e1a341ccc460807d129aded6cb6314f472 Mon Sep 17 00:00:00 2001
 From: FiyeroT <me@fiyero.xyz>
 Date: Fri, 2 Oct 2026 07:21:22 +0300
-Subject: [PATCH 011/125] dns/fakeip: answer from memory, save to the cache
+Subject: [PATCH 011/148] dns/fakeip: answer from memory, save to the cache
  file in the background
 
 The store asked the cache file for everything. A query for a known name and
@@ -62,14 +62,14 @@ all 100 addresses still lead to their names. A range of 29 addresses and
 ---
  dns/transport/fakeip/memory.go               |   93 --
  dns/transport/fakeip/store.go                |  990 +++++++++++++--
- dns/transport/fakeip/store_cachefile_test.go |  111 ++
+ dns/transport/fakeip/store_cachefile_test.go |  123 ++
  dns/transport/fakeip/store_clock_test.go     |   42 +
  dns/transport/fakeip/store_test.go           | 1156 ++++++++++++++++++
  experimental/cachefile/cache.go              |    3 +
  experimental/cachefile/fakeip.go             |  132 ++
- experimental/cachefile/fakeip_test.go        |  111 ++
+ experimental/cachefile/fakeip_test.go        |  123 ++
  experimental/clashapi/cache.go               |   21 +-
- 9 files changed, 2472 insertions(+), 187 deletions(-)
+ 9 files changed, 2496 insertions(+), 187 deletions(-)
  delete mode 100644 dns/transport/fakeip/memory.go
  create mode 100644 dns/transport/fakeip/store_cachefile_test.go
  create mode 100644 dns/transport/fakeip/store_clock_test.go
@@ -1245,10 +1245,10 @@ index b7c51dfa5..8c3571288 100644
  }
 diff --git a/dns/transport/fakeip/store_cachefile_test.go b/dns/transport/fakeip/store_cachefile_test.go
 new file mode 100644
-index 000000000..2038d9ca8
+index 000000000..005c4a1c1
 --- /dev/null
 +++ b/dns/transport/fakeip/store_cachefile_test.go
-@@ -0,0 +1,111 @@
+@@ -0,0 +1,123 @@
 +package fakeip
 +
 +import (
@@ -1269,18 +1269,30 @@ index 000000000..2038d9ca8
 +	"github.com/stretchr/testify/require"
 +)
 +
++// scopedCacheFile is a cache file with the scope it was started with: closing the scope
++// closes the file, as when sing-box stops.
++type scopedCacheFile struct {
++	*cachefile.CacheFile
++	scope *adapter.Scope
++}
++
++func (f *scopedCacheFile) Close() error {
++	return f.scope.Close()
++}
++
 +// startWithCacheFile starts a store on a real cache file, as sing-box does.
-+func startWithCacheFile(t *testing.T, path string) (*Store, *cachefile.CacheFile) {
++func startWithCacheFile(t *testing.T, path string) (*Store, *scopedCacheFile) {
 +	t.Helper()
 +	ctx := service.ContextWithDefaultRegistry(context.Background())
 +	cacheFile := cachefile.New(ctx, logger.NOP(), option.CacheFileOptions{Enabled: true, Path: path, StoreFakeIP: true})
-+	require.NoError(t, cacheFile.Start(adapter.StartStateInitialize))
++	scope := adapter.NewScope(ctx, logger.NOP())
++	require.NoError(t, cacheFile.Start(adapter.StartStateInitialize, scope))
 +	service.MustRegister[adapter.CacheFile](ctx, cacheFile)
 +	store := NewStore(ctx, logger.NOP(), netip.MustParsePrefix("198.18.0.0/15"), netip.Prefix{})
 +	store.manual = true
 +	require.NoError(t, store.Start())
 +	require.NotNil(t, store.storage, "the cache file keeps the table")
-+	return store, cacheFile
++	return store, &scopedCacheFile{cacheFile, scope}
 +}
 +
 +// killed copies the cache file as a killed process leaves it: no write is under way.
@@ -2571,7 +2583,7 @@ index 000000000..4c5a80c1e
 +	})
 +}
 diff --git a/experimental/cachefile/cache.go b/experimental/cachefile/cache.go
-index 0d714a602..693c56f6b 100644
+index 3cbec7347..6bcb866da 100644
 --- a/experimental/cachefile/cache.go
 +++ b/experimental/cachefile/cache.go
 @@ -7,6 +7,7 @@ import (
@@ -2590,7 +2602,7 @@ index 0d714a602..693c56f6b 100644
  	saveMetadataAccess sync.Mutex
  	saveMetadata       *adapter.FakeIPMetadata
  	saveMetadataTimer  *time.Timer
-@@ -316,6 +318,7 @@ func (c *CacheFile) resetDB(failedDB *bbolt.DB, reason any) {
+@@ -312,6 +314,7 @@ func (c *CacheFile) resetDB(failedDB *bbolt.DB, reason any) {
  		return
  	}
  	c.logger.Error("database corrupted: ", reason, ": resetting")
@@ -2752,10 +2764,10 @@ index 814c2048d..8ec7d8eaa 100644
  	err := c.batch(func(tx *bbolt.Tx) error {
 diff --git a/experimental/cachefile/fakeip_test.go b/experimental/cachefile/fakeip_test.go
 new file mode 100644
-index 000000000..2322958cb
+index 000000000..a18c89050
 --- /dev/null
 +++ b/experimental/cachefile/fakeip_test.go
-@@ -0,0 +1,111 @@
+@@ -0,0 +1,123 @@
 +package cachefile
 +
 +import (
@@ -2772,14 +2784,26 @@ index 000000000..2322958cb
 +	"github.com/stretchr/testify/require"
 +)
 +
-+func openTestCacheFile(t *testing.T, path string) *CacheFile {
-+	t.Helper()
-+	cacheFile := New(context.Background(), logger.NOP(), option.CacheFileOptions{Enabled: true, Path: path, StoreFakeIP: true})
-+	require.NoError(t, cacheFile.Start(adapter.StartStateInitialize))
-+	return cacheFile
++// testCacheFile is a cache file with the scope it was started with: closing the scope
++// closes the file, as when sing-box stops.
++type testCacheFile struct {
++	*CacheFile
++	scope *adapter.Scope
 +}
 +
-+func loadTable(t *testing.T, cacheFile *CacheFile, refuse ...netip.Addr) (map[netip.Addr]string, *adapter.FakeIPMetadata, bool) {
++func (f *testCacheFile) Close() error {
++	return f.scope.Close()
++}
++
++func openTestCacheFile(t *testing.T, path string) *testCacheFile {
++	t.Helper()
++	cacheFile := New(context.Background(), logger.NOP(), option.CacheFileOptions{Enabled: true, Path: path, StoreFakeIP: true})
++	scope := adapter.NewScope(context.Background(), logger.NOP())
++	require.NoError(t, cacheFile.Start(adapter.StartStateInitialize, scope))
++	return &testCacheFile{cacheFile, scope}
++}
++
++func loadTable(t *testing.T, cacheFile *testCacheFile, refuse ...netip.Addr) (map[netip.Addr]string, *adapter.FakeIPMetadata, bool) {
 +	t.Helper()
 +	table := make(map[netip.Addr]string)
 +	metadata, clean, err := cacheFile.FakeIPLoadTable(func(address netip.Addr, domain string) bool {
