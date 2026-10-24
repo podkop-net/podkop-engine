@@ -11,7 +11,6 @@ DIST=${1:?dir with packages}; shift
 [ $# -gt 0 ] || set -- $LINES
 newest=$(echo $LINES | tr ' ' '\n' | sort -V | tail -1)
 repo=${GH_REPO:?GH_REPO=owner/repo}
-url="https://github.com/$repo/releases/download"
 
 for LINE in "$@"; do
   key=$(echo "$LINE" | tr . _)
@@ -65,13 +64,15 @@ fi)
 OpenWrt 24.10 и старше (opkg):
 \`\`\`sh
 # podkop-engine-full: то же с именем файла podkop-engine-full_${v}-r${r}_openwrt_<pkgarch>.ipk
-wget -O /tmp/pe.ipk $url/$tag/${f}_<pkgarch>.ipk && { opkg remove --force-depends sing-box sing-box-tiny 2>/dev/null; opkg install /tmp/pe.ipk; }
+n=${f}_<pkgarch>.ipk; u=\$(wget -qO- https://api.github.com/repos/$repo/releases/tags/$tag | jsonfilter -e "@.assets[@.name='\$n'].url") && wget -O /tmp/pe.ipk --header='Accept: application/octet-stream' "\$u" && { opkg remove --force-depends sing-box sing-box-tiny 2>/dev/null; opkg install /tmp/pe.ipk; }
 \`\`\`
 OpenWrt 25.12 и snapshot (apk):
 \`\`\`sh
 # podkop-engine-full: то же с именем файла podkop-engine-full_${v}-r${r}_openwrt_<pkgarch>.apk
-wget -O /tmp/pe.apk $url/$tag/${f}_<pkgarch>.apk && apk add --allow-untrusted /tmp/pe.apk
+n=${f}_<pkgarch>.apk; u=\$(wget -qO- https://api.github.com/repos/$repo/releases/tags/$tag | jsonfilter -e "@.assets[@.name='\$n'].url") && wget -O /tmp/pe.apk --header='Accept: application/octet-stream' "\$u" && apk add --allow-untrusted /tmp/pe.apk
 \`\`\`
+
+Файл берётся через API GitHub: wget в OpenWrt (uclient-fetch) не дочитывает ответ github.com на прямую ссылку скачивания (строка заголовка 9 КБ при его пределе 4 КБ) и висит до таймаута.
 
 Архитектуры ($n_ipk ipk, $n_apk apk): $arches
 
