@@ -13,7 +13,6 @@
 set -eu
 PKG=${PKG:-podkop-engine}
 PODKOP_VERSION=${PODKOP_VERSION:-0.7.22}
-REL=https://github.com/itdoginfo/podkop/releases/download/$PODKOP_VERSION
 fail() { echo "FAIL: $*"; exit 1; }
 # The package feed and GitHub drop a download now and then (podkop pulls a dozen packages
 # from the feed): what needs the network is tried up to four times, lists updated between.
@@ -26,19 +25,28 @@ retry() {
   done
 }
 mkdir -p /var/lock /tmp/pk
+# podkop of the release: from /pk when the caller put it there (CI takes it with curl on the
+# runner), else through the API of GitHub. The wget of OpenWrt (uclient-fetch) cannot read the
+# answer of github.com to a download address: a header line of 9 KB, over its 4 KB, and it
+# waits for its timeout; the answers of api.github.com are short.
+podkop_file() { # name destination
+  if [ -f "/pk/$1" ]; then cp "/pk/$1" "$2"; return; fi
+  url=$(wget -q -O - "https://api.github.com/repos/itdoginfo/podkop/releases/tags/$PODKOP_VERSION" | jsonfilter -e "@.assets[@.name=\"$1\"].url")
+  [ -n "$url" ] && wget -q -O "$2" --header='Accept: application/octet-stream' "$url"
+}
 
 if command -v apk >/dev/null 2>&1; then
   pkg=$(ls /pkgs/${PKG}_*.apk 2>/dev/null | head -1); [ -n "$pkg" ] || fail "no $PKG .apk in /pkgs"
   retry apk update -q || fail "apk update"
   retry apk add -q --allow-untrusted "$pkg" || fail "apk add $PKG"
-  retry wget -q -O /tmp/pk/podkop.apk "$REL/podkop-$PODKOP_VERSION-r1.apk" || fail "download of podkop"
+  retry podkop_file "podkop-$PODKOP_VERSION-r1.apk" /tmp/pk/podkop.apk || fail "download of podkop"
   retry apk add -q --allow-untrusted /tmp/pk/podkop.apk || fail "apk add podkop"
   apk list -I 2>/dev/null | grep -E '^(podkop|sing-box)' || true
 else
   pkg=$(ls /pkgs/${PKG}_*.ipk 2>/dev/null | head -1); [ -n "$pkg" ] || fail "no $PKG .ipk in /pkgs"
   retry opkg update >/dev/null 2>&1 || fail "opkg update"
   retry opkg install "$pkg" >/tmp/pk/opkg.log 2>&1 || { cat /tmp/pk/opkg.log; fail "opkg install $PKG"; }
-  retry wget -q -O /tmp/pk/podkop.ipk "$REL/podkop-v$PODKOP_VERSION-r1-all.ipk" || fail "download of podkop"
+  retry podkop_file "podkop-v$PODKOP_VERSION-r1-all.ipk" /tmp/pk/podkop.ipk || fail "download of podkop"
   retry opkg install /tmp/pk/podkop.ipk >/tmp/pk/opkg.log 2>&1 || { cat /tmp/pk/opkg.log; fail "opkg install podkop"; }
   opkg list-installed | grep -E '^(podkop|sing-box)' || true
 fi

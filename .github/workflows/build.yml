@@ -86,13 +86,19 @@ jobs:
           path: pkgs
       - name: Install into OpenWrt + podkop config check
         run: |
+          # podkop of the check taken here and put into the container: the wget of OpenWrt cannot
+          # read the answer of github.com to a download address (a header line of 9 KB)
+          pv=$(sed -n 's/^PODKOP_VERSION=\${PODKOP_VERSION:-\(.*\)}$/\1/p' lab/pkg-test.sh)
+          if [ "${{ matrix.format }}" = ipk ]; then f=podkop-v$pv-r1-all.ipk; else f=podkop-$pv-r1.apk; fi
+          mkdir -p pk
+          curl -fsSL --retry 4 -o "pk/$f" "https://github.com/itdoginfo/podkop/releases/download/$pv/$f"
           for line in ${{ inputs.lines }}; do
             v=$(. ./versions.env; eval echo "\$SB_$(echo $line | tr . _)_VERSION")
             for pkg in podkop-engine podkop-engine-full; do
               ls pkgs/"$pkg"_"$v"-* >/dev/null 2>&1 || continue
               mkdir -p "one/$line-$pkg" && cp pkgs/"$pkg"_"$v"-* "one/$line-$pkg/"
               echo "::group::$line $pkg"
-              docker run --rm -e PKG="$pkg" -v "$PWD/one/$line-$pkg:/pkgs:ro" -v "$PWD/lab/podkop-check:/t:ro" -v "$PWD/lab:/lab:ro" \
+              docker run --rm -e PKG="$pkg" -v "$PWD/one/$line-$pkg:/pkgs:ro" -v "$PWD/lab/podkop-check:/t:ro" -v "$PWD/lab:/lab:ro" -v "$PWD/pk:/pk:ro" \
                 "${{ matrix.rootfs }}" sh /lab/pkg-test.sh
               echo "::endgroup::"
             done
