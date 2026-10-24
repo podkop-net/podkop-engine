@@ -1,7 +1,7 @@
 From c0432109b0cd4665d9de57593c5375d764ec8212 Mon Sep 17 00:00:00 2001
 From: FiyeroT <me@fiyero.xyz>
 Date: Sat, 10 Oct 2026 20:48:31 +0300
-Subject: [PATCH 127/140] xhttp: the test of oversized upload headers no longer
+Subject: [PATCH 127/147] xhttp: the test of oversized upload headers no longer
  races the server's settings
 
 TestXHTTPHeadersTooLarge wrote 16 KiB right after the dial and expected the

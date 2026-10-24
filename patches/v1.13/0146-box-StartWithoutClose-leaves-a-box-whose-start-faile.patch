@@ -1,0 +1,47 @@
+From 7db6b1ec2dcb407da91c2667198b8f38581bf71b Mon Sep 17 00:00:00 2001
+From: FiyeroT <me@fiyero.xyz>
+Date: Sat, 24 Oct 2026 09:41:46 +0300
+Subject: [PATCH 146/147] box: StartWithoutClose leaves a box whose start
+ failed to its caller
+
+Start closes a box whose start failed at once, so a component whose Close
+does not return holds Start with it. StartWithoutClose returns the error
+and leaves the box as it is: the caller closes it with a bound of its own
+(the Go backend of podkop ends its process when the close does not come).
+---
+ box.go | 12 +++++++++++-
+ 1 file changed, 11 insertions(+), 1 deletion(-)
+
+diff --git a/box.go b/box.go
+index 1c818008e..e3e855518 100644
+--- a/box.go
++++ b/box.go
+@@ -428,7 +428,7 @@ func (s *Box) PreStart() error {
+ }
+ 
+ func (s *Box) Start() error {
+-	err := s.start()
++	err := s.StartWithoutClose()
+ 	if err != nil {
+ 		// TODO: remove catch error
+ 		defer func() {
+@@ -440,6 +440,16 @@ func (s *Box) Start() error {
+ 			}
+ 		}()
+ 		s.Close()
++	}
++	return err
++}
++
++// StartWithoutClose is Start that leaves a box whose start failed as it is: the caller
++// closes it, and may bound how long that takes (podkop-engine). Start closes it at once,
++// and a component whose Close does not return holds Start with it.
++func (s *Box) StartWithoutClose() error {
++	err := s.start()
++	if err != nil {
+ 		return err
+ 	}
+ 	s.logger.Info("sing-box started (", F.Seconds(time.Since(s.createdAt).Seconds()), "s)")
+-- 
+2.53.0
+

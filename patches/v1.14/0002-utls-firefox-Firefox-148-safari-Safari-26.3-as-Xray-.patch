@@ -1,7 +1,7 @@
 From 7a7db6669ba7ca1dcbfb8d26000203e4e6affd19 Mon Sep 17 00:00:00 2001
 From: FiyeroT <me@fiyero.xyz>
 Date: Sat, 26 Sep 2026 20:36:22 +0300
-Subject: [PATCH 002/148] utls: firefox -> Firefox 148, safari -> Safari 26.3
+Subject: [PATCH 002/155] utls: firefox -> Firefox 148, safari -> Safari 26.3
  (as Xray-core)
 
 metacubex/utls Firefox 120 and Safari 16.0 carry no X25519MLKEM768 key share,

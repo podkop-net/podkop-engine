@@ -1,7 +1,7 @@
 From cb585b7f3bd16652b221b21874f96a0f1b388228 Mon Sep 17 00:00:00 2001
 From: FiyeroT <me@fiyero.xyz>
 Date: Sat, 10 Oct 2026 17:59:40 +0300
-Subject: [PATCH 125/140] go.mod: sing-quic from a fork with the input
+Subject: [PATCH 125/147] go.mod: sing-quic from a fork with the input
  validation of UDP packets
 
 Two upstream commits on top of the version this line pins, f693b76 and e702a73

@@ -1,7 +1,7 @@
 From f53702490efc95383c433322d538592eb00b67dd Mon Sep 17 00:00:00 2001
 From: FiyeroT <me@fiyero.xyz>
 Date: Mon, 19 Oct 2026 22:59:58 +0300
-Subject: [PATCH 139/140] domainset: the build of sorted keys refuses what
+Subject: [PATCH 139/147] domainset: the build of sorted keys refuses what
  stops sing's build
 
 The legacy way of rule sets of version 1, and a list with a name that is

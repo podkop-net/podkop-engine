@@ -1,7 +1,7 @@
 From 15042ba947c79523ad51ff9e64f9ed1d78c85e9c Mon Sep 17 00:00:00 2001
 From: FiyeroT <me@fiyero.xyz>
 Date: Fri, 9 Oct 2026 16:15:04 +0300
-Subject: [PATCH 106/140] reality: refuse a short_id longer than it can be
+Subject: [PATCH 106/147] reality: refuse a short_id longer than it can be
 
 The short id is decoded into eight bytes with hex.Decode, which writes
 past a destination shorter than what it is given, and its length was

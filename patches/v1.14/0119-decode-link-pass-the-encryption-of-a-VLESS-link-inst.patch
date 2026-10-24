@@ -1,7 +1,7 @@
 From 1b97d216cefa111a14017d36fabcf2eb7f7a7dca Mon Sep 17 00:00:00 2001
 From: FiyeroT <me@fiyero.xyz>
 Date: Sat, 10 Oct 2026 15:33:14 +0300
-Subject: [PATCH 119/148] decode-link: pass the encryption of a VLESS link
+Subject: [PATCH 119/155] decode-link: pass the encryption of a VLESS link
  instead of refusing it
 
 The parameter "encryption" of a link becomes the option of the outbound when it is a

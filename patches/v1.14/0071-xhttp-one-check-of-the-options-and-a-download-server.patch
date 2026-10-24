@@ -1,7 +1,7 @@
 From 3b6d8eb2d02140b0874e50a318fe476cb430c081 Mon Sep 17 00:00:00 2001
 From: FiyeroT <me@fiyero.xyz>
 Date: Tue, 6 Oct 2026 23:57:23 +0300
-Subject: [PATCH 071/148] xhttp: one check of the options, and a download
+Subject: [PATCH 071/155] xhttp: one check of the options, and a download
  server needs its port
 
 CheckOptions, which the decoder of share links calls, repeated the validation of

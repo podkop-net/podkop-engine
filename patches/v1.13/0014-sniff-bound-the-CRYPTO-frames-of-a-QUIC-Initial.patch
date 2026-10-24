@@ -1,7 +1,7 @@
 From 0f6fc2fb2c272da0d8b7ec0a7de91d7355e5100d Mon Sep 17 00:00:00 2001
 From: FiyeroT <me@fiyero.xyz>
 Date: Sat, 3 Oct 2026 11:27:48 +0300
-Subject: [PATCH 014/140] sniff: bound the CRYPTO frames of a QUIC Initial
+Subject: [PATCH 014/147] sniff: bound the CRYPTO frames of a QUIC Initial
 
 The QUIC sniffer runs on every QUIC datagram of the inbounds it is set on.
 A crafted Initial could:

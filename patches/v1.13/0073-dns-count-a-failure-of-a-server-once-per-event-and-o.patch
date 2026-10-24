@@ -1,7 +1,7 @@
 From 2bb5e271b7b4dbed1377fde130bc7ac47d51bcb7 Mon Sep 17 00:00:00 2001
 From: FiyeroT <me@fiyero.xyz>
 Date: Tue, 6 Oct 2026 23:34:39 +0300
-Subject: [PATCH 073/140] dns: count a failure of a server once per event, and
+Subject: [PATCH 073/147] dns: count a failure of a server once per event, and
  only for names the provider resolved
 
 The fallback counted against the server every query that failed and was then answered by

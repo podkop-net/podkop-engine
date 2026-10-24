@@ -1,7 +1,7 @@
 From 83bc25de487d3c270a74e28795f9b7ef424e7b3d Mon Sep 17 00:00:00 2001
 From: FiyeroT <me@fiyero.xyz>
 Date: Tue, 6 Oct 2026 23:38:38 +0300
-Subject: [PATCH 075/148] dns: read the provider's servers again after a miss
+Subject: [PATCH 075/155] dns: read the provider's servers again after a miss
  at most once in 30 s
 
 When none of the provider's servers answered and the query still had time, that is after

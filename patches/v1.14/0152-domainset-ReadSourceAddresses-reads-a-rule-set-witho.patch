@@ -1,0 +1,213 @@
+From a7a2d572cab7cf9b1c9ffd16f1ba29a050717c60 Mon Sep 17 00:00:00 2001
+From: FiyeroT <me@fiyero.xyz>
+Date: Sat, 24 Oct 2026 09:39:26 +0300
+Subject: [PATCH 152/155] domainset: ReadSourceAddresses reads a rule set
+ without building its names
+
+For those who want the addresses of a rule set of the source format and
+the shape of its rules, not its matcher (the Go backend of podkop makes
+the sets of its firewall of them): the names of domain and domain_suffix
+are counted and the first three of each kept as the lists of the rule,
+the trie is not built. Everything else is read as ReadSource reads it.
+A list of 300000 names: 6 ms and under 1 KB, against 72 ms and 22 MB.
+---
+ common/domainset/addresses_test.go | 79 ++++++++++++++++++++++++++++++
+ common/domainset/source.go         | 72 +++++++++++++++++++++++----
+ 2 files changed, 141 insertions(+), 10 deletions(-)
+ create mode 100644 common/domainset/addresses_test.go
+
+diff --git a/common/domainset/addresses_test.go b/common/domainset/addresses_test.go
+new file mode 100644
+index 000000000..e8c385728
+--- /dev/null
++++ b/common/domainset/addresses_test.go
+@@ -0,0 +1,79 @@
++package domainset
++
++import (
++	"math/rand"
++	"net/netip"
++	"testing"
++
++	"github.com/sagernet/sing-box/common/cidrset"
++
++	"github.com/stretchr/testify/require"
++)
++
++func prefixesOf(set *cidrset.Set) []netip.Prefix {
++	if set == nil {
++		return nil
++	}
++	return set.Prefixes()
++}
++
++// ReadSourceAddresses reads what ReadSource reads but the trie: the same rules with the
++// same sets of addresses and fields, and the first three names of each domain list.
++func TestReadSourceAddressesSameAsReadSource(t *testing.T) {
++	random := rand.New(rand.NewSource(7))
++	for index := range 20000 {
++		g := sourceText{random: random, names: 4}
++		if index%100 == 0 {
++			g.names = 200
++		}
++		text := []byte(g.set())
++		full, fullErr := ReadSource(text)
++		fast, fastErr := ReadSourceAddresses(text)
++		if fullErr != nil {
++			require.Error(t, fastErr, "%s", text)
++			continue
++		}
++		require.NoError(t, fastErr, "%s", text)
++		require.Equal(t, len(full.Options.Rules), len(fast.Options.Rules), "%s", text)
++		for rule := range full.Options.Rules {
++			mine, theirs := fast.Options.Rules[rule].DefaultOptions, full.Options.Rules[rule].DefaultOptions
++			require.Nil(t, mine.DomainSet)
++			if set := theirs.DomainSet; set != nil {
++				require.True(t, len(mine.Domain)+len(mine.DomainSuffix) > 0, "%s", text)
++				require.LessOrEqual(t, len(mine.Domain), 3)
++				require.LessOrEqual(t, len(mine.DomainSuffix), 3)
++			} else {
++				require.Equal(t, theirs.Domain, mine.Domain, "%s", text)
++				require.Equal(t, theirs.DomainSuffix, mine.DomainSuffix, "%s", text)
++			}
++			mine.Domain, mine.DomainSuffix, mine.DomainSet = nil, nil, nil
++			theirs.Domain, theirs.DomainSuffix, theirs.DomainSet = nil, nil, nil
++			require.Equal(t, prefixesOf(theirs.IPRanges), prefixesOf(mine.IPRanges), "%s", text)
++			require.Equal(t, prefixesOf(theirs.SourceIPRanges), prefixesOf(mine.SourceIPRanges), "%s", text)
++			mine.IPRanges, mine.SourceIPRanges, theirs.IPRanges, theirs.SourceIPRanges = nil, nil, nil, nil
++			require.Equal(t, theirs, mine, "%s", text)
++			require.Equal(t, full.Options.Rules[rule].Type, fast.Options.Rules[rule].Type)
++		}
++	}
++}
++
++// What reading a list of names costs when only its addresses are wanted.
++func BenchmarkReadSourceAddresses(b *testing.B) {
++	text := sourceList(300000)
++	b.Run("ReadSource", func(b *testing.B) {
++		b.ReportAllocs()
++		for range b.N {
++			if _, err := ReadSource(text); err != nil {
++				b.Fatal(err)
++			}
++		}
++	})
++	b.Run("ReadSourceAddresses", func(b *testing.B) {
++		b.ReportAllocs()
++		for range b.N {
++			if _, err := ReadSourceAddresses(text); err != nil {
++				b.Fatal(err)
++			}
++		}
++	})
++}
+diff --git a/common/domainset/source.go b/common/domainset/source.go
+index 4b24f2380..b271d779b 100644
+--- a/common/domainset/source.go
++++ b/common/domainset/source.go
+@@ -66,14 +66,27 @@ var (
+ 	foldNames = append(fieldNames[:], "type")
+ )
+ 
++// ReadSourceAddresses is ReadSource for those who want the addresses of a rule set and the
++// shape of its rules, not its matcher: the names of domain and domain_suffix are counted,
++// not gathered, and a rule keeps the first three of each as its lists (Domain,
++// DomainSuffix) in place of the trie. Everything else is read as ReadSource reads it.
++func ReadSourceAddresses(content []byte) (option.PlainRuleSetCompat, error) {
++	compat, ok := readSourceText(&reader{text: content, ctx: context.Background(), addresses: true})
++	if ok {
++		return compat, nil
++	}
++	return json.UnmarshalExtended[option.PlainRuleSetCompat](content)
++}
++
+ // reader is the text of a rule set and where it is read. It stops once ctx is done, and
+-// err tells why.
++// err tells why. addresses: the names of domains are not gathered (ReadSourceAddresses).
+ type reader struct {
+-	text  []byte
+-	at    int
+-	ctx   context.Context
+-	items int
+-	err   error
++	text      []byte
++	at        int
++	ctx       context.Context
++	items     int
++	err       error
++	addresses bool
+ }
+ 
+ // stopped tells, every stopEvery items, whether the reading is to stop.
+@@ -251,11 +264,15 @@ func (r *reader) rule() (option.HeadlessRule, bool, bool) {
+ 				seen |= 1 << field
+ 				var count int
+ 				if field == fieldDomain || field == fieldDomainSuffix {
+-					if names == nil {
+-						names = NewCollectorContext(r.ctx, r.text)
+-					}
+ 					side := field - fieldDomain
+-					count, ok = r.names(names, field == fieldDomainSuffix, &first[side])
++					if r.addresses {
++						count, ok = r.firstNames(&first[side])
++					} else {
++						if names == nil {
++							names = NewCollectorContext(r.ctx, r.text)
++						}
++						count, ok = r.names(names, field == fieldDomainSuffix, &first[side])
++					}
+ 					counts[side] = count
+ 				} else if field == fieldSourceIPCIDR || field == fieldIPCIDR {
+ 					side := field - fieldSourceIPCIDR
+@@ -332,6 +349,14 @@ func (r *reader) rule() (option.HeadlessRule, bool, bool) {
+ 		}
+ 		fields.DomainSet = set
+ 	}
++	if r.addresses {
++		if counts[0] > 0 {
++			fields.Domain = first[0]
++		}
++		if counts[1] > 0 {
++			fields.DomainSuffix = first[1]
++		}
++	}
+ 	return rule, full == 0 && restEmpty, true
+ }
+ 
+@@ -421,6 +446,33 @@ func (r *reader) names(names *Collector, suffix bool, first *[]string) (int, boo
+ 	return count, ok
+ }
+ 
++// firstNames reads a value of domain or domain_suffix without gathering it: how many names
++// there are, and the first three of them. An empty name is route/rule's to refuse, as in
++// names.
++func (r *reader) firstNames(first *[]string) (int, bool) {
++	count := 0
++	ok := r.each(func(start int, end int, plain bool) bool {
++		if start == end {
++			return false
++		}
++		count++
++		if len(*first) >= 3 {
++			return true
++		}
++		name := string(r.text[start:end])
++		if !plain {
++			var ok bool
++			name, ok = r.unquote(start, end)
++			if !ok || name == "" {
++				return false
++			}
++		}
++		*first = append(*first, name)
++		return true
++	})
++	return count, ok
++}
++
+ // cidrs reads a value of source_ip_cidr or ip_cidr into the builder: a string, an array of
+ // strings or null. A canonical IPv4 prefix is read from its text, any other by netip as
+ // NewIPCIDRItem reads it; one netip refuses is NewIPCIDRItem's to tell: the rule goes to
+-- 
+2.53.0
+

@@ -1,7 +1,7 @@
 From 6ebb13d8804f27b100da24ae138e13f103c231b3 Mon Sep 17 00:00:00 2001
 From: FiyeroT <me@fiyero.xyz>
 Date: Sun, 4 Oct 2026 08:43:17 +0300
-Subject: [PATCH 040/140] go.mod: sing-vmess v0.2.8-pdk13.2, with the upstream
+Subject: [PATCH 040/147] go.mod: sing-vmess v0.2.8-pdk13.2, with the upstream
  input validation fix
 
 The fork's tag v0.2.8-pdk13.2 adds upstream sing-vmess 9b95ab8 "Fix protocol

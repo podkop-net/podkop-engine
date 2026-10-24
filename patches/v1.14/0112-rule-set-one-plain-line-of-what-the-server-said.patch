@@ -1,7 +1,7 @@
 From 9f9ec8d3baf7f39884857f63bee4ef55d032ae04 Mon Sep 17 00:00:00 2001
 From: FiyeroT <me@fiyero.xyz>
 Date: Fri, 9 Oct 2026 16:15:04 +0300
-Subject: [PATCH 112/148] rule-set: one plain line of what the server said
+Subject: [PATCH 112/155] rule-set: one plain line of what the server said
 
 The error of a failed download quotes the beginning of the answer. It is
 written as one line of printable characters, 512 bytes at most: an HTML

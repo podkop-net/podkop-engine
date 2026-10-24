@@ -1,0 +1,58 @@
+From b4fd2d835281757ab18ed8ef2876899bd1de64df Mon Sep 17 00:00:00 2001
+From: FiyeroT <me@fiyero.xyz>
+Date: Sat, 24 Oct 2026 09:41:46 +0300
+Subject: [PATCH 145/147] cidrset: Ranges4 hands on the IPv4 ranges of a set as
+ they are kept
+
+The ranges of IPv4 of a set, packed (first address in the high 32 bits,
+last in the low ones), without a copy: for those who hand them on as they
+are, as the Go backend of podkop does to the firewall. Prefixes made them
+netip.Prefix, 32 bytes with a pointer each, against 8.
+---
+ common/cidrset/cidrset.go      | 10 ++++++++++
+ common/cidrset/cidrset_test.go | 11 +++++++++++
+ 2 files changed, 21 insertions(+)
+
+diff --git a/common/cidrset/cidrset.go b/common/cidrset/cidrset.go
+index 39d2e18a8..f2e82d432 100644
+--- a/common/cidrset/cidrset.go
++++ b/common/cidrset/cidrset.go
+@@ -130,6 +130,16 @@ func (s *Set) Ranges() []netipx.IPRange {
+ 	return ranges
+ }
+ 
++// Ranges4 are the ranges of IPv4 of the set, in order, each its first address in the high
++// 32 bits and its last in the low ones: the slice the set keeps, not a copy, for those who
++// hand the ranges on as they are (a firewall). It is not to be changed.
++func (s *Set) Ranges4() []uint64 {
++	if s == nil {
++		return nil
++	}
++	return s.v4
++}
++
+ // Prefixes are the prefixes that make up the set, in order, as netipx.IPSet.Prefixes has
+ // them.
+ func (s *Set) Prefixes() []netip.Prefix {
+diff --git a/common/cidrset/cidrset_test.go b/common/cidrset/cidrset_test.go
+index 698bf7bc3..00c71a32a 100644
+--- a/common/cidrset/cidrset_test.go
++++ b/common/cidrset/cidrset_test.go
+@@ -214,3 +214,14 @@ func BenchmarkBuild(b *testing.B) {
+ 		builder.Set("")
+ 	}
+ }
++
++// Ranges4 are the IPv4 ranges of Ranges, packed, and nothing of IPv6.
++func TestRanges4(t *testing.T) {
++	var builder Builder
++	builder.Add4(0x0a000000, 0x0affffff)
++	builder.AddPrefix(netip.MustParsePrefix("192.0.2.0/24"))
++	builder.AddPrefix(netip.MustParsePrefix("2001:db8::/32"))
++	set := builder.Set("")
++	require.Equal(t, []uint64{0x0a000000<<32 | 0x0affffff, 0xc0000200<<32 | 0xc00002ff}, set.Ranges4())
++	require.Nil(t, (*Set)(nil).Ranges4())
++}
+-- 
+2.53.0
+

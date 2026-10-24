@@ -1,7 +1,7 @@
 From 61cc82ea760d363dffc6fa61a3faae628d1cbda1 Mon Sep 17 00:00:00 2001
 From: FiyeroT <me@fiyero.xyz>
 Date: Sat, 3 Oct 2026 20:42:34 +0300
-Subject: [PATCH 032/148] box: let the Go memory limit follow the memory the
+Subject: [PATCH 032/155] box: let the Go memory limit follow the memory the
  system can still give
 
 Without a limit the collector lets the heap grow to twice its live size before

@@ -1,7 +1,7 @@
 From f8ee7cdc689b7b4e8cce5221de76580fdec254ff Mon Sep 17 00:00:00 2001
 From: FiyeroT <me@fiyero.xyz>
 Date: Thu, 8 Oct 2026 17:06:43 +0300
-Subject: [PATCH 095/148] tlsspoof: send the forged ClientHello the way the
+Subject: [PATCH 095/155] tlsspoof: send the forged ClientHello the way the
  connection goes, and nothing else
 
 On Linux:

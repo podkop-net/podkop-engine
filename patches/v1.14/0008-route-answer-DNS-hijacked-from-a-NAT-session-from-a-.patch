@@ -1,7 +1,7 @@
 From dad65335a180cb317bb23eb5e664a160195eccef Mon Sep 17 00:00:00 2001
 From: FiyeroT <me@fiyero.xyz>
 Date: Tue, 29 Sep 2026 21:16:02 +0300
-Subject: [PATCH 008/148] route: answer DNS hijacked from a NAT session from a
+Subject: [PATCH 008/155] route: answer DNS hijacked from a NAT session from a
  handler
 
 Since "Refactor UDP DNS hijack" (1.14), DNS hijacked from a UDP session

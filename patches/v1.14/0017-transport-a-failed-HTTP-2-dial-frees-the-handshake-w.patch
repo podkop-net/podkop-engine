@@ -1,7 +1,7 @@
 From c3088a486025b8a30df631bc2f9b011529e2de70 Mon Sep 17 00:00:00 2001
 From: FiyeroT <me@fiyero.xyz>
 Date: Sat, 3 Oct 2026 11:27:47 +0300
-Subject: [PATCH 017/148] transport: a failed HTTP/2 dial frees the handshake
+Subject: [PATCH 017/155] transport: a failed HTTP/2 dial frees the handshake
  write, with its error
 
 The gRPC-lite and HTTP/2 transports send the request body through a pipe

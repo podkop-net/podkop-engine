@@ -1,7 +1,7 @@
 From 11e06dfd75aa892dd77f0ce286c3d9264f23e69d Mon Sep 17 00:00:00 2001
 From: FiyeroT <me@fiyero.xyz>
 Date: Mon, 5 Oct 2026 12:48:02 +0300
-Subject: [PATCH 050/140] xhttp: do not cancel packet-up uploads with their
+Subject: [PATCH 050/147] xhttp: do not cancel packet-up uploads with their
  session
 
 net/http hands an HTTP/1.1 connection back to its pool before it delivers a

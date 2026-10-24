@@ -1,7 +1,7 @@
 From 24293dc15f376f18c62a57a1c12749bd46ceb433 Mon Sep 17 00:00:00 2001
 From: FiyeroT <me@fiyero.xyz>
 Date: Tue, 6 Oct 2026 23:57:40 +0300
-Subject: [PATCH 082/148] sniff: log the stack of a panicking sniffer once a
+Subject: [PATCH 082/155] sniff: log the stack of a panicking sniffer once a
  minute, not per connection
 
 A sniffer that panics is recovered, and the error returned carried the whole stack in its

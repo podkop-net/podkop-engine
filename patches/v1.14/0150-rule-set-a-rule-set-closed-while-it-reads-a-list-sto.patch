@@ -1,0 +1,496 @@
+From 7141259fa44b08286b3decfb2d9fd3f9fa31e235 Mon Sep 17 00:00:00 2001
+From: FiyeroT <me@fiyero.xyz>
+Date: Sat, 24 Oct 2026 09:32:35 +0300
+Subject: [PATCH 150/155] rule-set: a rule set closed while it reads a list
+ stops reading it
+
+A remote rule set checked its context before and after the parse of a
+downloaded list, not during it: a box closed meanwhile (an in-process
+reload: SIGHUP, or an apply of the Go backend of podkop) let the parse of
+a big list run to the end beside the new box, which downloads and parses
+its own. After a reboot every list starts empty and is downloaded at
+once, five at a time: an apply then stacked full parses in memory.
+
+The readers take the context of the rule set: the source format
+(domainset.ReadSourceContext) and the text format (ruletext.ReadContext)
+look at it every 4096 items, the build of the trie every 4096 nodes, a
+binary set reads through a reader that ends with the context, and the
+rules are made one at a time. Local rule sets read so too.
+---
+ common/domainset/collector.go           | 10 +++++
+ common/domainset/source.go              | 44 +++++++++++++++++----
+ common/domainset/source_test.go         |  3 +-
+ common/domainset/stop_test.go           | 52 +++++++++++++++++++++++++
+ common/domainset/trie.go                |  7 ++++
+ common/ruletext/ruletext.go             | 23 ++++++++---
+ common/ruletext/stop_test.go            | 25 ++++++++++++
+ route/rule/rule_set_local.go            |  6 +--
+ route/rule/rule_set_remote.go           | 27 +++++++++++--
+ route/rule/rule_set_remote_stop_test.go | 48 +++++++++++++++++++++++
+ 10 files changed, 224 insertions(+), 21 deletions(-)
+ create mode 100644 common/domainset/stop_test.go
+ create mode 100644 common/ruletext/stop_test.go
+ create mode 100644 route/rule/rule_set_remote_stop_test.go
+
+diff --git a/common/domainset/collector.go b/common/domainset/collector.go
+index d4d7eb4b5..e9ee48fa8 100644
+--- a/common/domainset/collector.go
++++ b/common/domainset/collector.go
+@@ -1,6 +1,7 @@
+ package domainset
+ 
+ import (
++	"context"
+ 	"math"
+ 	"slices"
+ 	"unicode/utf8"
+@@ -61,6 +62,8 @@ type Collector struct {
+ 	refs    []ref
+ 	// the bytes of all keys, labels included: the most labels the trie can have
+ 	keyBytes int
++	// ctx stops the build of the trie once it is done (NewCollectorContext)
++	ctx context.Context
+ }
+ 
+ // NewCollector makes a collector of names found in text.
+@@ -68,6 +71,13 @@ func NewCollector(text []byte) *Collector {
+ 	return &Collector{buffers: [2][]byte{text, nil}}
+ }
+ 
++// NewCollectorContext is NewCollector whose Set and Encode stop with the error of ctx once
++// it is done: the trie of a big list is the most a rule set costs to read, and the rule
++// set may be closed meanwhile.
++func NewCollectorContext(ctx context.Context, text []byte) *Collector {
++	return &Collector{buffers: [2][]byte{text, nil}, ctx: ctx}
++}
++
+ // Len is the number of names gathered, repeated ones included.
+ func (c *Collector) Len() int {
+ 	return len(c.refs)
+diff --git a/common/domainset/source.go b/common/domainset/source.go
+index ce2310945..4b24f2380 100644
+--- a/common/domainset/source.go
++++ b/common/domainset/source.go
+@@ -32,7 +32,17 @@ import (
+ // when the shape of the set is as above, or the whole text. So does any error: the error
+ // is then sing-box's own.
+ func ReadSource(content []byte) (option.PlainRuleSetCompat, error) {
+-	compat, ok := readSource(content)
++	return ReadSourceContext(context.Background(), content)
++}
++
++// ReadSourceContext is ReadSource that stops with the error of ctx once it is done: a rule
++// set closed while it reads a big list does not read it to the end. The decoding of
++// sing-box, for a text of another shape, is not stopped.
++func ReadSourceContext(ctx context.Context, content []byte) (option.PlainRuleSetCompat, error) {
++	compat, ok, err := readSource(ctx, content)
++	if err != nil {
++		return compat, err
++	}
+ 	if ok {
+ 		return compat, nil
+ 	}
+@@ -56,15 +66,33 @@ var (
+ 	foldNames = append(fieldNames[:], "type")
+ )
+ 
+-// reader is the text of a rule set and where it is read.
++// reader is the text of a rule set and where it is read. It stops once ctx is done, and
++// err tells why.
+ type reader struct {
+-	text []byte
+-	at   int
++	text  []byte
++	at    int
++	ctx   context.Context
++	items int
++	err   error
++}
++
++// stopped tells, every stopEvery items, whether the reading is to stop.
++func (r *reader) stopped() bool {
++	r.items++
++	if r.items&stopEvery == 0 && r.ctx.Err() != nil {
++		r.err = r.ctx.Err()
++	}
++	return r.err != nil
++}
++
++func readSource(ctx context.Context, text []byte) (option.PlainRuleSetCompat, bool, error) {
++	compat, ok := readSourceText(&reader{text: text, ctx: ctx})
++	return compat, ok, ctx.Err()
+ }
+ 
+-func readSource(text []byte) (option.PlainRuleSetCompat, bool) {
++func readSourceText(r *reader) (option.PlainRuleSetCompat, bool) {
+ 	var compat option.PlainRuleSetCompat
+-	r := reader{text: text}
++	text := r.text
+ 	r.space()
+ 	begin := r.at
+ 	if !r.take('{') {
+@@ -224,7 +252,7 @@ func (r *reader) rule() (option.HeadlessRule, bool, bool) {
+ 				var count int
+ 				if field == fieldDomain || field == fieldDomainSuffix {
+ 					if names == nil {
+-						names = NewCollector(r.text)
++						names = NewCollectorContext(r.ctx, r.text)
+ 					}
+ 					side := field - fieldDomain
+ 					count, ok = r.names(names, field == fieldDomainSuffix, &first[side])
+@@ -477,7 +505,7 @@ func (r *reader) each(take func(start int, end int, plain bool) bool) bool {
+ 		}
+ 		for {
+ 			start, end, plain, ok := r.str()
+-			if !ok || !take(start, end, plain) {
++			if !ok || r.stopped() || !take(start, end, plain) {
+ 				return false
+ 			}
+ 			r.space()
+diff --git a/common/domainset/source_test.go b/common/domainset/source_test.go
+index 0d86d1c53..6b57c6521 100644
+--- a/common/domainset/source_test.go
++++ b/common/domainset/source_test.go
+@@ -2,6 +2,7 @@ package domainset
+ 
+ import (
+ 	"bytes"
++	"context"
+ 	"fmt"
+ 	"math/rand"
+ 	"net/netip"
+@@ -237,7 +238,7 @@ func written(t testing.TB, matcher interface{ Write(varbin.Writer) error }) []by
+ // whether readSource read the text.
+ func sameAsStock(t testing.TB, text []byte) bool {
+ 	stock, stockErr := json.UnmarshalExtended[option.PlainRuleSetCompat](text)
+-	fast, ok := readSource(text)
++	fast, ok, _ := readSource(context.Background(), text)
+ 	if stockErr != nil {
+ 		require.False(t, ok, "sing-box refuses it (%v), readSource read it:\n%s", stockErr, text)
+ 		return false
+diff --git a/common/domainset/stop_test.go b/common/domainset/stop_test.go
+new file mode 100644
+index 000000000..fe08c2db7
+--- /dev/null
++++ b/common/domainset/stop_test.go
+@@ -0,0 +1,52 @@
++package domainset
++
++import (
++	"context"
++	"fmt"
++	"strings"
++	"testing"
++
++	"github.com/stretchr/testify/require"
++)
++
++// bigSource is a rule set of the source format with count names in one rule.
++func bigSource(count int) []byte {
++	var text strings.Builder
++	text.WriteString(`{"version":3,"rules":[{"domain_suffix":[`)
++	for index := range count {
++		if index > 0 {
++			text.WriteByte(',')
++		}
++		fmt.Fprintf(&text, `"host%d.example%d.com"`, index, index%97)
++	}
++	text.WriteString(`]}]}`)
++	return []byte(text.String())
++}
++
++// A rule set read for a context that is done stops with its error, and is not read by
++// sing-box instead; one read for a live context is read as before.
++func TestReadSourceContextStops(t *testing.T) {
++	text := bigSource(50000)
++	done, cancel := context.WithCancel(context.Background())
++	cancel()
++	_, err := ReadSourceContext(done, text)
++	require.ErrorIs(t, err, context.Canceled)
++	compat, err := ReadSourceContext(context.Background(), text)
++	require.NoError(t, err)
++	require.NotNil(t, compat.Options.Rules[0].DefaultOptions.DomainSet)
++}
++
++// The build of the trie stops too: the names are gathered, the context ends, the set is
++// not made.
++func TestCollectorContextStops(t *testing.T) {
++	ctx, cancel := context.WithCancel(context.Background())
++	names := NewCollectorContext(ctx, nil)
++	for index := range 50000 {
++		require.NoError(t, names.AddString(fmt.Sprintf("host%d.example.com", index), true))
++	}
++	cancel()
++	_, err := names.Set("")
++	require.ErrorIs(t, err, context.Canceled)
++	_, err = NewCollectorContext(context.Background(), nil).Set("")
++	require.Error(t, err, "no domain to build")
++}
+diff --git a/common/domainset/trie.go b/common/domainset/trie.go
+index a61c6e571..370caeb03 100644
+--- a/common/domainset/trie.go
++++ b/common/domainset/trie.go
+@@ -16,6 +16,10 @@ type trie struct {
+ 	labels              []byte
+ }
+ 
++// stopEvery is how many nodes, or items read, go between two looks at the context of a
++// build: a mask, a power of two less one.
++const stopEvery = 1<<12 - 1
++
+ // smallSpan is the most keys a node parts by sorting them in place; a node of more keys
+ // counts them by their next byte.
+ const smallSpan = 24
+@@ -204,6 +208,9 @@ func (c *Collector) build() (trie, error) {
+ 			bit++
+ 			node++
+ 			start = end
++			if node&stopEvery == 0 && c.ctx != nil && c.ctx.Err() != nil {
++				return trie{}, c.ctx.Err()
++			}
+ 		}
+ 		from, to = to, from
+ 		starts, nextStarts = nextStarts, starts
+diff --git a/common/ruletext/ruletext.go b/common/ruletext/ruletext.go
+index d99b6a2b4..f453310c5 100644
+--- a/common/ruletext/ruletext.go
++++ b/common/ruletext/ruletext.go
+@@ -7,6 +7,7 @@ package ruletext
+ 
+ import (
+ 	"bytes"
++	"context"
+ 	"net/netip"
+ 	"strings"
+ 
+@@ -36,17 +37,26 @@ type Skipped struct {
+ // The domains come as the trie of the rule (DomainSet), built by common/domainset from
+ // where they are in the content: a name in lower case already is not copied.
+ func Read(content []byte) (option.PlainRuleSetCompat, Skipped, error) {
+-	return read(content, true)
++	return read(context.Background(), content, true)
++}
++
++// ReadContext is Read that stops with the error of ctx once it is done: a rule set closed
++// while it reads a big list does not read it to the end.
++func ReadContext(ctx context.Context, content []byte) (option.PlainRuleSetCompat, Skipped, error) {
++	return read(ctx, content, true)
+ }
+ 
+ // ReadAddresses is Read without the matcher of the domains, for those who want the
+ // addresses of the list and whether sing-box takes it: the domains are checked and
+ // counted, not built.
+ func ReadAddresses(content []byte) (option.PlainRuleSetCompat, Skipped, error) {
+-	return read(content, false)
++	return read(context.Background(), content, false)
+ }
+ 
+-func read(content []byte, build bool) (option.PlainRuleSetCompat, Skipped, error) {
++// stopEvery is how many lines go between two looks at the context: a mask.
++const stopEvery = 1<<12 - 1
++
++func read(ctx context.Context, content []byte, build bool) (option.PlainRuleSetCompat, Skipped, error) {
+ 	var (
+ 		skipped Skipped
+ 		domains int
+@@ -59,8 +69,11 @@ func read(content []byte, build bool) (option.PlainRuleSetCompat, Skipped, error
+ 		items        int
+ 		lines        = bytes.Count(content, []byte{'\n'}) + 1
+ 	)
+-	names := domainset.NewCollector(content)
+-	for offset := 0; offset < len(content); {
++	names := domainset.NewCollectorContext(ctx, content)
++	for offset, number := 0, 0; offset < len(content); number++ {
++		if number&stopEvery == 0 && ctx.Err() != nil {
++			return option.PlainRuleSetCompat{}, skipped, ctx.Err()
++		}
+ 		lineStart := offset
+ 		lineEnd := bytes.IndexByte(content[offset:], '\n')
+ 		if lineEnd < 0 {
+diff --git a/common/ruletext/stop_test.go b/common/ruletext/stop_test.go
+new file mode 100644
+index 000000000..e6e925255
+--- /dev/null
++++ b/common/ruletext/stop_test.go
+@@ -0,0 +1,25 @@
++package ruletext
++
++import (
++	"context"
++	"fmt"
++	"strings"
++	"testing"
++
++	"github.com/stretchr/testify/require"
++)
++
++// A text list read for a context that is done stops with its error.
++func TestReadContextStops(t *testing.T) {
++	var text strings.Builder
++	for index := range 50000 {
++		fmt.Fprintf(&text, "host%d.example.com\n", index)
++	}
++	done, cancel := context.WithCancel(context.Background())
++	cancel()
++	_, _, err := ReadContext(done, []byte(text.String()))
++	require.ErrorIs(t, err, context.Canceled)
++	compat, _, err := ReadContext(context.Background(), []byte(text.String()))
++	require.NoError(t, err)
++	require.Len(t, compat.Options.Rules, 1)
++}
+diff --git a/route/rule/rule_set_local.go b/route/rule/rule_set_local.go
+index fad1e499e..2644f725d 100644
+--- a/route/rule/rule_set_local.go
++++ b/route/rule/rule_set_local.go
+@@ -120,7 +120,7 @@ func (s *LocalRuleSet) reloadFile(path string) error {
+ 		if err != nil {
+ 			return err
+ 		}
+-		ruleSet, err = domainset.ReadSource(content)
++		ruleSet, err = domainset.ReadSourceContext(s.ctx, content)
+ 		if err != nil {
+ 			return err
+ 		}
+@@ -131,7 +131,7 @@ func (s *LocalRuleSet) reloadFile(path string) error {
+ 			return err
+ 		}
+ 		defer setFile.Close()
+-		ruleSet, err = srs.ReadSets(setFile)
++		ruleSet, err = srs.ReadSets(contextReader{s.ctx, setFile})
+ 		if err != nil {
+ 			return err
+ 		}
+@@ -140,7 +140,7 @@ func (s *LocalRuleSet) reloadFile(path string) error {
+ 		if err != nil {
+ 			return err
+ 		}
+-		ruleSet, _, err = ruletext.Read(content)
++		ruleSet, _, err = ruletext.ReadContext(s.ctx, content)
+ 		if err != nil {
+ 			return err
+ 		}
+diff --git a/route/rule/rule_set_remote.go b/route/rule/rule_set_remote.go
+index ae80497d9..0afb3a054 100644
+--- a/route/rule/rule_set_remote.go
++++ b/route/rule/rule_set_remote.go
+@@ -262,7 +262,9 @@ func (s *RemoteRuleSet) loadBytes(content []byte) error {
+ }
+ 
+ // commitBytes takes a new content without telling anyone: a download tells the callbacks
+-// once the content is in the cache file too.
++// once the content is in the cache file too. A rule set closed meanwhile stops reading it:
++// the box that replaces this one reads its own, and two reads of a big list at once are
++// the most memory an apply takes.
+ func (s *RemoteRuleSet) commitBytes(content []byte) error {
+ 	var (
+ 		ruleSet option.PlainRuleSetCompat
+@@ -270,18 +272,18 @@ func (s *RemoteRuleSet) commitBytes(content []byte) error {
+ 	)
+ 	switch s.options.Format {
+ 	case C.RuleSetFormatSource:
+-		ruleSet, err = domainset.ReadSource(content)
++		ruleSet, err = domainset.ReadSourceContext(s.ctx, content)
+ 		if err != nil {
+ 			return err
+ 		}
+ 	case C.RuleSetFormatBinary:
+-		ruleSet, err = srs.ReadSets(bytes.NewReader(content))
++		ruleSet, err = srs.ReadSets(contextReader{s.ctx, bytes.NewReader(content)})
+ 		if err != nil {
+ 			return err
+ 		}
+ 	case C.RuleSetFormatText:
+ 		var skipped ruletext.Skipped
+-		ruleSet, skipped, err = ruletext.Read(content)
++		ruleSet, skipped, err = ruletext.ReadContext(s.ctx, content)
+ 		if err != nil {
+ 			return err
+ 		}
+@@ -297,6 +299,9 @@ func (s *RemoteRuleSet) commitBytes(content []byte) error {
+ 	}
+ 	rules := make([]adapter.HeadlessRule, len(plainRuleSet.Rules))
+ 	for i, ruleOptions := range plainRuleSet.Rules {
++		if s.ctx.Err() != nil {
++			return s.ctx.Err()
++		}
+ 		rules[i], err = NewHeadlessRule(s.ctx, ruleOptions)
+ 		if err != nil {
+ 			return E.Cause(err, "parse rule_set.rules.[", i, "]")
+@@ -315,6 +320,20 @@ func (s *RemoteRuleSet) commitBytes(content []byte) error {
+ 	return nil
+ }
+ 
++// contextReader ends with the error of ctx once it is done: a rule set of the binary
++// format closed while it is read stops at the next read.
++type contextReader struct {
++	ctx    context.Context
++	reader io.Reader
++}
++
++func (r contextReader) Read(p []byte) (int, error) {
++	if err := r.ctx.Err(); err != nil {
++		return 0, err
++	}
++	return r.reader.Read(p)
++}
++
+ // notifyUpdated runs the callbacks of a new content. A download calls it once the content
+ // is saved to the cache file as well: a callback may read the set from there.
+ func (s *RemoteRuleSet) notifyUpdated() {
+diff --git a/route/rule/rule_set_remote_stop_test.go b/route/rule/rule_set_remote_stop_test.go
+new file mode 100644
+index 000000000..62c61a447
+--- /dev/null
++++ b/route/rule/rule_set_remote_stop_test.go
+@@ -0,0 +1,48 @@
++package rule
++
++import (
++	"bytes"
++	"context"
++	"fmt"
++	"strings"
++	"testing"
++
++	C "github.com/sagernet/sing-box/constant"
++	"github.com/sagernet/sing-box/option"
++
++	"github.com/stretchr/testify/require"
++)
++
++// A rule set closed while it reads a downloaded list stops reading it: the content it had
++// stays, and the error is the one of its context.
++func TestRemoteRuleSetClosedStopsReading(t *testing.T) {
++	var source, text strings.Builder
++	source.WriteString(`{"version":3,"rules":[{"domain_suffix":[`)
++	for index := range 50000 {
++		if index > 0 {
++			source.WriteByte(',')
++		}
++		fmt.Fprintf(&source, `"host%d.example.com"`, index)
++		fmt.Fprintf(&text, "host%d.example.com\n", index)
++	}
++	source.WriteString(`]}]}`)
++	for format, content := range map[string]string{C.RuleSetFormatSource: source.String(), C.RuleSetFormatText: text.String()} {
++		ctx, cancel := context.WithCancel(context.Background())
++		ruleSet := &RemoteRuleSet{ctx: ctx, tag: "big", options: option.RuleSet{Format: format}}
++		cancel()
++		require.ErrorIs(t, ruleSet.commitBytes([]byte(content)), context.Canceled, format)
++		require.Nil(t, ruleSet.rules, format)
++	}
++}
++
++func TestContextReader(t *testing.T) {
++	ctx, cancel := context.WithCancel(context.Background())
++	reader := contextReader{ctx, bytes.NewReader([]byte("abcdef"))}
++	buffer := make([]byte, 3)
++	count, err := reader.Read(buffer)
++	require.NoError(t, err)
++	require.Equal(t, 3, count)
++	cancel()
++	_, err = reader.Read(buffer)
++	require.ErrorIs(t, err, context.Canceled)
++}
+-- 
+2.53.0
+

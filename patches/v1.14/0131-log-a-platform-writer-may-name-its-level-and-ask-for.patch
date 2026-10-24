@@ -1,7 +1,7 @@
 From 69e5322b047b37fc46060651c9bd1f12f3910932 Mon Sep 17 00:00:00 2001
 From: FiyeroT <me@fiyero.xyz>
 Date: Sat, 17 Oct 2026 01:46:45 +0300
-Subject: [PATCH 131/148] log: a platform writer may name its level and ask for
+Subject: [PATCH 131/155] log: a platform writer may name its level and ask for
  no colours
 
 A platform writer was handed every entry, whatever the level of the log, so

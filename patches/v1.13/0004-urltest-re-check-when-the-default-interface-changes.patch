@@ -1,7 +1,7 @@
 From 88fd5639c0ed49c9df955e995c300cc2a35da6d5 Mon Sep 17 00:00:00 2001
 From: FiyeroT <me@fiyero.xyz>
 Date: Mon, 28 Sep 2026 08:37:30 +0300
-Subject: [PATCH 004/140] urltest: re-check when the default interface changes
+Subject: [PATCH 004/147] urltest: re-check when the default interface changes
 
 Before the first check urltest uses its first outbound, and the first check
 runs right at start. If WAN is not up yet, every outbound fails that check

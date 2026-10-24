@@ -1,7 +1,7 @@
 From a68c1260680af6b5fffe5e5ce539f74910e43818 Mon Sep 17 00:00:00 2001
 From: FiyeroT <me@fiyero.xyz>
 Date: Sat, 3 Oct 2026 11:27:47 +0300
-Subject: [PATCH 022/148] urltest: leave a member when its connections fail,
+Subject: [PATCH 022/155] urltest: leave a member when its connections fail,
  not at the next test
 
 Upstream urltest learns that a member is broken only from its periodic

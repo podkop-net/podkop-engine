@@ -1,7 +1,7 @@
 From 98565fada63dbf489d6c70083bc5f109501e099b Mon Sep 17 00:00:00 2001
 From: FiyeroT <me@fiyero.xyz>
 Date: Thu, 8 Oct 2026 15:11:05 +0300
-Subject: [PATCH 089/140] rule-set: download as an external connection
+Subject: [PATCH 089/147] rule-set: download as an external connection
 
 A urltest or selector group that switches members closes every connection
 it does not know as a routed one, whatever interrupt_exist_connections

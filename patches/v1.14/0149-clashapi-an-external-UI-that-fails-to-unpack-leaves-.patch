@@ -1,0 +1,279 @@
+From 6678b03c0edd6cac223dbf3ea73c97dd1482a179 Mon Sep 17 00:00:00 2001
+From: FiyeroT <me@fiyero.xyz>
+Date: Sat, 24 Oct 2026 07:50:13 +0300
+Subject: [PATCH 149/155] clashapi: an external UI that fails to unpack leaves
+ the one served
+
+The download of the external UI (at the start into an empty directory, and on
+POST /upgrade/ui) unpacked the archive over the files served and, when that
+failed, removed everything in the directory: an upgrade on a router with too
+little free space ("no space left on device" halfway through the 4.6 MB of
+Yacd-meta) left the dashboard empty until it was downloaded again.
+
+The archive is now unpacked into a directory of its own inside the external
+UI directory, on the same file system whether that is a mount point or a
+symbolic link, and its files replace the others only when all of them are
+there; they are moved, not copied. A failure removes only what was unpacked.
+An archive with no files, or with a path that leads out of the directory, is
+refused instead of written; one with a single file at its root no longer
+makes the unpacking panic.
+---
+ experimental/clashapi/server_resources.go     |  96 ++++++++++++-----
+ .../clashapi/server_resources_test.go         | 102 ++++++++++++++++++
+ 2 files changed, 174 insertions(+), 24 deletions(-)
+ create mode 100644 experimental/clashapi/server_resources_test.go
+
+diff --git a/experimental/clashapi/server_resources.go b/experimental/clashapi/server_resources.go
+index a5997ebea..5586632e5 100644
+--- a/experimental/clashapi/server_resources.go
++++ b/experimental/clashapi/server_resources.go
+@@ -76,11 +76,7 @@ func (s *Server) downloadExternalUI() error {
+ 	if response.StatusCode != http.StatusOK {
+ 		return E.New("download external ui failed: ", response.Status)
+ 	}
+-	err = s.downloadZIP(response.Body, s.externalUI)
+-	if err != nil {
+-		removeAllInDirectory(s.ctx, s.externalUI)
+-	}
+-	return err
++	return s.downloadZIP(response.Body, s.externalUI)
+ }
+ 
+ func (s *Server) downloadZIP(body io.Reader, output string) error {
+@@ -94,13 +90,42 @@ func (s *Server) downloadZIP(body io.Reader, output string) error {
+ 	if err != nil {
+ 		return err
+ 	}
+-	reader, err := zip.OpenReader(tempFile.Name())
++	return extractExternalUI(s.ctx, tempFile.Name(), output)
++}
++
++// externalUIStaging is the directory inside the external UI directory that an archive is
++// unpacked into before its files replace those served.
++const externalUIStaging = ".external-ui-update"
++
++// extractExternalUI unpacks the archive into a directory of its own inside output, and puts
++// what it unpacked in place of the other files of output only when all of it is there: an
++// archive that fails to unpack (no space left, a broken or an empty archive) leaves the
++// files that were served. The directory is inside output to be on its file system, a mount
++// point or a symbolic link included: the files are moved into place, not copied.
++func extractExternalUI(ctx context.Context, archive string, output string) error {
++	reader, err := zip.OpenReader(archive)
+ 	if err != nil {
+ 		return err
+ 	}
+ 	defer reader.Close()
+-	trimDir := zipIsInSingleDirectory(reader.File)
+-	for _, file := range reader.File {
++	staging := filepath.Join(output, externalUIStaging)
++	// left by an update that did not end
++	err = filemanager.RemoveAll(ctx, staging)
++	if err != nil {
++		return err
++	}
++	err = unpackZIP(ctx, reader.File, staging)
++	if err != nil {
++		filemanager.RemoveAll(ctx, staging)
++		return err
++	}
++	return replaceWithStaging(ctx, output, staging)
++}
++
++func unpackZIP(ctx context.Context, files []*zip.File, output string) error {
++	trimDir := zipIsInSingleDirectory(files)
++	var unpacked int
++	for _, file := range files {
+ 		if file.FileInfo().IsDir() {
+ 			continue
+ 		}
+@@ -108,23 +133,56 @@ func (s *Server) downloadZIP(body io.Reader, output string) error {
+ 		if trimDir {
+ 			pathElements = pathElements[1:]
+ 		}
+-		saveDirectory := output
+-		if len(pathElements) > 1 {
+-			saveDirectory = filepath.Join(saveDirectory, filepath.Join(pathElements[:len(pathElements)-1]...))
++		name := filepath.Join(pathElements...)
++		if !filepath.IsLocal(name) || pathElements[0] == externalUIStaging {
++			return E.New("invalid path in archive: ", file.Name)
+ 		}
+-		err = filemanager.MkdirAll(s.ctx, saveDirectory, 0o755)
++		savePath := filepath.Join(output, name)
++		err := filemanager.MkdirAll(ctx, filepath.Dir(savePath), 0o755)
+ 		if err != nil {
+ 			return err
+ 		}
+-		savePath := filepath.Join(saveDirectory, pathElements[len(pathElements)-1])
+-		err = downloadZIPEntry(s.ctx, file, savePath)
++		err = downloadZIPEntry(ctx, file, savePath)
+ 		if err != nil {
+ 			return err
+ 		}
++		unpacked++
++	}
++	if unpacked == 0 {
++		return E.New("no files in archive")
+ 	}
+ 	return nil
+ }
+ 
++// replaceWithStaging puts the files of staging, a directory inside directory, in place of
++// the other files of directory.
++func replaceWithStaging(ctx context.Context, directory string, staging string) error {
++	entries, err := filemanager.ReadDir(ctx, directory)
++	if err != nil {
++		return err
++	}
++	for _, entry := range entries {
++		if entry.Name() == externalUIStaging {
++			continue
++		}
++		err = filemanager.RemoveAll(ctx, filepath.Join(directory, entry.Name()))
++		if err != nil {
++			return err
++		}
++	}
++	entries, err = filemanager.ReadDir(ctx, staging)
++	if err != nil {
++		return err
++	}
++	for _, entry := range entries {
++		err = filemanager.Rename(ctx, filepath.Join(staging, entry.Name()), filepath.Join(directory, entry.Name()))
++		if err != nil {
++			return err
++		}
++	}
++	return filemanager.Remove(ctx, staging)
++}
++
+ func downloadZIPEntry(ctx context.Context, zipFile *zip.File, savePath string) error {
+ 	saveFile, err := filemanager.Create(ctx, savePath)
+ 	if err != nil {
+@@ -139,16 +197,6 @@ func downloadZIPEntry(ctx context.Context, zipFile *zip.File, savePath string) e
+ 	return common.Error(io.Copy(saveFile, reader))
+ }
+ 
+-func removeAllInDirectory(ctx context.Context, directory string) {
+-	dirEntries, err := filemanager.ReadDir(ctx, directory)
+-	if err != nil {
+-		return
+-	}
+-	for _, dirEntry := range dirEntries {
+-		filemanager.RemoveAll(ctx, filepath.Join(directory, dirEntry.Name()))
+-	}
+-}
+-
+ func zipIsInSingleDirectory(files []*zip.File) bool {
+ 	var singleDirectory string
+ 	for _, file := range files {
+diff --git a/experimental/clashapi/server_resources_test.go b/experimental/clashapi/server_resources_test.go
+new file mode 100644
+index 000000000..893589ca9
+--- /dev/null
++++ b/experimental/clashapi/server_resources_test.go
+@@ -0,0 +1,102 @@
++package clashapi
++
++import (
++	"archive/zip"
++	"context"
++	"os"
++	"path/filepath"
++	"sort"
++	"strings"
++	"testing"
++
++	"github.com/stretchr/testify/require"
++)
++
++func writeArchive(t *testing.T, files ...string) string {
++	t.Helper()
++	path := filepath.Join(t.TempDir(), "ui.zip")
++	file, err := os.Create(path)
++	require.NoError(t, err)
++	writer := zip.NewWriter(file)
++	for _, name := range files {
++		entry, err := writer.Create(name)
++		require.NoError(t, err)
++		if !strings.HasSuffix(name, "/") {
++			_, err = entry.Write([]byte("new " + name))
++			require.NoError(t, err)
++		}
++	}
++	require.NoError(t, writer.Close())
++	require.NoError(t, file.Close())
++	return path
++}
++
++func listFiles(t *testing.T, directory string) []string {
++	t.Helper()
++	var files []string
++	err := filepath.WalkDir(directory, func(path string, entry os.DirEntry, err error) error {
++		if err != nil {
++			return err
++		}
++		if !entry.IsDir() {
++			relative, _ := filepath.Rel(directory, path)
++			files = append(files, filepath.ToSlash(relative))
++		}
++		return nil
++	})
++	require.NoError(t, err)
++	sort.Strings(files)
++	return files
++}
++
++func servedDirectory(t *testing.T) string {
++	t.Helper()
++	directory := filepath.Join(t.TempDir(), "ui")
++	require.NoError(t, os.MkdirAll(filepath.Join(directory, "assets"), 0o755))
++	require.NoError(t, os.WriteFile(filepath.Join(directory, "index.html"), []byte("old"), 0o644))
++	require.NoError(t, os.WriteFile(filepath.Join(directory, "assets", "old.js"), []byte("old"), 0o644))
++	return directory
++}
++
++var oldFiles = []string{"assets/old.js", "index.html"}
++
++func TestExtractExternalUIReplaces(t *testing.T) {
++	directory := servedDirectory(t)
++	// left by an update that did not end
++	require.NoError(t, os.MkdirAll(filepath.Join(directory, externalUIStaging, "x"), 0o755))
++	archive := writeArchive(t, "Yacd-meta-gh-pages/", "Yacd-meta-gh-pages/index.html", "Yacd-meta-gh-pages/assets/new.js")
++	require.NoError(t, extractExternalUI(context.Background(), archive, directory))
++	require.Equal(t, []string{"assets/new.js", "index.html"}, listFiles(t, directory))
++	content, err := os.ReadFile(filepath.Join(directory, "index.html"))
++	require.NoError(t, err)
++	require.Equal(t, "new Yacd-meta-gh-pages/index.html", string(content))
++}
++
++func TestExtractExternalUIIntoEmptyDirectory(t *testing.T) {
++	directory := filepath.Join(t.TempDir(), "ui")
++	require.NoError(t, os.MkdirAll(directory, 0o755))
++	archive := writeArchive(t, "index.html", "assets/a.js")
++	require.NoError(t, extractExternalUI(context.Background(), archive, directory))
++	require.Equal(t, []string{"assets/a.js", "index.html"}, listFiles(t, directory))
++}
++
++// An archive that does not unpack leaves the files served as they were, and nothing of it.
++func TestExtractExternalUIKeepsServedOnFailure(t *testing.T) {
++	broken := filepath.Join(t.TempDir(), "broken.zip")
++	require.NoError(t, os.WriteFile(broken, []byte("not a zip"), 0o644))
++	for name, archive := range map[string]string{
++		"a file where a directory goes": writeArchive(t, "index.html", "assets", "assets/a.js"),
++		"a path out of the directory":   writeArchive(t, "index.html", "../escaped.js"),
++		"the name of the staging":       writeArchive(t, "index.html", externalUIStaging+"/a.js"),
++		"no files":                      writeArchive(t, "dist/"),
++		"one file in a single folder":   writeArchive(t, "index.html"),
++		"not an archive":                broken,
++	} {
++		t.Run(name, func(t *testing.T) {
++			directory := servedDirectory(t)
++			require.Error(t, extractExternalUI(context.Background(), archive, directory))
++			require.Equal(t, oldFiles, listFiles(t, directory))
++			require.NoFileExists(t, filepath.Join(filepath.Dir(directory), "escaped.js"))
++		})
++	}
++}
+-- 
+2.53.0
+

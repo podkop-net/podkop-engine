@@ -1,0 +1,305 @@
+From d0740843bd7e9954d1a85efe2dc0b7ac39e5dee9 Mon Sep 17 00:00:00 2001
+From: FiyeroT <me@fiyero.xyz>
+Date: Sat, 24 Oct 2026 09:37:14 +0300
+Subject: [PATCH 151/155] rule-set: an answer "not modified" writes the time
+ alone to the cache file
+
+On a 304 a remote rule set loaded its whole saved list from the cache file
+and saved it again, only to change its time: the list written once per
+update_interval to a cache file that may be on flash (podkop keeps it
+there to survive a reboot), a few MB per list.
+
+The cache file keeps that time apart, in the bucket rule_set_checked: a
+304 writes eight bytes. A start takes the later of the time of the saved
+content and that one. A sing-box without the bucket deletes it at its
+start and reads the time of the content, as before; a cache file that
+does not keep the times (adapter.RuleSetCheckCache) saves the set again.
+---
+ adapter/experimental.go                       |  8 +++
+ experimental/cachefile/cache.go               | 35 ++++++++++
+ .../cachefile/rule_set_checked_test.go        | 30 ++++++++
+ route/rule/rule_set_remote.go                 | 55 ++++++++++-----
+ route/rule/rule_set_remote_checked_test.go    | 69 +++++++++++++++++++
+ 5 files changed, 180 insertions(+), 17 deletions(-)
+ create mode 100644 experimental/cachefile/rule_set_checked_test.go
+ create mode 100644 route/rule/rule_set_remote_checked_test.go
+
+diff --git a/adapter/experimental.go b/adapter/experimental.go
+index d5a1e5bb4..86aba7186 100644
+--- a/adapter/experimental.go
++++ b/adapter/experimental.go
+@@ -48,6 +48,14 @@ type CacheFile interface {
+ 	SaveRuleSet(tag string, set *SavedBinary) error
+ }
+ 
++// RuleSetCheckCache is a cache file that keeps the time a remote rule set was last found
++// up to date apart from its content (podkop-engine): an answer "not modified" writes the
++// time alone, not the whole list again.
++type RuleSetCheckCache interface {
++	LoadRuleSetChecked(tag string) time.Time
++	StoreRuleSetChecked(tag string, at time.Time) error
++}
++
+ type SavedBinary struct {
+ 	Content     []byte
+ 	LastUpdated time.Time
+diff --git a/experimental/cachefile/cache.go b/experimental/cachefile/cache.go
+index 6bcb866da..3741baf25 100644
+--- a/experimental/cachefile/cache.go
++++ b/experimental/cachefile/cache.go
+@@ -2,6 +2,7 @@ package cachefile
+ 
+ import (
+ 	"context"
++	"encoding/binary"
+ 	"errors"
+ 	"net/netip"
+ 	"os"
+@@ -26,12 +27,15 @@ var (
+ 	bucketExpand   = []byte("group_expand")
+ 	bucketMode     = []byte("clash_mode")
+ 	bucketRuleSet  = []byte("rule_set")
++	// when each remote rule set was last found up to date (podkop-engine)
++	bucketRuleSetChecked = []byte("rule_set_checked")
+ 
+ 	bucketNameList = []string{
+ 		string(bucketSelected),
+ 		string(bucketExpand),
+ 		string(bucketMode),
+ 		string(bucketRuleSet),
++		string(bucketRuleSetChecked),
+ 		string(bucketRDRC),
+ 		string(bucketDNSCache),
+ 	}
+@@ -458,6 +462,37 @@ func (c *CacheFile) LoadRuleSet(tag string) *adapter.SavedBinary {
+ 	return &savedSet
+ }
+ 
++var _ adapter.RuleSetCheckCache = (*CacheFile)(nil)
++
++// LoadRuleSetChecked is when the rule set was last found up to date, the zero time when
++// that is not kept.
++func (c *CacheFile) LoadRuleSetChecked(tag string) time.Time {
++	var at time.Time
++	_ = c.view(func(t *bbolt.Tx) error {
++		bucket := c.bucket(t, bucketRuleSetChecked)
++		if bucket == nil {
++			return nil
++		}
++		if value := bucket.Get([]byte(tag)); len(value) == 8 {
++			at = time.Unix(0, int64(binary.BigEndian.Uint64(value)))
++		}
++		return nil
++	})
++	return at
++}
++
++// StoreRuleSetChecked keeps when the rule set was found up to date: eight bytes, where a
++// save of the rule set writes its whole content again.
++func (c *CacheFile) StoreRuleSetChecked(tag string, at time.Time) error {
++	return c.batch(func(t *bbolt.Tx) error {
++		bucket, err := c.createBucket(t, bucketRuleSetChecked)
++		if err != nil {
++			return err
++		}
++		return bucket.Put([]byte(tag), binary.BigEndian.AppendUint64(nil, uint64(at.UnixNano())))
++	})
++}
++
+ func (c *CacheFile) SaveRuleSet(tag string, set *adapter.SavedBinary) error {
+ 	return c.batch(func(t *bbolt.Tx) error {
+ 		bucket, err := c.createBucket(t, bucketRuleSet)
+diff --git a/experimental/cachefile/rule_set_checked_test.go b/experimental/cachefile/rule_set_checked_test.go
+new file mode 100644
+index 000000000..90c260238
+--- /dev/null
++++ b/experimental/cachefile/rule_set_checked_test.go
+@@ -0,0 +1,30 @@
++package cachefile
++
++import (
++	"path/filepath"
++	"testing"
++	"time"
++
++	"github.com/sagernet/sing-box/adapter"
++
++	"github.com/stretchr/testify/require"
++)
++
++// The time a rule set was found up to date is kept apart from its content, and stays
++// across a reopen; a rule set without one has the zero time.
++func TestRuleSetChecked(t *testing.T) {
++	path := filepath.Join(t.TempDir(), "cache.db")
++	cacheFile := openTestCacheFile(t, path)
++	require.NoError(t, cacheFile.SaveRuleSet("lists", &adapter.SavedBinary{Content: []byte("list"), LastUpdated: time.Unix(100, 0)}))
++	checked := time.Unix(200, 5)
++	require.NoError(t, cacheFile.StoreRuleSetChecked("lists", checked))
++	require.True(t, cacheFile.LoadRuleSetChecked("other").IsZero())
++	require.NoError(t, cacheFile.Close())
++
++	cacheFile = openTestCacheFile(t, path)
++	defer cacheFile.Close()
++	require.True(t, checked.Equal(cacheFile.LoadRuleSetChecked("lists")))
++	saved := cacheFile.LoadRuleSet("lists")
++	require.Equal(t, "list", string(saved.Content))
++	require.True(t, time.Unix(100, 0).Equal(saved.LastUpdated), "the content is not written again")
++}
+diff --git a/route/rule/rule_set_remote.go b/route/rule/rule_set_remote.go
+index 0afb3a054..430756e8c 100644
+--- a/route/rule/rule_set_remote.go
++++ b/route/rule/rule_set_remote.go
+@@ -130,22 +130,7 @@ func (s *RemoteRuleSet) StartContext(ctx context.Context, startContext *adapter.
+ 	}
+ 	startContext.Register(transport)
+ 	s.httpClient = &http.Client{Transport: transport}
+-	if s.cacheFile != nil {
+-		savedSet := s.cacheFile.LoadRuleSet(s.tag)
+-		if savedSet != nil {
+-			if len(savedSet.URLHash) > 0 && !bytes.Equal(savedSet.URLHash, s.urlHash[:]) {
+-				s.logger.Info("cached rule-set was downloaded from another URL, will refetch")
+-			} else {
+-				err = s.loadBytes(savedSet.Content)
+-				if err != nil {
+-					s.logger.Warn(E.Cause(err, "restore cached rule-set, will refetch"))
+-				} else {
+-					s.lastUpdated = savedSet.LastUpdated
+-					s.lastEtag = savedSet.LastEtag
+-				}
+-			}
+-		}
+-	}
++	s.loadCached()
+ 	var loadedFromInitialPath bool
+ 	if s.lastUpdated.IsZero() && s.initialPath != "" {
+ 		var content []byte
+@@ -165,6 +150,34 @@ func (s *RemoteRuleSet) StartContext(ctx context.Context, startContext *adapter.
+ 	return nil
+ }
+ 
++// loadCached takes the content of the cache file, when there is one, made from the URL of
++// the set, and when it was last downloaded or found up to date.
++func (s *RemoteRuleSet) loadCached() {
++	if s.cacheFile == nil {
++		return
++	}
++	savedSet := s.cacheFile.LoadRuleSet(s.tag)
++	if savedSet != nil {
++		if len(savedSet.URLHash) > 0 && !bytes.Equal(savedSet.URLHash, s.urlHash[:]) {
++			s.logger.Info("cached rule-set was downloaded from another URL, will refetch")
++		} else {
++			err := s.loadBytes(savedSet.Content)
++			if err != nil {
++				s.logger.Warn(E.Cause(err, "restore cached rule-set, will refetch"))
++			} else {
++				s.lastUpdated = savedSet.LastUpdated
++				s.lastEtag = savedSet.LastEtag
++				// found up to date since the content was saved
++				if checks, kept := s.cacheFile.(adapter.RuleSetCheckCache); kept {
++					if checked := checks.LoadRuleSetChecked(s.tag); checked.After(s.lastUpdated) {
++						s.lastUpdated = checked
++					}
++				}
++			}
++		}
++	}
++}
++
+ // startWithNothingLoaded starts a set that has neither a cached nor an initial content.
+ func (s *RemoteRuleSet) startWithNothingLoaded(ctx context.Context) {
+ 	if ruleSetStartEmpty() {
+@@ -559,7 +572,15 @@ func (s *RemoteRuleSet) fetch(ctx context.Context, isStart bool) error {
+ 	case http.StatusOK:
+ 	case http.StatusNotModified:
+ 		s.lastUpdated = time.Now()
+-		if s.cacheFile != nil {
++		if checks, kept := s.cacheFile.(adapter.RuleSetCheckCache); kept {
++			// the time alone: a save of the set writes the whole list again, at every
++			// update_interval, to a cache file that may be on flash
++			err = checks.StoreRuleSetChecked(s.tag, s.lastUpdated)
++			if err != nil {
++				s.logger.Error("save rule-set updated time: ", err)
++				return nil
++			}
++		} else if s.cacheFile != nil {
+ 			savedRuleSet := s.cacheFile.LoadRuleSet(s.tag)
+ 			if savedRuleSet != nil {
+ 				savedRuleSet.LastUpdated = s.lastUpdated
+diff --git a/route/rule/rule_set_remote_checked_test.go b/route/rule/rule_set_remote_checked_test.go
+new file mode 100644
+index 000000000..59807cef7
+--- /dev/null
++++ b/route/rule/rule_set_remote_checked_test.go
+@@ -0,0 +1,69 @@
++package rule
++
++import (
++	"context"
++	"net/http"
++	"net/http/httptest"
++	"testing"
++	"time"
++
++	"github.com/sagernet/sing-box/adapter"
++	C "github.com/sagernet/sing-box/constant"
++
++	"github.com/stretchr/testify/require"
++)
++
++// checkingCache is a cache file that keeps rule sets and the times they were found up to
++// date, and counts the saves of rule sets.
++type checkingCache struct {
++	savingCache
++	saves   int
++	checked map[string]time.Time
++}
++
++func (c *checkingCache) SaveRuleSet(tag string, set *adapter.SavedBinary) error {
++	c.saves++
++	return c.savingCache.SaveRuleSet(tag, set)
++}
++
++func (c *checkingCache) LoadRuleSetChecked(tag string) time.Time { return c.checked[tag] }
++
++func (c *checkingCache) StoreRuleSetChecked(tag string, at time.Time) error {
++	c.checked[tag] = at
++	return nil
++}
++
++// An answer "not modified" keeps the time alone: the list is not written again. The next
++// start takes the set as found up to date then.
++func TestRemoteRuleSetNotModifiedKeepsTheTimeOnly(t *testing.T) {
++	content := []byte(`{"version":3,"rules":[{"domain_suffix":["example.com"]}]}`)
++	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		if r.Header.Get("If-None-Match") == `"v1"` {
++			w.WriteHeader(http.StatusNotModified)
++			return
++		}
++		w.Header().Set("Etag", `"v1"`)
++		w.Write(content)
++	}))
++	defer server.Close()
++	cache := &checkingCache{savingCache: savingCache{saved: make(map[string]*adapter.SavedBinary)}, checked: make(map[string]time.Time)}
++	set := newTestRuleSet(server.URL)
++	set.options.Format = C.RuleSetFormatSource
++	set.cacheFile = cache
++	require.NoError(t, set.fetch(context.Background(), false))
++	require.Equal(t, 1, cache.saves)
++	downloaded := cache.saved["test"].LastUpdated
++
++	time.Sleep(10 * time.Millisecond)
++	require.NoError(t, set.fetch(context.Background(), false))
++	require.Equal(t, 1, cache.saves, "the list is not saved again")
++	require.True(t, cache.checked["test"].After(downloaded))
++
++	next := newTestRuleSet(server.URL)
++	next.options.Format = C.RuleSetFormatSource
++	next.cacheFile = cache
++	next.loadCached()
++	require.True(t, next.lastUpdated.Equal(cache.checked["test"]))
++	require.Equal(t, `"v1"`, next.lastEtag)
++	require.NotNil(t, next.rules)
++}
+-- 
+2.53.0
+

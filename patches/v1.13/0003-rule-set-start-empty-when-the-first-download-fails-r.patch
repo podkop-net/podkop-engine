@@ -1,7 +1,7 @@
 From 493adbaac0801bc3ee54831a117309b0902200a2 Mon Sep 17 00:00:00 2001
 From: FiyeroT <me@fiyero.xyz>
 Date: Mon, 28 Sep 2026 08:37:30 +0300
-Subject: [PATCH 003/140] rule-set: start empty when the first download fails,
+Subject: [PATCH 003/147] rule-set: start empty when the first download fails,
  retry, run a hook
 
 A remote rule-set that cannot be downloaded at start (WAN not up yet, clock

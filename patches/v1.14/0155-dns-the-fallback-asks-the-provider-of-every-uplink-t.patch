@@ -1,0 +1,673 @@
+From 5d99dc7986cb1cbc3ed8c14c04595d306000d505 Mon Sep 17 00:00:00 2001
+From: FiyeroT <me@fiyero.xyz>
+Date: Sat, 24 Oct 2026 11:05:00 +0300
+Subject: [PATCH 155/155] dns: the fallback asks the provider of every uplink
+ through it; a list for each box
+
+The fallback took the DNS servers of one device: the one sing-box binds its
+sockets to, else the one of the default route with the lowest metric. With
+mwan3 the WAN often stays up while its provider is down: mwan3 sends the
+traffic through the backup modem, the default route of the main table is
+still the WAN's, and the fallback asked the WAN's provider, now through the
+modem, where providers answer only their own customers. It answered nothing
+until the list was read again, at least 30 s later.
+
+When sing-box binds no socket, the list holds the servers of every uplink (an
+interface that is up, has a default route and is no tunnel), and a query to
+a server of an uplink is bound to the device of that uplink: each provider is
+asked through its own line, whatever mwan3 does. The answers choose the
+server as before: an uplink whose provider is down does not answer, the one
+that comes back takes over when it answers first. When sing-box binds its
+sockets to a device, the servers of that device alone, as before.
+
+The list belonged to the process: a box that replaced another one in the
+same process (SIGHUP, the Go backend of podkop) with another output device
+asked the servers of the old one. The DNS router of each box keeps its own.
+---
+ dns/client_fallback.go             |  44 +++++++-
+ dns/client_fallback_provider.go    | 176 ++++++++++++++++++++---------
+ dns/client_fallback_reload_test.go |  56 +++++++++
+ dns/client_fallback_test.go        |  95 ++++++++++++++--
+ dns/router.go                      |  12 +-
+ 5 files changed, 316 insertions(+), 67 deletions(-)
+ create mode 100644 dns/client_fallback_reload_test.go
+
+diff --git a/dns/client_fallback.go b/dns/client_fallback.go
+index cacbe32b2..1c35027c8 100644
+--- a/dns/client_fallback.go
++++ b/dns/client_fallback.go
+@@ -25,8 +25,9 @@ import (
+ //
+ // When a DNS server that sing-box reaches directly through the WAN fails to answer
+ // (timeout, refused or reset connection, TLS or HTTP error), the query is sent to the
+-// provider's servers: the DNS servers that netifd knows for the output device of sing-box
+-// (see client_fallback_provider.go). Setting SING_BOX_DNS_FALLBACK turns this on; the
++// provider's servers: the DNS servers that netifd knows for the output device of sing-box,
++// or for every uplink when sing-box binds no socket, each asked through its uplink (see
++// client_fallback_provider.go). Setting SING_BOX_DNS_FALLBACK turns this on; the
+ // init script of podkop-engine does it when podkop is installed.
+ //
+ // Which servers qualify is decided once, from the configuration: a plain socket (no
+@@ -79,6 +80,10 @@ type fallbackServer struct {
+ 	decided    atomic.Bool // eligible is set
+ 	eligible   bool
+ 	dialer     N.Dialer
++	// ctx is the one of the box (decide); bound are the dialers of the server bound to the
++	// devices of uplinks (dialerFor)
++	ctx   context.Context
++	bound map[string]N.Dialer
+ 
+ 	access        sync.Mutex
+ 	failures      int
+@@ -89,7 +94,7 @@ type fallbackServer struct {
+ 	probeEvery    time.Duration
+ 	unusableUntil time.Time
+ 
+-	providers *providerSet // shared by all servers
++	providers *providerSet // the box's, shared by all its servers (decide)
+ }
+ 
+ // newFallbackServer returns the fallback state of a remote server, nil when the fallback
+@@ -98,7 +103,7 @@ func newFallbackServer(options option.RemoteDNSServerOptions) *fallbackServer {
+ 	if !fallbackEnabled {
+ 		return nil
+ 	}
+-	return &fallbackServer{options: options, providers: fallbackProviders}
++	return &fallbackServer{options: options}
+ }
+ 
+ func fallbackFor(transport adapter.DNSTransport) *fallbackServer {
+@@ -199,8 +204,11 @@ func (s *fallbackServer) decide(ctx context.Context, logger logger.ContextLogger
+ 			if err != nil {
+ 				reason = err.Error()
+ 			} else {
+-				s.dialer = dialer
++				s.dialer, s.ctx = dialer, ctx
+ 				s.eligible = true
++				if s.providers == nil {
++					s.providers = providersFrom(ctx)
++				}
+ 				s.providers.list(ctx, logger) // at once: the first query may need them
+ 			}
+ 		}
+@@ -310,6 +318,32 @@ func localName(name string) bool {
+ 	return false
+ }
+ 
++// dialerFor is the dialer of a query to a server of the provider: the server's own, or for
++// a server of an uplink one like it bound to the device of that uplink, made once. Only a
++// plain socket qualifies (fallbackExclusion): the detour to a direct outbound is left out.
++func (s *fallbackServer) dialerFor(device string) N.Dialer {
++	if device == "" || s.ctx == nil {
++		return s.dialer
++	}
++	s.access.Lock()
++	defer s.access.Unlock()
++	if dialer, made := s.bound[device]; made {
++		return dialer
++	}
++	options := s.options
++	options.DialerOptions.Detour = ""
++	options.DialerOptions.BindInterface = device
++	dialer, err := NewRemoteDialer(s.ctx, options)
++	if err != nil {
++		dialer = s.dialer
++	}
++	if s.bound == nil {
++		s.bound = make(map[string]N.Dialer)
++	}
++	s.bound[device] = dialer
++	return dialer
++}
++
+ func (s *fallbackServer) isDown() bool {
+ 	s.access.Lock()
+ 	defer s.access.Unlock()
+diff --git a/dns/client_fallback_provider.go b/dns/client_fallback_provider.go
+index c707d61bb..204aeff32 100644
+--- a/dns/client_fallback_provider.go
++++ b/dns/client_fallback_provider.go
+@@ -3,6 +3,7 @@ package dns
+ import (
+ 	"context"
+ 	"encoding/json"
++	"maps"
+ 	"net"
+ 	"net/netip"
+ 	"os/exec"
+@@ -22,24 +23,35 @@ import (
+ 
+ // The provider's servers for the fallback (podkop-engine).
+ //
+-// They are the DNS servers of the OpenWrt interfaces on the output device of sing-box,
+-// taken from netifd over ubus: on the device that sing-box binds its sockets to
+-// (auto_detect_interface or default_interface), else on the device of the default route.
+-// For DHCP or PPPoE these are the servers of wan and wan6 (or wan_6). VPN tunnels, a LAN
+-// with DNS set by hand and a backup modem are other devices and are left out. The list is
+-// read at the first fallback, and again when sing-box resets the network after its
+-// default interface changed (the DNS router calls ResetFallbackProviders): another uplink,
+-// the WAN down and up, a new PPPoE session. It is also read again after none of its
+-// servers answered and 30 s after ubus could not be asked, in both cases not sooner than
+-// 30 s after the last read: each read runs ubus.
++// They are the DNS servers of the OpenWrt interfaces, taken from netifd over ubus:
++//
++//   - When sing-box binds its sockets to a device (auto_detect_interface or
++//     default_interface), the servers of the interfaces on that device: all its traffic
++//     leaves there. For DHCP or PPPoE these are the servers of wan and wan6 (or wan_6).
++//   - Else the servers of every uplink: each interface that is up and has a default route,
++//     tunnels left out (wireguard, openvpn and the like), so a backup modem or a second WAN
++//     too. A query to a server of an uplink is bound to the device of that uplink: a
++//     provider answers its own customers, and when mwan3 (or anything else) sends the
++//     traffic of the router another way, the server of each uplink is still reached through
++//     it. An uplink whose provider is down does not answer; another one does.
++//
++// A LAN with DNS set by hand, an interface without a default route and a tunnel are left
++// out. The list belongs to a box (the DNS router makes it): a box that replaces another one
++// in the same process, with other settings, reads it again. It is read at the first
++// fallback, and again when sing-box resets the network after its default interface changed
++// (the DNS router calls forget): another uplink, the WAN down and up, a new PPPoE session.
++// It is also read again after none of its servers answered and 30 s after ubus could not be
++// asked, in both cases not sooner than 30 s after the last read: each read runs ubus.
+ //
+ // The servers are chosen by their answers, as dnsmasq does: the first fallback query goes
+ // to all of them at once, the first to answer gets the next queries alone, and all of them
+-// are asked again every 20 s or 50 queries, and as soon as it misses one.
++// are asked again every 20 s or 50 queries, and as soon as it misses one: an uplink that
++// comes back takes over again when it answers first.
+ 
+ const (
+ 	providerRetryAfter  = 30 * time.Second // between reads after ubus could not be asked or no server answered
+-	providerMax         = 4                // servers asked at once
++	providerMax         = 4                // servers of one device
++	providerMaxAll      = 8                // servers asked at once
+ 	providerRoundEvery  = 20 * time.Second
+ 	providerRoundAfter  = 50 // queries
+ 	providerBestTimeout = 1500 * time.Millisecond
+@@ -50,19 +62,40 @@ var (
+ 	errNoProviders = E.New("no provider DNS on the output device")
+ 
+ 	// provider queries have their own sockets: a burst of queries waiting for a silent
+-	// server must not keep them from the provider
++	// server must not keep them from the provider. The bound is of the process, not of a box.
+ 	fallbackSocketSlots = make(chan struct{}, 256)
+ 
+-	fallbackProviders = &providerSet{read: readUbusInterfaces}
++	// the set of a context without a DNS router (providersFrom)
++	defaultProviders = newProviderSet()
++
++	// the protocols of netifd that make tunnels, not uplinks of a provider
++	tunnelProtocols = []string{"wireguard", "amneziawg", "openvpn", "openconnect", "vpnc", "gre", "gretap", "grev6", "grev6tap", "vti", "vtiv6", "xfrm", "ipip"}
+ )
+ 
++func newProviderSet() *providerSet {
++	return &providerSet{read: readUbusInterfaces}
++}
++
++// providersFrom is the provider set of the box of ctx, which its DNS router registers.
++func providersFrom(ctx context.Context) *providerSet {
++	if ctx != nil {
++		if set := service.FromContext[*providerSet](ctx); set != nil {
++			return set
++		}
++	}
++	return defaultProviders
++}
++
+ type providerSet struct {
+ 	read func(ctx context.Context) ([]netifdInterface, error)
+ 
+ 	access  sync.Mutex
+ 	reading bool // one read at a time, outside the lock
+ 	servers []M.Socksaddr
+-	device  string // the output device the list is for
++	// devices are the devices of the uplinks the queries to the servers are bound to; a
++	// server without one is asked through the dialer of the server (sing-box binds them)
++	devices map[M.Socksaddr]string
++	device  string // the output device the list is for, "" for every uplink
+ 	readAt  time.Time
+ 	readErr bool        // ubus could not be asked
+ 	stale   bool        // no server answered: the list may have changed
+@@ -75,6 +108,7 @@ type providerSet struct {
+ type netifdInterface struct {
+ 	Name      string   `json:"interface"`
+ 	Up        bool     `json:"up"`
++	Proto     string   `json:"proto"`
+ 	L3Device  string   `json:"l3_device"`
+ 	DNSServer []string `json:"dns-server"`
+ 	Route     []struct {
+@@ -140,37 +174,43 @@ func (p *providerSet) list(ctx context.Context, logger logger.ContextLogger) []M
+ func (p *providerSet) refresh(logger logger.ContextLogger, device string) []M.Socksaddr {
+ 	var (
+ 		servers []M.Socksaddr
++		devices map[M.Socksaddr]string
+ 		names   []string
+ 	)
+ 	interfaces, err := p.read(context.Background())
+ 	if err == nil {
+-		servers, names, device = providersOn(interfaces, device)
++		servers, devices, names = providersOn(interfaces, device)
+ 	}
+ 	p.access.Lock()
+ 	defer p.access.Unlock()
+ 	p.reading = false
+-	changed := p.readAt.IsZero() || device != p.device || !slices.Equal(servers, p.servers)
+-	p.servers, p.device, p.readAt, p.readErr, p.stale = servers, device, time.Now(), err != nil, false
++	changed := p.readAt.IsZero() || device != p.device || !slices.Equal(servers, p.servers) || !maps.Equal(devices, p.devices)
++	p.servers, p.devices, p.device, p.readAt, p.readErr, p.stale = servers, devices, device, time.Now(), err != nil, false
+ 	if changed {
+ 		p.best = M.Socksaddr{}
+ 		if logger != nil {
+ 			switch {
+ 			case err != nil:
+ 				logger.Warn("no provider DNS for the fallback: ", err)
+-			case len(servers) == 0:
++			case len(servers) == 0 && device != "":
+ 				logger.Warn("no provider DNS for the fallback on ", device)
+-			default:
++			case len(servers) == 0:
++				logger.Warn("no provider DNS for the fallback: no uplink has DNS servers")
++			case device != "":
+ 				logger.Warn("provider DNS for the fallback on ", device, " (", strings.Join(names, ", "), "): ", joinServers(servers))
++			default:
++				logger.Warn("provider DNS for the fallback, each through its uplink: ", strings.Join(names, "; "))
+ 			}
+ 		}
+ 	}
+ 	return servers
+ }
+ 
+-// ResetFallbackProviders makes the next fallback read the provider's servers again: the
+-// DNS router calls it when sing-box resets the network.
+-func ResetFallbackProviders() {
+-	fallbackProviders.forget()
++// deviceOf is the device a query to a server is bound to, "" for none.
++func (p *providerSet) deviceOf(server M.Socksaddr) string {
++	p.access.Lock()
++	defer p.access.Unlock()
++	return p.devices[server]
+ }
+ 
+ // forget makes the next use read the servers again.
+@@ -222,62 +262,94 @@ func (p *providerSet) missed(server M.Socksaddr) {
+ 	p.access.Unlock()
+ }
+ 
+-// providersOn returns the DNS servers of the interfaces that are up on device, or, when
+-// device is not known, on the device of the default route with the lowest metric.
+-func providersOn(interfaces []netifdInterface, device string) (servers []M.Socksaddr, names []string, onDevice string) {
+-	if device == "" {
+-		device = defaultRouteDevice(interfaces)
+-	}
++// providersOn returns the DNS servers of the interfaces that are up on device; when device
++// is "" (sing-box binds no socket), those of every uplink, each with the device of its
++// uplink to bind the queries to, the uplinks in the order of their default routes. The
++// names tell the interfaces the servers come from.
++func providersOn(interfaces []netifdInterface, device string) (servers []M.Socksaddr, devices map[M.Socksaddr]string, names []string) {
+ 	own := ownAddresses()
+ 	seen := make(map[netip.Addr]bool)
+-	for _, networkInterface := range interfaces {
+-		if !networkInterface.Up || device == "" || networkInterface.L3Device != device || len(networkInterface.DNSServer) == 0 {
+-			continue
+-		}
+-		names = append(names, networkInterface.Name)
++	// the servers of each device: at most providerMax
++	counts := make(map[string]int)
++	add := func(networkInterface netifdInterface, bind bool) []string {
++		var added []string
+ 		for _, server := range networkInterface.DNSServer {
+ 			address, err := netip.ParseAddr(server)
+ 			if err != nil || address.IsLoopback() || address.IsUnspecified() || own[address.Unmap()] {
+ 				continue
+ 			}
+ 			if address.IsLinkLocalUnicast() && address.Zone() == "" {
+-				address = address.WithZone(device)
++				address = address.WithZone(networkInterface.L3Device)
+ 			}
+-			if seen[address] || len(servers) >= providerMax {
++			if seen[address] || counts[networkInterface.L3Device] >= providerMax || len(servers) >= providerMaxAll {
+ 				continue
+ 			}
+ 			seen[address] = true
+-			servers = append(servers, M.SocksaddrFrom(address, 53))
++			counts[networkInterface.L3Device]++
++			socksaddr := M.SocksaddrFrom(address, 53)
++			servers = append(servers, socksaddr)
++			if bind {
++				if devices == nil {
++					devices = make(map[M.Socksaddr]string)
++				}
++				devices[socksaddr] = networkInterface.L3Device
++			}
++			added = append(added, address.String())
++		}
++		return added
++	}
++	if device != "" {
++		for _, networkInterface := range interfaces {
++			if networkInterface.Up && networkInterface.L3Device == device && len(networkInterface.DNSServer) > 0 {
++				names = append(names, networkInterface.Name)
++				add(networkInterface, false)
++			}
+ 		}
++		return servers, nil, names
+ 	}
+-	return servers, names, device
++	for _, networkInterface := range uplinks(interfaces) {
++		if added := add(networkInterface, true); len(added) > 0 {
++			names = append(names, networkInterface.Name+" on "+networkInterface.L3Device+": "+strings.Join(added, ", "))
++		}
++	}
++	return servers, devices, names
+ }
+ 
+-func defaultRouteDevice(interfaces []netifdInterface) string {
+-	var (
+-		device string
+-		best   int
+-		found  bool
+-	)
++// uplinks are the interfaces that are up, have a device and a default route, and are no
++// tunnel, in the order of the metric of their default route (IPv4 first).
++func uplinks(interfaces []netifdInterface) []netifdInterface {
++	type uplink struct {
++		networkInterface netifdInterface
++		metric           int
++	}
++	var found []uplink
+ 	for _, networkInterface := range interfaces {
+-		if !networkInterface.Up || networkInterface.L3Device == "" {
++		if !networkInterface.Up || networkInterface.L3Device == "" || slices.Contains(tunnelProtocols, networkInterface.Proto) {
+ 			continue
+ 		}
++		best, isUplink := 0, false
+ 		for _, route := range networkInterface.Route {
+ 			if route.Mask != 0 || (route.Target != "0.0.0.0" && route.Target != "::") {
+ 				continue
+ 			}
+-			// IPv4 first: the default route of the uplink
+ 			metric := route.Metric
+ 			if route.Target == "::" {
+ 				metric += 1 << 20
+ 			}
+-			if !found || metric < best {
+-				device, best, found = networkInterface.L3Device, metric, true
++			if !isUplink || metric < best {
++				best, isUplink = metric, true
+ 			}
+ 		}
++		if isUplink {
++			found = append(found, uplink{networkInterface, best})
++		}
++	}
++	slices.SortStableFunc(found, func(left uplink, right uplink) int { return left.metric - right.metric })
++	result := make([]netifdInterface, len(found))
++	for index, item := range found {
++		result[index] = item.networkInterface
+ 	}
+-	return device
++	return result
+ }
+ 
+ // outputDevice is the device sing-box binds its sockets to (auto_detect_interface or
+@@ -327,7 +399,7 @@ func (s *fallbackServer) exchangeProvider(ctx context.Context, baseCtx context.C
+ 	defer cancel()
+ 	if best, loaded := s.providers.pick(servers); loaded {
+ 		bestCtx, bestCancel := context.WithTimeout(ctx, providerBestTimeout)
+-		response, err := exchangeFresh(bestCtx, fallbackSocketSlots, s.dialer, best, message)
++		response, err := exchangeFresh(bestCtx, fallbackSocketSlots, s.dialerFor(s.providers.deviceOf(best)), best, message)
+ 		bestCancel()
+ 		if err == nil && response.Rcode != mDNS.RcodeRefused {
+ 			return s.providerAnswered(response), nil
+@@ -368,7 +440,7 @@ func (s *fallbackServer) exchangeAll(ctx context.Context, servers []M.Socksaddr,
+ 		exchanges.Add(1)
+ 		go func(server M.Socksaddr) {
+ 			defer exchanges.Done()
+-			response, err := exchangeFresh(ctx, fallbackSocketSlots, s.dialer, server, message)
++			response, err := exchangeFresh(ctx, fallbackSocketSlots, s.dialerFor(s.providers.deviceOf(server)), server, message)
+ 			results <- result{server, response, err}
+ 		}(server)
+ 	}
+diff --git a/dns/client_fallback_reload_test.go b/dns/client_fallback_reload_test.go
+new file mode 100644
+index 000000000..b4dc05f14
+--- /dev/null
++++ b/dns/client_fallback_reload_test.go
+@@ -0,0 +1,56 @@
++package dns
++
++import (
++	"context"
++	"encoding/json"
++	"testing"
++
++	"github.com/sagernet/sing-box/adapter"
++	"github.com/sagernet/sing/service"
++)
++
++// boundNetwork is a network manager that binds the sockets of sing-box to a device, as
++// default_interface does; nothing else of it is asked here.
++type boundNetwork struct {
++	adapter.NetworkManager
++	device string
++}
++
++func (n boundNetwork) DefaultOptions() adapter.NetworkOptions {
++	return adapter.NetworkOptions{BindInterface: n.device}
++}
++
++func (n boundNetwork) AutoDetectInterface() bool { return false }
++
++// Two boxes one after another in one process (a reload with other settings) have a list of
++// the provider's servers each: the first, which binds no socket, every uplink; the second,
++// which binds its sockets to the modem (wwan0), the servers of the modem alone.
++func TestFallbackProvidersAfterReload(t *testing.T) {
++	var dump struct {
++		Interface []netifdInterface `json:"interface"`
++	}
++	if err := json.Unmarshal([]byte(testUbusDump), &dump); err != nil {
++		t.Fatal(err)
++	}
++	read := func(ctx context.Context) ([]netifdInterface, error) { return dump.Interface, nil }
++	box := func(network adapter.NetworkManager) context.Context {
++		ctx := service.ContextWithDefaultRegistry(context.Background())
++		if network != nil {
++			service.MustRegister[adapter.NetworkManager](ctx, network)
++		}
++		// as the DNS router of the box registers it
++		service.MustRegister[*providerSet](ctx, &providerSet{read: read})
++		return ctx
++	}
++	first := box(nil)
++	if got := joinServers(providersFrom(first).list(first, nil)); got != "10.99.0.53, 10.99.0.54, 100.64.5.1, fe80::1%wan0, 2a00::53" {
++		t.Fatalf("the first box: %q", got)
++	}
++	second := box(boundNetwork{device: "wwan0"})
++	if providersFrom(second) == providersFrom(first) {
++		t.Fatal("the boxes share a list")
++	}
++	if got := joinServers(providersFrom(second).list(second, nil)); got != "100.64.5.1" {
++		t.Fatalf("the second box, bound to wwan0, asks %q", got)
++	}
++}
+diff --git a/dns/client_fallback_test.go b/dns/client_fallback_test.go
+index b95eac970..f93273938 100644
+--- a/dns/client_fallback_test.go
++++ b/dns/client_fallback_test.go
+@@ -5,7 +5,9 @@ import (
+ 	"context"
+ 	"encoding/json"
+ 	"net"
++	"slices"
+ 	"strings"
++	"sync"
+ 	"testing"
+ 	"time"
+ 
+@@ -64,7 +66,7 @@ func TestFallbackExclusion(t *testing.T) {
+ // A dump of `ubus call network.interface dump` with a tunnel, a LAN with DNS set by hand
+ // and a backup modem next to the WAN.
+ const testUbusDump = `{"interface":[
+-{"interface":"awg","up":true,"l3_device":"awg0","dns-server":["10.9.0.1"],"route":[]},
++{"interface":"awg","up":true,"proto":"amneziawg","l3_device":"awg0","dns-server":["10.9.0.1"],"route":[{"target":"0.0.0.0","mask":0,"metric":5}]},
+ {"interface":"lan","up":true,"l3_device":"br-lan","dns-server":["1.1.1.1"],"route":[]},
+ {"interface":"loopback","up":true,"l3_device":"lo","dns-server":[],"route":[]},
+ {"interface":"modem","up":true,"l3_device":"wwan0","dns-server":["100.64.5.1"],"route":[{"target":"0.0.0.0","mask":0,"metric":20}]},
+@@ -81,16 +83,28 @@ func TestProvidersOn(t *testing.T) {
+ 		t.Fatal(err)
+ 	}
+ 	for _, test := range []struct {
+-		device, wantDevice, wantNames, wantServers string
++		device, wantNames, wantServers, wantDevices string
+ 	}{
+-		{"wan0", "wan0", "wan, wan6", "10.99.0.53, 10.99.0.54, fe80::1%wan0, 2a00::53"}, // at most 4
+-		{"", "wan0", "wan, wan6", "10.99.0.53, 10.99.0.54, fe80::1%wan0, 2a00::53"},     // the default route with the lowest metric
+-		{"wwan0", "wwan0", "modem", "100.64.5.1"},
+-		{"eth9", "eth9", "", ""},
++		// sing-box binds its sockets to a device: its servers, asked as the server is
++		{"wan0", "wan; wan6", "10.99.0.53, 10.99.0.54, fe80::1%wan0, 2a00::53", ""}, // at most 4
++		{"wwan0", "modem", "100.64.5.1", ""},
++		{"eth9", "", "", ""},
++		// it binds none: every uplink, each server bound to its uplink, the uplinks by the
++		// metric of their default route; the tunnel and the interfaces without a default
++		// route are left out
++		{"", "wan on wan0: 10.99.0.53, 10.99.0.54; modem on wwan0: 100.64.5.1; wan6 on wan0: fe80::1%wan0, 2a00::53",
++			"10.99.0.53, 10.99.0.54, 100.64.5.1, fe80::1%wan0, 2a00::53", "wan0, wan0, wwan0, wan0, wan0"},
+ 	} {
+-		servers, names, device := providersOn(dump.Interface, test.device)
+-		if device != test.wantDevice || strings.Join(names, ", ") != test.wantNames || joinServers(servers) != test.wantServers {
+-			t.Errorf("device %q: got %q %q %q, want %q %q %q", test.device, device, strings.Join(names, ", "), joinServers(servers), test.wantDevice, test.wantNames, test.wantServers)
++		servers, devices, names := providersOn(dump.Interface, test.device)
++		var bound []string
++		for _, server := range servers {
++			if device := devices[server]; device != "" {
++				bound = append(bound, device)
++			}
++		}
++		if strings.Join(names, "; ") != test.wantNames || joinServers(servers) != test.wantServers || strings.Join(bound, ", ") != test.wantDevices {
++			t.Errorf("device %q: got %q %q %q, want %q %q %q", test.device, strings.Join(names, "; "), joinServers(servers), strings.Join(bound, ", "),
++				test.wantNames, test.wantServers, test.wantDevices)
+ 		}
+ 	}
+ }
+@@ -202,6 +216,7 @@ func TestFallbackLogs(t *testing.T) {
+ 	}
+ 	(&fallbackServer{}).decide(nil, logger, "dns-server") //nolint:staticcheck
+ 	(&providerSet{read: readDump}).refresh(logger, "eth9")
++	(&providerSet{read: readDump}).refresh(logger, "wan0")
+ 	(&providerSet{read: func(ctx context.Context) ([]netifdInterface, error) { return nil, E.New("no ubus in tests") }}).refresh(logger, "")
+ 
+ 	// the server fails, the provider fails, the server is back
+@@ -225,6 +240,7 @@ func TestFallbackLogs(t *testing.T) {
+ 
+ 	for _, message := range []string{
+ 		"provider DNS for the fallback on wan0 (wan, wan6): 10.99.0.53, 10.99.0.54, fe80::1%wan0, 2a00::53",
++		"provider DNS for the fallback, each through its uplink: wan on wan0: 10.99.0.53, 10.99.0.54; modem on wwan0: 100.64.5.1; wan6 on wan0: fe80::1%wan0, 2a00::53",
+ 		"server dns-server falls back to provider DNS when it fails",
+ 		"no provider DNS fallback for server dns-server: no context",
+ 		"no provider DNS for the fallback on eth9",
+@@ -238,3 +254,64 @@ func TestFallbackLogs(t *testing.T) {
+ 		}
+ 	}
+ }
++
++// recordingDialer dials as the system does and tells which servers it was asked for.
++type recordingDialer struct {
++	N.Dialer
++	access sync.Mutex
++	asked  []string
++}
++
++func (d *recordingDialer) ListenPacket(ctx context.Context, destination M.Socksaddr) (net.PacketConn, error) {
++	d.access.Lock()
++	d.asked = append(d.asked, destination.String())
++	d.access.Unlock()
++	return d.Dialer.ListenPacket(ctx, destination)
++}
++
++func (d *recordingDialer) DialContext(ctx context.Context, network string, destination M.Socksaddr) (net.Conn, error) {
++	d.access.Lock()
++	d.asked = append(d.asked, destination.String())
++	d.access.Unlock()
++	return d.Dialer.DialContext(ctx, network, destination)
++}
++
++func (d *recordingDialer) told() []string {
++	d.access.Lock()
++	defer d.access.Unlock()
++	return slices.Clone(d.asked)
++}
++
++// A server of an uplink is asked through the dialer bound to the device of that uplink, a
++// server without one through the dialer of the server.
++func TestProviderOfAnUplinkThroughIt(t *testing.T) {
++	t.Parallel()
++	ofUplink, ofServer := testResolver(t, mDNS.RcodeSuccess), testResolver(t, -1)
++	own, bound := &recordingDialer{Dialer: N.SystemDialer}, &recordingDialer{Dialer: N.SystemDialer}
++	state := &fallbackServer{
++		dialer: own,
++		ctx:    context.Background(),
++		bound:  map[string]N.Dialer{"wan9": bound},
++		providers: &providerSet{
++			servers: []M.Socksaddr{ofUplink, ofServer},
++			devices: map[M.Socksaddr]string{ofUplink: "wan9"},
++			readAt:  time.Now(),
++		},
++	}
++	message := new(mDNS.Msg)
++	message.SetQuestion("example.com.", mDNS.TypeA)
++	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
++	defer cancel()
++	if _, err := state.exchangeAll(ctx, state.providers.servers, message); err != nil {
++		t.Fatal(err)
++	}
++	if got := bound.told(); len(got) != 1 || got[0] != ofUplink.String() {
++		t.Errorf("the dialer of wan9 was asked for %v, want %v", got, ofUplink)
++	}
++	if got := own.told(); len(got) != 1 || got[0] != ofServer.String() {
++		t.Errorf("the dialer of the server was asked for %v, want %v", got, ofServer)
++	}
++	if state.dialerFor("") != own {
++		t.Error("a server without a device is not asked through the dialer of the server")
++	}
++}
+diff --git a/dns/router.go b/dns/router.go
+index 05ddac937..d61e8730a 100644
+--- a/dns/router.go
++++ b/dns/router.go
+@@ -51,6 +51,8 @@ type Router struct {
+ 	rulesAccess           sync.RWMutex
+ 	started               bool
+ 	closing               bool
++	// providers are the provider's servers of the fallback of this box (podkop-engine)
++	providers *providerSet
+ }
+ 
+ func NewRouter(ctx context.Context, logFactory log.Factory, options option.DNSOptions) (*Router, error) {
+@@ -63,7 +65,13 @@ func NewRouter(ctx context.Context, logFactory log.Factory, options option.DNSOp
+ 		rawRules:              make([]option.DNSRule, 0, len(options.Rules)),
+ 		rules:                 make([]adapter.DNSRule, 0, len(options.Rules)),
+ 		defaultDomainStrategy: C.DomainStrategy(options.Strategy),
++		providers:             newProviderSet(),
+ 	}
++	// the transports of this box find the provider's servers of its fallback here
++	if service.RegistryFromContext(ctx) != nil {
++		service.MustRegister[*providerSet](ctx, router.providers)
++	}
++
+ 	if options.DNSClientOptions.IndependentCache {
+ 		deprecated.Report(ctx, deprecated.OptionIndependentDNSCache)
+ 	}
+@@ -1398,7 +1406,9 @@ func (r *Router) ResetNetwork() {
+ 			state.reset()
+ 		}
+ 	}
+-	ResetFallbackProviders() // the output device may have changed
++	if r.providers != nil {
++		r.providers.forget() // the output device may have changed
++	}
+ }
+ 
+ func defaultRuleNeedsLegacyDNSModeFromAddressFilter(rule option.DefaultDNSRule) bool {
+-- 
+2.53.0
+

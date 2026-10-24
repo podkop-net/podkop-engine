@@ -1,7 +1,7 @@
 From b574cd838a2b8e198ff49d20a8579cd54c36d6e4 Mon Sep 17 00:00:00 2001
 From: FiyeroT <me@fiyero.xyz>
 Date: Tue, 6 Oct 2026 23:37:26 +0300
-Subject: [PATCH 083/140] tls: do not rebuild the Client Hello after the
+Subject: [PATCH 083/147] tls: do not rebuild the Client Hello after the
  handshake
 
 The uTLS connection with ALPN rebuilds its Client Hello in HandshakeContext, and the

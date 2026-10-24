@@ -1,7 +1,7 @@
 From d676e23bfe8d581bb517593f10ef9814a0c7fbdb Mon Sep 17 00:00:00 2001
 From: FiyeroT <me@fiyero.xyz>
 Date: Sun, 18 Oct 2026 14:40:32 +0300
-Subject: [PATCH 131/140] domainset: the trie a type of its own, filled in
+Subject: [PATCH 131/147] domainset: the trie a type of its own, filled in
  place
 
 domain.ReadMatcher copies the trie it is handed, growing its slices a

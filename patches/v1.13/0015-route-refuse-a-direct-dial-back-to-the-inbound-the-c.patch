@@ -1,7 +1,7 @@
 From 5405ab3b2d0d1c5d71122f2f5c4b8b59b6c0a1f3 Mon Sep 17 00:00:00 2001
 From: FiyeroT <me@fiyero.xyz>
 Date: Sat, 3 Oct 2026 11:27:48 +0300
-Subject: [PATCH 015/140] route: refuse a direct dial back to the inbound the
+Subject: [PATCH 015/147] route: refuse a direct dial back to the inbound the
  connection came in on
 
 A direct inbound hands out its own listen address as the destination of

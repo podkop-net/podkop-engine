@@ -1,7 +1,7 @@
 From 974222877106f350dfe0b675abe3e213803b2fa6 Mon Sep 17 00:00:00 2001
 From: FiyeroT <me@fiyero.xyz>
 Date: Mon, 19 Oct 2026 20:15:14 +0300
-Subject: [PATCH 133/140] xhttp: a write after the server ended the upload is
+Subject: [PATCH 133/147] xhttp: a write after the server ended the upload is
  the end of the connection
 
 When the server ends its answer to the request that carries the upload
