@@ -1,0 +1,97 @@
+From 3e9ea62bc78c5895e2f3f0ebfd5ae5b9f7122185 Mon Sep 17 00:00:00 2001
+From: FiyeroT <me@fiyero.xyz>
+Date: Sun, 25 Oct 2026 22:54:25 +0300
+Subject: [PATCH 151/152] tls: a dial waits for the probe of the fingerprint
+ fallback 5 s at most
+
+A probe that ends without a verdict (a server that is down, a TCP handshake
+that does not end, a failure the watch does not see) left nothing known, and
+the next dial became the probe in its turn: the dials behind went one at a
+time, each waiting out its timeout. A probe takes a second or two, four
+unanswered ClientHellos about four on a path of 50 ms; after 5 s a waiting
+dial goes on its own. On a stand whose server dropped every ClientHello, 15
+of 20 dials of a burst were still waiting when the client gave up; now none.
+---
+ common/tls/utls_fallback.go      | 10 ++++++++++
+ common/tls/utls_fallback_test.go | 23 ++++++++++++++++++++++-
+ 2 files changed, 32 insertions(+), 1 deletion(-)
+
+diff --git a/common/tls/utls_fallback.go b/common/tls/utls_fallback.go
+index eefd51318..4e1959857 100644
+--- a/common/tls/utls_fallback.go
++++ b/common/tls/utls_fallback.go
+@@ -65,6 +65,11 @@ var (
+ 	// A choice is kept this long, also across restarts in the cache file; then one dial
+ 	// tries the first candidate again: the server may have been updated, the path changed.
+ 	utlsFallbackRecheck = 24 * time.Hour
++	// A dial waits this long at most for the probe of another. A probe takes a second or
++	// two, four unanswered ClientHellos about four on a path of 50 ms; one that takes longer
++	// is kept by something else (a server that is down, a TCP handshake that does not end),
++	// and the dials behind it would go one at a time, each waiting out its timeout.
++	utlsFallbackProbeWait = 5 * time.Second
+ )
+ 
+ // utlsFallbackCandidate is a ClientHello the fallback may send: a fingerprint, with or
+@@ -442,6 +447,8 @@ type utlsFallbackDial struct {
+ 
+ func (d *utlsFallbackDial) ready(ctx context.Context, destination M.Socksaddr) error {
+ 	f := d.fallback
++	timer := time.NewTimer(utlsFallbackProbeWait)
++	defer timer.Stop()
+ 	for {
+ 		f.access.Lock()
+ 		f.load(d.serverName, destination)
+@@ -459,6 +466,9 @@ func (d *utlsFallbackDial) ready(ctx context.Context, destination M.Socksaddr) e
+ 		f.access.Unlock()
+ 		select {
+ 		case <-probing:
++		case <-timer.C:
++			// the probe takes long: the dial goes on its own
++			return nil
+ 		case <-ctx.Done():
+ 			return ctx.Err()
+ 		}
+diff --git a/common/tls/utls_fallback_test.go b/common/tls/utls_fallback_test.go
+index 28ce99bd7..17a312442 100644
+--- a/common/tls/utls_fallback_test.go
++++ b/common/tls/utls_fallback_test.go
+@@ -271,7 +271,8 @@ func TestUTLSFallbackDial(t *testing.T) {
+ 
+ // While nothing is known of a server, one dial tries the ClientHellos and the others wait
+ // for it before they connect; then nobody waits. A dial whose caller gives up does not wait
+-// on. While the fallback rests nobody waits either: the dials go as without it.
++// on. While the fallback rests nobody waits either: the dials go as without it; and no dial
++// waits for a probe longer than utlsFallbackProbeWait.
+ func TestUTLSFallbackProbe(t *testing.T) {
+ 	setFallback(t, true)
+ 	quietLog(t)
+@@ -360,6 +361,26 @@ func TestUTLSFallbackProbe(t *testing.T) {
+ 		require.False(t, waiting(readyLater(dial)))
+ 		require.False(t, dial.(*utlsFallbackDial).probe)
+ 	}
++
++	// a probe that takes long (a server that is down, say) holds the others for
++	// utlsFallbackProbeWait at most: then they go on their own, none of them a probe
++	probeWait := utlsFallbackProbeWait
++	utlsFallbackProbeWait = 400 * time.Millisecond
++	t.Cleanup(func() { utlsFallbackProbeWait = probeWait })
++	config, _ = fallbackClient(t, "chrome", false)
++	first = newDialOf(config)
++	require.NoError(t, first.ready(ctx, fallbackServer))
++	second = newDialOf(config)
++	secondReady = readyLater(second)
++	require.True(t, waiting(secondReady))
++	select {
++	case err := <-secondReady:
++		require.NoError(t, err)
++	case <-time.After(time.Second):
++		t.Fatal("the second dial waits on past utlsFallbackProbeWait")
++	}
++	require.False(t, second.(*utlsFallbackDial).probe)
++	first.done()
+ }
+ 
+ // A REALITY server since Xray-core v26.9.8 answers the ClientHello without the
+-- 
+2.53.0
+

@@ -1,7 +1,7 @@
 From dc9284098234adcb265bc55d36b18ed27db9877e Mon Sep 17 00:00:00 2001
 From: FiyeroT <me@fiyero.xyz>
 Date: Fri, 2 Oct 2026 06:52:30 +0300
-Subject: [PATCH 012/147] route: a FakeIP address without a record goes by the
+Subject: [PATCH 012/152] route: a FakeIP address without a record goes by the
  sniffed domain
 
 A connection to a FakeIP address the store has no record for was refused

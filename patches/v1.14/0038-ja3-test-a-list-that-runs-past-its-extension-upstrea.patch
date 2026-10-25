@@ -1,7 +1,7 @@
 From ca3c0dabf0e7d5fd5763a2406aaf8da24cc894fb Mon Sep 17 00:00:00 2001
 From: FiyeroT <me@fiyero.xyz>
 Date: Sun, 4 Oct 2026 08:35:15 +0300
-Subject: [PATCH 038/155] ja3: test a list that runs past its extension
+Subject: [PATCH 038/160] ja3: test a list that runs past its extension
  (upstream 07512b109)
 
 What is left of the backport of "Fix protocol input validation" from the

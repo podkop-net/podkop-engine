@@ -1,7 +1,7 @@
 From 1fe9628e5daeb210861b6eff5db29a39448f51e4 Mon Sep 17 00:00:00 2001
 From: FiyeroT <me@fiyero.xyz>
 Date: Thu, 8 Oct 2026 17:10:37 +0300
-Subject: [PATCH 094/147] tls: spoof and spoof_method, the route options
+Subject: [PATCH 094/152] tls: spoof and spoof_method, the route options
  tls_spoof and tls_spoof_method (from sing-box 1.14)
 
 A forged ClientHello with a name of the user's choice is sent before the real one, in

@@ -1,7 +1,7 @@
 From 46ac448b5eee3614a56a8ac7f111e070873e5d9d Mon Sep 17 00:00:00 2001
 From: FiyeroT <me@fiyero.xyz>
 Date: Mon, 19 Oct 2026 20:40:43 +0300
-Subject: [PATCH 134/147] domainset: build on 32-bit architectures
+Subject: [PATCH 134/152] domainset: build on 32-bit architectures
 
 Collector.add compared an int with math.MaxUint32, a constant that does not
 fit in the int of a 32-bit target: the package, and with it every build of

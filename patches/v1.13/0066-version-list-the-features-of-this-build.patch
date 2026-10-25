@@ -1,7 +1,7 @@
 From d13f32581537c0fe08fda19f21652753e0113618 Mon Sep 17 00:00:00 2001
 From: FiyeroT <me@fiyero.xyz>
 Date: Tue, 6 Oct 2026 07:09:49 +0300
-Subject: [PATCH 066/147] version: list the features of this build
+Subject: [PATCH 066/152] version: list the features of this build
 
 "sing-box version" ends with a line "Features:" naming what the build adds
 that a configuration or a script may depend on: urltest.fallbacks,

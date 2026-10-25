@@ -1,7 +1,7 @@
 From 07c69f3164f5a8c33e1879046dd4e1ef852d26fa Mon Sep 17 00:00:00 2001
 From: FiyeroT <me@fiyero.xyz>
 Date: Sat, 17 Oct 2026 08:07:38 +0300
-Subject: [PATCH 133/155] rule-set: format text, a list of domains and IP CIDRs
+Subject: [PATCH 133/160] rule-set: format text, a list of domains and IP CIDRs
  as plain text
 
 Many sites publish their lists as plain text, a domain or an address a line,

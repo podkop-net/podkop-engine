@@ -1,7 +1,7 @@
 From 813ea3aea79d68bc85ea549dbc6c1753c25e44dd Mon Sep 17 00:00:00 2001
 From: FiyeroT <me@fiyero.xyz>
 Date: Wed, 7 Oct 2026 05:01:52 +0300
-Subject: [PATCH 086/147] go.mod: golang.org/x/net v0.57.0, with x/crypto,
+Subject: [PATCH 086/152] go.mod: golang.org/x/net v0.57.0, with x/crypto,
  x/text and x/sys, as the 1.14 line
 
 x/net v0.50.0 calls a nil parser for HTTP/2 frames of types 0x0a to 0x0f: one such frame

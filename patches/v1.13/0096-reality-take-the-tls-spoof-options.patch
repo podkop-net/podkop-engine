@@ -1,7 +1,7 @@
 From b82bd3efbe8b209c9b1d3fa8f0453f2210aab42f Mon Sep 17 00:00:00 2001
 From: FiyeroT <me@fiyero.xyz>
 Date: Thu, 8 Oct 2026 17:06:43 +0300
-Subject: [PATCH 096/147] reality: take the tls spoof options
+Subject: [PATCH 096/152] reality: take the tls spoof options
 
 The REALITY client refused spoof and spoof_method, though its handshake runs over the
 same TCP connection as that of any other TLS client, and REALITY authenticates by the

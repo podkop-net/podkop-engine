@@ -1,7 +1,7 @@
 From 20f608a16a93cd4f1ae36235e71515eaab43d0a2 Mon Sep 17 00:00:00 2001
 From: FiyeroT <me@fiyero.xyz>
 Date: Tue, 6 Oct 2026 05:06:27 +0300
-Subject: [PATCH 064/155] tools decode-link: do not wrap a nil error
+Subject: [PATCH 064/160] tools decode-link: do not wrap a nil error
 
 E.Cause panics on one: every xhttp link that passed the check of its options
 crashed the command.

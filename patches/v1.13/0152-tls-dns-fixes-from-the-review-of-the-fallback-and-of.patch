@@ -1,0 +1,431 @@
+From e358a6a8d724d5780db91fb4e110580627bd6c3c Mon Sep 17 00:00:00 2001
+From: FiyeroT <me@fiyero.xyz>
+Date: Sun, 25 Oct 2026 23:42:39 +0300
+Subject: [PATCH 152/152] tls, dns: fixes from the review of the fallback and
+ of ipv6_if_no_ipv4
+
+- The choice of the fallback is written to the cache file in the background,
+  not under the lock every dial of the outbound takes, and only when the
+  choice of a path changes or gets old: two local addresses with choices of
+  their own (two uplinks) no longer rewrite it by turns.
+- What a dial made during a rest got through with (the configured
+  fingerprint as it is when nothing has worked) is no longer written as the
+  choice for the server.
+- The first candidate is left on a failure of any kind while it has not
+  worked: it is not the configured fingerprint, which the rule protected.
+- The same ClientHello is not tried twice: random may have taken firefox.
+- The A question of ipv6_if_no_ipv4 goes with the address check of the rule:
+  an answer the rule refuses is not cached and tells nothing.
+---
+ common/tls/utls_fallback.go      |  57 +++++++++----
+ common/tls/utls_fallback_test.go | 137 +++++++++++++++++++++++++++++--
+ dns/client.go                    |   2 +-
+ dns/client_ipv6.go               |  13 +--
+ dns/client_ipv6_test.go          |  17 ++++
+ 5 files changed, 193 insertions(+), 33 deletions(-)
+
+diff --git a/common/tls/utls_fallback.go b/common/tls/utls_fallback.go
+index 4e1959857..bc2a3d594 100644
+--- a/common/tls/utls_fallback.go
++++ b/common/tls/utls_fallback.go
+@@ -123,8 +123,10 @@ type utlsFallbackPath struct {
+ 	// one that did last (-1: none); a candidate refused since is in neither
+ 	worked uint64
+ 	last   int
+-	// when the candidate in use was chosen or confirmed last
++	// when the candidate in use was chosen or confirmed last, and the candidate this path
++	// kept as the choice for the server then (-1: none)
+ 	chosen time.Time
++	choice int
+ 	// a dial is trying the first candidate again, the choice being old
+ 	rechecking bool
+ 	// when the ClientHello of the candidate in use went unanswered for the first time
+@@ -186,6 +188,10 @@ type utlsFallback struct {
+ 	// until when a path rests: its dials are made as without the fallback, and none waits
+ 	// for a probe, which would make them one at a time, each waiting out its timeout
+ 	restUntil time.Time
++	// the writes of the choice to the cache file, made in the order the choices were: a
++	// write waits for the file (a batch of bbolt) and is not made under access
++	storing sync.Mutex
++	stored  time.Time
+ }
+ 
+ // utlsFallbackEnabled tells whether the fallback is on: the option
+@@ -224,11 +230,10 @@ func newUTLSFallback(ctx context.Context, logger logger.ContextLogger, configure
+ 	if !utlsClassicFingerprint(configured) {
+ 		candidates[0].noMLKEM = true
+ 	}
+-	if configured != utlsFallbackWithKeyShare {
+-		id, err := uTLSClientHelloID(utlsFallbackWithKeyShare)
+-		if err == nil {
+-			candidates = append(candidates, utlsFallbackCandidate{name: utlsFallbackWithKeyShare, id: id})
+-		}
++	// the same ClientHello is not tried twice: random may have taken firefox
++	id, err := uTLSClientHelloID(utlsFallbackWithKeyShare)
++	if err == nil && id != configuredID {
++		candidates = append(candidates, utlsFallbackCandidate{name: utlsFallbackWithKeyShare, id: id})
+ 	}
+ 	configuredIndex := -1
+ 	for index, candidate := range candidates {
+@@ -305,14 +310,25 @@ func (f *utlsFallback) load(serverName string, destination M.Socksaddr) {
+ 	}
+ }
+ 
+-// store keeps the candidate in use of a path as the choice for the server. The caller holds
+-// the lock.
++// store keeps the candidate in use of a path as the choice for the server; the cache file
++// is written in the background. The caller holds the lock.
+ func (f *utlsFallback) store(path *utlsFallbackPath, now time.Time) {
+-	path.chosen = now
++	path.chosen, path.choice = now, path.position
+ 	f.saved, f.savedAt = path.position, now
+-	if f.cache != nil && f.key != "" {
+-		_ = f.cache.StoreUTLSChoice(f.key, f.candidates[path.position].String(), now)
++	if f.cache == nil || f.key == "" {
++		return
+ 	}
++	cache, key, choice := f.cache, f.key, f.candidates[path.position].String()
++	go func() {
++		f.storing.Lock()
++		defer f.storing.Unlock()
++		if now.Before(f.stored) {
++			// a later choice is written already
++			return
++		}
++		f.stored = now
++		_ = cache.StoreUTLSChoice(key, choice, now)
++	}()
+ }
+ 
+ // path returns what is known of the local address of conn. The caller holds the lock.
+@@ -326,10 +342,10 @@ func (f *utlsFallback) path(conn net.Conn) *utlsFallbackPath {
+ 			return path
+ 		}
+ 	}
+-	path := &utlsFallbackPath{local: local, last: -1, resume: -1}
++	path := &utlsFallbackPath{local: local, last: -1, resume: -1, choice: -1}
+ 	if f.saved >= 0 {
+ 		// what was chosen for the server before, on this or another address
+-		path.position, path.last, path.chosen = f.saved, f.saved, f.savedAt
++		path.position, path.last, path.chosen, path.choice = f.saved, f.saved, f.savedAt, f.saved
+ 		path.worked = 1 << f.saved
+ 	}
+ 	if len(f.paths) < utlsFallbackPaths {
+@@ -558,12 +574,16 @@ func (d *utlsFallbackDial) answered() {
+ 	path.worked |= 1 << d.position
+ 	path.last = d.position
+ 	f.known = true
+-	if first || f.saved != d.position || now.Sub(path.chosen) >= utlsFallbackRecheck {
+-		f.store(path, now)
+-	}
+ 	if !d.watched || now.Before(path.restUntil) {
++		// what a dial made during a rest got through with (the configured fingerprint as it
++		// is when nothing has worked) is no choice of the fallback: it is not kept
+ 		return
+ 	}
++	// kept when the choice of this path changes or gets old: two paths with choices of
++	// their own do not write by turns
++	if path.choice != d.position || now.Sub(path.chosen) >= utlsFallbackRecheck {
++		f.store(path, now)
++	}
+ 	name := f.candidates[d.position].String()
+ 	if !path.suspected.IsZero() {
+ 		// On this or on another connection: what left the other ClientHello unanswered did
+@@ -646,8 +666,9 @@ func (d *utlsFallbackDial) failed(ctx context.Context, destination M.Socksaddr,
+ 	if !d.watched || ctx.Err() != nil || d.position != path.position || now.Before(path.restUntil) {
+ 		return false
+ 	}
+-	if !refused && path.twice() {
+-		// answered, with a failure of another kind: not what the fallback is for
++	if !refused && path.worked&(1<<d.position) != 0 {
++		// answered, with a failure of another kind, a candidate that has worked here: not
++		// what the fallback is for
+ 		path.suspected = time.Time{}
+ 		return false
+ 	}
+diff --git a/common/tls/utls_fallback_test.go b/common/tls/utls_fallback_test.go
+index 17a312442..c71580ea4 100644
+--- a/common/tls/utls_fallback_test.go
++++ b/common/tls/utls_fallback_test.go
+@@ -136,6 +136,12 @@ func TestUTLSFallbackCandidates(t *testing.T) {
+ 	}
+ 	config, _ := fallbackClient(t, "android", false)
+ 	require.Equal(t, "android, firefox", namesOf(t, config))
++	// random that took firefox is not tried again as firefox: the same ClientHello
++	previous := randomFingerprint
++	t.Cleanup(func() { randomFingerprint = previous })
++	randomFingerprint, _ = uTLSClientHelloID("firefox")
++	config, _ = fallbackClient(t, "random", false)
++	require.Equal(t, "random without X25519MLKEM768, random", namesOf(t, config))
+ 
+ 	setFallback(t, false)
+ 	config, _ = fallbackClient(t, "chrome", false)
+@@ -515,9 +521,10 @@ func attemptAndFail(t *testing.T, dial fingerprintDial, err error) error {
+ 	return err
+ }
+ 
+-// A ClientHello that fails in another way before it has completed a handshake is left; the
+-// first candidate, and one that has worked, stay through such a failure, as without the
+-// fallback. A handshake that waited out its whole time ends the dial.
++// A ClientHello that fails in another way before it has completed a handshake is left, the
++// first candidate too (it is not the configured fingerprint); one that has worked stays
++// through such a failure, as without the fallback. A handshake that waited out its whole
++// time ends the dial.
+ func TestUTLSFallbackLeavesWhatFails(t *testing.T) {
+ 	setFallback(t, true)
+ 	quietLog(t)
+@@ -527,9 +534,22 @@ func TestUTLSFallbackLeavesWhatFails(t *testing.T) {
+ 
+ 	dial := newDialOf(config)
+ 	require.Equal(t, chromeWithout, attemptName(t, dial, "192.0.2.10"))
+-	require.False(t, dial.failed(ctx, fallbackServer, refused), "the first candidate fails as without the fallback")
+-	require.Empty(t, warnings.take())
++	require.True(t, dial.failed(ctx, fallbackServer, refused), "the first candidate, never answered, is left")
++	first := warnings.take()
++	require.Len(t, first, 1)
++	require.Contains(t, first[0], "failed with "+chromeWithout+" (remote error: tls: handshake failure), retrying with firefox")
++	require.Equal(t, "firefox", attemptName(t, dial, "192.0.2.10"))
++	// once answered here it stays through such a failure
++	config, warnings = fallbackClient(t, "chrome", false)
++	dial = newDialOf(config)
++	require.Equal(t, chromeWithout, attemptName(t, dial, "192.0.2.10"))
++	dial.answered()
++	dial = newDialOf(config)
++	require.Equal(t, chromeWithout, attemptName(t, dial, "192.0.2.10"))
++	require.False(t, dial.failed(ctx, fallbackServer, refused), "a candidate that has worked fails as without the fallback")
++	warnings.take()
+ 
++	config, warnings = fallbackClient(t, "chrome", false)
+ 	dial = newDialOf(config)
+ 	require.Equal(t, chromeWithout, attemptName(t, dial, "192.0.2.10"))
+ 	lost(t, dial)
+@@ -667,6 +687,7 @@ type choiceCache struct {
+ 	adapter.CacheFile
+ 	access  sync.Mutex
+ 	choices map[string]choiceEntry
++	writes  int
+ }
+ 
+ type choiceEntry struct {
+@@ -685,9 +706,39 @@ func (c *choiceCache) StoreUTLSChoice(key string, choice string, at time.Time) e
+ 	c.access.Lock()
+ 	defer c.access.Unlock()
+ 	c.choices[key] = choiceEntry{choice, at}
++	c.writes++
+ 	return nil
+ }
+ 
++// wait returns the only entry once it holds the choice: the fallback writes in the
++// background.
++func (c *choiceCache) wait(t *testing.T, choice string) (string, choiceEntry) {
++	t.Helper()
++	deadline := time.Now().Add(time.Second)
++	for {
++		c.access.Lock()
++		if len(c.choices) == 1 {
++			for key, entry := range c.choices {
++				if entry.choice == choice {
++					c.access.Unlock()
++					return key, entry
++				}
++			}
++		}
++		c.access.Unlock()
++		if time.Now().After(deadline) {
++			t.Fatalf("the cache has %v, not the choice %s", c.choices, choice)
++		}
++		time.Sleep(10 * time.Millisecond)
++	}
++}
++
++func (c *choiceCache) writeCount() int {
++	c.access.Lock()
++	defer c.access.Unlock()
++	return c.writes
++}
++
+ func (c *choiceCache) only(t *testing.T) (string, choiceEntry) {
+ 	c.access.Lock()
+ 	defer c.access.Unlock()
+@@ -716,7 +767,7 @@ func TestUTLSFallbackCache(t *testing.T) {
+ 	require.Equal(t, "firefox", attemptName(t, dial, "192.0.2.10"))
+ 	dial.answered()
+ 	dial.done()
+-	key, entry := cache.only(t)
++	key, entry := cache.wait(t, "firefox")
+ 	require.Equal(t, "chrome example.org 192.0.2.1:443", key)
+ 	require.Equal(t, "firefox", entry.choice)
+ 	require.WithinDuration(t, time.Now(), entry.at, time.Minute)
+@@ -744,7 +795,7 @@ func TestUTLSFallbackCache(t *testing.T) {
+ 	require.Equal(t, "firefox", attemptName(t, recheck, "192.0.2.10"))
+ 	recheck.answered()
+ 	recheck.done()
+-	_, entry = cache.only(t)
++	_, entry = cache.wait(t, "firefox")
+ 	require.Equal(t, "firefox", entry.choice)
+ 	require.WithinDuration(t, time.Now(), entry.at, time.Minute)
+ 	require.WithinDuration(t, time.Now(), path.chosen, time.Minute)
+@@ -755,7 +806,7 @@ func TestUTLSFallbackCache(t *testing.T) {
+ 	recheck.answered()
+ 	recheck.done()
+ 	require.Equal(t, chromeWithout, attemptName(t, newDialOf(config), "192.0.2.10"))
+-	_, entry = cache.only(t)
++	_, entry = cache.wait(t, chromeWithout)
+ 	require.Equal(t, chromeWithout, entry.choice)
+ 
+ 	// box.New registers the cache file after it has made the outbounds: it is found at the
+@@ -769,7 +820,7 @@ func TestUTLSFallbackCache(t *testing.T) {
+ 	require.Equal(t, chromeWithout, attemptName(t, dial, "192.0.2.10"))
+ 
+ 	// a choice older than a day is not read: the client made again probes
+-	cache.choices[key] = choiceEntry{"firefox", time.Now().Add(-25 * time.Hour)}
++	require.NoError(t, cache.StoreUTLSChoice(key, "firefox", time.Now().Add(-25*time.Hour)))
+ 	config, _ = fallbackClientIn(t, ctx, "chrome", true)
+ 	dial = newDialOf(config)
+ 	require.NoError(t, dial.ready(ctx, fallbackServer))
+@@ -871,3 +922,71 @@ func TestUTLSFallbackWarnsOnce(t *testing.T) {
+ 	require.LessOrEqual(t, len(fallback.lines), utlsFallbackLines)
+ 	fallback.access.Unlock()
+ }
++
++// The choice is written when the choice of a path changes or gets old, in the background:
++// two paths with choices of their own do not write by turns, and what a dial made during a
++// rest got through with is not written.
++func TestUTLSFallbackStores(t *testing.T) {
++	setFallback(t, true)
++	quietLog(t)
++	cache := &choiceCache{choices: make(map[string]choiceEntry)}
++	ctx := service.ContextWith[adapter.CacheFile](context.Background(), adapter.CacheFile(cache))
++	config, _ := fallbackClientIn(t, ctx, "chrome", false)
++	dial := newDialOf(config)
++	require.NoError(t, dial.ready(ctx, fallbackServer))
++	require.Equal(t, chromeWithout, attemptName(t, dial, "192.0.2.10"))
++	dial.answered()
++	dial.done()
++	cache.wait(t, chromeWithout)
++	// another local address, where the first candidate goes unanswered: firefox
++	dial = newDialOf(config)
++	require.Equal(t, chromeWithout, attemptName(t, dial, "198.51.100.7"))
++	lost(t, dial)
++	require.Equal(t, chromeWithout, attemptName(t, dial, "198.51.100.7"))
++	lost(t, dial)
++	require.Equal(t, "firefox", attemptName(t, dial, "198.51.100.7"))
++	dial.answered()
++	cache.wait(t, "firefox")
++	writes := cache.writeCount()
++	require.Equal(t, 2, writes)
++	for range 5 {
++		for _, local := range []string{"192.0.2.10", "198.51.100.7"} {
++			dial = newDialOf(config)
++			attemptName(t, dial, local)
++			dial.answered()
++		}
++	}
++	time.Sleep(100 * time.Millisecond)
++	require.Equal(t, writes, cache.writeCount(), "dials by turns on the two paths write")
++
++	// nothing answered, the fallback rests on chrome as configured; a dial of the rest gets
++	// through with it, and nothing is written
++	rest := utlsFallbackRest
++	utlsFallbackRest = time.Minute
++	t.Cleanup(func() { utlsFallbackRest = rest })
++	cache = &choiceCache{choices: make(map[string]choiceEntry)}
++	ctx = service.ContextWith[adapter.CacheFile](context.Background(), adapter.CacheFile(cache))
++	config, _ = fallbackClientIn(t, ctx, "chrome", false)
++	dial = newDialOf(config)
++	require.NoError(t, dial.ready(ctx, fallbackServer))
++	require.Equal(t, chromeWithout, attemptName(t, dial, "192.0.2.10"))
++	lost(t, dial)
++	require.Equal(t, chromeWithout, attemptName(t, dial, "192.0.2.10"))
++	lost(t, dial)
++	require.Equal(t, "firefox", attemptName(t, dial, "192.0.2.10"))
++	lost(t, dial)
++	require.Equal(t, "chrome", attemptName(t, dial, "192.0.2.10"))
++	again, err := dial.unanswered(fallbackServer)
++	require.False(t, again)
++	require.Error(t, err)
++	dial.done()
++	dial = newDialOf(config)
++	require.NoError(t, dial.ready(ctx, fallbackServer))
++	name, watched := attemptWatched(t, dial, "192.0.2.10")
++	require.Equal(t, "chrome", name)
++	require.False(t, watched)
++	dial.answered()
++	dial.done()
++	time.Sleep(100 * time.Millisecond)
++	require.Zero(t, cache.writeCount())
++}
+diff --git a/dns/client.go b/dns/client.go
+index 7751e31d8..764038624 100644
+--- a/dns/client.go
++++ b/dns/client.go
+@@ -126,7 +126,7 @@ func stripDNSPadding(response *dns.Msg) {
+ }
+ 
+ func (c *Client) Exchange(ctx context.Context, transport adapter.DNSTransport, message *dns.Msg, options adapter.DNSQueryOptions, responseChecker func(responseAddrs []netip.Addr) bool) (*dns.Msg, error) {
+-	if c.mayAskIPv6(transport, message, options) && c.noIPv4(ctx, transport, message, options) {
++	if c.mayAskIPv6(transport, message, options) && c.noIPv4(ctx, transport, message, options, responseChecker) {
+ 		options.Strategy = C.DomainStrategyPreferIPv4
+ 	}
+ 	return c.exchange(ctx, transport, message, options, responseChecker)
+diff --git a/dns/client_ipv6.go b/dns/client_ipv6.go
+index 670c26c94..084a0eec4 100644
+--- a/dns/client_ipv6.go
++++ b/dns/client_ipv6.go
+@@ -2,6 +2,7 @@ package dns
+ 
+ import (
+ 	"context"
++	"net/netip"
+ 
+ 	"github.com/sagernet/sing-box/adapter"
+ 	C "github.com/sagernet/sing-box/constant"
+@@ -25,13 +26,15 @@ func (c *Client) mayAskIPv6(transport adapter.DNSTransport, message *dns.Msg, op
+ 		transport.Type() != C.DNSTypeFakeIP
+ }
+ 
+-// noIPv4 asks the A question of the name of an AAAA question through the same server. A
+-// success without an A record tells that the name has no IPv4 address; an error, another
+-// rcode or an A record tell nothing of the kind.
+-func (c *Client) noIPv4(ctx context.Context, transport adapter.DNSTransport, message *dns.Msg, options adapter.DNSQueryOptions) bool {
++// noIPv4 asks the A question of the name of an AAAA question through the same server, with
++// the check of the addresses of the rule (a refused answer is not cached, as for the A
++// question of a client). A success without an A record tells that the name has no IPv4
++// address; an error, a refused answer, another rcode or an A record tell nothing of the
++// kind.
++func (c *Client) noIPv4(ctx context.Context, transport adapter.DNSTransport, message *dns.Msg, options adapter.DNSQueryOptions, responseChecker func(responseAddrs []netip.Addr) bool) bool {
+ 	question := message.Copy()
+ 	question.Question[0].Qtype = dns.TypeA
+-	response, err := c.exchange(ctx, transport, question, options, nil)
++	response, err := c.exchange(ctx, transport, question, options, responseChecker)
+ 	if err != nil || response == nil || response.Rcode != dns.RcodeSuccess {
+ 		return false
+ 	}
+diff --git a/dns/client_ipv6_test.go b/dns/client_ipv6_test.go
+index 64ecfe9eb..940321540 100644
+--- a/dns/client_ipv6_test.go
++++ b/dns/client_ipv6_test.go
+@@ -155,3 +155,20 @@ func TestIPv6IfNoIPv4Lookup(t *testing.T) {
+ 	require.NoError(t, err)
+ 	require.Empty(t, addresses)
+ }
++
++// The A question goes with the check of the addresses of the rule: an answer the rule
++// refuses tells nothing and is not cached, as for the A question of a client.
++func TestIPv6IfNoIPv4Checked(t *testing.T) {
++	ctx := context.Background()
++	transport := newIPv6TestTransport("server", C.DNSTypeUDP)
++	client := ipv6TestClient(true)
++	refuse := func([]netip.Addr) bool { return false }
++	response, err := client.Exchange(ctx, transport, ipv6TestQuestion("dual.test.", mDNS.TypeAAAA), ipv4Only, refuse)
++	require.NoError(t, err)
++	require.Empty(t, response.Answer)
++	require.Equal(t, 1, transport.asked(mDNS.TypeA))
++	require.Zero(t, transport.asked(mDNS.TypeAAAA))
++	_, err = client.Exchange(ctx, transport, ipv6TestQuestion("dual.test.", mDNS.TypeA), ipv4Only, nil)
++	require.NoError(t, err)
++	require.Equal(t, 2, transport.asked(mDNS.TypeA), "the refused answer was cached")
++}
+-- 
+2.53.0
+

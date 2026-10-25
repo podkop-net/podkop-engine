@@ -1,7 +1,7 @@
 From 7350ab36c97617fe401ab24d321f23803b8ff50b Mon Sep 17 00:00:00 2001
 From: FiyeroT <me@fiyero.xyz>
 Date: Mon, 5 Oct 2026 14:09:32 +0300
-Subject: [PATCH 052/155] xhttp: fixes from the review
+Subject: [PATCH 052/160] xhttp: fixes from the review
 
 Configuration: a range as wide as int32 no longer panics (sing-box check for
 the XMUX pool sizes, the process for the rest); header names and values, keys

@@ -1,7 +1,7 @@
 From 2564cbf82aa301a1749e824b45d3a2549fc4b71f Mon Sep 17 00:00:00 2001
 From: FiyeroT <me@fiyero.xyz>
 Date: Thu, 8 Oct 2026 16:45:53 +0300
-Subject: [PATCH 092/147] clashapi: drop the sniffer state from a tracker's
+Subject: [PATCH 092/152] clashapi: drop the sniffer state from a tracker's
  metadata
 
 A tracker keeps a copy of the connection's metadata for as long as the connection

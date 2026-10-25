@@ -1,7 +1,7 @@
 From 0a5ec29c083014bf1d485316b8336f75ac4b3d01 Mon Sep 17 00:00:00 2001
 From: FiyeroT <me@fiyero.xyz>
 Date: Fri, 9 Oct 2026 16:15:05 +0300
-Subject: [PATCH 118/147] route: do not leave a packet of a new NAT session
+Subject: [PATCH 118/152] route: do not leave a packet of a new NAT session
  behind its DNS handler
 
 udpnat gives a packet to the handler of its session, and queues it while

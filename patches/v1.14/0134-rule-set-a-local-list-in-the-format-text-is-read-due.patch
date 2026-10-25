@@ -1,7 +1,7 @@
 From b6bba9a4bd842cdecf716f6150e12de446374bc7 Mon Sep 17 00:00:00 2001
 From: FiyeroT <me@fiyero.xyz>
 Date: Sat, 17 Oct 2026 18:19:28 +0300
-Subject: [PATCH 134/155] rule-set: a local list in the format text is read;
+Subject: [PATCH 134/160] rule-set: a local list in the format text is read;
  due rule-sets download five at a time
 
 The case of the format text in the reload of a local rule-set lost the default

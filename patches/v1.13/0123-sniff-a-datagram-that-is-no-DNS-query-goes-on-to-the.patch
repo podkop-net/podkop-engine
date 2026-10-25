@@ -1,7 +1,7 @@
 From 8b4f9aa7a4ee00ecb0c10c5e8fbd588d2b8444f4 Mon Sep 17 00:00:00 2001
 From: FiyeroT <me@fiyero.xyz>
 Date: Sat, 10 Oct 2026 17:44:47 +0300
-Subject: [PATCH 123/147] sniff: a datagram that is no DNS query goes on to the
+Subject: [PATCH 123/152] sniff: a datagram that is no DNS query goes on to the
  other packet sniffers
 
 The DNS sniffer of UDP returned the error of the unpacking for a response and

@@ -1,7 +1,7 @@
 From f694245f8ab6b8d9303adf032aeb4fbc366a1ed9 Mon Sep 17 00:00:00 2001
 From: FiyeroT <me@fiyero.xyz>
 Date: Mon, 19 Oct 2026 22:59:58 +0300
-Subject: [PATCH 140/147] rule-set: a closed rule-set does not parse or save a
+Subject: [PATCH 140/152] rule-set: a closed rule-set does not parse or save a
  list that came in
 
 Closing the box cancels the download of an update, but a body read to its

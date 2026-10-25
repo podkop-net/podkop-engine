@@ -1,7 +1,7 @@
 From 986c9e29bbf48aa15a99a6421b442ea6703aeeb5 Mon Sep 17 00:00:00 2001
 From: FiyeroT <me@fiyero.xyz>
 Date: Fri, 9 Oct 2026 16:15:05 +0300
-Subject: [PATCH 115/147] vless: warn about a flow over the quic transport too
+Subject: [PATCH 115/152] vless: warn about a flow over the quic transport too
 
 The warning at start about a flow that cannot work over a transport
 named ws, grpc, http and httpupgrade. Over the QUIC transport every

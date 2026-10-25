@@ -1,0 +1,110 @@
+From 7db9d009b1a9dab920dd7f8080ce029297f2f686 Mon Sep 17 00:00:00 2001
+From: FiyeroT <me@fiyero.xyz>
+Date: Sun, 25 Oct 2026 22:28:30 +0300
+Subject: [PATCH 150/152] tls: dials do not wait for a probe of the fingerprint
+ fallback while it rests
+
+While nothing was known of a server, every dial in turn became the probe
+and the others waited for it, also while the fallback rested after a list
+nobody answered: the dials of a burst went one at a time, each waiting out
+its timeout (seen with a server whose path dropped every ClientHello: one
+connection every 15 s). While a path rests, dials go as without the
+fallback: none waits and none probes.
+---
+ common/tls/utls_fallback.go      | 18 +++++++++++++-----
+ common/tls/utls_fallback_test.go | 29 ++++++++++++++++++++++++++++-
+ 2 files changed, 41 insertions(+), 6 deletions(-)
+
+diff --git a/common/tls/utls_fallback.go b/common/tls/utls_fallback.go
+index 67acf0857..eefd51318 100644
+--- a/common/tls/utls_fallback.go
++++ b/common/tls/utls_fallback.go
+@@ -178,6 +178,9 @@ type utlsFallback struct {
+ 	// so that a burst of connections does not try all of them at once: a server refusing a
+ 	// ClientHello counts every refusal, and a path freezes on a burst
+ 	probing chan struct{}
++	// until when a path rests: its dials are made as without the fallback, and none waits
++	// for a probe, which would make them one at a time, each waiting out its timeout
++	restUntil time.Time
+ }
+ 
+ // utlsFallbackEnabled tells whether the fallback is on: the option
+@@ -358,6 +361,9 @@ func (f *utlsFallback) advance(path *utlsFallbackPath) {
+ // caller holds the lock.
+ func (f *utlsFallback) rests(path *utlsFallbackPath, now time.Time, rest time.Duration) {
+ 	path.restUntil = now.Add(rest)
++	if path.restUntil.After(f.restUntil) {
++		f.restUntil = path.restUntil
++	}
+ 	path.position = path.last
+ 	path.resume = -1
+ 	if path.position < 0 {
+@@ -439,11 +445,13 @@ func (d *utlsFallbackDial) ready(ctx context.Context, destination M.Socksaddr) e
+ 	for {
+ 		f.access.Lock()
+ 		f.load(d.serverName, destination)
+-		if f.known || f.probing == nil {
+-			if !f.known {
+-				f.probing = make(chan struct{})
+-				d.probe = true
+-			}
++		if f.known || time.Now().Before(f.restUntil) {
++			f.access.Unlock()
++			return nil
++		}
++		if f.probing == nil {
++			f.probing = make(chan struct{})
++			d.probe = true
+ 			f.access.Unlock()
+ 			return nil
+ 		}
+diff --git a/common/tls/utls_fallback_test.go b/common/tls/utls_fallback_test.go
+index e067bd5e1..28ce99bd7 100644
+--- a/common/tls/utls_fallback_test.go
++++ b/common/tls/utls_fallback_test.go
+@@ -271,7 +271,7 @@ func TestUTLSFallbackDial(t *testing.T) {
+ 
+ // While nothing is known of a server, one dial tries the ClientHellos and the others wait
+ // for it before they connect; then nobody waits. A dial whose caller gives up does not wait
+-// on.
++// on. While the fallback rests nobody waits either: the dials go as without it.
+ func TestUTLSFallbackProbe(t *testing.T) {
+ 	setFallback(t, true)
+ 	quietLog(t)
+@@ -333,6 +333,33 @@ func TestUTLSFallbackProbe(t *testing.T) {
+ 	require.False(t, waiting(secondReady))
+ 	require.True(t, second.(*utlsFallbackDial).probe)
+ 	second.done()
++
++	// a probe that goes through the whole list puts the fallback to rest: the dial that
++	// waited is let go without probing, and while it rests no dial waits
++	config, _ = fallbackClient(t, "chrome", false)
++	first = newDialOf(config)
++	require.NoError(t, first.ready(ctx, fallbackServer))
++	second = newDialOf(config)
++	secondReady = readyLater(second)
++	require.True(t, waiting(secondReady))
++	require.Equal(t, chromeWithout, attemptName(t, first, "192.0.2.10"))
++	lost(t, first)
++	require.Equal(t, chromeWithout, attemptName(t, first, "192.0.2.10"))
++	lost(t, first)
++	require.Equal(t, "firefox", attemptName(t, first, "192.0.2.10"))
++	lost(t, first)
++	require.Equal(t, "chrome", attemptName(t, first, "192.0.2.10"))
++	again, err := first.unanswered(fallbackServer)
++	require.False(t, again)
++	require.ErrorContains(t, err, "unanswered with all of")
++	first.done()
++	require.False(t, waiting(secondReady))
++	require.False(t, second.(*utlsFallbackDial).probe)
++	for range 3 {
++		dial := newDialOf(config)
++		require.False(t, waiting(readyLater(dial)))
++		require.False(t, dial.(*utlsFallbackDial).probe)
++	}
+ }
+ 
+ // A REALITY server since Xray-core v26.9.8 answers the ClientHello without the
+-- 
+2.53.0
+

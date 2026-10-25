@@ -1,7 +1,7 @@
 From af4b43f7fdd16bc211682d5eb7b897defbdf16a8 Mon Sep 17 00:00:00 2001
 From: FiyeroT <me@fiyero.xyz>
 Date: Fri, 9 Oct 2026 16:15:03 +0300
-Subject: [PATCH 105/155] vmess: the security auto is not zero under TLS
+Subject: [PATCH 105/160] vmess: the security auto is not zero under TLS
 
 With TLS the outbound turned the security "auto" into "zero": no cipher
 of its own under a transport that encrypts. Xray-core has removed zero

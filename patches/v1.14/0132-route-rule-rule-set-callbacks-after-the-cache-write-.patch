@@ -1,7 +1,7 @@
 From 8066f7a52beaf3e80b2e75a3805e32eaa745a976 Mon Sep 17 00:00:00 2001
 From: FiyeroT <me@fiyero.xyz>
 Date: Sat, 17 Oct 2026 07:15:26 +0300
-Subject: [PATCH 132/155] route/rule: rule-set callbacks after the cache write;
+Subject: [PATCH 132/160] route/rule: rule-set callbacks after the cache write;
  start empty on request
 
 A download told the callbacks of a rule-set as soon as its rules were swapped,

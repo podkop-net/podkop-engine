@@ -1,7 +1,7 @@
 From 2ee0129fca4afa89b4233cafd8e7c913ccd8dfd8 Mon Sep 17 00:00:00 2001
 From: FiyeroT <me@fiyero.xyz>
 Date: Tue, 6 Oct 2026 01:08:07 +0300
-Subject: [PATCH 060/147] xhttp: no post interval for a range from zero; tests
+Subject: [PATCH 060/152] xhttp: no post interval for a range from zero; tests
  for rotation and deadlines
 
 A range of sc_min_posts_interval_ms that starts at zero means no waiting

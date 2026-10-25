@@ -1,7 +1,7 @@
 From 7ccc1eafbba9f4579459be5ab8a5228d42f3bc3d Mon Sep 17 00:00:00 2001
 From: FiyeroT <me@fiyero.xyz>
 Date: Sat, 3 Oct 2026 11:27:47 +0300
-Subject: [PATCH 020/155] rule-set: bound a remote fetch by stalls, start
+Subject: [PATCH 020/160] rule-set: bound a remote fetch by stalls, start
  without a list that does not come
 
 A remote rule-set was fetched with no deadline: a download that stalled

@@ -1,7 +1,7 @@
 From 2a0312a9859320f1e87f4ea54f080248897dec02 Mon Sep 17 00:00:00 2001
 From: FiyeroT <me@fiyero.xyz>
 Date: Fri, 9 Oct 2026 16:15:04 +0300
-Subject: [PATCH 111/147] route: apply tls_spoof of a bypass action
+Subject: [PATCH 111/152] route: apply tls_spoof of a bypass action
 
 The route option tls_spoof was read for the actions route and
 route-options and not for bypass, where it is of the most use: a

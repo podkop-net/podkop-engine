@@ -1,7 +1,7 @@
 From 6274e9b00262e8c3343a452d55bdacd1d717719b Mon Sep 17 00:00:00 2001
 From: FiyeroT <me@fiyero.xyz>
 Date: Mon, 5 Oct 2026 22:07:04 +0300
-Subject: [PATCH 056/155] xhttp: data written before a close is sent
+Subject: [PATCH 056/160] xhttp: data written before a close is sent
 
 sing-box closes a connection as soon as its source is done. The session then
 cancelled its requests at once and dropped what packet-up had not posted yet:

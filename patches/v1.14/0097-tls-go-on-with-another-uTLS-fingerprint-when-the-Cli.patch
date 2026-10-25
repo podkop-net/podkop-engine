@@ -1,7 +1,7 @@
 From 1f63d5228dc1b6f50ded859d90aa80b1f1808276 Mon Sep 17 00:00:00 2001
 From: FiyeroT <me@fiyero.xyz>
 Date: Thu, 8 Oct 2026 17:21:57 +0300
-Subject: [PATCH 097/155] tls: go on with another uTLS fingerprint when the
+Subject: [PATCH 097/160] tls: go on with another uTLS fingerprint when the
  ClientHello gets no acknowledgment
 
 A middlebox that judges a connection by its ClientHello may drop the ClientHello of

@@ -1,7 +1,7 @@
 From a593c960d17558ac6e0b99781040e1416041f155 Mon Sep 17 00:00:00 2001
 From: FiyeroT <me@fiyero.xyz>
 Date: Sat, 24 Oct 2026 11:05:00 +0300
-Subject: [PATCH 147/147] dns: the fallback asks the provider of every uplink
+Subject: [PATCH 147/152] dns: the fallback asks the provider of every uplink
  through it; a list for each box
 
 The fallback took the DNS servers of one device: the one sing-box binds its

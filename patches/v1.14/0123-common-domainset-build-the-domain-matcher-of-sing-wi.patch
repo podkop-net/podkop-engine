@@ -1,7 +1,7 @@
 From dd01d28301e3632d00f9ab3362e2023b8dff3141 Mon Sep 17 00:00:00 2001
 From: FiyeroT <me@fiyero.xyz>
 Date: Sun, 18 Oct 2026 10:26:56 +0300
-Subject: [PATCH 123/155] common/domainset: build the domain matcher of sing
+Subject: [PATCH 123/160] common/domainset: build the domain matcher of sing
  with a fraction of its memory
 
 domain.NewMatcher keeps the whole queue of its breadth-first walk while it

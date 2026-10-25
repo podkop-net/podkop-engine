@@ -1,7 +1,7 @@
 From 880cef568c1c59eb0772842357b4b9498e27d206 Mon Sep 17 00:00:00 2001
 From: FiyeroT <me@fiyero.xyz>
 Date: Thu, 8 Oct 2026 15:05:53 +0300
-Subject: [PATCH 087/155] rule-set: read and drop the rules of a local set
+Subject: [PATCH 087/160] rule-set: read and drop the rules of a local set
  under its lock
 
 The file watcher swaps the rules of a local rule-set from its own goroutine

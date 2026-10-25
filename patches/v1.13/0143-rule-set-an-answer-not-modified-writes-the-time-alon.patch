@@ -1,7 +1,7 @@
 From f5129bd88ffcc209393cae308ebb39add44c07f0 Mon Sep 17 00:00:00 2001
 From: FiyeroT <me@fiyero.xyz>
 Date: Sat, 24 Oct 2026 10:07:25 +0300
-Subject: [PATCH 143/147] rule-set: an answer "not modified" writes the time
+Subject: [PATCH 143/152] rule-set: an answer "not modified" writes the time
  alone to the cache file
 
 On a 304 a remote rule set loaded its whole saved list from the cache file

@@ -1,7 +1,7 @@
 From ae09bd696dff3abca3c7dc47abf6caa2e2338057 Mon Sep 17 00:00:00 2001
 From: FiyeroT <me@fiyero.xyz>
 Date: Sat, 24 Oct 2026 09:41:46 +0300
-Subject: [PATCH 154/155] box: StartWithoutClose leaves a box whose start
+Subject: [PATCH 154/160] box: StartWithoutClose leaves a box whose start
  failed to its caller
 
 Start closes a box whose start failed at once, so a component whose Close

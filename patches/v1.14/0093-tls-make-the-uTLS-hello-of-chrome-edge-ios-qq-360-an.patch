@@ -1,7 +1,7 @@
 From 514e205beceef36c0f2f1ecb1a07dcb1a0d4a3af Mon Sep 17 00:00:00 2001
 From: FiyeroT <me@fiyero.xyz>
 Date: Thu, 8 Oct 2026 16:44:37 +0300
-Subject: [PATCH 093/155] tls: make the uTLS hello of chrome, edge, ios, qq,
+Subject: [PATCH 093/160] tls: make the uTLS hello of chrome, edge, ios, qq,
  360 and android from its specification
 
 uTLS keeps the specification of a hello made by ID in the connection, and with it

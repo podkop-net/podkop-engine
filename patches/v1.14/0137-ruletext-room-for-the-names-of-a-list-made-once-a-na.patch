@@ -1,7 +1,7 @@
 From d3f9a488d0242523cd12d4776f7943cd5eadfe39 Mon Sep 17 00:00:00 2001
 From: FiyeroT <me@fiyero.xyz>
 Date: Sun, 18 Oct 2026 14:22:57 +0300
-Subject: [PATCH 137/155] ruletext: room for the names of a list made once, a
+Subject: [PATCH 137/160] ruletext: room for the names of a list made once, a
  name a line at most
 
 ---

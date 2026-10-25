@@ -1,7 +1,7 @@
 From dc85953f201379331e121eadb08f0728d927589d Mon Sep 17 00:00:00 2001
 From: FiyeroT <me@fiyero.xyz>
 Date: Tue, 6 Oct 2026 23:54:39 +0300
-Subject: [PATCH 069/147] xhttp: browser versions survive a clock that was
+Subject: [PATCH 069/152] xhttp: browser versions survive a clock that was
  never set
 
 The versions of the browser-like headers are worked out from the date when the package
