@@ -1,7 +1,7 @@
-From 2efb7c76570ad6393429c3da16a3042f4dd2be6e Mon Sep 17 00:00:00 2001
+From bafd7d1502fa2108911c0a2725f1ebd13a48a4c1 Mon Sep 17 00:00:00 2001
 From: FiyeroT <me@fiyero.xyz>
 Date: Sun, 4 Oct 2026 08:17:57 +0300
-Subject: [PATCH 036/160] urltest: take the download test URL from the group's
+Subject: [PATCH 036/171] urltest: take the download test URL from the group's
  download_url
 
 The download test URL came only from SING_BOX_URLTEST_DOWNLOAD_URL, one for every
@@ -66,10 +66,10 @@ index bc0c07e47..1c6477d51 100644
  	Tolerance                 uint16             `json:"tolerance,omitempty"`
  	IdleTimeout               badoption.Duration `json:"idle_timeout,omitempty"`
 diff --git a/protocol/group/urltest.go b/protocol/group/urltest.go
-index 460031284..d1001e515 100644
+index cc82b8ad3..5128ad691 100644
 --- a/protocol/group/urltest.go
 +++ b/protocol/group/urltest.go
-@@ -43,6 +43,7 @@ type URLTest struct {
+@@ -44,6 +44,7 @@ type URLTest struct {
  	logger                       log.ContextLogger
  	tags                         []string
  	link                         string
@@ -77,9 +77,9 @@ index 460031284..d1001e515 100644
  	interval                     time.Duration
  	tolerance                    uint16
  	idleTimeout                  time.Duration
-@@ -68,6 +69,11 @@ func NewURLTest(ctx context.Context, router adapter.Router, logger log.ContextLo
- 	if len(outbound.tags) == 0 {
- 		return nil, E.New("missing tags")
+@@ -73,6 +74,11 @@ func NewURLTest(ctx context.Context, router adapter.Router, logger log.ContextLo
+ 			return nil, E.New("duplicate tag: ", tag)
+ 		}
  	}
 +	var err error
 +	outbound.downloadLink, err = groupDownloadLink(options.DownloadURL)
@@ -89,7 +89,7 @@ index 460031284..d1001e515 100644
  	return outbound, nil
  }
  
-@@ -82,7 +88,7 @@ func (s *URLTest) Start(stage adapter.StartStage, scope *adapter.Scope) error {
+@@ -87,7 +93,7 @@ func (s *URLTest) Start(stage adapter.StartStage, scope *adapter.Scope) error {
  			}
  			outbounds = append(outbounds, detour)
  		}
@@ -98,7 +98,7 @@ index 460031284..d1001e515 100644
  		if err != nil {
  			return err
  		}
-@@ -261,7 +267,7 @@ type URLTestGroup struct {
+@@ -274,7 +280,7 @@ type URLTestGroup struct {
  	responsesClosed              atomic.Bool
  }
  
@@ -107,7 +107,7 @@ index 460031284..d1001e515 100644
  	if interval == 0 {
  		interval = C.DefaultURLTestInterval
  	}
-@@ -293,7 +299,7 @@ func NewURLTestGroup(ctx context.Context, outboundManager adapter.OutboundManage
+@@ -306,7 +312,7 @@ func NewURLTestGroup(ctx context.Context, outboundManager adapter.OutboundManage
  		interruptGroup:               interrupt.NewGroup(),
  		interruptExternalConnections: interruptExternalConnections,
  		epoch:                        time.Now(),

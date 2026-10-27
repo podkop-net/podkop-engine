@@ -1,7 +1,7 @@
-From d08605cf0c1861db2802c06fddb61259eba39845 Mon Sep 17 00:00:00 2001
+From 7d9860cac2c5facc973efd0878058837b3d4c21c Mon Sep 17 00:00:00 2001
 From: FiyeroT <me@fiyero.xyz>
 Date: Sat, 3 Oct 2026 11:27:48 +0300
-Subject: [PATCH 023/160] urltest: download 64 KiB through a member before
+Subject: [PATCH 023/171] urltest: download 64 KiB through a member before
  switching to it
 
 A server behind a DPI that freezes every connection after ~16 KB passes
@@ -254,10 +254,10 @@ index 26efe39cb..76ec79d0b 100644
 -	return
  }
 diff --git a/protocol/group/urltest.go b/protocol/group/urltest.go
-index 4e2ad3ef8..b01ffe521 100644
+index 57a1f8fb8..6150eaaa4 100644
 --- a/protocol/group/urltest.go
 +++ b/protocol/group/urltest.go
-@@ -131,8 +131,10 @@ func (s *URLTest) CheckOutbounds() {
+@@ -154,8 +154,10 @@ func (s *URLTest) CheckOutbounds() {
  	s.group.CheckOutbounds(s.ctx, true)
  }
  
@@ -269,7 +269,7 @@ index 4e2ad3ef8..b01ffe521 100644
  }
  
  func (s *URLTest) InterfaceUpdated(ctx context.Context) {
-@@ -164,7 +166,7 @@ func (s *URLTest) DialContext(ctx context.Context, network string, destination M
+@@ -187,7 +189,7 @@ func (s *URLTest) DialContext(ctx context.Context, network string, destination M
  	default:
  		return nil, E.Extend(N.ErrUnknownNetwork, network)
  	}
@@ -278,7 +278,7 @@ index 4e2ad3ef8..b01ffe521 100644
  		outbound, _ = s.group.Select(network)
  	}
  	if outbound == nil {
-@@ -189,7 +191,7 @@ func (s *URLTest) DialContext(ctx context.Context, network string, destination M
+@@ -212,7 +214,7 @@ func (s *URLTest) DialContext(ctx context.Context, network string, destination M
  func (s *URLTest) ListenPacket(ctx context.Context, destination M.Socksaddr) (net.PacketConn, error) {
  	s.group.Touch()
  	outbound := s.group.selectedOutboundUDP.Load()
@@ -287,7 +287,7 @@ index 4e2ad3ef8..b01ffe521 100644
  		outbound, _ = s.group.Select(N.NetworkUDP)
  	}
  	if outbound == nil {
-@@ -242,6 +244,8 @@ type URLTestGroup struct {
+@@ -255,6 +257,8 @@ type URLTestGroup struct {
  	confirms                     map[string]*memberConfirm
  	epoch                        time.Time
  	successes                    sync.Map // member tag → *atomic.Int64, its last successful TCP dial, since epoch
@@ -296,7 +296,7 @@ index 4e2ad3ef8..b01ffe521 100644
  }
  
  func NewURLTestGroup(ctx context.Context, outboundManager adapter.OutboundManager, logger log.Logger, outbounds []adapter.Outbound, link string, interval time.Duration, tolerance uint16, idleTimeout time.Duration, interruptExternalConnections bool) (*URLTestGroup, error) {
-@@ -276,6 +280,7 @@ func NewURLTestGroup(ctx context.Context, outboundManager adapter.OutboundManage
+@@ -289,6 +293,7 @@ func NewURLTestGroup(ctx context.Context, outboundManager adapter.OutboundManage
  		interruptGroup:               interrupt.NewGroup(),
  		interruptExternalConnections: interruptExternalConnections,
  		epoch:                        time.Now(),
@@ -304,7 +304,7 @@ index 4e2ad3ef8..b01ffe521 100644
  	}, nil
  }
  
-@@ -318,6 +323,11 @@ func (g *URLTestGroup) Close() error {
+@@ -331,6 +336,11 @@ func (g *URLTestGroup) Close() error {
  }
  
  func (g *URLTestGroup) Select(network string) (adapter.Outbound, bool) {
@@ -316,29 +316,29 @@ index 4e2ad3ef8..b01ffe521 100644
  	var minDelay uint16
  	var minOutbound adapter.Outbound
  	var selected adapter.Outbound
-@@ -328,7 +338,8 @@ func (g *URLTestGroup) Select(network string) (adapter.Outbound, bool) {
+@@ -341,7 +351,8 @@ func (g *URLTestGroup) Select(network string) (adapter.Outbound, bool) {
  		selected = g.selectedOutboundUDP.Load()
  	}
  	if selected != nil {
--		if history := g.history.LoadURLTestHistory(RealTag(g.outbound, selected)); history != nil {
-+		tag := RealTag(g.outbound, selected)
+-		if history := g.history.LoadURLTestHistory(RealTag(selected, network)); history != nil {
++		tag := RealTag(selected, network)
 +		if history := g.history.LoadURLTestHistory(tag); history != nil && (skip == nil || !skip(tag, history)) {
  			minOutbound = selected
  			minDelay = history.Delay
  		}
-@@ -337,8 +348,9 @@ func (g *URLTestGroup) Select(network string) (adapter.Outbound, bool) {
+@@ -350,8 +361,9 @@ func (g *URLTestGroup) Select(network string) (adapter.Outbound, bool) {
  		if !common.Contains(detour.Network(), network) {
  			continue
  		}
--		history := g.history.LoadURLTestHistory(RealTag(g.outbound, detour))
+-		history := g.history.LoadURLTestHistory(RealTag(detour, network))
 -		if history == nil {
-+		tag := RealTag(g.outbound, detour)
++		tag := RealTag(detour, network)
 +		history := g.history.LoadURLTestHistory(tag)
 +		if history == nil || (skip != nil && skip(tag, history)) {
  			continue
  		}
  		if minDelay == 0 || minDelay > history.Delay+g.tolerance {
-@@ -388,18 +400,27 @@ func (g *URLTestGroup) CheckOutbounds(ctx context.Context, force bool) {
+@@ -401,18 +413,27 @@ func (g *URLTestGroup) CheckOutbounds(ctx context.Context, force bool) {
  	_, _ = g.urlTest(ctx, force)
  }
  
@@ -370,7 +370,7 @@ index 4e2ad3ef8..b01ffe521 100644
  }
  
  type urlTestResult struct {
-@@ -503,12 +524,17 @@ func (b *urlTestBatch) test(outbounds []adapter.Outbound, link string, interval
+@@ -516,12 +537,17 @@ func (b *urlTestBatch) test(outbounds []adapter.Outbound, link string, interval
  func (g *URLTestGroup) performUpdateCheck() {
  	g.updateAccess.Lock()
  	defer g.updateAccess.Unlock()
@@ -389,7 +389,7 @@ index 4e2ad3ef8..b01ffe521 100644
  		if current := g.selectedOutboundTCP.Load(); current == nil || (exists && outbound != current) {
  			if current != nil {
  				updated = true
-@@ -518,7 +544,7 @@ func (g *URLTestGroup) performUpdateCheck() {
+@@ -531,7 +557,7 @@ func (g *URLTestGroup) performUpdateCheck() {
  			selected = true
  		}
  	}
@@ -841,7 +841,7 @@ index 000000000..98c78e159
 +	require.Equal(t, int32(0), frozen.gets.Load())
 +}
 diff --git a/protocol/group/urltest_failure.go b/protocol/group/urltest_failure.go
-index 1b508a649..d97e0dcd2 100644
+index 411a12dda..ae1a4045c 100644
 --- a/protocol/group/urltest_failure.go
 +++ b/protocol/group/urltest_failure.go
 @@ -95,14 +95,17 @@ func (g *URLTestGroup) succeededSince(tag string, start time.Time) bool {

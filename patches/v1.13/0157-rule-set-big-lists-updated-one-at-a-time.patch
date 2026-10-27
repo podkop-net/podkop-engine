@@ -1,0 +1,128 @@
+From 1ac4d6d1f157975fc26be6593e6e431ad09bf35b Mon Sep 17 00:00:00 2001
+From: FiyeroT <me@fiyero.xyz>
+Date: Mon, 26 Oct 2026 16:58:01 +0300
+Subject: [PATCH 157/159] rule set: big lists updated one at a time
+
+Each remote rule set of this line updates on its own timer, and lists started
+together are due together: a download holds the list, the parse builds the
+next one beside the one in use, and the save writes it, for all of them at
+once. A rule set whose content is 1 MiB or more now waits for the update of
+any other such one; small lists go as before.
+---
+ route/rule/rule_set_remote.go           | 20 +++++++++++
+ route/rule/rule_set_remote_body_test.go | 48 +++++++++++++++++++++++++
+ 2 files changed, 68 insertions(+)
+
+diff --git a/route/rule/rule_set_remote.go b/route/rule/rule_set_remote.go
+index 702fd7a40..143c8152c 100644
+--- a/route/rule/rule_set_remote.go
++++ b/route/rule/rule_set_remote.go
+@@ -63,6 +63,8 @@ type RemoteRuleSet struct {
+ 	fetchLoaded   bool
+ 	failures      int
+ 	failureLogged time.Time
++	// the size of the list it holds: big lists are updated one at a time (heavyRuleSetSize)
++	contentSize atomic.Int64
+ }
+ 
+ func NewRemoteRuleSet(ctx context.Context, logger logger.ContextLogger, options option.RuleSet) *RemoteRuleSet {
+@@ -234,6 +236,7 @@ func (s *RemoteRuleSet) loadBytes(content []byte) error {
+ 	s.rules = rules
+ 	callbacks := s.callbacks.Array()
+ 	s.access.Unlock()
++	s.contentSize.Store(int64(len(content)))
+ 	for _, callback := range callbacks {
+ 		callback(s)
+ 	}
+@@ -286,8 +289,25 @@ func (s *RemoteRuleSet) loopUpdate() {
+ 	}
+ }
+ 
++// heavyRuleSetSize is the size of a list from which its update waits for the update of
++// any other such list (podkop-engine): the download holds the list, the parse builds the
++// next one beside the one in use, and the save writes it; big lists started together are
++// due together and took all of that at once.
++const heavyRuleSetSize = 1 << 20
++
++// heavyUpdate is held by the update of a big list.
++var heavyUpdate = make(chan struct{}, 1)
++
+ // updateOnce updates the rule-set and reports whether it loaded a new list.
+ func (s *RemoteRuleSet) updateOnce() bool {
++	if s.contentSize.Load() >= heavyRuleSetSize {
++		select {
++		case heavyUpdate <- struct{}{}:
++			defer func() { <-heavyUpdate }()
++		case <-s.ctx.Done():
++			return false
++		}
++	}
+ 	s.fetchLoaded = false
+ 	err := s.fetch(s.ctx, nil)
+ 	if err != nil {
+diff --git a/route/rule/rule_set_remote_body_test.go b/route/rule/rule_set_remote_body_test.go
+index 9b63db9b5..242c543e7 100644
+--- a/route/rule/rule_set_remote_body_test.go
++++ b/route/rule/rule_set_remote_body_test.go
+@@ -8,6 +8,8 @@ import (
+ 	"net/http/httptest"
+ 	"strconv"
+ 	"strings"
++	"sync"
++	"sync/atomic"
+ 	"testing"
+ 	"time"
+ 	"unicode/utf8"
+@@ -175,3 +177,49 @@ func TestRuleSetLogText(t *testing.T) {
+ 	require.True(t, utf8.ValidString(long))
+ 	require.NotContains(t, long, "?")
+ }
++
++// Big lists are updated one at a time, small ones together: two sets that hold a big list
++// each never download at once, two small ones do. What was loaded tells its size.
++func TestRemoteRuleSetBigOneAtATime(t *testing.T) {
++	var bigInFlight, bigMost, smallInFlight, smallMost atomic.Int32
++	raise := func(most *atomic.Int32, now int32) {
++		for {
++			seen := most.Load()
++			if now <= seen || most.CompareAndSwap(seen, now) {
++				return
++			}
++		}
++	}
++	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		inFlight, most := &smallInFlight, &smallMost
++		if r.URL.Path == "/big" {
++			inFlight, most = &bigInFlight, &bigMost
++		}
++		raise(most, inFlight.Add(1))
++		defer inFlight.Add(-1)
++		time.Sleep(200 * time.Millisecond)
++		io.WriteString(w, testSourceSet)
++	}))
++	defer server.Close()
++	var sets []*RemoteRuleSet
++	for _, path := range []string{"/big", "/big", "/small", "/small"} {
++		set := newTestRuleSet(server.URL + path)
++		set.options.Format = C.RuleSetFormatSource
++		if path == "/big" {
++			set.contentSize.Store(heavyRuleSetSize)
++		}
++		sets = append(sets, set)
++	}
++	var group sync.WaitGroup
++	for _, set := range sets {
++		group.Add(1)
++		go func() {
++			defer group.Done()
++			require.True(t, set.updateOnce())
++		}()
++	}
++	group.Wait()
++	require.EqualValues(t, 1, bigMost.Load(), "two big lists were downloaded at once")
++	require.EqualValues(t, 2, smallMost.Load())
++	require.EqualValues(t, len(testSourceSet), sets[0].contentSize.Load())
++}
+-- 
+2.53.0
+

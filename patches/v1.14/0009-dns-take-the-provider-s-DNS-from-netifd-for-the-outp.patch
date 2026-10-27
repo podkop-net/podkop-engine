@@ -1,7 +1,7 @@
-From f1ab6ddb44ebfbaf4ad38cfc9eacd1b8fb57aa03 Mon Sep 17 00:00:00 2001
+From f3bc6de57a5a41d7fe69151aafbdb72d1e4d351f Mon Sep 17 00:00:00 2001
 From: FiyeroT <me@fiyero.xyz>
 Date: Tue, 29 Sep 2026 23:09:42 +0300
-Subject: [PATCH 009/160] dns: take the provider's DNS from netifd for the
+Subject: [PATCH 009/171] dns: take the provider's DNS from netifd for the
  output device, ask the fastest
 
 The fallback read the first three servers of resolv.conf.auto, where
@@ -868,10 +868,10 @@ index ecb77029e..b81c3a4ed 100644
  		"no provider DNS fallback for server dns-server: no context",
  	} {
 diff --git a/dns/router.go b/dns/router.go
-index ec8ef4e1b..1145d4639 100644
+index 40107d9e0..e88cfe16b 100644
 --- a/dns/router.go
 +++ b/dns/router.go
-@@ -1393,6 +1393,7 @@ func (r *Router) ResetNetwork() {
+@@ -1394,6 +1394,7 @@ func (r *Router) ResetNetwork() {
  	for _, transport := range r.transport.Transports() {
  		transport.Reset()
  	}

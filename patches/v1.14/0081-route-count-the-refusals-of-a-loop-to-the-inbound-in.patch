@@ -1,7 +1,7 @@
-From 5cf7af5e862f30fd94b9e67c217064102edd96af Mon Sep 17 00:00:00 2001
+From 2da4213ea81b322727e80272857c63d668cf44ac Mon Sep 17 00:00:00 2001
 From: FiyeroT <me@fiyero.xyz>
 Date: Tue, 6 Oct 2026 23:55:22 +0300
-Subject: [PATCH 081/160] route: count the refusals of a loop to the inbound
+Subject: [PATCH 081/171] route: count the refusals of a loop to the inbound
  instead of logging each
 
 A connection that the direct outbound would dial back to the inbound it came in on is
@@ -22,28 +22,28 @@ does for a server that fails.
  create mode 100644 route/route_loop_log.go
 
 diff --git a/route/route.go b/route/route.go
-index 42e93844f..ed9c6ecff 100644
+index 9bc174a06..6cf13e752 100644
 --- a/route/route.go
 +++ b/route/route.go
-@@ -162,7 +162,7 @@ func (r *Router) routeConnection(ctx context.Context, conn net.Conn, metadata ad
- 
- 	if r.wouldLoopToInbound(&metadata, selectedOutbound) {
+@@ -155,7 +155,7 @@ func (r *Router) routeConnection(ctx context.Context, conn net.Conn, metadata ad
+ 	}
+ 	if r.wouldLoopToInbound(&metadata, chain[len(chain)-1]) {
  		buf.ReleaseMulti(buffers)
 -		return E.New("refused connection to the address of inbound ", metadata.Inbound, " (", metadata.Destination, "): not hijacked, would loop")
 +		return &inboundLoopError{metadata.Inbound, E.New("refused connection to the address of inbound ", metadata.Inbound, " (", metadata.Destination, "): not hijacked, would loop")}
  	}
  	for _, buffer := range buffers {
  		conn = bufio.NewCachedConn(conn, buffer)
-@@ -297,7 +297,7 @@ func (r *Router) routePacketConnection(ctx context.Context, conn N.PacketConn, m
+@@ -324,7 +324,7 @@ func (r *Router) routePacketConnection(ctx context.Context, conn N.PacketConn, m
  	}
- 	if r.wouldLoopToInbound(&metadata, selectedOutbound) {
+ 	if r.wouldLoopToInbound(&metadata, chain[len(chain)-1]) {
  		N.ReleaseMultiPacketBuffer(packetBuffers)
 -		return E.New("refused packet to the address of inbound ", metadata.Inbound, " (", metadata.Destination, "): not hijacked, would loop")
 +		return &inboundLoopError{metadata.Inbound, E.New("refused packet to the address of inbound ", metadata.Inbound, " (", metadata.Destination, "): not hijacked, would loop")}
  	}
  	for _, buffer := range packetBuffers {
  		conn = bufio.NewCachedPacketConn(conn, buffer.Buffer, buffer.Destination)
-@@ -564,6 +564,11 @@ func (r *Router) logRefused(ctx context.Context, destination M.Socksaddr, err er
+@@ -591,6 +591,11 @@ func (r *Router) logRefused(ctx context.Context, destination M.Socksaddr, err er
  		r.logger.WarnContext(ctx, "connection to ", destination, " refused: no fakeip record (the address was given out shortly before a crash, was flushed, or was unused for a long time); the client gets a new one when it resolves the name again")
  		return true
  	}

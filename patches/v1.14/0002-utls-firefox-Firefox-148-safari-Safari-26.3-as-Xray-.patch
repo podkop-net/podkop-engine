@@ -1,7 +1,7 @@
-From 7a7db6669ba7ca1dcbfb8d26000203e4e6affd19 Mon Sep 17 00:00:00 2001
+From b6985ee63dd2d436e3c06fbbc5c1e1f01054a189 Mon Sep 17 00:00:00 2001
 From: FiyeroT <me@fiyero.xyz>
 Date: Sat, 26 Sep 2026 20:36:22 +0300
-Subject: [PATCH 002/160] utls: firefox -> Firefox 148, safari -> Safari 26.3
+Subject: [PATCH 002/171] utls: firefox -> Firefox 148, safari -> Safari 26.3
  (as Xray-core)
 
 metacubex/utls Firefox 120 and Safari 16.0 carry no X25519MLKEM768 key share,
@@ -17,10 +17,10 @@ fingerprints that carry X25519MLKEM768 only.
  create mode 100644 common/tls/utls_spec.go
 
 diff --git a/common/tls/reality_client.go b/common/tls/reality_client.go
-index 231114a24..4bc75db06 100644
+index dfa743b84..4c1e368e8 100644
 --- a/common/tls/reality_client.go
 +++ b/common/tls/reality_client.go
-@@ -138,12 +138,15 @@ func (e *RealityClientConfig) ClientHandshake(ctx context.Context, conn net.Conn
+@@ -139,12 +139,15 @@ func (e *RealityClientConfig) ClientHandshake(ctx context.Context, conn net.Conn
  	uConfig.InsecureSkipVerify = true
  	uConfig.SessionTicketsDisabled = true
  	uConfig.VerifyPeerCertificate = verifier.VerifyPeerCertificate

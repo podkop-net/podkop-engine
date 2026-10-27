@@ -1,7 +1,7 @@
-From b398064883e5a8ecd9c56cdf87263017610d069b Mon Sep 17 00:00:00 2001
+From 92b29fcb5dcfb8452cedac20685b79b471fd8643 Mon Sep 17 00:00:00 2001
 From: FiyeroT <me@fiyero.xyz>
 Date: Tue, 29 Sep 2026 21:15:48 +0300
-Subject: [PATCH 007/160] dns: fall back to the provider's DNS when a server
+Subject: [PATCH 007/171] dns: fall back to the provider's DNS when a server
  reached through the WAN fails
 
 With SING_BOX_DNS_FALLBACK naming a resolv.conf (podkop-engine sets
@@ -54,10 +54,10 @@ off.
  create mode 100644 dns/client_fallback_test.go
 
 diff --git a/dns/client.go b/dns/client.go
-index 77fe1cbc5..451e99081 100644
+index 51cedd60c..f55a768fb 100644
 --- a/dns/client.go
 +++ b/dns/client.go
-@@ -746,7 +746,7 @@ func stripDNSPadding(response *dns.Msg) {
+@@ -756,7 +756,7 @@ func stripDNSPadding(response *dns.Msg) {
  }
  
  func (c *Client) exchangeToTransport(ctx context.Context, transport adapter.DNSTransport, message *dns.Msg) (*dns.Msg, error) {
@@ -66,7 +66,7 @@ index 77fe1cbc5..451e99081 100644
  	if err == nil {
  		stripDNSPadding(response)
  		return response, nil
-@@ -759,7 +759,7 @@ func (c *Client) exchangeToTransport(ctx context.Context, transport adapter.DNST
+@@ -769,7 +769,7 @@ func (c *Client) exchangeToTransport(ctx context.Context, transport adapter.DNST
  }
  
  func (c *Client) exchangeToTransportAsync(ctx context.Context, transport adapter.DNSTransport, message *dns.Msg, callback func(response *dns.Msg, err error)) {
@@ -739,7 +739,7 @@ index 7d2ebfa7e..252bfc6eb 100644
 +	return a.fallback
 +}
 diff --git a/protocol/direct/outbound.go b/protocol/direct/outbound.go
-index af8826b89..f183d0098 100644
+index 78fee262e..144b74272 100644
 --- a/protocol/direct/outbound.go
 +++ b/protocol/direct/outbound.go
 @@ -45,6 +45,7 @@ type Outbound struct {
@@ -758,7 +758,7 @@ index af8826b89..f183d0098 100644
  	}
  	//nolint:staticcheck
  	if options.ProxyProtocol != 0 {
-@@ -261,3 +263,8 @@ func (h *Outbound) ListenSerialNetworkPacket(ctx context.Context, destination M.
+@@ -269,3 +271,8 @@ func (h *Outbound) ListenSerialNetworkPacket(ctx context.Context, destination M.
  func (h *Outbound) IsEmpty() bool {
  	return h.isEmpty
  }

@@ -1,0 +1,140 @@
+From 48c08fec70f8046df5c6cc7ccf0f4a0bf50c4e76 Mon Sep 17 00:00:00 2001
+From: FiyeroT <me@fiyero.xyz>
+Date: Mon, 26 Oct 2026 16:03:10 +0300
+Subject: [PATCH 163/171] xhttp: the idle connections of the pool are closed on
+ request
+
+sing-box 1.14 closes the idle connections of an outbound nothing references
+any more (a urltest member that is not selected) through
+adapter.IdleConnectionKeeper; the xhttp transport did not have it, and its
+idle connections waited out the idle timeout of the pool (5 minutes). The
+connections of sessions stay.
+---
+ transport/v2rayxhttp/client.go     | 23 ++++++++++++++++++-
+ transport/v2rayxhttp/pool.go       | 23 +++++++++++++++++++
+ transport/v2rayxhttp/reset_test.go | 37 ++++++++++++++++++++++++++++++
+ 3 files changed, 82 insertions(+), 1 deletion(-)
+
+diff --git a/transport/v2rayxhttp/client.go b/transport/v2rayxhttp/client.go
+index 93f779ae3..c7c173ea3 100644
+--- a/transport/v2rayxhttp/client.go
++++ b/transport/v2rayxhttp/client.go
+@@ -28,7 +28,10 @@ import (
+ 	"golang.org/x/net/http2"
+ )
+ 
+-var _ adapter.V2RayClientTransport = (*Client)(nil)
++var (
++	_ adapter.V2RayClientTransport = (*Client)(nil)
++	_ adapter.IdleConnectionKeeper = (*Client)(nil)
++)
+ 
+ type Client struct {
+ 	mode string
+@@ -331,6 +334,24 @@ func (c *Client) sessionClients(s *session) (*poolClient, *poolClient, error) {
+ // with it. (sing-box cancels the context before it closes the outbounds.)
+ // Closed while the context lives, the client holds nothing but the idle
+ // timers of the connections dialed afterwards.
++// SetKeepIdleConnections and CloseIdleConnections make the transport an
++// adapter.IdleConnectionKeeper, as the other transports of sing-box 1.14 are: the
++// idle connections of an outbound nothing references any more (a member of a
++// urltest group that is not selected) are closed instead of waiting out the idle
++// timeout of the pool. The connections of sessions stay.
++func (c *Client) SetKeepIdleConnections(keep bool) {
++	if !keep {
++		c.CloseIdleConnections()
++	}
++}
++
++func (c *Client) CloseIdleConnections() {
++	c.upPool.closeIdle()
++	if c.downPool != nil && c.downPool != c.upPool {
++		c.downPool.closeIdle()
++	}
++}
++
+ func (c *Client) Close() error {
+ 	c.upPool.close()
+ 	if c.downPool != c.upPool {
+diff --git a/transport/v2rayxhttp/pool.go b/transport/v2rayxhttp/pool.go
+index 8f064ffa5..430c8d078 100644
+--- a/transport/v2rayxhttp/pool.go
++++ b/transport/v2rayxhttp/pool.go
+@@ -391,6 +391,29 @@ func (c *poolClient) shutdown() {
+ 	c.closeOnce.Do(c.connection.close)
+ }
+ 
++// closeIdle takes the clients no session or request uses out of the pool and closes
++// them; the busy ones stay. A get counts its client as running under the lock, so
++// a client found idle here is not handed out meanwhile.
++func (p *pool) closeIdle() {
++	p.access.Lock()
++	var idle []*poolClient
++	busy := p.clients[:0]
++	for _, client := range p.clients {
++		if client.running.Load() > 0 {
++			busy = append(busy, client)
++			continue
++		}
++		p.retireLocked(client)
++		idle = append(idle, client)
++	}
++	clear(p.clients[len(busy):])
++	p.clients = busy
++	p.access.Unlock()
++	for _, client := range idle {
++		client.closeIfIdle()
++	}
++}
++
+ // close closes every client, those in the pool and those retired from it that
+ // sessions still hold, and forgets what it held against the server: the pool
+ // starts anew, with the next get opening a connection. The sessions on the
+diff --git a/transport/v2rayxhttp/reset_test.go b/transport/v2rayxhttp/reset_test.go
+index 161f3f3c1..be5a75859 100644
+--- a/transport/v2rayxhttp/reset_test.go
++++ b/transport/v2rayxhttp/reset_test.go
+@@ -317,3 +317,40 @@ func TestXHTTPResetRefusesRequestsOfClosedClients(t *testing.T) {
+ 	p.access.Unlock()
+ 	require.Zero(t, failures)
+ }
++
++// closingConnection counts the times it is closed.
++type closingConnection struct {
++	countingConnection
++	closed atomic.Int32
++}
++
++func (c *closingConnection) close() { c.closed.Add(1) }
++
++// The idle connections of the pool are closed on request (an outbound nothing references
++// any more), those a session uses stay, and the pool opens a new one for the next session.
++func TestXHTTPCloseIdleConnections(t *testing.T) {
++	var connections []*closingConnection
++	p := newPool(context.Background(), xmuxConfig{}, func() pooledConnection {
++		connection := new(closingConnection)
++		connections = append(connections, connection)
++		return connection
++	})
++	defer p.close()
++	idle, err := p.get(true)
++	require.NoError(t, err)
++	idle.endSession()
++	idle.release()
++	p.closeIdle()
++	require.Len(t, connections, 1)
++	require.EqualValues(t, 1, connections[0].closed.Load(), "the idle connection stays open")
++
++	busy, err := p.get(true)
++	require.NoError(t, err)
++	require.Len(t, connections, 2, "no new connection after the idle one was closed")
++	p.closeIdle()
++	require.Zero(t, connections[1].closed.Load(), "the connection of a session was closed")
++	busy.endSession()
++	busy.release()
++	p.closeIdle()
++	require.EqualValues(t, 1, connections[1].closed.Load())
++}
+-- 
+2.53.0
+

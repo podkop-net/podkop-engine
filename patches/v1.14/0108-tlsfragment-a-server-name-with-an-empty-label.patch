@@ -1,7 +1,7 @@
-From bc3eb0c3c3bc638da7647238d0c4236fac4dd296 Mon Sep 17 00:00:00 2001
+From 371ce7d1b8911d9a5bb9eb80b2be657ceac6d550 Mon Sep 17 00:00:00 2001
 From: FiyeroT <me@fiyero.xyz>
 Date: Fri, 9 Oct 2026 16:15:03 +0300
-Subject: [PATCH 108/160] tlsfragment: a server name with an empty label
+Subject: [PATCH 108/171] tlsfragment: a server name with an empty label
 
 The place of a cut inside a label was drawn with rand.Intn(len(label)).
 For an empty label that is rand.Intn(0), which panics, and nothing

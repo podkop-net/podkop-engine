@@ -1,7 +1,7 @@
-From f39d65c71334a1804492a47d373e7b94cce24359 Mon Sep 17 00:00:00 2001
+From abac3a2120705012599da0da80f88611216a3c8d Mon Sep 17 00:00:00 2001
 From: FiyeroT <me@fiyero.xyz>
 Date: Sun, 4 Oct 2026 08:49:33 +0300
-Subject: [PATCH 042/160] clashapi: a failed listen of the external controller
+Subject: [PATCH 042/171] clashapi: a failed listen of the external controller
  does not fail the start
 
 The Clash API carries no traffic, yet a failed listen of external_controller
@@ -18,7 +18,7 @@ minute, until it succeeds or the server closes.
  create mode 100644 experimental/clashapi/server_listen_test.go
 
 diff --git a/experimental/clashapi/server.go b/experimental/clashapi/server.go
-index 6623906a7..4efd6d191 100644
+index a8c99af36..5a4be4b30 100644
 --- a/experimental/clashapi/server.go
 +++ b/experimental/clashapi/server.go
 @@ -9,6 +9,7 @@ import (
@@ -36,8 +36,8 @@ index 6623906a7..4efd6d191 100644
 +	"github.com/sagernet/sing/common"
  	E "github.com/sagernet/sing/common/exceptions"
  	"github.com/sagernet/sing/common/json"
- 	"github.com/sagernet/sing/service"
-@@ -47,6 +49,8 @@ type Server struct {
+ 	M "github.com/sagernet/sing/common/metadata"
+@@ -49,6 +51,8 @@ type Server struct {
  	endpoint       adapter.EndpointManager
  	logger         log.Logger
  	httpServer     *http.Server
@@ -46,7 +46,7 @@ index 6623906a7..4efd6d191 100644
  	trafficManager *trafficcontrol.Manager
  	urlTestHistory *urltest.HistoryStorage
  	clashMode      *clashmode.Manager
-@@ -84,6 +88,7 @@ func NewServer(ctx context.Context, logFactory log.ObservableFactory, options op
+@@ -86,6 +90,7 @@ func NewServer(ctx context.Context, logFactory log.ObservableFactory, options op
  			Addr:    options.ExternalController,
  			Handler: chiRouter,
  		},
@@ -54,7 +54,7 @@ index 6623906a7..4efd6d191 100644
  		trafficManager:           trafficManager,
  		urlTestHistory:           urlTestHistory,
  		clashMode:                clashMode,
-@@ -152,33 +157,81 @@ func (s *Server) Start(stage adapter.StartStage, scope *adapter.Scope) error {
+@@ -154,33 +159,81 @@ func (s *Server) Start(stage adapter.StartStage, scope *adapter.Scope) error {
  	}
  	if s.externalController {
  		s.checkAndDownloadExternalUI()
@@ -63,7 +63,7 @@ index 6623906a7..4efd6d191 100644
 -			err      error
 -		)
 -		for range 3 {
--			listener, err = net.Listen("tcp", s.httpServer.Addr)
+-			listener, err = net.Listen(M.NetworkFromNetAddr(N.NetworkTCP, M.ParseSocksaddr(s.httpServer.Addr).Addr), s.httpServer.Addr)
 -			if runtime.GOOS == "android" && errors.Is(err, syscall.EADDRINUSE) {
 -				time.Sleep(100 * time.Millisecond)
 -				continue
@@ -103,7 +103,7 @@ index 6623906a7..4efd6d191 100644
 +
 +func (s *Server) listen() (listener net.Listener, err error) {
 +	for range 3 {
-+		listener, err = net.Listen("tcp", s.httpServer.Addr)
++		listener, err = net.Listen(M.NetworkFromNetAddr(N.NetworkTCP, M.ParseSocksaddr(s.httpServer.Addr).Addr), s.httpServer.Addr)
 +		if runtime.GOOS == "android" && errors.Is(err, syscall.EADDRINUSE) {
 +			time.Sleep(100 * time.Millisecond)
 +			continue

@@ -1,7 +1,7 @@
-From 9788c6ba1dd34eeb7ec40b6424dd5711939faadb Mon Sep 17 00:00:00 2001
+From 1814af0f1f19ac07650063bfc8167c6681619855 Mon Sep 17 00:00:00 2001
 From: FiyeroT <me@fiyero.xyz>
 Date: Tue, 6 Oct 2026 23:41:11 +0300
-Subject: [PATCH 077/160] dns: use slices.Equal and slices.Contains for the
+Subject: [PATCH 077/171] dns: use slices.Equal and slices.Contains for the
  provider's servers
 
 sameServers and containsServer were the two functions of the standard library written

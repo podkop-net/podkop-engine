@@ -1,7 +1,7 @@
-From e1f22f5b23d88bdce8db3b9ae662737919fbf820 Mon Sep 17 00:00:00 2001
+From 312286f0699213926f7307d68048afac5159ab6c Mon Sep 17 00:00:00 2001
 From: FiyeroT <me@fiyero.xyz>
 Date: Fri, 9 Oct 2026 16:15:04 +0300
-Subject: [PATCH 110/160] tls: fingerprint fallback, what two reviews and the
+Subject: [PATCH 110/171] tls: fingerprint fallback, what two reviews and the
  stands showed
 
 The fallback is turned on and off, and given its list, by the option
@@ -105,7 +105,7 @@ configuration.
  create mode 100644 common/tls/detour_test.go
 
 diff --git a/box.go b/box.go
-index 31e7731bc..fb97c52fd 100644
+index 9ddc4ba2f..8ceb7d507 100644
 --- a/box.go
 +++ b/box.go
 @@ -143,6 +143,10 @@ func New(options Options) (*Box, error) {
@@ -677,10 +677,10 @@ index dd564f534..8f8a24a96 100644
  	ServerConfig
  	logger             logger.ContextLogger
 diff --git a/common/tls/reality_client.go b/common/tls/reality_client.go
-index cde7e5805..6e2dc451c 100644
+index 4bd477f74..73ac6a86e 100644
 --- a/common/tls/reality_client.go
 +++ b/common/tls/reality_client.go
-@@ -50,13 +50,31 @@ type RealityClientConfig struct {
+@@ -51,13 +51,31 @@ type RealityClientConfig struct {
  	shortID   [8]byte
  	// the name of a uTLS fingerprint without an X25519MLKEM768 key share, otherwise empty
  	classicFingerprint string
@@ -713,7 +713,7 @@ index cde7e5805..6e2dc451c 100644
  
  // checkRealityFingerprint refuses the uTLS fingerprints REALITY cannot work with and
  // reports whether the named one lacks the X25519MLKEM768 key share.
-@@ -72,13 +90,27 @@ func checkRealityFingerprint(name string) (classic bool, err error) {
+@@ -73,13 +91,27 @@ func checkRealityFingerprint(name string) (classic bool, err error) {
  	}
  }
  
@@ -747,7 +747,7 @@ index cde7e5805..6e2dc451c 100644
  }
  
  func NewRealityClient(ctx context.Context, logger logger.ContextLogger, serverAddress string, options option.OutboundTLSOptions) (Config, error) {
-@@ -124,7 +156,7 @@ func newRealityClient(ctx context.Context, logger logger.ContextLogger, serverAd
+@@ -125,7 +157,7 @@ func newRealityClient(ctx context.Context, logger logger.ContextLogger, serverAd
  	if classicFingerprint {
  		realityConfig.classicFingerprint = options.UTLS.Fingerprint
  		if logger != nil {
@@ -756,7 +756,7 @@ index cde7e5805..6e2dc451c 100644
  		}
  	}
  	var config Config = realityConfig
-@@ -275,7 +307,7 @@ func (e *RealityClientConfig) ClientHandshake(ctx context.Context, conn net.Conn
+@@ -276,7 +308,7 @@ func (e *RealityClientConfig) ClientHandshake(ctx context.Context, conn net.Conn
  		if verifier.rejected && e.classicFingerprint != "" {
  			// the server passed the connection on to its target, and the certificate of
  			// the target is not valid here: the cause is the same as below
@@ -765,7 +765,7 @@ index cde7e5805..6e2dc451c 100644
  		}
  		return nil, err
  	}
-@@ -286,7 +318,7 @@ func (e *RealityClientConfig) ClientHandshake(ctx context.Context, conn net.Conn
+@@ -287,7 +319,7 @@ func (e *RealityClientConfig) ClientHandshake(ctx context.Context, conn net.Conn
  
  	if !verifier.verified {
  		go realityClientFallback(e.ctx, uConn, e.uClient.ServerName(), e.uClient.id)
@@ -774,7 +774,7 @@ index cde7e5805..6e2dc451c 100644
  	}
  
  	releaseHandshakeState(uConn)
-@@ -324,6 +356,7 @@ func (e *RealityClientConfig) Clone() Config {
+@@ -333,6 +365,7 @@ func (e *RealityClientConfig) Clone() Config {
  		e.publicKey,
  		e.shortID,
  		e.classicFingerprint,
@@ -782,7 +782,7 @@ index cde7e5805..6e2dc451c 100644
  	}
  }
  
-@@ -401,3 +434,7 @@ func (c *realityClientConnWrapper) ReaderReplaceable() bool {
+@@ -410,3 +443,7 @@ func (c *realityClientConnWrapper) ReaderReplaceable() bool {
  func (c *realityClientConnWrapper) WriterReplaceable() bool {
  	return false
  }

@@ -1,7 +1,7 @@
-From 2e23bcc5699dd94e7e719bd8d013fc1aca876e41 Mon Sep 17 00:00:00 2001
+From 7554414783412e34093294f8133f573d3091e35e Mon Sep 17 00:00:00 2001
 From: FiyeroT <me@fiyero.xyz>
 Date: Sat, 3 Oct 2026 03:46:31 +0300
-Subject: [PATCH 018/160] sniff: stop the TLS server handshake once the
+Subject: [PATCH 018/171] sniff: stop the TLS server handshake once the
  ClientHello is captured
 
 TLSClientHello parses the ClientHello by running the crypto/tls server handshake
@@ -21,11 +21,11 @@ the cost per sniffed connection drops from about 140 us to 5 us on x86.
  create mode 100644 common/sniff/tls_test.go
 
 diff --git a/common/sniff/tls.go b/common/sniff/tls.go
-index 613086e81..c6d4cabb6 100644
+index e994c8aa6..4ead32dc3 100644
 --- a/common/sniff/tls.go
 +++ b/common/sniff/tls.go
-@@ -12,12 +12,18 @@ import (
- 	E "github.com/sagernet/sing/common/exceptions"
+@@ -13,12 +13,18 @@ import (
+ 	M "github.com/sagernet/sing/common/metadata"
  )
  
 +// errClientHelloCaptured ends the server handshake as soon as the ClientHello is parsed.

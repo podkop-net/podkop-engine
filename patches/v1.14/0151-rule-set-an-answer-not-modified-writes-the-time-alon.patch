@@ -1,7 +1,7 @@
-From d0740843bd7e9954d1a85efe2dc0b7ac39e5dee9 Mon Sep 17 00:00:00 2001
+From 3c1838a1b03d61df1c3ce203d03293dbec75e35c Mon Sep 17 00:00:00 2001
 From: FiyeroT <me@fiyero.xyz>
 Date: Sat, 24 Oct 2026 09:37:14 +0300
-Subject: [PATCH 151/160] rule-set: an answer "not modified" writes the time
+Subject: [PATCH 151/171] rule-set: an answer "not modified" writes the time
  alone to the cache file
 
 On a 304 a remote rule set loaded its whole saved list from the cache file
@@ -25,7 +25,7 @@ does not keep the times (adapter.RuleSetCheckCache) saves the set again.
  create mode 100644 route/rule/rule_set_remote_checked_test.go
 
 diff --git a/adapter/experimental.go b/adapter/experimental.go
-index d5a1e5bb4..86aba7186 100644
+index 7df508d49..38998a622 100644
 --- a/adapter/experimental.go
 +++ b/adapter/experimental.go
 @@ -48,6 +48,14 @@ type CacheFile interface {

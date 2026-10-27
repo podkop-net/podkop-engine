@@ -1,7 +1,7 @@
 From 9f8ba59fbfa7ac3d452c2ee045a587f5502ba362 Mon Sep 17 00:00:00 2001
 From: FiyeroT <me@fiyero.xyz>
 Date: Tue, 6 Oct 2026 23:31:37 +0300
-Subject: [PATCH 072/152] dns: test the decisions of the provider DNS fallback
+Subject: [PATCH 072/159] dns: test the decisions of the provider DNS fallback
 
 No test called exchangeWithFallback, the function that decides who answers a query and
 what a failure does to the server: the tests covered the parts around it (which servers

@@ -1,0 +1,189 @@
+From 834727551634e043ef33071686debc2ad5979a1a Mon Sep 17 00:00:00 2001
+From: FiyeroT <me@fiyero.xyz>
+Date: Mon, 26 Oct 2026 17:08:10 +0300
+Subject: [PATCH 169/171] cachefile: lists of an earlier version moved into
+ files, the file compacted
+
+A cache file an earlier version filled with lists stays at three to four
+times their size after they leave it: bbolt never gives a page back to the
+file system. At the start the rule sets of the bucket rule_set move into
+their files one at a time (one that cannot be written stays and is read
+from there), and a cache file of 8 MiB or more that is more than half free
+pages is written anew with bbolt.Compact and renamed into place.
+---
+ experimental/cachefile/cache.go              |  8 +-
+ experimental/cachefile/rule_set_file.go      | 81 ++++++++++++++++++++
+ experimental/cachefile/rule_set_file_test.go | 41 ++++++++++
+ 3 files changed, 129 insertions(+), 1 deletion(-)
+
+diff --git a/experimental/cachefile/cache.go b/experimental/cachefile/cache.go
+index 63480c700..eb1c589b5 100644
+--- a/experimental/cachefile/cache.go
++++ b/experimental/cachefile/cache.go
+@@ -249,8 +249,14 @@ func (c *CacheFile) start() error {
+ 		db.Close()
+ 		return err
+ 	}
+-	c.pruneRuleSetFiles(db)
+ 	c.DB = db
++	c.moveRuleSetsToFiles()
++	db, err = c.compactSparse(db)
++	if err != nil {
++		return err
++	}
++	c.DB = db
++	c.pruneRuleSetFiles(db)
+ 	return nil
+ }
+ 
+diff --git a/experimental/cachefile/rule_set_file.go b/experimental/cachefile/rule_set_file.go
+index d21a730e4..05d1f8f50 100644
+--- a/experimental/cachefile/rule_set_file.go
++++ b/experimental/cachefile/rule_set_file.go
+@@ -9,6 +9,7 @@ import (
+ 	"os"
+ 	"path/filepath"
+ 	"strings"
++	"time"
+ 
+ 	"github.com/sagernet/bbolt"
+ 	"github.com/sagernet/sing-box/adapter"
+@@ -179,6 +180,86 @@ func (c *CacheFile) saveRuleSetFile(tag string, set *adapter.SavedBinary) error
+ 	})
+ }
+ 
++// moveRuleSetsToFiles moves the rule sets an earlier version kept in the database into
++// their files, one at a time; one that cannot be written stays where it is and is read
++// from there.
++func (c *CacheFile) moveRuleSetsToFiles() {
++	var tags []string
++	_ = c.view(func(t *bbolt.Tx) error {
++		bucket := c.bucket(t, bucketRuleSet)
++		if bucket == nil {
++			return nil
++		}
++		return bucket.ForEach(func(tag []byte, _ []byte) error {
++			tags = append(tags, string(tag))
++			return nil
++		})
++	})
++	for _, tag := range tags {
++		var saved adapter.SavedBinary
++		err := c.view(func(t *bbolt.Tx) error {
++			return saved.UnmarshalBinary(c.bucket(t, bucketRuleSet).Get([]byte(tag)))
++		})
++		if err != nil {
++			continue
++		}
++		err = c.saveRuleSetFile(tag, &saved)
++		if err != nil {
++			c.logger.Warn("rule-set cache ", tag, ": move it into its file: ", err)
++			return
++		}
++	}
++}
++
++// compactFrom is the size from which a cache file that is mostly free pages is written
++// anew: the lists an earlier version kept in it left it at three to four times their size,
++// and bbolt never gives a page back to the file system.
++const compactFrom = 8 << 20
++
++// compactSparse writes the database anew into a file of the size of what it holds when
++// more than half of a big file is free pages, and returns the database to use.
++func (c *CacheFile) compactSparse(db *bbolt.DB) (*bbolt.DB, error) {
++	info, err := os.Stat(c.path)
++	if err != nil || info.Size() < compactFrom {
++		return db, nil
++	}
++	stats := db.Stats()
++	free := int64(stats.FreePageN+stats.PendingPageN) * int64(db.Info().PageSize)
++	if free*2 < info.Size() {
++		return db, nil
++	}
++	compact := c.path + ".compact"
++	_ = os.Remove(compact)
++	destination, err := bbolt.Open(compact, 0o666, &bbolt.Options{Timeout: time.Second})
++	if err != nil {
++		return db, nil
++	}
++	err = bbolt.Compact(destination, db, 4<<20)
++	closeErr := destination.Close()
++	if err == nil {
++		err = closeErr
++	}
++	if err != nil {
++		_ = os.Remove(compact)
++		c.logger.Warn("compact the cache file: ", err)
++		return db, nil
++	}
++	db.Close()
++	err = os.Rename(compact, c.path)
++	if err != nil {
++		_ = os.Remove(compact)
++	}
++	db, openErr := bbolt.Open(c.path, 0o666, &bbolt.Options{Timeout: time.Second})
++	if openErr != nil {
++		return nil, openErr
++	}
++	if err == nil {
++		c.logger.Info("cache file compacted: ", info.Size()>>20, " MiB, most of it free pages")
++		_ = filemanager.Chown(c.ctx, c.path)
++	}
++	return db, nil
++}
++
+ // pruneRuleSetFiles removes the files of the directory that no record names (of any cache
+ // ID), and files whose write was cut.
+ func (c *CacheFile) pruneRuleSetFiles(db *bbolt.DB) {
+diff --git a/experimental/cachefile/rule_set_file_test.go b/experimental/cachefile/rule_set_file_test.go
+index f8e6de4db..4d9431ff1 100644
+--- a/experimental/cachefile/rule_set_file_test.go
++++ b/experimental/cachefile/rule_set_file_test.go
+@@ -110,3 +110,44 @@ func TestRuleSetFileName(t *testing.T) {
+ 	require.NotEqual(t, ruleSetFileName(nil, "a/b"), ruleSetFileName(nil, "a_b"))
+ 	require.NotEqual(t, ruleSetFileName(nil, "a"), ruleSetFileName([]byte("\x00x"), "a"))
+ }
++
++// The lists an earlier version kept in the database move into their files at the start,
++// and the cache file they left at three times their size is written anew, small; what was
++// saved is read as before, and the rest of the database stays.
++func TestRuleSetFileMovedAndCompacted(t *testing.T) {
++	path := filepath.Join(t.TempDir(), "cache.db")
++	cacheFile := openTestCacheFile(t, path)
++	list := bytes.Repeat([]byte("203.0.113.0/24\n"), 300000)
++	for round := byte(0); round < 3; round++ {
++		list[0] = '0' + round
++		value, err := (&adapter.SavedBinary{Content: list, LastUpdated: time.Unix(100+int64(round), 0)}).MarshalBinary()
++		require.NoError(t, err)
++		require.NoError(t, cacheFile.batch(func(tx *bbolt.Tx) error {
++			bucket, err := cacheFile.createBucket(tx, bucketRuleSet)
++			if err != nil {
++				return err
++			}
++			return bucket.Put([]byte("big"), value)
++		}))
++	}
++	require.NoError(t, cacheFile.StoreSelected("proxy", "main"))
++	require.NoError(t, cacheFile.Close())
++	info, err := os.Stat(path)
++	require.NoError(t, err)
++	require.Greater(t, info.Size(), int64(2*len(list)), "the database of an earlier version is not as big")
++
++	cacheFile = openTestCacheFile(t, path)
++	defer cacheFile.Close()
++	info, err = os.Stat(path)
++	require.NoError(t, err)
++	require.Less(t, info.Size(), int64(len(list)/4), "the cache file is not compacted")
++	saved := cacheFile.LoadRuleSet("big")
++	require.NotNil(t, saved)
++	require.Equal(t, list, saved.Content)
++	require.True(t, time.Unix(102, 0).Equal(saved.LastUpdated))
++	require.Equal(t, "main", cacheFile.LoadSelected("proxy"))
++	require.NoError(t, cacheFile.view(func(tx *bbolt.Tx) error {
++		require.Nil(t, cacheFile.bucket(tx, bucketRuleSet).Get([]byte("big")))
++		return nil
++	}))
++}
+-- 
+2.53.0
+

@@ -1,7 +1,7 @@
-From 33ac62705caad783bc0aa715fe2ce58744170f83 Mon Sep 17 00:00:00 2001
+From fde26811088ac52f1b46578fcb8e142d25430868 Mon Sep 17 00:00:00 2001
 From: FiyeroT <me@fiyero.xyz>
 Date: Sun, 25 Oct 2026 21:20:32 +0300
-Subject: [PATCH 156/160] tls: the fingerprint fallback tries the ClientHello
+Subject: [PATCH 156/171] tls: the fingerprint fallback tries the ClientHello
  without X25519MLKEM768 first, then firefox
 
 Measured in October 2026: the Russian DPI freezes the connections of chrome (Chrome 133
@@ -32,7 +32,7 @@ fingerprints of the option is no longer used.
  create mode 100644 experimental/cachefile/utls_choice.go
 
 diff --git a/adapter/experimental.go b/adapter/experimental.go
-index 86aba7186..a4051e2bf 100644
+index 38998a622..dceb4f287 100644
 --- a/adapter/experimental.go
 +++ b/adapter/experimental.go
 @@ -46,6 +46,9 @@ type CacheFile interface {
@@ -321,10 +321,10 @@ index 579c6a065..48cc08eec 100644
 +	require.Equal(t, "ping", string(answer))
  }
 diff --git a/common/tls/reality_client.go b/common/tls/reality_client.go
-index 9048098bb..9d90a74a3 100644
+index 66cd56d98..79c59b914 100644
 --- a/common/tls/reality_client.go
 +++ b/common/tls/reality_client.go
-@@ -232,6 +232,14 @@ func (e *RealityClientConfig) ClientHandshake(ctx context.Context, conn net.Conn
+@@ -233,6 +233,14 @@ func (e *RealityClientConfig) ClientHandshake(ctx context.Context, conn net.Conn
  	if err != nil {
  		return nil, err
  	}

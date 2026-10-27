@@ -1,7 +1,7 @@
-From f8ee7cdc689b7b4e8cce5221de76580fdec254ff Mon Sep 17 00:00:00 2001
+From 1dfa4d3794fe1eb52ab9a18669805151e8f6f638 Mon Sep 17 00:00:00 2001
 From: FiyeroT <me@fiyero.xyz>
 Date: Thu, 8 Oct 2026 17:06:43 +0300
-Subject: [PATCH 095/160] tlsspoof: send the forged ClientHello the way the
+Subject: [PATCH 095/171] tlsspoof: send the forged ClientHello the way the
  connection goes, and nothing else
 
 On Linux:
@@ -27,9 +27,9 @@ The packets themselves do not change: a test holds them byte for byte.
 ---
  common/tlsspoof/integration_unix_test.go |  10 ++
  common/tlsspoof/packet_vectors_test.go   |  46 +++++++
- common/tlsspoof/raw_linux.go             | 108 +++++++++++++--
+ common/tlsspoof/raw_linux.go             | 149 +++++++++++++--------
  common/tlsspoof/raw_linux_test.go        | 163 +++++++++++++++++++++++
- 4 files changed, 313 insertions(+), 14 deletions(-)
+ 4 files changed, 313 insertions(+), 55 deletions(-)
  create mode 100644 common/tlsspoof/packet_vectors_test.go
  create mode 100644 common/tlsspoof/raw_linux_test.go
 
@@ -119,7 +119,7 @@ index 000000000..4784e58df
 +	}
 +}
 diff --git a/common/tlsspoof/raw_linux.go b/common/tlsspoof/raw_linux.go
-index 3e4761147..7d55111a9 100644
+index bca7b5920..7d55111a9 100644
 --- a/common/tlsspoof/raw_linux.go
 +++ b/common/tlsspoof/raw_linux.go
 @@ -1,6 +1,7 @@
@@ -144,7 +144,7 @@ index 3e4761147..7d55111a9 100644
  	src         netip.AddrPort
  	dst         netip.AddrPort
  	rawFD       int
-@@ -30,28 +34,84 @@ type linuxSpoofer struct {
+@@ -30,35 +34,84 @@ type linuxSpoofer struct {
  	timestamp   uint32
  }
  
@@ -158,6 +158,12 @@ index 3e4761147..7d55111a9 100644
  		return nil, err
  	}
 -	fd, sockaddr, err := openLinuxRawSocket(dst)
+-	if err != nil {
+-		return nil, err
+-	}
+-	err = control.Conn(tcpConn, func(raw uintptr) error {
+-		return inheritRouting(fd, int(raw), src)
+-	})
 +	return &linuxSpoofer{
 +		method:  method,
 +		tcpConn: tcpConn,
@@ -170,6 +176,7 @@ index 3e4761147..7d55111a9 100644
 +func (s *linuxSpoofer) open() error {
 +	fd, sockaddr, err := openLinuxRawSocket(s.dst)
  	if err != nil {
+-		unix.Close(fd)
 -		return nil, err
 -	}
 -	spoofer := &linuxSpoofer{
@@ -242,7 +249,48 @@ index 3e4761147..7d55111a9 100644
  }
  
  func openLinuxRawSocket(dst netip.AddrPort) (int, unix.Sockaddr, error) {
-@@ -87,6 +147,16 @@ func (s *linuxSpoofer) loadSequenceNumbers(tcpConn *net.TCPConn) error {
+@@ -82,40 +135,6 @@ func openLinuxRawSocket(dst netip.AddrPort) (int, unix.Sockaddr, error) {
+ 	return fd, sockaddr, nil
+ }
+ 
+-// Linux routes IP_HDRINCL packets by the raw socket's bound device, mark and
+-// bound address (raw_sendmsg), not by the addresses in the supplied header.
+-func inheritRouting(rawSocket, tcpSocket int, src netip.AddrPort) error {
+-	bindInterface, err := unix.GetsockoptString(tcpSocket, unix.SOL_SOCKET, unix.SO_BINDTODEVICE)
+-	if err != nil {
+-		return E.Cause(err, "read SO_BINDTODEVICE")
+-	}
+-	if bindInterface != "" {
+-		err = unix.BindToDevice(rawSocket, bindInterface)
+-		if err != nil {
+-			return E.Cause(err, "bind raw socket to interface ", bindInterface)
+-		}
+-	}
+-	routingMark, err := unix.GetsockoptInt(tcpSocket, unix.SOL_SOCKET, unix.SO_MARK)
+-	if err != nil {
+-		return E.Cause(err, "read SO_MARK")
+-	}
+-	if routingMark != 0 {
+-		err = unix.SetsockoptInt(rawSocket, unix.SOL_SOCKET, unix.SO_MARK, routingMark)
+-		if err != nil {
+-			return E.Cause(err, "set raw socket SO_MARK")
+-		}
+-	}
+-	if src.Addr().Is4() {
+-		err = unix.Bind(rawSocket, &unix.SockaddrInet4{Addr: src.Addr().As4()})
+-	} else {
+-		err = unix.Bind(rawSocket, &unix.SockaddrInet6{Addr: src.Addr().As16()})
+-	}
+-	if err != nil {
+-		return E.Cause(err, "bind raw socket to ", src.Addr())
+-	}
+-	return nil
+-}
+-
+ // loadSequenceNumbers puts the socket briefly into TCP_REPAIR mode to read
+ // snd_nxt and rcv_nxt from the kernel. TCP_REPAIR requires CAP_NET_ADMIN;
+ // callers must run as root or grant both CAP_NET_RAW and CAP_NET_ADMIN.
+@@ -128,6 +147,16 @@ func (s *linuxSpoofer) loadSequenceNumbers(tcpConn *net.TCPConn) error {
  		fd := int(raw)
  
  		if s.method == MethodWrongTimestamp {
@@ -259,7 +307,7 @@ index 3e4761147..7d55111a9 100644
  			timestamp, err := unix.GetsockoptInt(fd, unix.IPPROTO_TCP, unix.TCP_TIMESTAMP)
  			if err != nil {
  				return E.Cause(err, "read timestamp")
-@@ -99,7 +169,12 @@ func (s *linuxSpoofer) loadSequenceNumbers(tcpConn *net.TCPConn) error {
+@@ -140,7 +169,12 @@ func (s *linuxSpoofer) loadSequenceNumbers(tcpConn *net.TCPConn) error {
  			return E.Cause(err, "enter TCP_REPAIR (need CAP_NET_ADMIN)")
  		}
  		defer func() {
@@ -273,7 +321,7 @@ index 3e4761147..7d55111a9 100644
  			if err == nil && offErr != nil {
  				err = E.Cause(offErr, "leave TCP_REPAIR")
  			}
-@@ -128,6 +203,11 @@ func (s *linuxSpoofer) loadSequenceNumbers(tcpConn *net.TCPConn) error {
+@@ -169,6 +203,11 @@ func (s *linuxSpoofer) loadSequenceNumbers(tcpConn *net.TCPConn) error {
  }
  
  func (s *linuxSpoofer) Inject(payload []byte) error {

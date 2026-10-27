@@ -1,7 +1,7 @@
-From 54e733ee6c6cbca36e7f816c02df5f0e3c3c8fa4 Mon Sep 17 00:00:00 2001
+From 5c4934e6cf0753d0fa93a25e4ad565d101b999a6 Mon Sep 17 00:00:00 2001
 From: FiyeroT <me@fiyero.xyz>
 Date: Tue, 6 Oct 2026 23:37:27 +0300
-Subject: [PATCH 085/160] urltest: check the download URL of the environment at
+Subject: [PATCH 085/171] urltest: check the download URL of the environment at
  start
 
 A download_url the test cannot use is refused as a configuration error, while the value
@@ -19,10 +19,10 @@ group warns once and works without the download test.
  3 files changed, 113 insertions(+), 3 deletions(-)
 
 diff --git a/protocol/group/urltest.go b/protocol/group/urltest.go
-index 2b386380c..d41ac17a1 100644
+index 552b9073d..ebbf77c9e 100644
 --- a/protocol/group/urltest.go
 +++ b/protocol/group/urltest.go
-@@ -93,6 +93,13 @@ func NewURLTest(ctx context.Context, router adapter.Router, logger log.ContextLo
+@@ -97,6 +97,13 @@ func NewURLTest(ctx context.Context, router adapter.Router, logger log.ContextLo
  	if err != nil {
  		return nil, err
  	}

@@ -1,7 +1,7 @@
-From c3088a486025b8a30df631bc2f9b011529e2de70 Mon Sep 17 00:00:00 2001
+From b5741cbee43cf22ee7705365d2d0ad423d449e72 Mon Sep 17 00:00:00 2001
 From: FiyeroT <me@fiyero.xyz>
 Date: Sat, 3 Oct 2026 11:27:47 +0300
-Subject: [PATCH 017/160] transport: a failed HTTP/2 dial frees the handshake
+Subject: [PATCH 017/171] transport: a failed HTTP/2 dial frees the handshake
  write, with its error
 
 The gRPC-lite and HTTP/2 transports send the request body through a pipe
@@ -25,7 +25,7 @@ On 1.13 Read and Close no longer take the reader before setup has set it
  create mode 100644 transport/v2rayhttp/conn_test.go
 
 diff --git a/transport/v2raygrpclite/client.go b/transport/v2raygrpclite/client.go
-index 62163e447..38657552f 100644
+index 3ac0404cc..67a961583 100644
 --- a/transport/v2raygrpclite/client.go
 +++ b/transport/v2raygrpclite/client.go
 @@ -122,10 +122,16 @@ func (c *Client) DialContext(ctx context.Context) (net.Conn, error) {
@@ -132,10 +132,10 @@ index 000000000..d74a1b348
 +	}
 +}
 diff --git a/transport/v2rayhttp/client.go b/transport/v2rayhttp/client.go
-index 9d21d91fe..ed8a65cb8 100644
+index b831086d3..c7f975d5b 100644
 --- a/transport/v2rayhttp/client.go
 +++ b/transport/v2rayhttp/client.go
-@@ -166,10 +166,16 @@ func (c *Client) dialHTTP2(ctx context.Context) (net.Conn, error) {
+@@ -170,10 +170,16 @@ func (c *Client) dialHTTP2(ctx context.Context) (net.Conn, error) {
  			if handshakeTimedOut.Load() {
  				err = os.ErrDeadlineExceeded
  			}

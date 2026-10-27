@@ -1,7 +1,7 @@
 From 183b0336fc7c074cf6bbd23bea21f6af225c95b7 Mon Sep 17 00:00:00 2001
 From: FiyeroT <me@fiyero.xyz>
 Date: Mon, 5 Oct 2026 20:28:39 +0300
-Subject: [PATCH 055/152] xhttp: an oversized request no longer takes the
+Subject: [PATCH 055/159] xhttp: an oversized request no longer takes the
  connection down
 
 With upload data in headers or cookies a request can exceed the header limit

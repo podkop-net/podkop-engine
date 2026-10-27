@@ -1,7 +1,7 @@
-From c9d580016f1394ce1de2e13d4c614dba4a3a9bd8 Mon Sep 17 00:00:00 2001
+From 94d0be40d58a79a983e7de464f0e4feffe49485c Mon Sep 17 00:00:00 2001
 From: FiyeroT <me@fiyero.xyz>
 Date: Thu, 8 Oct 2026 17:06:43 +0300
-Subject: [PATCH 096/160] reality: take the tls spoof options
+Subject: [PATCH 096/171] reality: take the tls spoof options
 
 The REALITY client refused spoof and spoof_method, though its handshake runs over the
 same TCP connection as that of any other TLS client, and REALITY authenticates by the
@@ -14,10 +14,10 @@ before the uTLS handshake, as the uTLS client does it; the options keep their ch
  create mode 100644 common/tls/reality_spoof_test.go
 
 diff --git a/common/tls/reality_client.go b/common/tls/reality_client.go
-index f6ec87dee..d2e3178dc 100644
+index 0a331dd73..8308a5009 100644
 --- a/common/tls/reality_client.go
 +++ b/common/tls/reality_client.go
-@@ -89,9 +89,6 @@ func newRealityClient(ctx context.Context, logger logger.ContextLogger, serverAd
+@@ -90,9 +90,6 @@ func newRealityClient(ctx context.Context, logger logger.ContextLogger, serverAd
  	if options.UTLS == nil || !options.UTLS.Enabled {
  		return nil, E.New("uTLS is required by reality client")
  	}
@@ -27,7 +27,7 @@ index f6ec87dee..d2e3178dc 100644
  
  	classicFingerprint, err := checkRealityFingerprint(options.UTLS.Fingerprint)
  	if err != nil {
-@@ -181,6 +178,12 @@ func (e *RealityClientConfig) ClientHandshake(ctx context.Context, conn net.Conn
+@@ -182,6 +179,12 @@ func (e *RealityClientConfig) ClientHandshake(ctx context.Context, conn net.Conn
  	uConfig.InsecureSkipVerify = true
  	uConfig.SessionTicketsDisabled = true
  	uConfig.VerifyPeerCertificate = verifier.VerifyPeerCertificate

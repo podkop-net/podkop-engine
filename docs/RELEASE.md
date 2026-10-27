@@ -12,9 +12,9 @@
    `FiyeroT <me@fiyero.xyz>` (`git config user.name FiyeroT; git config user.email me@fiyero.xyz`):
    она попадает в `From:` патчей и в коммиты.
    ```sh
-   git checkout -b pe-1.14 v1.14.3
+   git checkout -b pe-1.14 v1.14.4
    git am -3 /path/podkop-engine/patches/v1.14/*.patch     # конфликты — поправить, git am --continue
-   git format-patch v1.14.3 -o /path/podkop-engine/patches/v1.14/   # заменить старые файлы
+   git format-patch v1.14.4 -o /path/podkop-engine/patches/v1.14/   # заменить старые файлы
    ```
    Для патча include (0035 в r9) проверить, не появились ли в `include/registry.go` новые
    регистрации: новый тип выхода — в `include/podkop_full.go` и `podkop_full_stub.go`, новый вход,
@@ -32,15 +32,15 @@
    [FiyeroT/sing-vmess](https://github.com/FiyeroT/sing-vmess) и
    [FiyeroT/sing-quic](https://github.com/FiyeroT/sing-quic): директивы `replace` в `go.mod`,
    патчи `go.mod: …`. Исправление в библиотеке — это коммит в ветке форка (sing-vmess:
-   `pdk-1.13`, `pdk-1.14.3`; sing-quic: `pdk-1.13`), новый тег (sing-vmess: `v0.2.8-pdk13.N`
+   `pdk-1.13`, `pdk-1.14.4`; sing-quic: `pdk-1.13`), новый тег (sing-vmess: `v0.2.8-pdk13.N`
    и `v0.2.9-pdk.N`, sing-quic: `v0.6.5-pdk13.N`) и новые строки
    `go.mod` и `go.sum` в sing-box. Тег должен быть опубликован до сборки: SDK берёт модули
-   через прокси Go. С r15 линия 1.14 стоит на 1.14.3, где исправления форка sing-quic уже в
+   через прокси Go. С r15 линия 1.14 стоит на 1.14.3 (с r18 — на 1.14.4), где исправления форка sing-quic уже в
    версии upstream: форк там не нужен.
 
 2. **versions.env**: `SB_<ветка>_VERSION`, `SB_<ветка>_HASH`
    (`curl -sL https://codeload.github.com/SagerNet/sing-box/tar.gz/v<версия> | sha256sum`),
-   `SB_<ветка>_RELEASE=1` для новой версии upstream или +1, если менялись только патчи.
+   `SB_<ветка>_RELEASE` — номер выпуска podkop-engine, общий для линий, которые в нём собираются (1.13.21-r18 и 1.14.4-r18), и для новой версии upstream тоже.
    Если upstream поднял требуемый Go выше закреплённого — обновить `GOLANG_FEED_COMMIT`
    (последний коммит `lang/golang` в нужной ветке openwrt/packages).
 

@@ -1,7 +1,7 @@
 From 688fba7b6e2508891a016cb51a66dcdd861f7642 Mon Sep 17 00:00:00 2001
 From: FiyeroT <me@fiyero.xyz>
 Date: Sat, 3 Oct 2026 10:46:09 +0300
-Subject: [PATCH 024/152] include: drop the resolved service and DNS transport
+Subject: [PATCH 024/159] include: drop the resolved service and DNS transport
 
 They are the systemd-resolved D-Bus service, which OpenWrt does not run
 and podkop never configures. Its D-Bus export makes the linker keep every

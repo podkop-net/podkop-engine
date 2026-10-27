@@ -1,7 +1,7 @@
 From 1dd87f341c530d598d54785a3ebb4752307eddfe Mon Sep 17 00:00:00 2001
 From: FiyeroT <me@fiyero.xyz>
 Date: Sat, 24 Oct 2026 09:32:35 +0300
-Subject: [PATCH 142/152] rule-set: a rule set closed while it reads a list
+Subject: [PATCH 142/159] rule-set: a rule set closed while it reads a list
  stops reading it
 
 A remote rule set checked its context before and after the parse of a

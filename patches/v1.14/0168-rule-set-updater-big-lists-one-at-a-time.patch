@@ -1,0 +1,171 @@
+From a1068a5cfb902b4e5d812082c17eb61bba6f5a9b Mon Sep 17 00:00:00 2001
+From: FiyeroT <me@fiyero.xyz>
+Date: Mon, 26 Oct 2026 16:52:29 +0300
+Subject: [PATCH 168/171] rule-set updater: big lists one at a time
+
+An update of a list holds its download, builds the next list beside the one
+in use and saves it; five big lists due together took all of that at once.
+A rule set whose content is 1 MiB or more now waits for the update of any
+other such one; small lists and those that hold nothing yet go together as
+before, small ones first.
+---
+ route/rule/rule_set_remote.go       |  3 ++
+ route/rule/rule_set_updater.go      | 33 ++++++++++++++++--
+ route/rule/rule_set_updater_test.go | 53 +++++++++++++++++++++++++++++
+ 3 files changed, 87 insertions(+), 2 deletions(-)
+
+diff --git a/route/rule/rule_set_remote.go b/route/rule/rule_set_remote.go
+index 7e7bb437a..ec8be1b5f 100644
+--- a/route/rule/rule_set_remote.go
++++ b/route/rule/rule_set_remote.go
+@@ -68,6 +68,8 @@ type RemoteRuleSet struct {
+ 	fetchLoaded   bool
+ 	failures      int
+ 	failureLogged time.Time
++	// the size of the list it holds: big lists are updated one at a time (heavyRuleSetSize)
++	contentSize atomic.Int64
+ }
+ 
+ func NewRemoteRuleSet(ctx context.Context, logger logger.ContextLogger, tag string, options option.RuleSet) (*RemoteRuleSet, error) {
+@@ -330,6 +332,7 @@ func (s *RemoteRuleSet) commitBytes(content []byte) error {
+ 	s.rules = rules
+ 	s.contentUnknown = false
+ 	s.access.Unlock()
++	s.contentSize.Store(int64(len(content)))
+ 	return nil
+ }
+ 
+diff --git a/route/rule/rule_set_updater.go b/route/rule/rule_set_updater.go
+index 59c34ac2a..e6b3b3144 100644
+--- a/route/rule/rule_set_updater.go
++++ b/route/rule/rule_set_updater.go
+@@ -1,8 +1,10 @@
+ package rule
+ 
+ import (
++	"cmp"
+ 	"context"
+ 	"runtime"
++	"slices"
+ 	"sync"
+ 	"time"
+ 
+@@ -155,11 +157,27 @@ type updateResult struct {
+ 	failed bool
+ }
+ 
+-// updateAll updates the rule-sets of the indexes, ruleSetUpdateConcurrency at a time, and
+-// returns what each came to, by index. A rule-set is touched by one goroutine only.
++// heavyRuleSetSize is the size of a list from which its update waits for the update of
++// any other such list (podkop-engine): the download holds the list, the parse builds the
++// next one beside the one in use, and the save writes it; big lists updated together took
++// all of that at once. Small lists, and those that hold nothing yet, go together as before.
++const heavyRuleSetSize = 1 << 20
++
++// updateAll updates the rule-sets of the indexes, ruleSetUpdateConcurrency at a time and
++// the big ones one at a time, and returns what each came to, by index. A rule-set is
++// touched by one goroutine only.
+ func (u *RuleSetUpdater) updateAll(indexes []int) []updateResult {
+ 	results := make([]updateResult, len(u.ruleSets))
+ 	slots := make(chan struct{}, ruleSetUpdateConcurrency)
++	heavy := make(chan struct{}, 1)
++	isHeavy := func(i int) bool {
++		return u.ruleSets[i].contentSize.Load() >= heavyRuleSetSize
++	}
++	// the small ones first: big ones waiting for each other hold slots meanwhile
++	indexes = slices.Clone(indexes)
++	slices.SortStableFunc(indexes, func(left int, right int) int {
++		return cmp.Compare(boolOrder(isHeavy(left)), boolOrder(isHeavy(right)))
++	})
+ 	var group sync.WaitGroup
+ 	for _, i := range indexes {
+ 		group.Add(1)
+@@ -167,6 +185,10 @@ func (u *RuleSetUpdater) updateAll(indexes []int) []updateResult {
+ 		go func(i int) {
+ 			defer group.Done()
+ 			defer func() { <-slots }()
++			if isHeavy(i) {
++				heavy <- struct{}{}
++				defer func() { <-heavy }()
++			}
+ 			ruleSet := u.ruleSets[i]
+ 			failures := ruleSet.failures
+ 			results[i].loaded = ruleSet.updateOnce()
+@@ -177,6 +199,13 @@ func (u *RuleSetUpdater) updateAll(indexes []int) []updateResult {
+ 	return results
+ }
+ 
++func boolOrder(value bool) int {
++	if value {
++		return 1
++	}
++	return 0
++}
++
+ func waitUntilNext(nextUpdates []time.Time) time.Duration {
+ 	next := nextUpdates[0]
+ 	for _, nextUpdate := range nextUpdates[1:] {
+diff --git a/route/rule/rule_set_updater_test.go b/route/rule/rule_set_updater_test.go
+index a701f7562..0772e140f 100644
+--- a/route/rule/rule_set_updater_test.go
++++ b/route/rule/rule_set_updater_test.go
+@@ -106,3 +106,56 @@ func TestRuleSetUpdaterConcurrent(t *testing.T) {
+ 	require.EqualValues(t, ruleSetUpdateConcurrency, most.Load())
+ 	require.Less(t, time.Since(started), 1500*time.Millisecond, "the sets were downloaded one by one")
+ }
++
++// Big lists are updated one at a time, small ones together as before: two sets that hold a
++// big list each never download at once, while the three small ones do.
++func TestRuleSetUpdaterBigOneAtATime(t *testing.T) {
++	var bigInFlight, bigMost, smallInFlight, smallMost atomic.Int32
++	raise := func(most *atomic.Int32, now int32) {
++		for {
++			seen := most.Load()
++			if now <= seen || most.CompareAndSwap(seen, now) {
++				return
++			}
++		}
++	}
++	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		inFlight, most := &smallInFlight, &smallMost
++		if r.URL.Path == "/big" {
++			inFlight, most = &bigInFlight, &bigMost
++		}
++		raise(most, inFlight.Add(1))
++		defer inFlight.Add(-1)
++		time.Sleep(200 * time.Millisecond)
++		io.WriteString(w, testSourceSet)
++	}))
++	defer server.Close()
++	ctx, cancel := context.WithCancel(context.Background())
++	defer cancel()
++	var sets []adapter.RuleSet
++	for index := range 5 {
++		path := "/small"
++		if index%2 == 0 && index < 4 {
++			path = "/big"
++		}
++		set := newTestRuleSet(server.URL + path)
++		set.ctx = ctx
++		set.options.Format = C.RuleSetFormatSource
++		set.updateInterval = time.Hour
++		set.lastUpdated = time.Now()
++		if path == "/big" {
++			set.contentSize.Store(heavyRuleSetSize)
++		}
++		sets = append(sets, set)
++	}
++	updater := NewRuleSetUpdater(ctx, sets)
++	updater.Start()
++	defer updater.Close()
++	summary, err := updater.UpdateNow(ctx)
++	require.NoError(t, err)
++	require.Equal(t, RuleSetUpdateSummary{Total: 5, Loaded: 5}, summary)
++	require.EqualValues(t, 1, bigMost.Load(), "two big lists were downloaded at once")
++	require.EqualValues(t, 3, smallMost.Load())
++	// what was loaded tells its size: the small list of the test is small
++	require.Less(t, sets[0].(*RemoteRuleSet).contentSize.Load(), int64(heavyRuleSetSize))
++}
+-- 
+2.53.0
+

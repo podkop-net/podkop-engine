@@ -1,7 +1,7 @@
-From 6522748211558b26939c03d996a421c2bc79d92d Mon Sep 17 00:00:00 2001
+From 83a43ee6cd13ce84c35615f2f59b9baefd1f041b Mon Sep 17 00:00:00 2001
 From: FiyeroT <me@fiyero.xyz>
 Date: Fri, 2 Oct 2026 06:52:21 +0300
-Subject: [PATCH 013/160] route: a FakeIP address without a record goes by the
+Subject: [PATCH 013/171] route: a FakeIP address without a record goes by the
  sniffed domain
 
 A connection to a FakeIP address the store has no record for was refused
@@ -25,10 +25,10 @@ domain are refused. QUIC is not tested.
  1 file changed, 33 insertions(+), 1 deletion(-)
 
 diff --git a/route/route.go b/route/route.go
-index 8dddb0431..bc1d41b4c 100644
+index bf25baeee..d9b5ff2be 100644
 --- a/route/route.go
 +++ b/route/route.go
-@@ -542,6 +542,11 @@ func (r *Router) preMatchFlow(ctx context.Context, metadata *adapter.InboundCont
+@@ -569,6 +569,11 @@ func (r *Router) preMatchFlow(ctx context.Context, metadata *adapter.InboundCont
  	return result
  }
  
@@ -40,7 +40,7 @@ index 8dddb0431..bc1d41b4c 100644
  func (r *Router) prepareMatchMetadata(ctx context.Context, metadata *adapter.InboundContext) error {
  	r.searchProcessInfo(ctx, metadata)
  	if r.neighborResolver != nil && metadata.SourceMACAddress == nil && metadata.Source.Addr.IsValid() {
-@@ -564,7 +569,7 @@ func (r *Router) prepareMatchMetadata(ctx context.Context, metadata *adapter.Inb
+@@ -591,7 +596,7 @@ func (r *Router) prepareMatchMetadata(ctx context.Context, metadata *adapter.Inb
  	if metadata.Destination.Addr.IsValid() && r.dnsTransport.FakeIP() != nil && r.dnsTransport.FakeIP().Store().Contains(metadata.Destination.Addr) {
  		domain, loaded := r.dnsTransport.FakeIP().Store().Lookup(metadata.Destination.Addr)
  		if !loaded {
@@ -49,7 +49,7 @@ index 8dddb0431..bc1d41b4c 100644
  		}
  		if domain != "" {
  			metadata.OriginDestination = metadata.Destination
-@@ -598,6 +603,23 @@ func (r *Router) matchRule(
+@@ -625,6 +630,23 @@ func (r *Router) matchRule(
  	buffers []*buf.Buffer, packetBuffers []*N.PacketBuffer, fatalErr error,
  ) {
  	fatalErr = r.prepareMatchMetadata(ctx, metadata)
@@ -73,7 +73,7 @@ index 8dddb0431..bc1d41b4c 100644
  	if fatalErr != nil {
  		return
  	}
-@@ -679,6 +701,16 @@ match:
+@@ -706,6 +728,16 @@ match:
  				fatalErr = newErr
  				return
  			}

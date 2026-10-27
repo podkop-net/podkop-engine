@@ -1,7 +1,7 @@
 From 74d8aa23a86deecf215a9050e23c83ceb3f28ab4 Mon Sep 17 00:00:00 2001
 From: FiyeroT <me@fiyero.xyz>
 Date: Sun, 25 Oct 2026 22:18:22 +0300
-Subject: [PATCH 149/152] dns: the AAAA question of a name without an IPv4
+Subject: [PATCH 149/159] dns: the AAAA question of a name without an IPv4
  address goes out under ipv4_only
 
 The strategy ipv4_only answers every AAAA question with no address, so a

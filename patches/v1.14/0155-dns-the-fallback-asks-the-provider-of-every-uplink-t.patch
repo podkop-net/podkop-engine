@@ -1,7 +1,7 @@
-From 5d99dc7986cb1cbc3ed8c14c04595d306000d505 Mon Sep 17 00:00:00 2001
+From 69ccd4a8036fe7c47358f472a94001f469e321a5 Mon Sep 17 00:00:00 2001
 From: FiyeroT <me@fiyero.xyz>
 Date: Sat, 24 Oct 2026 11:05:00 +0300
-Subject: [PATCH 155/160] dns: the fallback asks the provider of every uplink
+Subject: [PATCH 155/171] dns: the fallback asks the provider of every uplink
  through it; a list for each box
 
 The fallback took the DNS servers of one device: the one sing-box binds its
@@ -631,7 +631,7 @@ index b95eac970..f93273938 100644
 +	}
 +}
 diff --git a/dns/router.go b/dns/router.go
-index 05ddac937..d61e8730a 100644
+index b4da5add4..9cd4d9cfb 100644
 --- a/dns/router.go
 +++ b/dns/router.go
 @@ -51,6 +51,8 @@ type Router struct {
@@ -657,7 +657,7 @@ index 05ddac937..d61e8730a 100644
  	if options.DNSClientOptions.IndependentCache {
  		deprecated.Report(ctx, deprecated.OptionIndependentDNSCache)
  	}
-@@ -1398,7 +1406,9 @@ func (r *Router) ResetNetwork() {
+@@ -1399,7 +1407,9 @@ func (r *Router) ResetNetwork() {
  			state.reset()
  		}
  	}

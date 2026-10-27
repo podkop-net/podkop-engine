@@ -1,0 +1,326 @@
+From 41f832ef9f808029a722164f3533e2199550205b Mon Sep 17 00:00:00 2001
+From: FiyeroT <me@fiyero.xyz>
+Date: Mon, 26 Oct 2026 15:53:46 +0300
+Subject: [PATCH 161/171] patches: adapt to sing-box 1.14.4
+
+sing-box 1.14.4 resolves a group into the chain of outbounds the connection
+is dialed through (OutboundGroup.Selected, RealTag by network) and marks
+external connections explicitly. The loop check of the direct inbound takes
+the last outbound of that chain; the urltest code names members by RealTag
+for TCP; the rule-set download is marked external with true.
+---
+ common/httpclient/dial_context_test.go     |  2 +-
+ common/trafficcontrol/manager_race_test.go |  2 +-
+ protocol/group/urltest.go                  |  2 +-
+ protocol/group/urltest_download.go         |  6 ++--
+ protocol/group/urltest_failure.go          |  4 +--
+ protocol/group/urltest_fallback_test.go    | 15 ++++----
+ protocol/group/urltest_response.go         |  4 +--
+ route/route.go                             | 15 ++------
+ route/route_loop_test.go                   | 40 ++++++++++++++--------
+ route/rule/rule_set_remote.go              |  2 +-
+ 10 files changed, 48 insertions(+), 44 deletions(-)
+
+diff --git a/common/httpclient/dial_context_test.go b/common/httpclient/dial_context_test.go
+index 503d48d25..4872f01cb 100644
+--- a/common/httpclient/dial_context_test.go
++++ b/common/httpclient/dial_context_test.go
+@@ -82,7 +82,7 @@ func TestRequestContextReachesDialer(t *testing.T) {
+ 			require.NoError(t, err, testCase.name)
+ 			ctx := context.Background()
+ 			if marked {
+-				ctx = interrupt.ContextWithIsExternalConnection(ctx)
++				ctx = interrupt.ContextWithIsExternalConnection(ctx, true)
+ 			}
+ 			request, err := http.NewRequestWithContext(ctx, http.MethodGet, testCase.link, nil)
+ 			require.NoError(t, err, testCase.name)
+diff --git a/common/trafficcontrol/manager_race_test.go b/common/trafficcontrol/manager_race_test.go
+index e4ce44977..b3b48765c 100644
+--- a/common/trafficcontrol/manager_race_test.go
++++ b/common/trafficcontrol/manager_race_test.go
+@@ -20,7 +20,7 @@ func (t *recordTracker) Close() error               { return nil }
+ // writes its time into the copy it keeps and not into that record. With the race detector
+ // this test is the race itself.
+ func TestLeaveDoesNotWriteTheRecordBeingRead(t *testing.T) {
+-	manager := NewManager(nil)
++	manager := NewManager()
+ 	var read int64
+ 	for range 100 {
+ 		tracker := &recordTracker{metadata: TrackerMetadata{ID: uuid.Must(uuid.NewV4()), Upload: new(atomic.Int64), Download: new(atomic.Int64)}}
+diff --git a/protocol/group/urltest.go b/protocol/group/urltest.go
+index 17d6f01c8..5d2520cb6 100644
+--- a/protocol/group/urltest.go
++++ b/protocol/group/urltest.go
+@@ -475,7 +475,7 @@ func (g *URLTestGroup) selectAmong(network string, skip func(tag string, history
+ 			if !common.Contains(detour.Network(), network) {
+ 				continue
+ 			}
+-			tag := RealTag(g.outbound, detour)
++			tag := RealTag(detour, network)
+ 			history := g.history.LoadURLTestHistory(tag)
+ 			if history == nil || (skip != nil && skip(tag, history)) {
+ 				continue
+diff --git a/protocol/group/urltest_download.go b/protocol/group/urltest_download.go
+index ce6b3ebf5..cc1bcd4a3 100644
+--- a/protocol/group/urltest_download.go
++++ b/protocol/group/urltest_download.go
+@@ -85,7 +85,7 @@ func (g *URLTestGroup) selectTested() (adapter.Outbound, bool) {
+ 		if candidate == nil || !exists {
+ 			break
+ 		}
+-		tag := RealTag(g.outbound, candidate)
++		tag := RealTag(candidate, N.NetworkTCP)
+ 		if candidate == current {
+ 			if _, wasFrozen := g.frozen.Load()[tag]; !wasFrozen {
+ 				break
+@@ -105,7 +105,7 @@ func (g *URLTestGroup) selectTested() (adapter.Outbound, bool) {
+ 		g.setFrozen(tag, start)
+ 		tried[tag] = true
+ 	}
+-	if current != nil && g.history.LoadURLTestHistory(RealTag(g.outbound, current)) != nil {
++	if current != nil && g.history.LoadURLTestHistory(RealTag(current, N.NetworkTCP)) != nil {
+ 		return current, true
+ 	}
+ 	return g.Select(N.NetworkTCP)
+@@ -115,7 +115,7 @@ func (g *URLTestGroup) selectTested() (adapter.Outbound, bool) {
+ // download check may keep the next selection waiting (one download test per candidate):
+ // connections then go by the plain choice instead of a member known to be down.
+ func (g *URLTestGroup) selectionPending(selected adapter.Outbound) bool {
+-	return g.downloadLink != "" && g.history.LoadURLTestHistory(RealTag(g.outbound, selected)) == nil
++	return g.downloadLink != "" && g.history.LoadURLTestHistory(RealTag(selected, N.NetworkTCP)) == nil
+ }
+ 
+ // selectUDP chooses the UDP member as Select does, passing over the members frozen for TCP.
+diff --git a/protocol/group/urltest_failure.go b/protocol/group/urltest_failure.go
+index 821280236..a49acb63c 100644
+--- a/protocol/group/urltest_failure.go
++++ b/protocol/group/urltest_failure.go
+@@ -173,7 +173,7 @@ func (g *URLTestGroup) networkPaused() bool {
+ 	}
+ 	reported := g.epoch.Add(time.Duration(g.networkPauseAt.Load()))
+ 	for _, member := range g.members {
+-		history := g.history.LoadURLTestHistory(RealTag(g.outbound, member))
++		history := g.history.LoadURLTestHistory(RealTag(member, N.NetworkTCP))
+ 		if history != nil && history.Time.After(reported) {
+ 			return false
+ 		}
+@@ -227,7 +227,7 @@ func (g *URLTestGroup) probeUnseenNetwork() {
+ 		return
+ 	}
+ 	for _, member := range g.members {
+-		if g.history.LoadURLTestHistory(RealTag(g.outbound, member)) != nil {
++		if g.history.LoadURLTestHistory(RealTag(member, N.NetworkTCP)) != nil {
+ 			return
+ 		}
+ 	}
+diff --git a/protocol/group/urltest_fallback_test.go b/protocol/group/urltest_fallback_test.go
+index f692ec512..ba05756e2 100644
+--- a/protocol/group/urltest_fallback_test.go
++++ b/protocol/group/urltest_fallback_test.go
+@@ -2,6 +2,7 @@ package group
+ 
+ import (
+ 	"context"
++	"io"
+ 	"net"
+ 	"sync/atomic"
+ 	"syscall"
+@@ -284,18 +285,19 @@ func TestURLTestFallbackClosesUnanswered(t *testing.T) {
+ // testGroup is a group member that is a group itself, with the member now in use.
+ type testGroup struct {
+ 	*testMember
+-	now string
++	member adapter.Outbound
+ }
+ 
+-func (g *testGroup) Now() string   { return g.now }
+-func (g *testGroup) All() []string { return []string{g.now} }
++func (g *testGroup) All() []string                              { return []string{g.member.Tag()} }
++func (g *testGroup) Selected(string) adapter.Outbound           { return g.member }
++func (g *testGroup) AttachConnection(io.Closer) (detach func()) { return func() {} }
+ 
+ // A fallback that is a group is judged by the member it uses, and tested through it.
+ func TestURLTestFallbackNestedGroup(t *testing.T) {
+ 	link, requests := testURL(t, 0)
+ 	a := newTestMember(C.TypeVLESS, "a", dialRefused)
+ 	inner := newTestMember(C.TypeSOCKS, "inner", dialWorking)
+-	selector := &testGroup{testMember: newTestMember(C.TypeSelector, "selector", inner.dial), now: "inner"}
++	selector := &testGroup{testMember: newTestMember(C.TypeSelector, "selector", inner.dial), member: inner}
+ 	_, group := newTestFallbackGroup(t, link, "", members(a), []adapter.Outbound{selector}, map[string]uint16{"inner": 10})
+ 	group.outbound.(*testOutboundManager).members["inner"] = inner
+ 	group.performUpdateCheck()
+@@ -310,7 +312,7 @@ func TestURLTestFallbackNestedGroup(t *testing.T) {
+ }
+ 
+ // The options: All and the dependencies list the outbounds, then the fallbacks; a tag
+-// listed twice with fallbacks is an error, the outbounds alone are taken as before.
++// listed twice is an error.
+ func TestURLTestFallbackOptions(t *testing.T) {
+ 	newGroup := func(outbounds, fallbacks []string) (*URLTest, error) {
+ 		created, err := NewURLTest(context.Background(), nil, log.NewNOPFactory().NewLogger("urltest"), "auto", option.URLTestOutboundOptions{
+@@ -342,8 +344,9 @@ func TestURLTestFallbackOptions(t *testing.T) {
+ 	require.Error(t, err)
+ 	_, err = newGroup(nil, []string{"f"})
+ 	require.Error(t, err)
++	// sing-box 1.14.4 refuses a tag listed twice in the outbounds too
+ 	_, err = newGroup([]string{"a", "a"}, nil)
+-	require.NoError(t, err)
++	require.Error(t, err)
+ }
+ 
+ // Start resolves the fallbacks; a missing one is an error.
+diff --git a/protocol/group/urltest_response.go b/protocol/group/urltest_response.go
+index a7815563b..77ba9e28c 100644
+--- a/protocol/group/urltest_response.go
++++ b/protocol/group/urltest_response.go
+@@ -119,7 +119,7 @@ func (g *URLTestGroup) watchResponse(conn net.Conn, member adapter.Outbound, des
+ 	if !watchResponses(member) {
+ 		return conn
+ 	}
+-	tag := RealTag(g.outbound, member)
++	tag := RealTag(member, N.NetworkTCP)
+ 	if g.history.LoadURLTestHistory(tag) == nil {
+ 		return conn
+ 	}
+@@ -417,7 +417,7 @@ func (g *URLTestGroup) closeUnanswered() {
+ 	var unanswered []*responseConn
+ 	g.responses.Range(func(key, value any) bool {
+ 		tag := key.(string)
+-		if g.history.LoadURLTestHistory(tag) != nil || (selected != nil && RealTag(g.outbound, selected) == tag) {
++		if g.history.LoadURLTestHistory(tag) != nil || (selected != nil && RealTag(selected, N.NetworkTCP) == tag) {
+ 			return true
+ 		}
+ 		responses := value.(*memberResponses)
+diff --git a/route/route.go b/route/route.go
+index 600f82ec8..982c0beb0 100644
+--- a/route/route.go
++++ b/route/route.go
+@@ -661,22 +661,13 @@ func (r *Router) prepareMatchMetadata(ctx context.Context, metadata *adapter.Inb
+ // direct outbound dials the raw destination, and only a return to the SAME inbound is a
+ // loop: a connection chained to a different local inbound (a urltest member pointed at a
+ // mixed inbound) goes through a proxy outbound to another inbound and is left alone.
++//
++// selectedOutbound is the outbound the connection is dialed through: the last of the chain
++// the router resolved, a group's selected member.
+ func (r *Router) wouldLoopToInbound(metadata *adapter.InboundContext, selectedOutbound adapter.Outbound) bool {
+ 	if metadata.Inbound == "" {
+ 		return false
+ 	}
+-	// a group dials through the member it has selected
+-	for range 8 {
+-		group, isGroup := selectedOutbound.(adapter.OutboundGroup)
+-		if !isGroup {
+-			break
+-		}
+-		member, loaded := r.outbound.Outbound(group.Now())
+-		if !loaded {
+-			return false
+-		}
+-		selectedOutbound = member
+-	}
+ 	if selectedOutbound.Type() != C.TypeDirect {
+ 		return false
+ 	}
+diff --git a/route/route_loop_test.go b/route/route_loop_test.go
+index 5beea226b..55f450bea 100644
+--- a/route/route_loop_test.go
++++ b/route/route_loop_test.go
+@@ -1,11 +1,13 @@
+ package route
+ 
+ import (
++	"io"
+ 	"testing"
+ 
+ 	"github.com/sagernet/sing-box/adapter"
+ 	C "github.com/sagernet/sing-box/constant"
+ 	M "github.com/sagernet/sing/common/metadata"
++	N "github.com/sagernet/sing/common/network"
+ 
+ 	"github.com/stretchr/testify/require"
+ )
+@@ -16,6 +18,10 @@ type fakeOutbound struct {
+ }
+ 
+ func (o fakeOutbound) Type() string { return o.typ }
++func (o fakeOutbound) Tag() string  { return o.typ }
++func (o fakeOutbound) Network() []string {
++	return []string{N.NetworkTCP, N.NetworkUDP}
++}
+ 
+ type fakeListenInbound struct {
+ 	adapter.Inbound
+@@ -26,11 +32,12 @@ func (i fakeListenInbound) ListenAddress() M.Socksaddr { return i.addr }
+ 
+ type fakeGroup struct {
+ 	fakeOutbound
+-	now string
++	member adapter.Outbound
+ }
+ 
+-func (g fakeGroup) Now() string   { return g.now }
+-func (g fakeGroup) All() []string { return []string{g.now} }
++func (g fakeGroup) All() []string                              { return nil }
++func (g fakeGroup) Selected(string) adapter.Outbound           { return g.member }
++func (g fakeGroup) AttachConnection(io.Closer) (detach func()) { return func() {} }
+ 
+ type fakeOutboundManager struct {
+ 	adapter.OutboundManager
+@@ -92,26 +99,29 @@ func TestWouldLoopToInbound(t *testing.T) {
+ 	require.False(t, r.wouldLoopToInbound(mk("gone", dnsIn), direct))
+ }
+ 
+-// A group dials through its selected member: a selector or urltest whose current member is
+-// the direct outbound forms the same loop; one whose member is a proxy does not.
++// A group dials through its selected member, which the router resolves before the check
++// (the last outbound of the chain): a selector or urltest whose current member is the direct
++// outbound forms the same loop; one whose member is a proxy does not.
+ func TestWouldLoopToInboundThroughGroup(t *testing.T) {
+ 	t.Parallel()
+ 	dnsIn := M.ParseSocksaddr("127.0.0.42:53")
+ 	direct := fakeOutbound{typ: C.TypeDirect}
+ 	socks := fakeOutbound{typ: C.TypeSOCKS}
+ 	r := &Router{
+-		inbound: fakeInboundManager{inbounds: map[string]adapter.Inbound{"dns-in": fakeListenInbound{addr: dnsIn}}},
+-		outbound: fakeOutboundManager{outbounds: map[string]adapter.Outbound{
+-			"direct":    direct,
+-			"socks":     socks,
+-			"to-direct": fakeGroup{fakeOutbound{typ: C.TypeSelector}, "direct"},
+-		}},
++		inbound:  fakeInboundManager{inbounds: map[string]adapter.Inbound{"dns-in": fakeListenInbound{addr: dnsIn}}},
++		outbound: fakeOutboundManager{outbounds: map[string]adapter.Outbound{"direct": direct, "socks": socks}},
+ 	}
+ 	metadata := &adapter.InboundContext{Inbound: "dns-in", Destination: dnsIn}
+-	require.True(t, r.wouldLoopToInbound(metadata, fakeGroup{fakeOutbound{typ: C.TypeURLTest}, "direct"}))
+-	require.True(t, r.wouldLoopToInbound(metadata, fakeGroup{fakeOutbound{typ: C.TypeSelector}, "to-direct"}), "a group inside a group")
+-	require.False(t, r.wouldLoopToInbound(metadata, fakeGroup{fakeOutbound{typ: C.TypeURLTest}, "socks"}))
+-	require.False(t, r.wouldLoopToInbound(metadata, fakeGroup{fakeOutbound{typ: C.TypeURLTest}, "missing"}), "a member that is gone")
++	last := func(outbound adapter.Outbound) adapter.Outbound {
++		chain, err := resolveOutbound(outbound, N.NetworkTCP)
++		require.NoError(t, err)
++		return chain[len(chain)-1]
++	}
++	require.True(t, r.wouldLoopToInbound(metadata, last(fakeGroup{fakeOutbound{typ: C.TypeURLTest}, direct})))
++	require.True(t, r.wouldLoopToInbound(metadata, last(fakeGroup{fakeOutbound{typ: C.TypeSelector}, fakeGroup{fakeOutbound{typ: C.TypeSelector}, direct}})), "a group inside a group")
++	require.False(t, r.wouldLoopToInbound(metadata, last(fakeGroup{fakeOutbound{typ: C.TypeURLTest}, socks})))
++	_, err := resolveOutbound(fakeGroup{fakeOutbound{typ: C.TypeURLTest}, nil}, N.NetworkTCP)
++	require.Error(t, err, "a group without a member is refused before the check")
+ }
+ 
+ // A listener on every address (0.0.0.0, ::) is reached at whichever address the connection
+diff --git a/route/rule/rule_set_remote.go b/route/rule/rule_set_remote.go
+index 430756e8c..7e7bb437a 100644
+--- a/route/rule/rule_set_remote.go
++++ b/route/rule/rule_set_remote.go
+@@ -521,7 +521,7 @@ func (s *RemoteRuleSet) fetch(ctx context.Context, isStart bool) error {
+ 	s.logger.Debug("updating rule-set ", s.tag, " from URL: ", s.url)
+ 	// a group that switches members closes the connections it does not know as routed
+ 	// ones: a list half downloaded through it would wait for the next update_interval
+-	ctx = interrupt.ContextWithIsExternalConnection(ctx)
++	ctx = interrupt.ContextWithIsExternalConnection(ctx, true)
+ 	ctx, cancel := context.WithCancel(ctx)
+ 	defer cancel()
+ 	if isStart {
+-- 
+2.53.0
+

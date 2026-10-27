@@ -1,7 +1,7 @@
 From 5fa30a48dd1bab5b21163f57223761aa841e2fa3 Mon Sep 17 00:00:00 2001
 From: FiyeroT <me@fiyero.xyz>
 Date: Sat, 3 Oct 2026 17:42:50 +0300
-Subject: [PATCH 027/152] dns: log failed exchanges once per server, with a
+Subject: [PATCH 027/159] dns: log failed exchanges once per server, with a
  count every 10 s
 
 A failed DNS exchange was not logged at all on most paths of 1.14 (the rule

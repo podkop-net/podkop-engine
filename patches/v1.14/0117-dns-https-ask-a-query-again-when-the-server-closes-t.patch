@@ -1,7 +1,7 @@
-From fcf14b7175eaf2cfba410131dc41e42e10fabbe5 Mon Sep 17 00:00:00 2001
+From 362e7748e43f1eddd7591ff4b05579fe282c8f4a Mon Sep 17 00:00:00 2001
 From: FiyeroT <me@fiyero.xyz>
 Date: Sat, 10 Oct 2026 11:56:33 +0300
-Subject: [PATCH 117/160] dns/https: ask a query again when the server closes
+Subject: [PATCH 117/171] dns/https: ask a query again when the server closes
  the connection without a GOAWAY
 
 Quad9 closes its HTTP/2 connections without a GOAWAY, busy ones too: from the lab host
@@ -17,10 +17,10 @@ a new connection, while the query has time left.
  create mode 100644 dns/transport/https_test.go
 
 diff --git a/dns/transport/https.go b/dns/transport/https.go
-index 5f262618b..840a05ae1 100644
+index 7e0cf0e68..a793471e4 100644
 --- a/dns/transport/https.go
 +++ b/dns/transport/https.go
-@@ -190,6 +190,20 @@ func (t *HTTPSTransport) resetTransportLocked() {
+@@ -187,6 +187,20 @@ func (t *HTTPSTransport) resetTransportLocked() {
  func (t *HTTPSTransport) Exchange(ctx context.Context, message *mDNS.Msg) (*mDNS.Msg, error) {
  	startAt := time.Now()
  	response, err := t.exchange(ctx, message)

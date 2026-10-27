@@ -1,7 +1,7 @@
-From 45d899310bfc8537303d34a9354bb11072ff4a97 Mon Sep 17 00:00:00 2001
+From bc823daa389e4e391a38e7275c4a19560824de32 Mon Sep 17 00:00:00 2001
 From: FiyeroT <me@fiyero.xyz>
 Date: Sun, 25 Oct 2026 22:28:30 +0300
-Subject: [PATCH 158/160] tls: dials do not wait for a probe of the fingerprint
+Subject: [PATCH 158/171] tls: dials do not wait for a probe of the fingerprint
  fallback while it rests
 
 While nothing was known of a server, every dial in turn became the probe

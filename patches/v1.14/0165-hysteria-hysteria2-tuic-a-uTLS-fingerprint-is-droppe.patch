@@ -1,0 +1,138 @@
+From dbe74957e1b2bfb2a93748c75b2a43e3fc7e867b Mon Sep 17 00:00:00 2001
+From: FiyeroT <me@fiyero.xyz>
+Date: Mon, 26 Oct 2026 16:03:10 +0300
+Subject: [PATCH 165/171] hysteria, hysteria2, tuic: a uTLS fingerprint is
+ dropped with a warning
+
+quic-go makes the ClientHello itself, and the QUIC outbounds take the
+crypto/tls form of the TLS config: with a uTLS fingerprint set, every
+connection failed ("unsupported usage for uTLS"). The fingerprint is
+dropped with a warning when the outbound is made, as the decoder of share
+links drops it and as Xray ignores fp over QUIC.
+---
+ common/tls/quic_config.go       | 20 ++++++++++++++++-
+ common/tls/quic_options_test.go | 40 +++++++++++++++++++++++++++++++++
+ protocol/hysteria/outbound.go   |  2 +-
+ protocol/hysteria2/outbound.go  |  2 +-
+ protocol/tuic/outbound.go       |  2 +-
+ 5 files changed, 62 insertions(+), 4 deletions(-)
+ create mode 100644 common/tls/quic_options_test.go
+
+diff --git a/common/tls/quic_config.go b/common/tls/quic_config.go
+index 8e403f623..3b9541e0e 100644
+--- a/common/tls/quic_config.go
++++ b/common/tls/quic_config.go
+@@ -1,6 +1,24 @@
+ package tls
+ 
+-import E "github.com/sagernet/sing/common/exceptions"
++import (
++	"github.com/sagernet/sing-box/option"
++	E "github.com/sagernet/sing/common/exceptions"
++	"github.com/sagernet/sing/common/logger"
++)
++
++// QUICClientOptions are the TLS options of an outbound that runs over QUIC (hysteria,
++// hysteria2, tuic) as it can use them: quic-go makes the ClientHello itself, so a uTLS
++// fingerprint cannot be sent, and with one every connection failed ("unsupported usage
++// for uTLS"). The fingerprint is dropped with a warning, as the decoder of share links
++// drops it and as Xray ignores fp over QUIC (podkop-engine).
++func QUICClientOptions(logger logger.Logger, options option.OutboundTLSOptions) option.OutboundTLSOptions {
++	if options.UTLS == nil || !options.UTLS.Enabled {
++		return options
++	}
++	logger.Warn("uTLS is not used over QUIC: the fingerprint ", options.UTLS.Fingerprint, " is ignored")
++	options.UTLS = nil
++	return options
++}
+ 
+ // STDConfigForQUIC returns the crypto/tls form of a client config for a QUIC
+ // handshake, which quic-go builds itself (podkop-engine, XHTTP over HTTP/3).
+diff --git a/common/tls/quic_options_test.go b/common/tls/quic_options_test.go
+new file mode 100644
+index 000000000..515e767cf
+--- /dev/null
++++ b/common/tls/quic_options_test.go
+@@ -0,0 +1,40 @@
++//go:build with_utls
++
++package tls
++
++import (
++	"context"
++	"testing"
++
++	"github.com/sagernet/sing-box/log"
++	"github.com/sagernet/sing-box/option"
++
++	"github.com/stretchr/testify/require"
++)
++
++// An outbound over QUIC with a uTLS fingerprint gets the TLS client QUIC can use (the
++// fingerprint dropped): with it its every connection failed.
++func TestQUICClientOptionsDropUTLS(t *testing.T) {
++	logger := log.NewNOPFactory().Logger()
++	options := option.OutboundTLSOptions{
++		Enabled:    true,
++		ServerName: "example.org",
++		UTLS:       &option.OutboundUTLSOptions{Enabled: true, Fingerprint: "chrome"},
++	}
++	config, err := NewClient(context.Background(), logger, "example.org", options)
++	require.NoError(t, err)
++	_, err = config.STDConfig()
++	require.Error(t, err, "uTLS has no form QUIC can use")
++
++	quicOptions := QUICClientOptions(logger, options)
++	require.Nil(t, quicOptions.UTLS)
++	require.NotNil(t, options.UTLS, "the options of the caller were changed")
++	config, err = NewClient(context.Background(), logger, "example.org", quicOptions)
++	require.NoError(t, err)
++	stdConfig, err := config.STDConfig()
++	require.NoError(t, err)
++	require.Equal(t, "example.org", stdConfig.ServerName)
++
++	plain := option.OutboundTLSOptions{Enabled: true, ServerName: "example.org"}
++	require.Equal(t, plain, QUICClientOptions(logger, plain))
++}
+diff --git a/protocol/hysteria/outbound.go b/protocol/hysteria/outbound.go
+index 9e1244f4e..b85e24342 100644
+--- a/protocol/hysteria/outbound.go
++++ b/protocol/hysteria/outbound.go
+@@ -43,7 +43,7 @@ func NewOutbound(ctx context.Context, router adapter.Router, logger log.ContextL
+ 	if options.TLS == nil || !options.TLS.Enabled {
+ 		return nil, C.ErrTLSRequired
+ 	}
+-	tlsConfig, err := tls.NewClient(ctx, logger, options.Server, common.PtrValueOrDefault(options.TLS))
++	tlsConfig, err := tls.NewClient(ctx, logger, options.Server, tls.QUICClientOptions(logger, common.PtrValueOrDefault(options.TLS)))
+ 	if err != nil {
+ 		return nil, err
+ 	}
+diff --git a/protocol/hysteria2/outbound.go b/protocol/hysteria2/outbound.go
+index 2e8ba0953..316e81667 100644
+--- a/protocol/hysteria2/outbound.go
++++ b/protocol/hysteria2/outbound.go
+@@ -55,7 +55,7 @@ func NewOutbound(ctx context.Context, router adapter.Router, logger log.ContextL
+ 	if err != nil {
+ 		return nil, err
+ 	}
+-	tlsConfig, err := tls.NewClient(ctx, logger, tlsServerAddress, tlsOptions)
++	tlsConfig, err := tls.NewClient(ctx, logger, tlsServerAddress, tls.QUICClientOptions(logger, tlsOptions))
+ 	if err != nil {
+ 		return nil, err
+ 	}
+diff --git a/protocol/tuic/outbound.go b/protocol/tuic/outbound.go
+index efe96aaf6..0c499c395 100644
+--- a/protocol/tuic/outbound.go
++++ b/protocol/tuic/outbound.go
+@@ -48,7 +48,7 @@ func NewOutbound(ctx context.Context, router adapter.Router, logger log.ContextL
+ 	if options.TLS == nil || !options.TLS.Enabled {
+ 		return nil, C.ErrTLSRequired
+ 	}
+-	tlsConfig, err := tls.NewClient(ctx, logger, options.Server, common.PtrValueOrDefault(options.TLS))
++	tlsConfig, err := tls.NewClient(ctx, logger, options.Server, tls.QUICClientOptions(logger, common.PtrValueOrDefault(options.TLS)))
+ 	if err != nil {
+ 		return nil, err
+ 	}
+-- 
+2.53.0
+

@@ -1,7 +1,7 @@
 From d70ec17fccdfe11123c5aac921df42bd86677cd3 Mon Sep 17 00:00:00 2001
 From: FiyeroT <me@fiyero.xyz>
 Date: Tue, 6 Oct 2026 23:37:26 +0300
-Subject: [PATCH 082/152] tls: name the uTLS fingerprints REALITY cannot use
+Subject: [PATCH 082/159] tls: name the uTLS fingerprints REALITY cannot use
 
 REALITY takes the Client Hello as the uTLS fingerprint builds it, and servers since
 Xray-core v26.9.8 pass a Client Hello without an X25519MLKEM768 key share on to their

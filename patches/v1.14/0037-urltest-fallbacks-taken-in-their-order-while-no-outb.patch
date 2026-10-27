@@ -1,7 +1,7 @@
-From 33dbe049c3febbe16b17d2ca400ea4736eca64c5 Mon Sep 17 00:00:00 2001
+From 6384c52ef0d6d3099b205d3e84f929bd199b481d Mon Sep 17 00:00:00 2001
 From: FiyeroT <me@fiyero.xyz>
 Date: Sun, 4 Oct 2026 08:27:02 +0300
-Subject: [PATCH 037/160] urltest: fallbacks, taken in their order while no
+Subject: [PATCH 037/171] urltest: fallbacks, taken in their order while no
  outbound answers
 
 A urltest group had no way to say "these only when the others are down":
@@ -22,10 +22,10 @@ without the option nothing changes.
 ---
  docs/configuration/outbound/urltest.md  |  19 ++
  option/group.go                         |   1 +
- protocol/group/urltest.go               |  73 ++++-
+ protocol/group/urltest.go               |  72 ++++-
  protocol/group/urltest_failure_test.go  |   2 +-
  protocol/group/urltest_fallback_test.go | 377 ++++++++++++++++++++++++
- 5 files changed, 462 insertions(+), 10 deletions(-)
+ 5 files changed, 461 insertions(+), 10 deletions(-)
  create mode 100644 protocol/group/urltest_fallback_test.go
 
 diff --git a/docs/configuration/outbound/urltest.md b/docs/configuration/outbound/urltest.md
@@ -78,19 +78,11 @@ index 1c6477d51..ac02ff794 100644
  	DownloadURL               *string            `json:"download_url,omitempty"`
  	Interval                  badoption.Duration `json:"interval,omitempty"`
 diff --git a/protocol/group/urltest.go b/protocol/group/urltest.go
-index d1001e515..7986cd8bb 100644
+index 5128ad691..94b14d300 100644
 --- a/protocol/group/urltest.go
 +++ b/protocol/group/urltest.go
-@@ -4,6 +4,7 @@ import (
- 	"context"
- 	"maps"
- 	"net"
-+	"slices"
- 	"sync"
- 	"sync/atomic"
- 	"time"
-@@ -42,6 +43,8 @@ type URLTest struct {
- 	connection                   adapter.ConnectionManager
+@@ -43,6 +43,8 @@ type URLTest struct {
+ 	outbound                     adapter.OutboundManager
  	logger                       log.ContextLogger
  	tags                         []string
 +	fallbackTags                 []string
@@ -98,7 +90,7 @@ index d1001e515..7986cd8bb 100644
  	link                         string
  	downloadLink                 string
  	interval                     time.Duration
-@@ -53,13 +56,17 @@ type URLTest struct {
+@@ -54,12 +56,16 @@ type URLTest struct {
  }
  
  func NewURLTest(ctx context.Context, router adapter.Router, logger log.ContextLogger, tag string, options option.URLTestOutboundOptions) (adapter.Outbound, error) {
@@ -109,7 +101,6 @@ index d1001e515..7986cd8bb 100644
 +		Adapter:                      outbound.NewAdapter(C.TypeURLTest, tag, []string{N.NetworkTCP, N.NetworkUDP}, all),
  		ctx:                          ctx,
  		outbound:                     service.FromContext[adapter.OutboundManager](ctx),
- 		connection:                   service.FromContext[adapter.ConnectionManager](ctx),
  		logger:                       logger,
  		tags:                         options.Outbounds,
 +		fallbackTags:                 options.Fallbacks,
@@ -117,9 +108,9 @@ index d1001e515..7986cd8bb 100644
  		link:                         options.URL,
  		interval:                     time.Duration(options.Interval),
  		tolerance:                    options.Tolerance,
-@@ -69,6 +76,18 @@ func NewURLTest(ctx context.Context, router adapter.Router, logger log.ContextLo
- 	if len(outbound.tags) == 0 {
- 		return nil, E.New("missing tags")
+@@ -74,6 +80,18 @@ func NewURLTest(ctx context.Context, router adapter.Router, logger log.ContextLo
+ 			return nil, E.New("duplicate tag: ", tag)
+ 		}
  	}
 +	if len(outbound.fallbackTags) > 0 {
 +		listed := make(map[string]bool, len(all))
@@ -136,7 +127,7 @@ index d1001e515..7986cd8bb 100644
  	var err error
  	outbound.downloadLink, err = groupDownloadLink(options.DownloadURL)
  	if err != nil {
-@@ -88,7 +107,15 @@ func (s *URLTest) Start(stage adapter.StartStage, scope *adapter.Scope) error {
+@@ -93,7 +111,15 @@ func (s *URLTest) Start(stage adapter.StartStage, scope *adapter.Scope) error {
  			}
  			outbounds = append(outbounds, detour)
  		}
@@ -153,7 +144,7 @@ index d1001e515..7986cd8bb 100644
  		if err != nil {
  			return err
  		}
-@@ -109,8 +136,9 @@ func (s *URLTest) Now() string {
+@@ -114,8 +140,9 @@ func (s *URLTest) Now() string {
  	return ""
  }
  
@@ -163,8 +154,8 @@ index d1001e515..7986cd8bb 100644
 +	return s.all
  }
  
- func (s *URLTest) References() []string {
-@@ -239,6 +267,8 @@ type URLTestGroup struct {
+ func (s *URLTest) Selected(network string) adapter.Outbound {
+@@ -252,6 +279,8 @@ type URLTestGroup struct {
  	pauseCallback                *list.Element[pause.Callback]
  	logger                       log.Logger
  	outbounds                    []adapter.Outbound
@@ -173,7 +164,7 @@ index d1001e515..7986cd8bb 100644
  	link                         string
  	interval                     time.Duration
  	tolerance                    uint16
-@@ -267,7 +297,7 @@ type URLTestGroup struct {
+@@ -280,7 +309,7 @@ type URLTestGroup struct {
  	responsesClosed              atomic.Bool
  }
  
@@ -182,7 +173,7 @@ index d1001e515..7986cd8bb 100644
  	if interval == 0 {
  		interval = C.DefaultURLTestInterval
  	}
-@@ -289,6 +319,8 @@ func NewURLTestGroup(ctx context.Context, outboundManager adapter.OutboundManage
+@@ -302,6 +331,8 @@ func NewURLTestGroup(ctx context.Context, outboundManager adapter.OutboundManage
  		outbound:                     outboundManager,
  		logger:                       logger,
  		outbounds:                    outbounds,
@@ -191,7 +182,7 @@ index d1001e515..7986cd8bb 100644
  		link:                         link,
  		interval:                     interval,
  		tolerance:                    tolerance,
-@@ -346,7 +378,9 @@ func (g *URLTestGroup) Select(network string) (adapter.Outbound, bool) {
+@@ -359,7 +390,9 @@ func (g *URLTestGroup) Select(network string) (adapter.Outbound, bool) {
  	return g.selectAmong(network, nil)
  }
  
@@ -202,17 +193,17 @@ index d1001e515..7986cd8bb 100644
  func (g *URLTestGroup) selectAmong(network string, skip func(tag string, history *adapter.URLTestHistory) bool) (adapter.Outbound, bool) {
  	var minDelay uint16
  	var minOutbound adapter.Outbound
-@@ -357,7 +391,8 @@ func (g *URLTestGroup) selectAmong(network string, skip func(tag string, history
+@@ -370,7 +403,8 @@ func (g *URLTestGroup) selectAmong(network string, skip func(tag string, history
  	case N.NetworkUDP:
  		selected = g.selectedOutboundUDP.Load()
  	}
 -	if selected != nil {
 +	// a fallback in use holds back no outbound: it is chosen only while none is a candidate
 +	if selected != nil && !g.isFallback(selected) {
- 		tag := RealTag(g.outbound, selected)
+ 		tag := RealTag(selected, network)
  		if history := g.history.LoadURLTestHistory(tag); history != nil && (skip == nil || !skip(tag, history)) {
  			minOutbound = selected
-@@ -379,7 +414,19 @@ func (g *URLTestGroup) selectAmong(network string, skip func(tag string, history
+@@ -392,7 +426,19 @@ func (g *URLTestGroup) selectAmong(network string, skip func(tag string, history
  		}
  	}
  	if minOutbound == nil {
@@ -233,7 +224,7 @@ index d1001e515..7986cd8bb 100644
  			if !common.Contains(detour.Network(), network) {
  				continue
  			}
-@@ -390,6 +437,10 @@ func (g *URLTestGroup) selectAmong(network string, skip func(tag string, history
+@@ -403,6 +449,10 @@ func (g *URLTestGroup) selectAmong(network string, skip func(tag string, history
  	return minOutbound, true
  }
  
@@ -244,7 +235,7 @@ index d1001e515..7986cd8bb 100644
  func (g *URLTestGroup) loopCheck(ticker *time.Ticker, closeChan <-chan struct{}) {
  	if time.Since(g.lastActive.Load()) > g.interval {
  		g.lastActive.Store(time.Now())
-@@ -440,7 +491,7 @@ func (g *URLTestGroup) urlTestRound(ctx context.Context, force bool) (map[string
+@@ -453,7 +503,7 @@ func (g *URLTestGroup) urlTestRound(ctx context.Context, force bool) (map[string
  		return make(map[string]uint16), nil
  	}
  	defer g.checking.Store(false)
@@ -253,7 +244,7 @@ index d1001e515..7986cd8bb 100644
  }
  
  type urlTestResult struct {
-@@ -563,7 +614,11 @@ func (g *URLTestGroup) updateSelection() {
+@@ -576,7 +626,11 @@ func (g *URLTestGroup) updateSelection() {
  		if current := g.selectedOutboundTCP.Load(); current == nil || (exists && outbound != current) {
  			if current != nil {
  				updated = true

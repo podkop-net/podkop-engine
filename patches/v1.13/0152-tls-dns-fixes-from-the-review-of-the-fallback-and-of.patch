@@ -1,7 +1,7 @@
 From e358a6a8d724d5780db91fb4e110580627bd6c3c Mon Sep 17 00:00:00 2001
 From: FiyeroT <me@fiyero.xyz>
 Date: Sun, 25 Oct 2026 23:42:39 +0300
-Subject: [PATCH 152/152] tls, dns: fixes from the review of the fallback and
+Subject: [PATCH 152/159] tls, dns: fixes from the review of the fallback and
  of ipv6_if_no_ipv4
 
 - The choice of the fallback is written to the cache file in the background,

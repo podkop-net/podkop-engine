@@ -1,0 +1,146 @@
+From 4da83d81204242edc3298a12783928d3a26fe88f Mon Sep 17 00:00:00 2001
+From: FiyeroT <me@fiyero.xyz>
+Date: Tue, 27 Oct 2026 16:33:56 +0300
+Subject: [PATCH 170/171] route: a chain with a URL test is dialed through the
+ URL test
+
+sing-box 1.14.4 resolves a group into the chain of outbounds a connection
+goes through and dials the last of them. The URL test of podkop-engine judges
+the dials of its members in its DialContext and ListenPacket: a member that
+fails or does not answer is tested out of turn and left, a fallback is taken,
+a member whose test is pending is not used. A dial past the group left all of
+that out, and a dead member kept the new connections until the next test
+round (3 minutes by default).
+
+The chain stays for the metadata, the loop check and the interruption of the
+connections; a connection is dialed through the first URL test of it, as
+before 1.14.4. The history of a member is no longer deleted at any failed dial
+of such a chain: the group tells a failure of the member from one of the
+destination or of the network of the router.
+---
+ route/conn.go                   | 10 +++------
+ route/route.go                  | 18 +++++++++++++--
+ route/route_dial_target_test.go | 39 +++++++++++++++++++++++++++++++++
+ 3 files changed, 58 insertions(+), 9 deletions(-)
+ create mode 100644 route/route_dial_target_test.go
+
+diff --git a/route/conn.go b/route/conn.go
+index cff6b1397..54b1e947d 100644
+--- a/route/conn.go
++++ b/route/conn.go
+@@ -6,7 +6,6 @@ import (
+ 	"net"
+ 	"net/netip"
+ 	"os"
+-	"slices"
+ 	"strings"
+ 	"sync"
+ 	"sync/atomic"
+@@ -281,13 +280,10 @@ func (m *ConnectionManager) NewPacketConnection(ctx context.Context, this N.Dial
+ 	go m.packetConnectionCopy(ctx, destination, conn, true, &done, onClose)
+ }
+ 
++// deleteURLTestHistory is left to the URL test group: a connection of a chain with one is
++// dialed through it (dialTarget), and it judges the failures of its members itself, a failure of
++// the destination or of the network of the router not taken for one of the member.
+ func (m *ConnectionManager) deleteURLTestHistory(chain []adapter.Outbound) {
+-	if slices.ContainsFunc(chain, func(it adapter.Outbound) bool {
+-		_, isURLTestGroup := it.(adapter.URLTestGroup)
+-		return isURLTestGroup
+-	}) {
+-		m.urlTestHistory.DeleteURLTestHistory(chain[len(chain)-1].Tag())
+-	}
+ }
+ 
+ func (m *ConnectionManager) connectionCopy(ctx context.Context, source net.Conn, destination net.Conn, direction bool, done *atomic.Bool, onClose N.CloseHandlerFunc) {
+diff --git a/route/route.go b/route/route.go
+index 982c0beb0..787c46288 100644
+--- a/route/route.go
++++ b/route/route.go
+@@ -173,7 +173,7 @@ func (r *Router) routeConnection(ctx context.Context, conn net.Conn, metadata ad
+ 	}
+ 	ctx = interrupt.ContextWithIsExternalConnection(ctx, true)
+ 	onClose = registerInterrupt(chain, conn, onClose)
+-	outbound := chain[len(chain)-1]
++	outbound := dialTarget(chain)
+ 	if outboundHandler, isHandler := outbound.(adapter.ConnectionHandler); isHandler {
+ 		outboundHandler.NewConnection(ctx, conn, metadata, onClose)
+ 	} else {
+@@ -201,6 +201,20 @@ func resolveOutbound(outbound adapter.Outbound, network string) ([]adapter.Outbo
+ 	return chain, nil
+ }
+ 
++// dialTarget is the outbound of a chain a routed connection is dialed through: the first URL
++// test group of the chain, else the last outbound. The URL test of podkop-engine judges the
++// dials of its members itself (a member that fails or does not answer is tested out of turn and
++// left at once, a fallback taken, a member whose test is pending not used): a dial of the member
++// past the group, as sing-box 1.14.4 makes it, would leave all of that out.
++func dialTarget(chain []adapter.Outbound) adapter.Outbound {
++	for _, outbound := range chain {
++		if _, isURLTestGroup := outbound.(adapter.URLTestGroup); isURLTestGroup {
++			return outbound
++		}
++	}
++	return chain[len(chain)-1]
++}
++
+ func registerInterrupt(chain []adapter.Outbound, closer io.Closer, onClose N.CloseHandlerFunc) N.CloseHandlerFunc {
+ 	var removers []func()
+ 	for _, outbound := range chain {
+@@ -349,7 +363,7 @@ func (r *Router) routePacketConnection(ctx context.Context, conn N.PacketConn, m
+ 	}
+ 	ctx = interrupt.ContextWithIsExternalConnection(ctx, true)
+ 	onClose = registerInterrupt(chain, conn, onClose)
+-	outbound := chain[len(chain)-1]
++	outbound := dialTarget(chain)
+ 	if outboundHandler, isHandler := outbound.(adapter.PacketConnectionHandler); isHandler {
+ 		outboundHandler.NewPacketConnection(ctx, conn, metadata, onClose)
+ 	} else {
+diff --git a/route/route_dial_target_test.go b/route/route_dial_target_test.go
+new file mode 100644
+index 000000000..9ea502877
+--- /dev/null
++++ b/route/route_dial_target_test.go
+@@ -0,0 +1,39 @@
++package route
++
++import (
++	"context"
++	"testing"
++
++	"github.com/sagernet/sing-box/adapter"
++	N "github.com/sagernet/sing/common/network"
++
++	"github.com/stretchr/testify/require"
++)
++
++type fakeSelector struct{ fakeGroup }
++
++type fakeURLTest struct{ fakeGroup }
++
++func (fakeURLTest) URLTest(context.Context) (map[string]uint16, error) { return nil, nil }
++func (fakeURLTest) PerformUpdateCheck()                                {}
++
++// A routed connection of a chain with a URL test is dialed through the URL test, which judges
++// the dials of its members; other chains through their last outbound, as sing-box dials them.
++func TestDialTarget(t *testing.T) {
++	member := fakeOutbound{typ: "vless"}
++	urltest := fakeURLTest{fakeGroup{fakeOutbound{typ: "urltest"}, member}}
++	selector := fakeSelector{fakeGroup{fakeOutbound{typ: "selector"}, urltest}}
++	var _ adapter.URLTestGroup = urltest
++
++	chain, err := resolveOutbound(selector, N.NetworkTCP)
++	require.NoError(t, err)
++	require.Equal(t, []adapter.Outbound{selector, urltest, member}, chain)
++	require.Equal(t, adapter.Outbound(urltest), dialTarget(chain))
++
++	// a member chosen by hand in the selector
++	selector = fakeSelector{fakeGroup{fakeOutbound{typ: "selector"}, member}}
++	chain, err = resolveOutbound(selector, N.NetworkUDP)
++	require.NoError(t, err)
++	require.Equal(t, adapter.Outbound(member), dialTarget(chain))
++	require.Equal(t, adapter.Outbound(member), dialTarget([]adapter.Outbound{member}))
++}
+-- 
+2.53.0
+

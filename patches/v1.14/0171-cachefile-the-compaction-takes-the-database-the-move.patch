@@ -1,0 +1,30 @@
+From 4db012f5d23de8ac1808b3585c8fee601dc80606 Mon Sep 17 00:00:00 2001
+From: FiyeroT <me@fiyero.xyz>
+Date: Tue, 27 Oct 2026 16:33:56 +0300
+Subject: [PATCH 171/171] cachefile: the compaction takes the database the move
+ of the lists left
+
+The move of the lists of an earlier version resets a database that has a
+damaged page; the compaction then got the handle closed by the reset, and the
+cache file used it for the life of the process.
+---
+ experimental/cachefile/cache.go | 3 ++-
+ 1 file changed, 2 insertions(+), 1 deletion(-)
+
+diff --git a/experimental/cachefile/cache.go b/experimental/cachefile/cache.go
+index eb1c589b5..9758afe6b 100644
+--- a/experimental/cachefile/cache.go
++++ b/experimental/cachefile/cache.go
+@@ -251,7 +251,8 @@ func (c *CacheFile) start() error {
+ 	}
+ 	c.DB = db
+ 	c.moveRuleSetsToFiles()
+-	db, err = c.compactSparse(db)
++	// the move may have reset the database (a damaged page found on the way): the one it left
++	db, err = c.compactSparse(c.DB)
+ 	if err != nil {
+ 		return err
+ 	}
+-- 
+2.53.0
+

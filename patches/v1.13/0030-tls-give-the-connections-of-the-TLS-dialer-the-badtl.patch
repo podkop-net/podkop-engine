@@ -1,7 +1,7 @@
 From 58b695c4565fb22b1f2d9e57ed15391aa6c2bb80 Mon Sep 17 00:00:00 2001
 From: FiyeroT <me@fiyero.xyz>
 Date: Sat, 3 Oct 2026 20:23:36 +0300
-Subject: [PATCH 030/152] tls: give the connections of the TLS dialer the
+Subject: [PATCH 030/159] tls: give the connections of the TLS dialer the
  badtls read waiter
 
 ClientHandshake wraps a client connection in badtls.ReadWaitConn, but the dialer

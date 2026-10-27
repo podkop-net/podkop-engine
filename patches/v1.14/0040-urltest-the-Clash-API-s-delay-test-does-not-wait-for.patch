@@ -1,7 +1,7 @@
-From 29d4eb843b69e8a9a53cbf18bcb2c1d9563f4497 Mon Sep 17 00:00:00 2001
+From 3ff536dae181ed1166d874a04c65a5b6900e335b Mon Sep 17 00:00:00 2001
 From: FiyeroT <me@fiyero.xyz>
 Date: Sun, 4 Oct 2026 08:45:40 +0300
-Subject: [PATCH 040/160] urltest: the Clash API's delay test does not wait for
+Subject: [PATCH 040/171] urltest: the Clash API's delay test does not wait for
  nested selections
 
 The Clash API's delay test of a group returns once the members are tested,
@@ -25,10 +25,10 @@ group selects afterwards, as its own delay test already did.
  5 files changed, 71 insertions(+), 10 deletions(-)
 
 diff --git a/daemon/started_service.go b/daemon/started_service.go
-index f1fb0f0d8..955628546 100644
+index 41c9c926a..917c13b8b 100644
 --- a/daemon/started_service.go
 +++ b/daemon/started_service.go
-@@ -734,7 +734,7 @@ func (s *StartedService) URLTest(ctx context.Context, request *URLTestRequest) (
+@@ -737,7 +737,7 @@ func (s *StartedService) URLTest(ctx context.Context, request *URLTestRequest) (
  			itOutbound, _ := boxService.outboundManager.Outbound(it)
  			return itOutbound
  		}))
@@ -51,10 +51,10 @@ index 725f37288..452f05001 100644
  
  		if err != nil {
 diff --git a/protocol/group/urltest.go b/protocol/group/urltest.go
-index 7986cd8bb..2b386380c 100644
+index 94b14d300..552b9073d 100644
 --- a/protocol/group/urltest.go
 +++ b/protocol/group/urltest.go
-@@ -472,26 +472,28 @@ func (g *URLTestGroup) CheckOutbounds(ctx context.Context, force bool) {
+@@ -484,26 +484,28 @@ func (g *URLTestGroup) CheckOutbounds(ctx context.Context, force bool) {
  }
  
  // URLTest is the Clash API's round: it does not wait for the selection, which may run a
@@ -88,7 +88,7 @@ index 7986cd8bb..2b386380c 100644
  }
  
  type urlTestResult struct {
-@@ -507,11 +509,17 @@ type urlTestBatch struct {
+@@ -519,11 +521,17 @@ type urlTestBatch struct {
  	batch    *batch.Batch[any]
  	checked  map[string]bool
  	groups   []adapter.OutboundGroup
@@ -107,7 +107,7 @@ index 7986cd8bb..2b386380c 100644
  	b, _ := batch.New(ctx, batch.WithConcurrencyNum[any](10))
  	testBatch := &urlTestBatch{
  		ctx:      ctx,
-@@ -520,6 +528,7 @@ func URLTestOutbounds(ctx context.Context, outboundManager adapter.OutboundManag
+@@ -532,6 +540,7 @@ func URLTestOutbounds(ctx context.Context, outboundManager adapter.OutboundManag
  		logger:   logger,
  		batch:    b,
  		checked:  make(map[string]bool),
@@ -115,7 +115,7 @@ index 7986cd8bb..2b386380c 100644
  		result:   make(map[string]uint16),
  	}
  	testBatch.test(outbounds, link, interval, force)
-@@ -544,7 +553,13 @@ func (b *urlTestBatch) test(outbounds []adapter.Outbound, link string, interval
+@@ -556,7 +565,13 @@ func (b *urlTestBatch) test(outbounds []adapter.Outbound, link string, interval
  			b.checked[tag] = true
  			b.groups = append(b.groups, nested)
  			b.batch.Go(tag, func() (any, error) {

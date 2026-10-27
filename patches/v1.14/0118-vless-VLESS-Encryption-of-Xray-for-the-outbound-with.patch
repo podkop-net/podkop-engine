@@ -1,7 +1,7 @@
-From de2bb7a4ed3e77430cd571ea3fd47853e389d24e Mon Sep 17 00:00:00 2001
+From 5e8df786e2ebf44d27fa7b9b6050f9365d416119 Mon Sep 17 00:00:00 2001
 From: FiyeroT <me@fiyero.xyz>
 Date: Sat, 10 Oct 2026 15:33:14 +0300
-Subject: [PATCH 118/160] vless: VLESS Encryption of Xray for the outbound,
+Subject: [PATCH 118/171] vless: VLESS Encryption of Xray for the outbound,
  with Vision over it
 
 A server of Xray that has "decryption" set takes no client without this layer: a link
@@ -53,7 +53,7 @@ server that does not answer. Stand against Xray 26.9.9 (rs-lab/r14/enc): 55 case
  create mode 100644 protocol/vless/encryption_test.go
 
 diff --git a/go.mod b/go.mod
-index d66508473..ca450d982 100644
+index 635b74e62..4b0ed048b 100644
 --- a/go.mod
 +++ b/go.mod
 @@ -81,6 +81,7 @@ require (
@@ -73,7 +73,7 @@ index d66508473..ca450d982 100644
  )
  
 diff --git a/option/vless.go b/option/vless.go
-index 5acf2aeed..d4c34e9a4 100644
+index 1f13537dc..d420e8576 100644
 --- a/option/vless.go
 +++ b/option/vless.go
 @@ -17,9 +17,14 @@ type VLESSUser struct {

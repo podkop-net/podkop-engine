@@ -1,7 +1,7 @@
-From a68c1260680af6b5fffe5e5ce539f74910e43818 Mon Sep 17 00:00:00 2001
+From e208a688fce1168a63069d0ba5e546105338237b Mon Sep 17 00:00:00 2001
 From: FiyeroT <me@fiyero.xyz>
 Date: Sat, 3 Oct 2026 11:27:47 +0300
-Subject: [PATCH 022/160] urltest: leave a member when its connections fail,
+Subject: [PATCH 022/171] urltest: leave a member when its connections fail,
  not at the next test
 
 Upstream urltest learns that a member is broken only from its periodic
@@ -25,33 +25,46 @@ carried the handshake the dial deferred, is now evidence about it:
 The selection is stored atomically, and a switch is logged at warn
 after the reason.
 ---
- protocol/group/urltest.go              | 102 +++---
+ protocol/group/urltest.go              | 107 +++---
  protocol/group/urltest_failure.go      | 226 ++++++++++++
  protocol/group/urltest_failure_test.go | 469 +++++++++++++++++++++++++
- 3 files changed, 749 insertions(+), 48 deletions(-)
+ 3 files changed, 756 insertions(+), 46 deletions(-)
  create mode 100644 protocol/group/urltest_failure.go
  create mode 100644 protocol/group/urltest_failure_test.go
 
 diff --git a/protocol/group/urltest.go b/protocol/group/urltest.go
-index e1875c779..4e2ad3ef8 100644
+index e3ff848fb..57a1f8fb8 100644
 --- a/protocol/group/urltest.go
 +++ b/protocol/group/urltest.go
-@@ -95,10 +95,10 @@ func (s *URLTest) Start(stage adapter.StartStage, scope *adapter.Scope) error {
+@@ -99,6 +99,15 @@ func (s *URLTest) Start(stage adapter.StartStage, scope *adapter.Scope) error {
+ 	return nil
  }
  
- func (s *URLTest) Now() string {
--	if s.group.selectedOutboundTCP != nil {
--		return s.group.selectedOutboundTCP.Tag()
--	} else if s.group.selectedOutboundUDP != nil {
--		return s.group.selectedOutboundUDP.Tag()
++func (s *URLTest) Now() string {
 +	if selected := s.group.selectedOutboundTCP.Load(); selected != nil {
 +		return selected.Tag()
 +	} else if selected := s.group.selectedOutboundUDP.Load(); selected != nil {
 +		return selected.Tag()
- 	}
- 	return ""
++	}
++	return ""
++}
++
+ func (s *URLTest) All() []string {
+ 	return s.tags
  }
-@@ -113,11 +113,12 @@ func (s *URLTest) References() []string {
+@@ -106,9 +115,9 @@ func (s *URLTest) All() []string {
+ func (s *URLTest) Selected(network string) adapter.Outbound {
+ 	var outbound adapter.Outbound
+ 	if network == N.NetworkUDP {
+-		outbound = s.group.selectedOutboundUDP
++		outbound = s.group.selectedOutboundUDP.Load()
+ 	} else {
+-		outbound = s.group.selectedOutboundTCP
++		outbound = s.group.selectedOutboundTCP.Load()
+ 	}
+ 	if outbound == nil {
+ 		outbound, _ = s.group.Select(network)
+@@ -127,11 +136,12 @@ func (s *URLTest) References() []string {
  		return nil
  	}
  	var references []string
@@ -68,7 +81,7 @@ index e1875c779..4e2ad3ef8 100644
  	}
  	return references
  }
-@@ -157,9 +158,9 @@ func (s *URLTest) DialContext(ctx context.Context, network string, destination M
+@@ -171,9 +181,9 @@ func (s *URLTest) DialContext(ctx context.Context, network string, destination M
  	var outbound adapter.Outbound
  	switch N.NetworkName(network) {
  	case N.NetworkTCP:
@@ -80,7 +93,7 @@ index e1875c779..4e2ad3ef8 100644
  	default:
  		return nil, E.Extend(N.ErrUnknownNetwork, network)
  	}
-@@ -169,18 +170,25 @@ func (s *URLTest) DialContext(ctx context.Context, network string, destination M
+@@ -183,18 +193,25 @@ func (s *URLTest) DialContext(ctx context.Context, network string, destination M
  	if outbound == nil {
  		return nil, E.New("missing supported outbound")
  	}
@@ -108,7 +121,7 @@ index e1875c779..4e2ad3ef8 100644
  	if outbound == nil {
  		outbound, _ = s.group.Select(N.NetworkUDP)
  	}
-@@ -192,7 +200,7 @@ func (s *URLTest) ListenPacket(ctx context.Context, destination M.Socksaddr) (ne
+@@ -206,7 +223,7 @@ func (s *URLTest) ListenPacket(ctx context.Context, destination M.Socksaddr) (ne
  		return s.group.interruptGroup.NewPacketConn(conn, interrupt.IsExternalConnectionFromContext(ctx)), nil
  	}
  	s.logger.ErrorContext(ctx, err)
@@ -117,7 +130,7 @@ index e1875c779..4e2ad3ef8 100644
  	return nil, err
  }
  
-@@ -219,8 +227,8 @@ type URLTestGroup struct {
+@@ -223,8 +240,8 @@ type URLTestGroup struct {
  	idleTimeout                  time.Duration
  	history                      *urltest.HistoryStorage
  	checking                     atomic.Bool
@@ -128,7 +141,7 @@ index e1875c779..4e2ad3ef8 100644
  	interruptGroup               *interrupt.Group
  	interruptExternalConnections bool
  	access                       sync.Mutex
-@@ -229,6 +237,11 @@ type URLTestGroup struct {
+@@ -233,6 +250,11 @@ type URLTestGroup struct {
  	close                        chan struct{}
  	started                      bool
  	lastActive                   common.TypedValue[time.Time]
@@ -140,7 +153,7 @@ index e1875c779..4e2ad3ef8 100644
  }
  
  func NewURLTestGroup(ctx context.Context, outboundManager adapter.OutboundManager, logger log.Logger, outbounds []adapter.Outbound, link string, interval time.Duration, tolerance uint16, idleTimeout time.Duration, interruptExternalConnections bool) (*URLTestGroup, error) {
-@@ -262,6 +275,7 @@ func NewURLTestGroup(ctx context.Context, outboundManager adapter.OutboundManage
+@@ -266,6 +288,7 @@ func NewURLTestGroup(ctx context.Context, outboundManager adapter.OutboundManage
  		pause:                        service.FromContext[pause.Manager](ctx),
  		interruptGroup:               interrupt.NewGroup(),
  		interruptExternalConnections: interruptExternalConnections,
@@ -148,7 +161,7 @@ index e1875c779..4e2ad3ef8 100644
  	}, nil
  }
  
-@@ -306,20 +320,17 @@ func (g *URLTestGroup) Close() error {
+@@ -310,20 +333,17 @@ func (g *URLTestGroup) Close() error {
  func (g *URLTestGroup) Select(network string) (adapter.Outbound, bool) {
  	var minDelay uint16
  	var minOutbound adapter.Outbound
@@ -156,7 +169,7 @@ index e1875c779..4e2ad3ef8 100644
  	switch network {
  	case N.NetworkTCP:
 -		if g.selectedOutboundTCP != nil {
--			if history := g.history.LoadURLTestHistory(RealTag(g.outbound, g.selectedOutboundTCP)); history != nil {
+-			if history := g.history.LoadURLTestHistory(RealTag(g.selectedOutboundTCP, N.NetworkTCP)); history != nil {
 -				minOutbound = g.selectedOutboundTCP
 -				minDelay = history.Delay
 -			}
@@ -164,20 +177,20 @@ index e1875c779..4e2ad3ef8 100644
 +		selected = g.selectedOutboundTCP.Load()
  	case N.NetworkUDP:
 -		if g.selectedOutboundUDP != nil {
--			if history := g.history.LoadURLTestHistory(RealTag(g.outbound, g.selectedOutboundUDP)); history != nil {
+-			if history := g.history.LoadURLTestHistory(RealTag(g.selectedOutboundUDP, N.NetworkUDP)); history != nil {
 -				minOutbound = g.selectedOutboundUDP
 -				minDelay = history.Delay
 -			}
 +		selected = g.selectedOutboundUDP.Load()
 +	}
 +	if selected != nil {
-+		if history := g.history.LoadURLTestHistory(RealTag(g.outbound, selected)); history != nil {
++		if history := g.history.LoadURLTestHistory(RealTag(selected, network)); history != nil {
 +			minOutbound = selected
 +			minDelay = history.Delay
  		}
  	}
  	for _, detour := range g.outbounds {
-@@ -465,19 +476,8 @@ func (b *urlTestBatch) test(outbounds []adapter.Outbound, link string, interval
+@@ -469,19 +489,8 @@ func (b *urlTestBatch) test(outbounds []adapter.Outbound, link string, interval
  			}
  			b.checked[tag] = true
  			b.batch.Go(tag, func() (any, error) {
@@ -198,7 +211,7 @@ index e1875c779..4e2ad3ef8 100644
  				if testResult.err != nil {
  					if b.ctx.Err() != nil {
  						return nil, nil
-@@ -507,19 +507,25 @@ func (g *URLTestGroup) performUpdateCheck() {
+@@ -511,19 +520,25 @@ func (g *URLTestGroup) performUpdateCheck() {
  		updated  bool
  		selected bool
  	)
@@ -236,7 +249,7 @@ index e1875c779..4e2ad3ef8 100644
  		g.interruptGroup.Interrupt(g.interruptExternalConnections)
 diff --git a/protocol/group/urltest_failure.go b/protocol/group/urltest_failure.go
 new file mode 100644
-index 000000000..1b508a649
+index 000000000..411a12dda
 --- /dev/null
 +++ b/protocol/group/urltest_failure.go
 @@ -0,0 +1,226 @@
@@ -304,7 +317,7 @@ index 000000000..1b508a649
 +	if ctx.Err() != nil || errors.Is(err, net.ErrClosed) || errors.Is(err, os.ErrClosed) {
 +		return
 +	}
-+	tag := RealTag(g.outbound, member)
++	tag := RealTag(member, network)
 +	if !start.IsZero() && g.succeededSince(tag, start) {
 +		g.logger.Debug("outbound ", tag, " failed while another connection through it succeeded: ", err)
 +		return
@@ -322,7 +335,7 @@ index 000000000..1b508a649
 +
 +// memberSucceeded records a successful TCP dial through member.
 +func (g *URLTestGroup) memberSucceeded(member adapter.Outbound) {
-+	tag := RealTag(g.outbound, member)
++	tag := RealTag(member, N.NetworkTCP)
 +	value, loaded := g.successes.Load(tag)
 +	if !loaded {
 +		value, _ = g.successes.LoadOrStore(tag, new(atomic.Int64))

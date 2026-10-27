@@ -1,0 +1,416 @@
+From 384b5173c9ab6d4457e30af7cec3580bc53c6d91 Mon Sep 17 00:00:00 2001
+From: FiyeroT <me@fiyero.xyz>
+Date: Mon, 26 Oct 2026 16:52:29 +0300
+Subject: [PATCH 167/171] cachefile: the content of a remote rule set in a file
+ of its own
+
+In bbolt a list of megabytes took three times its size or more: a changed
+value is written anew, the freed pages stay in the file and are never given
+back. Measured with a million subnets and 800000 names (34 MB of lists):
+cache.db of 106 MB after the first update and 141 MB after five, on flash or
+in RAM where the cache file is. Each save also held two more copies of the
+list in memory (the marshalled value and the pages written).
+
+The content now goes into <cache path>.rule-sets/<tag>-<hash>, written and
+renamed into place; the bucket rule_set_file keeps the rest and the size,
+and a file of another size (a write cut by a power loss) is downloaded
+again. A record of an earlier version is read until the next save, which
+deletes it; an earlier version finds no record and downloads the list. A
+start removes the files no record names.
+---
+ experimental/cachefile/cache.go              |  18 +-
+ experimental/cachefile/rule_set_file.go      | 213 +++++++++++++++++++
+ experimental/cachefile/rule_set_file_test.go | 112 ++++++++++
+ 3 files changed, 332 insertions(+), 11 deletions(-)
+ create mode 100644 experimental/cachefile/rule_set_file.go
+ create mode 100644 experimental/cachefile/rule_set_file_test.go
+
+diff --git a/experimental/cachefile/cache.go b/experimental/cachefile/cache.go
+index 903ae4e39..63480c700 100644
+--- a/experimental/cachefile/cache.go
++++ b/experimental/cachefile/cache.go
+@@ -36,6 +36,7 @@ var (
+ 		string(bucketMode),
+ 		string(bucketRuleSet),
+ 		string(bucketRuleSetChecked),
++		string(bucketRuleSetFile),
+ 		string(bucketUTLSChoice),
+ 		string(bucketRDRC),
+ 		string(bucketDNSCache),
+@@ -248,6 +249,7 @@ func (c *CacheFile) start() error {
+ 		db.Close()
+ 		return err
+ 	}
++	c.pruneRuleSetFiles(db)
+ 	c.DB = db
+ 	return nil
+ }
+@@ -445,6 +447,9 @@ func (c *CacheFile) StoreGroupExpand(group string, isExpand bool) error {
+ }
+ 
+ func (c *CacheFile) LoadRuleSet(tag string) *adapter.SavedBinary {
++	if saved, found := c.loadRuleSetFile(tag); found {
++		return saved
++	}
+ 	var savedSet adapter.SavedBinary
+ 	err := c.view(func(t *bbolt.Tx) error {
+ 		bucket := c.bucket(t, bucketRuleSet)
+@@ -494,16 +499,7 @@ func (c *CacheFile) StoreRuleSetChecked(tag string, at time.Time) error {
+ 	})
+ }
+ 
++// SaveRuleSet keeps the content of a rule set in a file of its own (rule_set_file.go).
+ func (c *CacheFile) SaveRuleSet(tag string, set *adapter.SavedBinary) error {
+-	return c.batch(func(t *bbolt.Tx) error {
+-		bucket, err := c.createBucket(t, bucketRuleSet)
+-		if err != nil {
+-			return err
+-		}
+-		setBinary, err := set.MarshalBinary()
+-		if err != nil {
+-			return err
+-		}
+-		return bucket.Put([]byte(tag), setBinary)
+-	})
++	return c.saveRuleSetFile(tag, set)
+ }
+diff --git a/experimental/cachefile/rule_set_file.go b/experimental/cachefile/rule_set_file.go
+new file mode 100644
+index 000000000..d21a730e4
+--- /dev/null
++++ b/experimental/cachefile/rule_set_file.go
+@@ -0,0 +1,213 @@
++package cachefile
++
++import (
++	"bytes"
++	"crypto/sha256"
++	"encoding/binary"
++	"encoding/hex"
++	"io"
++	"os"
++	"path/filepath"
++	"strings"
++
++	"github.com/sagernet/bbolt"
++	"github.com/sagernet/sing-box/adapter"
++	E "github.com/sagernet/sing/common/exceptions"
++	"github.com/sagernet/sing/service/filemanager"
++)
++
++// The content of a remote rule set is kept in a file of its own beside the cache file
++// (podkop-engine); the bucket rule_set_file keeps the rest of what is saved of it and the
++// size of the content. In the database a list of megabytes took three times its size: bbolt
++// writes a changed value anew, keeps the pages it freed and never gives them back to the
++// file system, which on a router is flash or RAM. The write also took two copies of the
++// list in memory, the value and the pages it was written into.
++//
++// The file is written first and renamed into place, then the record: a file whose size is
++// not the one its record tells (a write cut by a power loss) is not read, and the rule set
++// is downloaded again. A record in the bucket rule_set of an earlier version is read until
++// the rule set is saved again; the save deletes it. An earlier version finds no record
++// there and downloads the list.
++var bucketRuleSetFile = []byte("rule_set_file")
++
++// ruleSetFileSuffix names the directory of the files: the path of the cache file with it.
++const ruleSetFileSuffix = ".rule-sets"
++
++// a file being written has this added to its name until it is complete
++const ruleSetFileWriting = ".new"
++
++func (c *CacheFile) ruleSetDirectory() string {
++	return c.path + ruleSetFileSuffix
++}
++
++// ruleSetFileName is the name of the file of a rule set of a cache ID: the tag with what a
++// file name cannot have replaced, and a hash of both, as tags differ only in such
++// characters, and two cache IDs may have the same tag.
++func ruleSetFileName(cacheID []byte, tag string) string {
++	sum := sha256.Sum256(append(append([]byte{}, cacheID...), "\x00"+tag...))
++	var name strings.Builder
++	for _, char := range tag {
++		if name.Len() >= 64 {
++			break
++		}
++		switch {
++		case char >= 'a' && char <= 'z', char >= 'A' && char <= 'Z', char >= '0' && char <= '9', char == '-', char == '_', char == '.':
++			name.WriteRune(char)
++		default:
++			name.WriteByte('_')
++		}
++	}
++	return name.String() + "-" + hex.EncodeToString(sum[:4])
++}
++
++// ruleSetRecord is what the bucket keeps of a rule set: the size of its content, then the
++// rest of adapter.SavedBinary as it writes itself, without the content.
++func ruleSetRecord(set *adapter.SavedBinary) ([]byte, error) {
++	rest, err := (&adapter.SavedBinary{LastUpdated: set.LastUpdated, LastEtag: set.LastEtag, URLHash: set.URLHash}).MarshalBinary()
++	if err != nil {
++		return nil, err
++	}
++	record := binary.AppendUvarint([]byte{1}, uint64(len(set.Content)))
++	return append(record, rest...), nil
++}
++
++func parseRuleSetRecord(record []byte) (*adapter.SavedBinary, uint64, error) {
++	reader := bytes.NewReader(record)
++	version, err := reader.ReadByte()
++	if err != nil {
++		return nil, 0, err
++	}
++	if version != 1 {
++		return nil, 0, E.New("unknown version of a rule-set record: ", version)
++	}
++	size, err := binary.ReadUvarint(reader)
++	if err != nil {
++		return nil, 0, err
++	}
++	rest, err := io.ReadAll(reader)
++	if err != nil {
++		return nil, 0, err
++	}
++	var saved adapter.SavedBinary
++	err = saved.UnmarshalBinary(rest)
++	if err != nil {
++		return nil, 0, err
++	}
++	return &saved, size, nil
++}
++
++// loadRuleSetFile reads a rule set saved in a file; found tells that it has a record,
++// which is then the only place it is read from (nil when its file is not whole).
++func (c *CacheFile) loadRuleSetFile(tag string) (saved *adapter.SavedBinary, found bool) {
++	var record []byte
++	_ = c.view(func(t *bbolt.Tx) error {
++		bucket := c.bucket(t, bucketRuleSetFile)
++		if bucket == nil {
++			return nil
++		}
++		record = bytes.Clone(bucket.Get([]byte(tag)))
++		return nil
++	})
++	if record == nil {
++		return nil, false
++	}
++	saved, size, err := parseRuleSetRecord(record)
++	if err != nil {
++		c.logger.Warn("rule-set cache ", tag, ": ", err)
++		return nil, true
++	}
++	path := filepath.Join(c.ruleSetDirectory(), ruleSetFileName(c.cacheID, tag))
++	content, err := os.ReadFile(path)
++	if err != nil {
++		c.logger.Warn("rule-set cache ", tag, ": ", err)
++		return nil, true
++	}
++	if uint64(len(content)) != size {
++		c.logger.Warn("rule-set cache ", tag, ": the file of the content has ", len(content), " bytes of ", size, ", it is downloaded again")
++		return nil, true
++	}
++	saved.Content = content
++	return saved, true
++}
++
++// saveRuleSetFile writes the content of a rule set into its file, then its record; the
++// record of an earlier version goes.
++func (c *CacheFile) saveRuleSetFile(tag string, set *adapter.SavedBinary) error {
++	record, err := ruleSetRecord(set)
++	if err != nil {
++		return err
++	}
++	directory := c.ruleSetDirectory()
++	err = filemanager.MkdirAll(c.ctx, directory, 0o755)
++	if err != nil {
++		return err
++	}
++	path := filepath.Join(directory, ruleSetFileName(c.cacheID, tag))
++	writing := path + ruleSetFileWriting
++	file, err := filemanager.OpenFile(c.ctx, writing, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o644)
++	if err != nil {
++		return err
++	}
++	_, err = file.Write(set.Content)
++	if err == nil {
++		err = file.Sync()
++	}
++	closeErr := file.Close()
++	if err == nil {
++		err = closeErr
++	}
++	if err == nil {
++		err = os.Rename(writing, path)
++	}
++	if err != nil {
++		_ = os.Remove(writing)
++		return err
++	}
++	return c.batch(func(t *bbolt.Tx) error {
++		bucket, err := c.createBucket(t, bucketRuleSetFile)
++		if err != nil {
++			return err
++		}
++		err = bucket.Put([]byte(tag), record)
++		if err != nil {
++			return err
++		}
++		if legacy := c.bucket(t, bucketRuleSet); legacy != nil && legacy.Get([]byte(tag)) != nil {
++			return legacy.Delete([]byte(tag))
++		}
++		return nil
++	})
++}
++
++// pruneRuleSetFiles removes the files of the directory that no record names (of any cache
++// ID), and files whose write was cut.
++func (c *CacheFile) pruneRuleSetFiles(db *bbolt.DB) {
++	entries, err := os.ReadDir(c.ruleSetDirectory())
++	if err != nil {
++		return
++	}
++	named := make(map[string]bool)
++	_ = db.View(func(t *bbolt.Tx) error {
++		collect := func(cacheID []byte, bucket *bbolt.Bucket) {
++			if bucket == nil {
++				return
++			}
++			_ = bucket.ForEach(func(tag []byte, _ []byte) error {
++				named[ruleSetFileName(cacheID, string(tag))] = true
++				return nil
++			})
++		}
++		collect(nil, t.Bucket(bucketRuleSetFile))
++		return t.ForEach(func(name []byte, bucket *bbolt.Bucket) error {
++			if len(name) > 0 && name[0] == 0 {
++				collect(bytes.Clone(name), bucket.Bucket(bucketRuleSetFile))
++			}
++			return nil
++		})
++	})
++	for _, entry := range entries {
++		if !named[entry.Name()] {
++			_ = os.Remove(filepath.Join(c.ruleSetDirectory(), entry.Name()))
++		}
++	}
++}
+diff --git a/experimental/cachefile/rule_set_file_test.go b/experimental/cachefile/rule_set_file_test.go
+new file mode 100644
+index 000000000..f8e6de4db
+--- /dev/null
++++ b/experimental/cachefile/rule_set_file_test.go
+@@ -0,0 +1,112 @@
++package cachefile
++
++import (
++	"bytes"
++	"context"
++	"os"
++	"path/filepath"
++	"testing"
++	"time"
++
++	"github.com/sagernet/bbolt"
++	"github.com/sagernet/sing-box/adapter"
++	"github.com/sagernet/sing-box/option"
++	"github.com/sagernet/sing/common/logger"
++
++	"github.com/stretchr/testify/require"
++)
++
++// A big list changed again and again takes its size once in the file beside the cache file,
++// and the cache file stays small; what is saved comes back across a reopen.
++func TestRuleSetFile(t *testing.T) {
++	path := filepath.Join(t.TempDir(), "cache.db")
++	cacheFile := openTestCacheFile(t, path)
++	list := bytes.Repeat([]byte("203.0.113.0/24\n"), 300000)
++	for round := byte(0); round < 4; round++ {
++		list[0] = '0' + round
++		require.NoError(t, cacheFile.SaveRuleSet("big", &adapter.SavedBinary{Content: list, LastUpdated: time.Unix(100+int64(round), 0), LastEtag: "e", URLHash: []byte{1, 2}}))
++	}
++	require.NoError(t, cacheFile.Close())
++	info, err := os.Stat(path)
++	require.NoError(t, err)
++	require.Less(t, info.Size(), int64(len(list)/4), "the list is not in the cache file")
++	entries, err := os.ReadDir(path + ruleSetFileSuffix)
++	require.NoError(t, err)
++	require.Len(t, entries, 1)
++
++	cacheFile = openTestCacheFile(t, path)
++	defer cacheFile.Close()
++	saved := cacheFile.LoadRuleSet("big")
++	require.NotNil(t, saved)
++	require.Equal(t, list, saved.Content)
++	require.True(t, time.Unix(103, 0).Equal(saved.LastUpdated))
++	require.Equal(t, "e", saved.LastEtag)
++	require.Equal(t, []byte{1, 2}, saved.URLHash)
++	require.Nil(t, cacheFile.LoadRuleSet("other"))
++}
++
++// A rule set an earlier version kept in the database is read from there until it is saved
++// again; the save moves it into its file.
++func TestRuleSetFileFromDatabase(t *testing.T) {
++	path := filepath.Join(t.TempDir(), "cache.db")
++	cacheFile := openTestCacheFile(t, path)
++	old, err := (&adapter.SavedBinary{Content: []byte("old.lab.example\n"), LastUpdated: time.Unix(50, 0)}).MarshalBinary()
++	require.NoError(t, err)
++	require.NoError(t, cacheFile.batch(func(tx *bbolt.Tx) error {
++		bucket, err := cacheFile.createBucket(tx, bucketRuleSet)
++		if err != nil {
++			return err
++		}
++		return bucket.Put([]byte("lists"), old)
++	}))
++	saved := cacheFile.LoadRuleSet("lists")
++	require.NotNil(t, saved)
++	require.Equal(t, "old.lab.example\n", string(saved.Content))
++
++	require.NoError(t, cacheFile.SaveRuleSet("lists", &adapter.SavedBinary{Content: []byte("new.lab.example\n"), LastUpdated: time.Unix(60, 0)}))
++	require.Equal(t, "new.lab.example\n", string(cacheFile.LoadRuleSet("lists").Content))
++	require.NoError(t, cacheFile.view(func(tx *bbolt.Tx) error {
++		require.Nil(t, cacheFile.bucket(tx, bucketRuleSet).Get([]byte("lists")), "the record of the earlier version is left")
++		return nil
++	}))
++	require.NoError(t, cacheFile.Close())
++}
++
++// A file that is not whole (a write cut by a power loss) is not read: the rule set is
++// downloaded again. A reopen removes the files no record names and the writes that were
++// cut, and keeps those of every cache ID.
++func TestRuleSetFileBroken(t *testing.T) {
++	path := filepath.Join(t.TempDir(), "cache.db")
++	cacheFile := openTestCacheFile(t, path)
++	require.NoError(t, cacheFile.SaveRuleSet("lists", &adapter.SavedBinary{Content: []byte("one.lab.example\ntwo.lab.example\n")}))
++	directory := path + ruleSetFileSuffix
++	file := filepath.Join(directory, ruleSetFileName(nil, "lists"))
++	require.NoError(t, os.WriteFile(file, []byte("one.lab.example\n"), 0o644))
++	require.Nil(t, cacheFile.LoadRuleSet("lists"))
++	require.NoError(t, cacheFile.Close())
++
++	other := New(context.Background(), logger.NOP(), option.CacheFileOptions{Enabled: true, Path: path, CacheID: "other"})
++	scope := adapter.NewScope(context.Background(), logger.NOP())
++	require.NoError(t, other.Start(adapter.StartStateInitialize, scope))
++	require.NoError(t, other.SaveRuleSet("lists", &adapter.SavedBinary{Content: []byte("three.lab.example\n")}))
++	require.NoError(t, scope.Close())
++
++	require.NoError(t, os.WriteFile(filepath.Join(directory, "gone-01020304"), []byte("x"), 0o644))
++	require.NoError(t, os.WriteFile(file+ruleSetFileWriting, []byte("x"), 0o644))
++	cacheFile = openTestCacheFile(t, path)
++	defer cacheFile.Close()
++	entries, err := os.ReadDir(directory)
++	require.NoError(t, err)
++	var names []string
++	for _, entry := range entries {
++		names = append(names, entry.Name())
++	}
++	require.ElementsMatch(t, []string{ruleSetFileName(nil, "lists"), ruleSetFileName([]byte("\x00other"), "lists")}, names)
++}
++
++// File names keep what a file name can have of a tag and differ for every tag and cache ID.
++func TestRuleSetFileName(t *testing.T) {
++	require.Regexp(t, `^main-subnets_list\.lst-[0-9a-f]{8}$`, ruleSetFileName(nil, "main-subnets/list.lst"))
++	require.NotEqual(t, ruleSetFileName(nil, "a/b"), ruleSetFileName(nil, "a_b"))
++	require.NotEqual(t, ruleSetFileName(nil, "a"), ruleSetFileName([]byte("\x00x"), "a"))
++}
+-- 
+2.53.0
+

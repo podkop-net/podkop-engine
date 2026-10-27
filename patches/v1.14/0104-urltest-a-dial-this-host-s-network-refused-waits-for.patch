@@ -1,7 +1,7 @@
-From 12bdcfc299cbf03c719e77af42a84839df17da09 Mon Sep 17 00:00:00 2001
+From 590c70ce9ce27fc521e62d4384ec545942357db7 Mon Sep 17 00:00:00 2001
 From: FiyeroT <me@fiyero.xyz>
 Date: Thu, 8 Oct 2026 19:46:34 +0300
-Subject: [PATCH 104/160] urltest: a dial this host's network refused waits for
+Subject: [PATCH 104/171] urltest: a dial this host's network refused waits for
  the network monitor
 
 When the default route goes, the network monitor reports the missing
@@ -25,10 +25,10 @@ missing route.
  3 files changed, 165 insertions(+), 3 deletions(-)
 
 diff --git a/protocol/group/urltest.go b/protocol/group/urltest.go
-index 6fcdd5bfc..49e521a96 100644
+index a5f1c87fd..1b8a41f33 100644
 --- a/protocol/group/urltest.go
 +++ b/protocol/group/urltest.go
-@@ -304,6 +304,7 @@ type URLTestGroup struct {
+@@ -316,6 +316,7 @@ type URLTestGroup struct {
  	unansweredConfirms           map[string]*memberConfirm
  	epoch                        time.Time
  	successes                    sync.Map // member tag → *atomic.Int64, its last successful TCP dial, since epoch
@@ -37,7 +37,7 @@ index 6fcdd5bfc..49e521a96 100644
  	frozen                       common.TypedValue[map[string]time.Time] // member tag → when it last failed the download test
  	responses                    sync.Map                                // member tag → *memberResponses
 diff --git a/protocol/group/urltest_failure.go b/protocol/group/urltest_failure.go
-index 42ee1a0d4..91263ae77 100644
+index a995148ca..2840dcd09 100644
 --- a/protocol/group/urltest_failure.go
 +++ b/protocol/group/urltest_failure.go
 @@ -7,6 +7,7 @@ import (
@@ -65,7 +65,7 @@ index 42ee1a0d4..91263ae77 100644
 @@ -71,6 +79,18 @@ func (g *URLTestGroup) memberFailed(ctx context.Context, member adapter.Outbound
  		return
  	}
- 	tag := RealTag(g.outbound, member)
+ 	tag := RealTag(member, network)
 +	if localNetworkError(err) {
 +		g.afterLocalFailure(tag, func() {
 +			g.judgeFailure(tag, member, network, err, start)

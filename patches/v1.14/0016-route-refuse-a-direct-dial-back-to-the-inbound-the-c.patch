@@ -1,7 +1,7 @@
-From 3b7bb2ffb03918c4e6b2dc153cf487c65205dbc9 Mon Sep 17 00:00:00 2001
+From 7e5c9c0afa783314c7d1a0894bfffe4b39867841 Mon Sep 17 00:00:00 2001
 From: FiyeroT <me@fiyero.xyz>
 Date: Sat, 3 Oct 2026 11:27:47 +0300
-Subject: [PATCH 016/160] route: refuse a direct dial back to the inbound the
+Subject: [PATCH 016/171] route: refuse a direct dial back to the inbound the
  connection came in on
 
 A direct inbound hands out its own listen address as the destination of
@@ -26,10 +26,10 @@ another local inbound, through a proxy outbound, is untouched.
  create mode 100644 route/route_loop_test.go
 
 diff --git a/adapter/inbound.go b/adapter/inbound.go
-index b081ddc94..4cc05632d 100644
+index 3027f1eb1..24cb837eb 100644
 --- a/adapter/inbound.go
 +++ b/adapter/inbound.go
-@@ -21,6 +21,14 @@ type Inbound interface {
+@@ -22,6 +22,14 @@ type Inbound interface {
  	Tag() string
  }
  
@@ -88,32 +88,32 @@ index 603ba6882..3c24e2cbb 100644
  	i.udpNat.Purge()
  }
 diff --git a/route/route.go b/route/route.go
-index bc1d41b4c..4a1bc5590 100644
+index d9b5ff2be..4082deaaf 100644
 --- a/route/route.go
 +++ b/route/route.go
-@@ -160,6 +160,10 @@ func (r *Router) routeConnection(ctx context.Context, conn net.Conn, metadata ad
- 		selectedOutbound = defaultOutbound
+@@ -153,6 +153,10 @@ func (r *Router) routeConnection(ctx context.Context, conn net.Conn, metadata ad
+ 		buf.ReleaseMulti(buffers)
+ 		return err
  	}
- 
-+	if r.wouldLoopToInbound(&metadata, selectedOutbound) {
++	if r.wouldLoopToInbound(&metadata, chain[len(chain)-1]) {
 +		buf.ReleaseMulti(buffers)
 +		return E.New("refused connection to the address of inbound ", metadata.Inbound, " (", metadata.Destination, "): not hijacked, would loop")
 +	}
  	for _, buffer := range buffers {
  		conn = bufio.NewCachedConn(conn, buffer)
  	}
-@@ -291,6 +295,10 @@ func (r *Router) routePacketConnection(ctx context.Context, conn N.PacketConn, m
- 		}
- 		selectedOutbound = defaultOutbound
+@@ -318,6 +322,10 @@ func (r *Router) routePacketConnection(ctx context.Context, conn N.PacketConn, m
+ 		N.ReleaseMultiPacketBuffer(packetBuffers)
+ 		return err
  	}
-+	if r.wouldLoopToInbound(&metadata, selectedOutbound) {
++	if r.wouldLoopToInbound(&metadata, chain[len(chain)-1]) {
 +		N.ReleaseMultiPacketBuffer(packetBuffers)
 +		return E.New("refused packet to the address of inbound ", metadata.Inbound, " (", metadata.Destination, "): not hijacked, would loop")
 +	}
  	for _, buffer := range packetBuffers {
  		conn = bufio.NewCachedPacketConn(conn, buffer.Buffer, buffer.Destination)
  		N.PutPacketBuffer(buffer)
-@@ -595,6 +603,53 @@ func (r *Router) prepareMatchMetadata(ctx context.Context, metadata *adapter.Inb
+@@ -622,6 +630,53 @@ func (r *Router) prepareMatchMetadata(ctx context.Context, metadata *adapter.Inb
  	return nil
  }
  

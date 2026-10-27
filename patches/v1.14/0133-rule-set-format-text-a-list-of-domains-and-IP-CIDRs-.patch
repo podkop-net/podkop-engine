@@ -1,7 +1,7 @@
-From 07c69f3164f5a8c33e1879046dd4e1ef852d26fa Mon Sep 17 00:00:00 2001
+From 01f958ab5ba5831bcc66e5f188a09576f7a5b799 Mon Sep 17 00:00:00 2001
 From: FiyeroT <me@fiyero.xyz>
 Date: Sat, 17 Oct 2026 08:07:38 +0300
-Subject: [PATCH 133/160] rule-set: format text, a list of domains and IP CIDRs
+Subject: [PATCH 133/171] rule-set: format text, a list of domains and IP CIDRs
  as plain text
 
 Many sites publish their lists as plain text, a domain or an address a line,
@@ -203,7 +203,7 @@ index 000000000..09b83f123
 +	require.Error(t, err)
 +}
 diff --git a/constant/rule.go b/constant/rule.go
-index 251ed4e9a..d404fa75b 100644
+index f8670f7d2..fa82ec058 100644
 --- a/constant/rule.go
 +++ b/constant/rule.go
 @@ -16,6 +16,9 @@ const (

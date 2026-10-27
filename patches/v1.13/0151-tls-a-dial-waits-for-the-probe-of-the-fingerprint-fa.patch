@@ -1,7 +1,7 @@
 From 3e9ea62bc78c5895e2f3f0ebfd5ae5b9f7122185 Mon Sep 17 00:00:00 2001
 From: FiyeroT <me@fiyero.xyz>
 Date: Sun, 25 Oct 2026 22:54:25 +0300
-Subject: [PATCH 151/152] tls: a dial waits for the probe of the fingerprint
+Subject: [PATCH 151/159] tls: a dial waits for the probe of the fingerprint
  fallback 5 s at most
 
 A probe that ends without a verdict (a server that is down, a TCP handshake

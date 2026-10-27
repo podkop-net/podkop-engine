@@ -1,7 +1,7 @@
-From 2fb7ba0003dae028cbdfa4da7aefef7062dd8921 Mon Sep 17 00:00:00 2001
+From b8464e0cfdf9f79d253871ee55f741caf7836253 Mon Sep 17 00:00:00 2001
 From: FiyeroT <me@fiyero.xyz>
 Date: Sat, 26 Sep 2026 20:23:09 +0300
-Subject: [PATCH 001/160] reality: keep X25519MLKEM768 key share, announce
+Subject: [PATCH 001/171] reality: keep X25519MLKEM768 key share, announce
  client version 26.3.27
 
 Xray-core v26.9.8+ (XTLS/REALITY@8cdf7bf) rejects a Client Hello without an
@@ -12,7 +12,7 @@ minClientVer to 26.3.27 and rejects the 1.8.1 announced before.
  1 file changed, 13 insertions(+), 20 deletions(-)
 
 diff --git a/common/tls/reality_client.go b/common/tls/reality_client.go
-index 13f88e385..231114a24 100644
+index be4806fe6..dfa743b84 100644
 --- a/common/tls/reality_client.go
 +++ b/common/tls/reality_client.go
 @@ -30,7 +30,6 @@ import (
@@ -23,7 +23,7 @@ index 13f88e385..231114a24 100644
  	"github.com/sagernet/sing/common/debug"
  	E "github.com/sagernet/sing/common/exceptions"
  	"github.com/sagernet/sing/common/logger"
-@@ -141,26 +140,13 @@ func (e *RealityClientConfig) ClientHandshake(ctx context.Context, conn net.Conn
+@@ -142,26 +141,13 @@ func (e *RealityClientConfig) ClientHandshake(ctx context.Context, conn net.Conn
  	uConfig.VerifyPeerCertificate = verifier.VerifyPeerCertificate
  	uConn := utls.UClient(conn, uConfig, e.uClient.id)
  	verifier.UConn = uConn
@@ -53,7 +53,7 @@ index 13f88e385..231114a24 100644
  
  	if len(uConfig.NextProtos) > 0 {
  		for _, extension := range uConn.Extensions {
-@@ -183,9 +169,11 @@ func (e *RealityClientConfig) ClientHandshake(ctx context.Context, conn net.Conn
+@@ -184,9 +170,11 @@ func (e *RealityClientConfig) ClientHandshake(ctx context.Context, conn net.Conn
  	}
  	binary.BigEndian.PutUint64(hello.SessionId, uint64(nowTime.Unix()))
  
@@ -68,7 +68,7 @@ index 13f88e385..231114a24 100644
  	binary.BigEndian.PutUint32(hello.SessionId[4:], uint32(time.Now().Unix()))
  	copy(hello.SessionId[8:], e.shortID[:])
  	if debug.Enabled {
-@@ -199,7 +187,12 @@ func (e *RealityClientConfig) ClientHandshake(ctx context.Context, conn net.Conn
+@@ -200,7 +188,12 @@ func (e *RealityClientConfig) ClientHandshake(ctx context.Context, conn net.Conn
  	if keyShareKeys == nil {
  		return nil, E.New("nil KeyShareKeys")
  	}

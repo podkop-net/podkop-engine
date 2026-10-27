@@ -1,7 +1,7 @@
-From bfffd967cd3954a7b28a0dd8b8171f5219051f7e Mon Sep 17 00:00:00 2001
+From 04648cd64d0616dbd505d71876309592ebea92d2 Mon Sep 17 00:00:00 2001
 From: FiyeroT <me@fiyero.xyz>
 Date: Fri, 9 Oct 2026 16:15:04 +0300
-Subject: [PATCH 111/160] urltest: failures across a change of the network, a
+Subject: [PATCH 111/171] urltest: failures across a change of the network, a
  monitor that sees no route
 
 What a failed dial says about a member depends on what the network did
@@ -43,10 +43,10 @@ looked at the flag, is not lost.
  create mode 100644 protocol/group/urltest_review2_test.go
 
 diff --git a/protocol/group/urltest.go b/protocol/group/urltest.go
-index 49e521a96..294287288 100644
+index 1b8a41f33..17d6f01c8 100644
 --- a/protocol/group/urltest.go
 +++ b/protocol/group/urltest.go
-@@ -178,12 +178,23 @@ func (s *URLTest) PerformUpdateCheck() {
+@@ -200,12 +200,23 @@ func (s *URLTest) PerformUpdateCheck() {
  	s.group.requestUpdateCheck()
  }
  
@@ -71,7 +71,7 @@ index 49e521a96..294287288 100644
  		return
  	}
  	go func() {
-@@ -221,7 +232,13 @@ func (s *URLTest) DialContext(ctx context.Context, network string, destination M
+@@ -243,7 +254,13 @@ func (s *URLTest) DialContext(ctx context.Context, network string, destination M
  		}
  		var handshake *handshakeConn
  		if N.NeedHandshakeForWrite(conn) {
@@ -86,7 +86,7 @@ index 49e521a96..294287288 100644
  			conn = handshake
  		}
  		if N.NetworkName(network) == N.NetworkTCP {
-@@ -288,6 +305,7 @@ type URLTestGroup struct {
+@@ -300,6 +317,7 @@ type URLTestGroup struct {
  	history                      *urltest.HistoryStorage
  	checking                     atomic.Bool
  	recheck                      atomic.Bool
@@ -94,7 +94,7 @@ index 49e521a96..294287288 100644
  	selectedOutboundTCP          common.TypedValue[adapter.Outbound]
  	selectedOutboundUDP          common.TypedValue[adapter.Outbound]
  	interruptGroup               *interrupt.Group
-@@ -305,10 +323,15 @@ type URLTestGroup struct {
+@@ -317,10 +335,15 @@ type URLTestGroup struct {
  	epoch                        time.Time
  	successes                    sync.Map // member tag → *atomic.Int64, its last successful TCP dial, since epoch
  	localFailures                sync.Map // member tag → a failure of this host's own network waits to be judged
@@ -114,7 +114,7 @@ index 49e521a96..294287288 100644
  }
  
  func NewURLTestGroup(ctx context.Context, outboundManager adapter.OutboundManager, logger log.Logger, outbounds []adapter.Outbound, fallbacks []adapter.Outbound, link string, downloadLink string, interval time.Duration, tolerance uint16, idleTimeout time.Duration, interruptExternalConnections bool) (*URLTestGroup, error) {
-@@ -328,7 +351,7 @@ func NewURLTestGroup(ctx context.Context, outboundManager adapter.OutboundManage
+@@ -340,7 +363,7 @@ func NewURLTestGroup(ctx context.Context, outboundManager adapter.OutboundManage
  	if history == nil {
  		return nil, E.New("missing URL test history storage")
  	}
@@ -123,7 +123,7 @@ index 49e521a96..294287288 100644
  		ctx:                          ctx,
  		outbound:                     outboundManager,
  		logger:                       logger,
-@@ -346,7 +369,9 @@ func NewURLTestGroup(ctx context.Context, outboundManager adapter.OutboundManage
+@@ -358,7 +381,9 @@ func NewURLTestGroup(ctx context.Context, outboundManager adapter.OutboundManage
  		interruptExternalConnections: interruptExternalConnections,
  		epoch:                        time.Now(),
  		downloadLink:                 downloadLink,
@@ -134,7 +134,7 @@ index 49e521a96..294287288 100644
  }
  
  func (g *URLTestGroup) PostStart() {
-@@ -365,11 +390,13 @@ func (g *URLTestGroup) Touch() {
+@@ -377,11 +402,13 @@ func (g *URLTestGroup) Touch() {
  	defer g.access.Unlock()
  	if g.ticker != nil {
  		g.lastActive.Store(time.Now())
@@ -148,7 +148,7 @@ index 49e521a96..294287288 100644
  	go g.loopCheck(ticker, g.close)
  }
  
-@@ -377,6 +404,10 @@ func (g *URLTestGroup) Close() error {
+@@ -389,6 +416,10 @@ func (g *URLTestGroup) Close() error {
  	g.responsesClosed.Store(true)
  	g.access.Lock()
  	defer g.access.Unlock()
@@ -159,7 +159,7 @@ index 49e521a96..294287288 100644
  	if g.ticker == nil {
  		return nil
  	}
-@@ -481,6 +512,18 @@ func (g *URLTestGroup) loopCheck(ticker *time.Ticker, closeChan <-chan struct{})
+@@ -493,6 +524,18 @@ func (g *URLTestGroup) loopCheck(ticker *time.Ticker, closeChan <-chan struct{})
  	}
  }
  
@@ -178,7 +178,7 @@ index 49e521a96..294287288 100644
  func (g *URLTestGroup) CheckOutbounds(ctx context.Context, force bool) {
  	_, _ = g.urlTest(ctx, force)
  }
-@@ -505,14 +548,16 @@ func (g *URLTestGroup) urlTest(ctx context.Context, force bool) (map[string]uint
+@@ -517,14 +560,16 @@ func (g *URLTestGroup) urlTest(ctx context.Context, force bool) (map[string]uint
  func (g *URLTestGroup) urlTestRound(ctx context.Context, force bool, wait bool) (map[string]uint16, error) {
  	if g.checking.Swap(true) {
  		if force {
@@ -199,7 +199,7 @@ index 49e521a96..294287288 100644
  			go g.CheckOutbounds(g.ctx, true)
  		}
 diff --git a/protocol/group/urltest_failure.go b/protocol/group/urltest_failure.go
-index 91263ae77..30b57ce94 100644
+index 2840dcd09..821280236 100644
 --- a/protocol/group/urltest_failure.go
 +++ b/protocol/group/urltest_failure.go
 @@ -15,6 +15,7 @@ import (
@@ -239,7 +239,7 @@ index 91263ae77..30b57ce94 100644
 +	if ctx.Err() != nil || !timeout && (errors.Is(err, net.ErrClosed) || errors.Is(err, os.ErrClosed) || errors.Is(err, context.Canceled)) {
  		return
  	}
- 	tag := RealTag(g.outbound, member)
+ 	tag := RealTag(member, network)
 @@ -91,6 +98,10 @@ func (g *URLTestGroup) memberFailed(ctx context.Context, member adapter.Outbound
  // judgeFailure decides what a failure that is neither the caller's nor the network's says
  // about the member.
@@ -907,7 +907,7 @@ index 000000000..37cfd2e87
 +	require.Eventually(t, func() bool { return requests.Load() >= 3 }, 5*time.Second, 10*time.Millisecond)
 +}
 diff --git a/route/network.go b/route/network.go
-index 53a1be8d8..e0df7bb85 100644
+index 1ff6e49e1..5912cdeb2 100644
 --- a/route/network.go
 +++ b/route/network.go
 @@ -453,6 +453,15 @@ func (r *NetworkManager) UpdateWIFIState(ctx context.Context) {

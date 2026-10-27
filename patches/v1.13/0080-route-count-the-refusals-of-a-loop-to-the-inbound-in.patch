@@ -1,7 +1,7 @@
 From 3f39434e99d83b3ecf9891a85fdf36c19364768e Mon Sep 17 00:00:00 2001
 From: FiyeroT <me@fiyero.xyz>
 Date: Tue, 6 Oct 2026 23:55:22 +0300
-Subject: [PATCH 080/152] route: count the refusals of a loop to the inbound
+Subject: [PATCH 080/159] route: count the refusals of a loop to the inbound
  instead of logging each
 
 A connection that the direct outbound would dial back to the inbound it came in on is

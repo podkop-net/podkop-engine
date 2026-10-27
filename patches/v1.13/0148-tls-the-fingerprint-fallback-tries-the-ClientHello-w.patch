@@ -1,7 +1,7 @@
 From 2667db8518bbf1a30f67985d96570fc0c63b2b2f Mon Sep 17 00:00:00 2001
 From: FiyeroT <me@fiyero.xyz>
 Date: Sun, 25 Oct 2026 21:20:32 +0300
-Subject: [PATCH 148/152] tls: the fingerprint fallback tries the ClientHello
+Subject: [PATCH 148/159] tls: the fingerprint fallback tries the ClientHello
  without X25519MLKEM768 first, then firefox
 
 Measured in October 2026: the Russian DPI freezes the connections of chrome (Chrome 133

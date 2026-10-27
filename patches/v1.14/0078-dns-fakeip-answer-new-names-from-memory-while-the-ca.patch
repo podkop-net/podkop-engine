@@ -1,7 +1,7 @@
-From a1d517992f4648772691966e82f666bf0b8f75e4 Mon Sep 17 00:00:00 2001
+From e4b0cb97b4c23c5b6ff8389499a7676c68795cd7 Mon Sep 17 00:00:00 2001
 From: FiyeroT <me@fiyero.xyz>
 Date: Tue, 6 Oct 2026 23:39:17 +0300
-Subject: [PATCH 078/160] dns/fakeip: answer new names from memory while the
+Subject: [PATCH 078/171] dns/fakeip: answer new names from memory while the
  cache file cannot be written
 
 With a cache file the store gave out addresses only within a reserve saved ahead (1024

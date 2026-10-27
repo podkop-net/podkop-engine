@@ -1,7 +1,7 @@
-From 9038e1672b0832a8a4da1b641455839efd5458db Mon Sep 17 00:00:00 2001
+From b1ad46b28397136a305d9b39c8af789678292dde Mon Sep 17 00:00:00 2001
 From: FiyeroT <me@fiyero.xyz>
 Date: Sun, 25 Oct 2026 22:18:22 +0300
-Subject: [PATCH 157/160] dns: the AAAA question of a name without an IPv4
+Subject: [PATCH 157/171] dns: the AAAA question of a name without an IPv4
  address goes out under ipv4_only
 
 The strategy ipv4_only answers every AAAA question with no address, so a
@@ -22,10 +22,10 @@ client asking A and AAAA together shares.
  create mode 100644 dns/client_ipv6_test.go
 
 diff --git a/dns/client.go b/dns/client.go
-index 027ce9714..c42fff7b4 100644
+index d6466534b..b61a09370 100644
 --- a/dns/client.go
 +++ b/dns/client.go
-@@ -51,6 +51,7 @@ type Client struct {
+@@ -52,6 +52,7 @@ type Client struct {
  	cacheLock         compatible.Map[dnsExchangeKey, chan struct{}]
  	backgroundRefresh compatible.Map[dnsCacheKey, struct{}]
  	failures          failureLog
@@ -33,7 +33,7 @@ index 027ce9714..c42fff7b4 100644
  }
  
  type ClientOptions struct {
-@@ -64,6 +65,7 @@ type ClientOptions struct {
+@@ -65,6 +66,7 @@ type ClientOptions struct {
  	RDRC              func() adapter.RDRCStore
  	DNSCache          func() adapter.DNSCacheStore
  	Logger            logger.ContextLogger
@@ -41,7 +41,7 @@ index 027ce9714..c42fff7b4 100644
  }
  
  func NewClient(options ClientOptions) *Client {
-@@ -79,6 +81,7 @@ func NewClient(options ClientOptions) *Client {
+@@ -80,6 +82,7 @@ func NewClient(options ClientOptions) *Client {
  		initRDRCFunc:      options.RDRC,
  		initDNSCacheFunc:  options.DNSCache,
  		logger:            options.Logger,
@@ -49,7 +49,7 @@ index 027ce9714..c42fff7b4 100644
  	}
  	if client.timeout == 0 {
  		client.timeout = C.DNSTimeout
-@@ -399,6 +402,13 @@ func (c *Client) finishExchange(transport adapter.DNSTransport, operation *excha
+@@ -403,6 +406,13 @@ func (c *Client) finishExchange(transport adapter.DNSTransport, operation *excha
  }
  
  func (c *Client) Exchange(ctx context.Context, transport adapter.DNSTransport, message *dns.Msg, options adapter.DNSQueryOptions, responseChecker func(response *dns.Msg) bool) (*dns.Msg, error) {
@@ -63,7 +63,7 @@ index 027ce9714..c42fff7b4 100644
  	if options.Timeout == 0 {
  		options.Timeout = c.timeout
  	}
-@@ -417,6 +427,16 @@ func (c *Client) Exchange(ctx context.Context, transport adapter.DNSTransport, m
+@@ -421,6 +431,16 @@ func (c *Client) Exchange(ctx context.Context, transport adapter.DNSTransport, m
  }
  
  func (c *Client) ExchangeAsync(ctx context.Context, transport adapter.DNSTransport, message *dns.Msg, options adapter.DNSQueryOptions, responseChecker func(response *dns.Msg) bool, callback func(response *dns.Msg, err error)) {
@@ -80,7 +80,7 @@ index 027ce9714..c42fff7b4 100644
  	if options.Timeout == 0 {
  		options.Timeout = c.timeout
  	}
-@@ -464,7 +484,11 @@ func (c *Client) Lookup(ctx context.Context, transport adapter.DNSTransport, dom
+@@ -468,7 +488,11 @@ func (c *Client) Lookup(ctx context.Context, transport adapter.DNSTransport, dom
  	}
  	switch strategy {
  	case C.DomainStrategyIPv4Only:
@@ -359,7 +359,7 @@ index 000000000..c89678055
 +	}
 +}
 diff --git a/dns/router.go b/dns/router.go
-index d61e8730a..d468b46e4 100644
+index 9cd4d9cfb..08f70380b 100644
 --- a/dns/router.go
 +++ b/dns/router.go
 @@ -53,6 +53,8 @@ type Router struct {
@@ -397,7 +397,7 @@ index d61e8730a..d468b46e4 100644
  	if strategy == C.DomainStrategyIPv6Only {
  		return r.lookupWithRulesType(ctx, rules, domain, mDNS.TypeAAAA, lookupOptions)
 diff --git a/option/dns.go b/option/dns.go
-index 1180a6227..40ccc7bc9 100644
+index 299c734c7..aee455763 100644
 --- a/option/dns.go
 +++ b/option/dns.go
 @@ -68,6 +68,10 @@ type DNSClientOptions struct {

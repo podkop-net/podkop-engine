@@ -1,7 +1,7 @@
-From df755e26e1c1aba768cfe197a3ccb14ff594ad77 Mon Sep 17 00:00:00 2001
+From 75578923fdc9dec4fa97664e0814cad3562a8604 Mon Sep 17 00:00:00 2001
 From: FiyeroT <me@fiyero.xyz>
 Date: Mon, 5 Oct 2026 11:12:45 +0300
-Subject: [PATCH 044/160] xhttp: add the client of Xray's XHTTP transport
+Subject: [PATCH 044/171] xhttp: add the client of Xray's XHTTP transport
 
 Client only, after Xray-core v26.9.9 transport/internet/splithttp: modes
 packet-up, stream-up and stream-one (auto as Xray: REALITY picks
@@ -149,7 +149,7 @@ index c3089a6cf..1811df5f2 100644
 +	V2RayTransportTypeXHTTP       = "xhttp"
  )
 diff --git a/go.mod b/go.mod
-index d7afdd217..d66508473 100644
+index dbb90bd8e..635b74e62 100644
 --- a/go.mod
 +++ b/go.mod
 @@ -20,6 +20,7 @@ require (

@@ -1,0 +1,30 @@
+From 66000c1d296064b9966236ec773b3c22a2954976 Mon Sep 17 00:00:00 2001
+From: FiyeroT <me@fiyero.xyz>
+Date: Mon, 26 Oct 2026 16:03:10 +0300
+Subject: [PATCH 166/171] decode-link: the help names the links of every
+ protocol it reads
+
+---
+ cmd/sing-box/cli/cmd_tools_decode_link.go | 6 ++++--
+ 1 file changed, 4 insertions(+), 2 deletions(-)
+
+diff --git a/cmd/sing-box/cli/cmd_tools_decode_link.go b/cmd/sing-box/cli/cmd_tools_decode_link.go
+index b5ba422bc..e6ea96b5c 100644
+--- a/cmd/sing-box/cli/cmd_tools_decode_link.go
++++ b/cmd/sing-box/cli/cmd_tools_decode_link.go
+@@ -26,8 +26,10 @@ var commandDecodeLinkFlagCompact bool
+ 
+ var commandDecodeLink = &cobra.Command{
+ 	Use:   "decode-link [link]",
+-	Short: "Convert a share link (vless://, trojan://) to an outbound",
+-	Long: "Convert a share link (vless://, trojan://) to an outbound.\n\n" +
++	Short: "Convert a share link (vless://, trojan://, ss://, hysteria2://, ...) to an outbound",
++	Long: "Convert a share link to an outbound: vless://, trojan://, ss://, socks://, hysteria2://\n" +
++		"(hy2://), tuic://, http(s)://; in a build with every outbound also vmess://, hysteria://,\n" +
++		"anytls:// and naive+https:// (naive+quic://).\n\n" +
+ 		"The link is the argument or, with no argument, the standard input. The outbound is\n" +
+ 		"printed to the standard output as JSON.\n\n" +
+ 		"Exit status:\n" +
+-- 
+2.53.0
+

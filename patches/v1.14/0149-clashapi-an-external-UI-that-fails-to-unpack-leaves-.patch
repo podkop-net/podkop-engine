@@ -1,7 +1,7 @@
-From 6678b03c0edd6cac223dbf3ea73c97dd1482a179 Mon Sep 17 00:00:00 2001
+From f70882d02a207c280697f51fb1e678bb3893cdf2 Mon Sep 17 00:00:00 2001
 From: FiyeroT <me@fiyero.xyz>
 Date: Sat, 24 Oct 2026 07:50:13 +0300
-Subject: [PATCH 149/160] clashapi: an external UI that fails to unpack leaves
+Subject: [PATCH 149/171] clashapi: an external UI that fails to unpack leaves
  the one served
 
 The download of the external UI (at the start into an empty directory, and on

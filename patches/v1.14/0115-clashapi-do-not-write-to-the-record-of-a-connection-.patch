@@ -1,7 +1,7 @@
-From 7ce95d0a7e2356922f0f765917566b458530716f Mon Sep 17 00:00:00 2001
+From 23dc434d61fdd4fe8e282de74dd71a02c250b7c7 Mon Sep 17 00:00:00 2001
 From: FiyeroT <me@fiyero.xyz>
 Date: Fri, 9 Oct 2026 16:15:04 +0300
-Subject: [PATCH 115/160] clashapi: do not write to the record of a connection
+Subject: [PATCH 115/171] clashapi: do not write to the record of a connection
  while it is listed
 
 When a tracked connection closes, the traffic manager wrote the closing
@@ -23,10 +23,10 @@ record of the connection itself.
  create mode 100644 common/trafficcontrol/manager_race_test.go
 
 diff --git a/common/trafficcontrol/manager.go b/common/trafficcontrol/manager.go
-index 19f6fd0a4..977bfe096 100644
+index 5e938cf6f..34eb216b2 100644
 --- a/common/trafficcontrol/manager.go
 +++ b/common/trafficcontrol/manager.go
-@@ -98,8 +98,11 @@ func (m *Manager) leave(tracker Tracker) {
+@@ -95,8 +95,11 @@ func (m *Manager) leave(tracker Tracker) {
  		m.closedConnectionsAccess.Unlock()
  		return
  	}

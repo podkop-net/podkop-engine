@@ -1,7 +1,7 @@
-From 12b2a1bfb3c760c363cdc780914d63147d402fce Mon Sep 17 00:00:00 2001
+From ba0a329c8ef94eaecc855ceea495921d9fc83def Mon Sep 17 00:00:00 2001
 From: FiyeroT <me@fiyero.xyz>
 Date: Mon, 19 Oct 2026 20:58:05 +0300
-Subject: [PATCH 034/160] go.mod: take sing-vmess from the podkop-engine fork
+Subject: [PATCH 034/171] go.mod: take sing-vmess from the podkop-engine fork
  (v0.2.9-pdk.1)
 
 github.com/FiyeroT/sing-vmess v0.2.9-pdk.1 is the sing-vmess of this line plus one
@@ -10,11 +10,11 @@ replaceable, so the copy loop reads the raw TCP connection (splice, no
 buffer held while idle) once the buffered remainder is out.
 ---
  go.mod | 2 ++
- go.sum | 4 ++--
- 2 files changed, 4 insertions(+), 2 deletions(-)
+ go.sum | 3 ++-
+ 2 files changed, 4 insertions(+), 1 deletion(-)
 
 diff --git a/go.mod b/go.mod
-index 53b8a1cae..d7afdd217 100644
+index 8d74d59a2..dbb90bd8e 100644
 --- a/go.mod
 +++ b/go.mod
 @@ -198,3 +198,5 @@ require (
@@ -24,7 +24,7 @@ index 53b8a1cae..d7afdd217 100644
 +
 +replace github.com/sagernet/sing-vmess => github.com/FiyeroT/sing-vmess v0.2.9-pdk.1
 diff --git a/go.sum b/go.sum
-index ed70f5876..384c69ba4 100644
+index 8b2a77583..efb72cd66 100644
 --- a/go.sum
 +++ b/go.sum
 @@ -10,6 +10,8 @@ filippo.io/edwards25519 v1.2.0/go.mod h1:xzAOLCNug/yB62zG1bQ8uziwrIqIuxhctzJT18Q
@@ -36,15 +36,14 @@ index ed70f5876..384c69ba4 100644
  github.com/RyuaNerin/go-krypto v1.3.0 h1:smavTzSMAx8iuVlGb4pEwl9MD2qicqMzuXR2QWp2/Pg=
  github.com/RyuaNerin/go-krypto v1.3.0/go.mod h1:9R9TU936laAIqAmjcHo/LsaXYOZlymudOAxjaBf62UM=
  github.com/RyuaNerin/testingutil v0.1.0 h1:IYT6JL57RV3U2ml3dLHZsVtPOP6yNK7WUVdzzlpNrss=
-@@ -342,8 +344,6 @@ github.com/sagernet/sing-tun v0.9.7-0.20261009020158-bca4bf029237 h1:B9tUcRf1FAa
- github.com/sagernet/sing-tun v0.9.7-0.20261009020158-bca4bf029237/go.mod h1:3EgPst7agntRO7D6GOsiZ1l9FoqdLeuWmKT5TnWkmf0=
+@@ -342,7 +344,6 @@ github.com/sagernet/sing-tun v0.9.7-0.20261023115432-040db71fcd33 h1:0+op+qbxh/M
+ github.com/sagernet/sing-tun v0.9.7-0.20261023115432-040db71fcd33/go.mod h1:3EgPst7agntRO7D6GOsiZ1l9FoqdLeuWmKT5TnWkmf0=
  github.com/sagernet/sing-usbip v0.0.0-20260817040617-28bd42667eca h1:5wA+IE0Fq1CGVLOgSpm0gKKZ03HzugcJ2JyhmDqeX6A=
  github.com/sagernet/sing-usbip v0.0.0-20260817040617-28bd42667eca/go.mod h1:ADAZZU85MnM91XNhd2TdZRTaIbA7RjTZuQ1KCHcUbNg=
--github.com/sagernet/sing-vmess v0.2.9-0.20260929152519-9b95ab8c9478 h1:q2eQn4nq8oWGxRm9zXesXSlPr9GEgPrOGzf4iPtzG9A=
--github.com/sagernet/sing-vmess v0.2.9-0.20260929152519-9b95ab8c9478/go.mod h1:P11scgTxMxVVQ8dlM27yNm3Cro40mD0+gHbnqrNGDuY=
+-github.com/sagernet/sing-vmess v0.2.9-0.20261019223527-a0c58542bd9d h1:K93710Sq6/TFl3GVs+NclQ3I+KPXFLluSsUFC0Sm0N8=
+ github.com/sagernet/sing-vmess v0.2.9-0.20261019223527-a0c58542bd9d/go.mod h1:P11scgTxMxVVQ8dlM27yNm3Cro40mD0+gHbnqrNGDuY=
  github.com/sagernet/smux v1.5.50-sing-box-mod.1 h1:XkJcivBC9V4wBjiGXIXZ229aZCU1hzcbp6kSkkyQ478=
  github.com/sagernet/smux v1.5.50-sing-box-mod.1/go.mod h1:NjhsCEWedJm7eFLyhuBgIEzwfhRmytrUoiLluxs5Sk8=
- github.com/sagernet/tailscale v1.102.1-sing-box-1.14-mod.5 h1:mGLWVgj2Pl2NlgE1+sEUIDIMB42JdWEPwYmxTnVWg44=
 -- 
 2.53.0
 

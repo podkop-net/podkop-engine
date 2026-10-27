@@ -1,7 +1,7 @@
-From dcedbd297b04712c9848d8add1bd8b8c67ca95a2 Mon Sep 17 00:00:00 2001
+From 15bb66148bddf5205604a4b153e13b0b5b97b437 Mon Sep 17 00:00:00 2001
 From: FiyeroT <me@fiyero.xyz>
 Date: Sun, 4 Oct 2026 08:40:40 +0300
-Subject: [PATCH 039/160] sniff: a panicking sniffer fails its connection, a
+Subject: [PATCH 039/171] sniff: a panicking sniffer fails its connection, a
  UDP sniff reads 16 packets
 
 Sniffers parse whatever a client in the LAN sends, and nothing recovered a
@@ -154,10 +154,10 @@ index b3651e1ff..d76552ef4 100644
  			return nil
  		}
 diff --git a/route/route.go b/route/route.go
-index 4a1bc5590..8563ba1c1 100644
+index 4082deaaf..ffc8d6dc7 100644
 --- a/route/route.go
 +++ b/route/route.go
-@@ -363,6 +363,7 @@ func (r *Router) PreMatch(metadata adapter.InboundContext, firstPacket []byte) a
+@@ -394,6 +394,7 @@ func (r *Router) PreMatch(metadata adapter.InboundContext, firstPacket []byte) a
  				packetSniffers = defaultPacketSniffers
  			}
  			sniffErr := sniff.PeekPacket(ctx, &metadata, firstPacket, packetSniffers...)
@@ -165,7 +165,7 @@ index 4a1bc5590..8563ba1c1 100644
  			metadata.SnifferNames = action.SnifferNames
  			metadata.SniffError = sniffErr
  			if sniffErr != nil {
-@@ -793,6 +794,21 @@ match:
+@@ -820,6 +821,21 @@ match:
  	return
  }
  
@@ -187,7 +187,7 @@ index 4a1bc5590..8563ba1c1 100644
  func (r *Router) actionSniff(
  	ctx context.Context, metadata *adapter.InboundContext, action *R.RuleActionSniff,
  	inputConn net.Conn, inputPacketConn N.PacketConn, inputBuffers []*buf.Buffer, inputPacketBuffers []*N.PacketBuffer,
-@@ -834,6 +850,7 @@ func (r *Router) actionSniff(
+@@ -861,6 +877,7 @@ func (r *Router) actionSniff(
  			action.Timeout,
  			streamSniffers...,
  		)
@@ -195,7 +195,7 @@ index 4a1bc5590..8563ba1c1 100644
  		metadata.SnifferNames = action.SnifferNames
  		metadata.SniffError = err
  		if err == nil {
-@@ -899,6 +916,11 @@ func (r *Router) actionSniff(
+@@ -926,6 +943,11 @@ func (r *Router) actionSniff(
  			goto finally
  		}
  		for {
@@ -207,7 +207,7 @@ index 4a1bc5590..8563ba1c1 100644
  			var (
  				sniffBuffer = buf.NewPacket()
  				destination M.Socksaddr
-@@ -959,6 +981,7 @@ func (r *Router) actionSniff(
+@@ -986,6 +1008,7 @@ func (r *Router) actionSniff(
  			goto finally
  		}
  	finally:

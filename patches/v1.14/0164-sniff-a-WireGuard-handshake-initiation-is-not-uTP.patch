@@ -1,0 +1,61 @@
+From e433f648e56dc7066a096b1a874b3980bd13ed80 Mon Sep 17 00:00:00 2001
+From: FiyeroT <me@fiyero.xyz>
+Date: Mon, 26 Oct 2026 16:03:10 +0300
+Subject: [PATCH 164/171] sniff: a WireGuard handshake initiation is not uTP
+
+The first packet of a plain WireGuard tunnel (148 bytes, the type 1 as four
+little-endian bytes) reads as a uTP data packet without extensions and with
+connection id 0, and every such tunnel through sing-box was named BitTorrent
+(measured: 3 of 3 on both lines). A packet of that length with that header is
+not taken for uTP.
+---
+ common/sniff/bittorrent.go      |  6 ++++++
+ common/sniff/bittorrent_test.go | 18 ++++++++++++++++++
+ 2 files changed, 24 insertions(+)
+
+diff --git a/common/sniff/bittorrent.go b/common/sniff/bittorrent.go
+index e4d9f4b8f..d55a5ae66 100644
+--- a/common/sniff/bittorrent.go
++++ b/common/sniff/bittorrent.go
+@@ -64,6 +64,12 @@ func UTP(_ context.Context, metadata *adapter.InboundContext, packet []byte) err
+ 	if version != 1 || ty > 4 {
+ 		return os.ErrInvalid
+ 	}
++	// podkop-engine: a WireGuard handshake initiation (148 bytes, the type 1 as four
++	// little-endian bytes) reads as a uTP data packet without extensions and with
++	// connection id 0; it began every plain WireGuard tunnel taken for BitTorrent
++	if len(packet) == 148 && packet[1] == 0 && packet[2] == 0 && packet[3] == 0 {
++		return os.ErrInvalid
++	}
+ 
+ 	// Validate the extensions
+ 	extension := packet[1]
+diff --git a/common/sniff/bittorrent_test.go b/common/sniff/bittorrent_test.go
+index fcb5f6fa4..2ac7322de 100644
+--- a/common/sniff/bittorrent_test.go
++++ b/common/sniff/bittorrent_test.go
+@@ -108,3 +108,21 @@ func TestSniffNotUTP(t *testing.T) {
+ 		require.Error(t, err)
+ 	}
+ }
++
++// A WireGuard handshake initiation (148 bytes, type 1 as four little-endian bytes, then
++// the sender index, the ephemeral key and the encrypted fields) is not uTP: it began every
++// plain WireGuard tunnel taken for BitTorrent (podkop-engine).
++func TestSniffWireGuardInitiationIsNotUTP(t *testing.T) {
++	t.Parallel()
++	packet := make([]byte, 148)
++	packet[0] = 1
++	for i := 4; i < len(packet); i++ {
++		packet[i] = byte(i*37 + 11)
++	}
++	var metadata adapter.InboundContext
++	require.Error(t, sniff.UTP(context.TODO(), &metadata, packet))
++	require.Empty(t, metadata.Protocol)
++	// a uTP data packet of another length, with the same header, still is uTP
++	require.NoError(t, sniff.UTP(context.TODO(), &metadata, packet[:120]))
++	require.Equal(t, C.ProtocolBitTorrent, metadata.Protocol)
++}
+-- 
+2.53.0
+

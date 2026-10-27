@@ -1,0 +1,42 @@
+From 71c29fad4b19d1909f5836ffb606ec1439333a38 Mon Sep 17 00:00:00 2001
+From: FiyeroT <me@fiyero.xyz>
+Date: Tue, 27 Oct 2026 16:34:38 +0300
+Subject: [PATCH 162/171] go.mod: sing-vmess v0.2.9-pdk.2, with upstream's fix
+ of the close after a direct write under Vision
+
+The fork of sing-vmess on the sing of sing-box 1.14.4: upstream's a0c5854 (Vision
+closed the connection after a write in direct mode) with our copy loop that
+reads the connection under Vision in direct mode on top.
+---
+ go.mod | 2 +-
+ go.sum | 4 ++--
+ 2 files changed, 3 insertions(+), 3 deletions(-)
+
+diff --git a/go.mod b/go.mod
+index 4b0ed048b..f4bf8c02e 100644
+--- a/go.mod
++++ b/go.mod
+@@ -199,4 +199,4 @@ require (
+ 	zombiezen.com/go/capnproto2 v2.18.2+incompatible // indirect
+ )
+ 
+-replace github.com/sagernet/sing-vmess => github.com/FiyeroT/sing-vmess v0.2.9-pdk.1
++replace github.com/sagernet/sing-vmess => github.com/FiyeroT/sing-vmess v0.2.9-pdk.2
+diff --git a/go.sum b/go.sum
+index efb72cd66..717a2152f 100644
+--- a/go.sum
++++ b/go.sum
+@@ -10,8 +10,8 @@ filippo.io/edwards25519 v1.2.0/go.mod h1:xzAOLCNug/yB62zG1bQ8uziwrIqIuxhctzJT18Q
+ filippo.io/hpke v0.4.0 h1:p575VVQ6ted4pL+it6M00V/f2qTZITO0zgmdKCkd5+A=
+ filippo.io/hpke v0.4.0/go.mod h1:EmAN849/P3qdeK+PCMkDpDm83vRHM5cDipBJ8xbQLVY=
+ github.com/BurntSushi/toml v0.3.1/go.mod h1:xHWCNGjB5oqiDr8zfno3MHue2Ht5sIBksp03qcyfWMU=
+-github.com/FiyeroT/sing-vmess v0.2.9-pdk.1 h1:+fBtfTV63DE19qLO9TtgB1eLl9sqJlsTqeP4WVrzv3w=
+-github.com/FiyeroT/sing-vmess v0.2.9-pdk.1/go.mod h1:RVJpToy1dBdA+RLfTwE8UKIvIhjDovH6KOmBcxsdZUI=
++github.com/FiyeroT/sing-vmess v0.2.9-pdk.2 h1:34fCUSdGPPKIliJO4KRm8/M/UiYu7xpiVYiioP9AFYo=
++github.com/FiyeroT/sing-vmess v0.2.9-pdk.2/go.mod h1:3UpnVR3BO46zDE0bqwpIYuG4zwDC9Ui0QVgB8DpJcHo=
+ github.com/RyuaNerin/go-krypto v1.3.0 h1:smavTzSMAx8iuVlGb4pEwl9MD2qicqMzuXR2QWp2/Pg=
+ github.com/RyuaNerin/go-krypto v1.3.0/go.mod h1:9R9TU936laAIqAmjcHo/LsaXYOZlymudOAxjaBf62UM=
+ github.com/RyuaNerin/testingutil v0.1.0 h1:IYT6JL57RV3U2ml3dLHZsVtPOP6yNK7WUVdzzlpNrss=
+-- 
+2.53.0
+
