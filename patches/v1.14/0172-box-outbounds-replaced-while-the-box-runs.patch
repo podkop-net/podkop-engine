@@ -1,0 +1,2111 @@
+From fe08b588e7c65a0621bb74839d1d18b3d1bb3949 Mon Sep 17 00:00:00 2001
+From: FiyeroT <me@fiyero.xyz>
+Date: Thu, 29 Oct 2026 01:38:43 +0300
+Subject: [PATCH 172/174] box: outbounds replaced while the box runs
+
+UpdateOutbounds builds the given outbounds, each in a scope of its own,
+starts them after their dependencies among them and puts them in the
+manager under their tags; the router, the Clash API and the reference
+manager find outbounds by tag, so new connections go through them while
+open ones keep the objects of their chains. An outbound that stays may
+not depend on one that changes. A failure puts the outbounds of before
+back and closes the new ones.
+
+A urltest group that is replaced stops testing, choosing and judging;
+the group taking its tag keeps its choice when it has the same member
+and tests only the members without a result, three at a time. The
+groups count the connections they dialed by member.
+
+What was replaced or taken out is kept while a connection in the list
+of the Clash API goes through it, or a kept group dialed one through it,
+at least two minutes and at most a day; groups let go of their members
+after two minutes. Beyond a limit of kept servers the update is refused
+and the caller makes a new box.
+
+The block outbound is back in podkop_slim: a section whose group has no
+server refuses its connections through a selector of it.
+---
+ adapter/lifecycle_podkop.go             |  40 ++
+ adapter/lifecycle_podkop_test.go        |  65 +++
+ adapter/outbound/manager_podkop.go      |  90 ++++
+ adapter/outbound/manager_podkop_test.go | 112 +++++
+ box.go                                  |   1 +
+ box_podkop.go                           | 570 ++++++++++++++++++++++++
+ box_podkop_test.go                      | 381 ++++++++++++++++
+ export_podkop_test.go                   |  33 ++
+ include/podkop_slim_stub.go             |   5 +-
+ include/podkop_test.go                  |   2 +-
+ protocol/group/swap.go                  | 207 +++++++++
+ protocol/group/swap_test.go             | 222 +++++++++
+ protocol/group/urltest.go               |  81 +++-
+ protocol/group/urltest_failure.go       |   7 +-
+ 14 files changed, 1807 insertions(+), 9 deletions(-)
+ create mode 100644 adapter/lifecycle_podkop.go
+ create mode 100644 adapter/lifecycle_podkop_test.go
+ create mode 100644 adapter/outbound/manager_podkop.go
+ create mode 100644 adapter/outbound/manager_podkop_test.go
+ create mode 100644 box_podkop.go
+ create mode 100644 box_podkop_test.go
+ create mode 100644 export_podkop_test.go
+ create mode 100644 protocol/group/swap.go
+ create mode 100644 protocol/group/swap_test.go
+
+diff --git a/adapter/lifecycle_podkop.go b/adapter/lifecycle_podkop.go
+new file mode 100644
+index 000000000..aa174de2c
+--- /dev/null
++++ b/adapter/lifecycle_podkop.go
+@@ -0,0 +1,40 @@
++package adapter
++
++import (
++	"maps"
++	"slices"
++
++	E "github.com/sagernet/sing/common/exceptions"
++)
++
++// CloseComponent closes the scopes a component was started in, found among the children of
++// this scope and theirs, and lets go of them: the scopes hold the component no more. The
++// cleanups that close them with their parents stay and do nothing then. It tells whether the
++// component was found (podkop-engine: an outbound that was replaced while the box runs is
++// closed alone).
++//
++// A component may have more than one: the outbound manager starts an outbound in its scope,
++// but the start stage of one that is a Lifecycle in the scope of the endpoint manager (it is
++// an adapter.Endpoint by its methods).
++func (s *Scope) CloseComponent(component Lifecycle) (bool, error) {
++	taken := s.takeChildren(component, nil)
++	var errors []error
++	for _, child := range taken {
++		errors = append(errors, child.Close())
++	}
++	return len(taken) > 0, E.Errors(errors...)
++}
++
++func (s *Scope) takeChildren(component Lifecycle, taken []*Scope) []*Scope {
++	s.access.Lock()
++	if child, loaded := s.children[component]; loaded {
++		delete(s.children, component)
++		taken = append(taken, child)
++	}
++	children := slices.Collect(maps.Values(s.children))
++	s.access.Unlock()
++	for _, child := range children {
++		taken = child.takeChildren(component, taken)
++	}
++	return taken
++}
+diff --git a/adapter/lifecycle_podkop_test.go b/adapter/lifecycle_podkop_test.go
+new file mode 100644
+index 000000000..e6decb20a
+--- /dev/null
++++ b/adapter/lifecycle_podkop_test.go
+@@ -0,0 +1,65 @@
++package adapter_test
++
++import (
++	"context"
++	"testing"
++
++	"github.com/sagernet/sing-box/adapter"
++	"github.com/sagernet/sing-box/log"
++
++	"github.com/stretchr/testify/require"
++)
++
++type closeCounter struct {
++	closed int
++	child  adapter.Lifecycle
++}
++
++func (c *closeCounter) Start(stage adapter.StartStage, scope *adapter.Scope) error {
++	if stage != adapter.StartStateInitialize {
++		return nil
++	}
++	scope.Add(func() error {
++		c.closed++
++		return nil
++	})
++	if c.child != nil {
++		return scope.Start("child", c.child, stage)
++	}
++	return nil
++}
++
++// A component found anywhere below a scope is closed alone, once: the close of the scope
++// it was in does not close it again.
++func TestCloseComponent(t *testing.T) {
++	scope := adapter.NewScope(context.Background(), log.NewNOPFactory().Logger())
++	deep := &closeCounter{}
++	parent := &closeCounter{child: deep}
++	other := &closeCounter{}
++	require.NoError(t, scope.Start("parent", parent, adapter.StartStateInitialize))
++	require.NoError(t, scope.Start("other", other, adapter.StartStateInitialize))
++
++	found, err := scope.CloseComponent(deep)
++	require.True(t, found)
++	require.NoError(t, err)
++	require.Equal(t, 1, deep.closed)
++	require.Zero(t, parent.closed)
++	found, _ = scope.CloseComponent(deep)
++	require.False(t, found, "let go of")
++
++	// started in two scopes, as an outbound that is a Lifecycle is: closed in both
++	twice := &closeCounter{}
++	require.NoError(t, scope.Start("left", &closeCounter{child: twice}, adapter.StartStateInitialize))
++	require.NoError(t, scope.Start("right", &closeCounter{child: twice}, adapter.StartStateInitialize))
++	found, err = scope.CloseComponent(twice)
++	require.True(t, found)
++	require.NoError(t, err)
++	require.Equal(t, 2, twice.closed, "both scopes it was started in")
++
++	require.NoError(t, scope.Close())
++	require.Equal(t, 1, deep.closed)
++	require.Equal(t, 1, parent.closed)
++	require.Equal(t, 1, other.closed)
++	found, _ = scope.CloseComponent(other)
++	require.False(t, found, "a closed scope has no children")
++}
+diff --git a/adapter/outbound/manager_podkop.go b/adapter/outbound/manager_podkop.go
+new file mode 100644
+index 000000000..4d588ad4f
+--- /dev/null
++++ b/adapter/outbound/manager_podkop.go
+@@ -0,0 +1,90 @@
++package outbound
++
++import (
++	"context"
++	"os"
++
++	"github.com/sagernet/sing-box/adapter"
++	"github.com/sagernet/sing-box/log"
++	E "github.com/sagernet/sing/common/exceptions"
++)
++
++// What podkop-engine adds to the manager: an outbound built and started outside it takes the
++// place of the one of its tag while the box runs (box.UpdateOutbounds). Nothing here starts,
++// stops or closes an outbound.
++
++// NewOutbound builds an outbound as Create does, without putting it in the manager.
++func (m *Manager) NewOutbound(ctx context.Context, router adapter.Router, logger log.ContextLogger, tag string, outboundType string, options any) (adapter.Outbound, error) {
++	if tag == "" {
++		return nil, os.ErrInvalid
++	}
++	return m.registry.CreateOutbound(ctx, router, logger, tag, outboundType, options)
++}
++
++// SwapOutbounds puts each outbound of put in the place of the one of its tag, or after the
++// others when its tag is new, and takes out those of the tags in remove. It returns the
++// outbounds it replaced or took out. The list and the map are copied, not changed: who read
++// them before goes on with what was there. Nothing is changed when a tag is given twice, is
++// that of an endpoint, is to be removed and is not there, or is the default outbound's to be
++// removed. The default outbound that is replaced is the new one.
++func (m *Manager) SwapOutbounds(put []adapter.Outbound, remove []string) ([]adapter.Outbound, error) {
++	m.access.Lock()
++	defer m.access.Unlock()
++	replacing := make(map[string]adapter.Outbound, len(put))
++	for _, outbound := range put {
++		tag := outbound.Tag()
++		if tag == "" {
++			return nil, os.ErrInvalid
++		}
++		if _, given := replacing[tag]; given {
++			return nil, E.New("duplicate outbound tag: ", tag)
++		}
++		if _, isEndpoint := m.endpoint.Get(tag); isEndpoint {
++			return nil, E.New("outbound tag is that of an endpoint: ", tag)
++		}
++		replacing[tag] = outbound
++	}
++	removing := make(map[string]bool, len(remove))
++	for _, tag := range remove {
++		if _, given := replacing[tag]; given || removing[tag] {
++			return nil, E.New("duplicate outbound tag: ", tag)
++		}
++		if _, loaded := m.outboundByTag[tag]; !loaded {
++			return nil, E.New("outbound not found: ", tag)
++		}
++		if m.defaultOutbound != nil && m.defaultOutbound.Tag() == tag {
++			return nil, E.New("the default outbound cannot be removed: ", tag)
++		}
++		removing[tag] = true
++	}
++	outbounds := make([]adapter.Outbound, 0, len(m.outbounds)+len(put))
++	outboundByTag := make(map[string]adapter.Outbound, len(m.outboundByTag)+len(put))
++	var previous []adapter.Outbound
++	for _, outbound := range m.outbounds {
++		tag := outbound.Tag()
++		if removing[tag] {
++			previous = append(previous, outbound)
++			continue
++		}
++		if next, replaced := replacing[tag]; replaced {
++			previous = append(previous, outbound)
++			outbound = next
++		}
++		outbounds = append(outbounds, outbound)
++		outboundByTag[tag] = outbound
++	}
++	for _, outbound := range put {
++		if _, placed := outboundByTag[outbound.Tag()]; !placed {
++			outbounds = append(outbounds, outbound)
++			outboundByTag[outbound.Tag()] = outbound
++		}
++	}
++	if m.defaultOutbound != nil {
++		if next, replaced := replacing[m.defaultOutbound.Tag()]; replaced {
++			m.defaultOutbound = next
++		}
++	}
++	m.outbounds = outbounds
++	m.outboundByTag = outboundByTag
++	return previous, nil
++}
+diff --git a/adapter/outbound/manager_podkop_test.go b/adapter/outbound/manager_podkop_test.go
+new file mode 100644
+index 000000000..4964ff1d3
+--- /dev/null
++++ b/adapter/outbound/manager_podkop_test.go
+@@ -0,0 +1,112 @@
++package outbound_test
++
++import (
++	"context"
++	"net"
++	"os"
++	"testing"
++
++	"github.com/sagernet/sing-box/adapter"
++	"github.com/sagernet/sing-box/adapter/endpoint"
++	"github.com/sagernet/sing-box/adapter/outbound"
++	"github.com/sagernet/sing-box/log"
++	M "github.com/sagernet/sing/common/metadata"
++	N "github.com/sagernet/sing/common/network"
++
++	"github.com/stretchr/testify/require"
++)
++
++type swapOutbound struct {
++	outbound.Adapter
++}
++
++func newSwapOutbound(tag string) *swapOutbound {
++	return &swapOutbound{Adapter: outbound.NewAdapter("test", tag, []string{N.NetworkTCP}, nil)}
++}
++
++func (o *swapOutbound) DialContext(context.Context, string, M.Socksaddr) (net.Conn, error) {
++	return nil, os.ErrInvalid
++}
++
++func (o *swapOutbound) ListenPacket(context.Context, M.Socksaddr) (net.PacketConn, error) {
++	return nil, os.ErrInvalid
++}
++
++func tagsOf(outbounds []adapter.Outbound) []string {
++	tags := make([]string, len(outbounds))
++	for i, outbound := range outbounds {
++		tags[i] = outbound.Tag()
++	}
++	return tags
++}
++
++// newSwapManager is a manager of the outbounds of the tags, the first the default.
++func newSwapManager(t *testing.T, tags ...string) *outbound.Manager {
++	registry := outbound.NewRegistry()
++	outbound.Register[struct{}](registry, "test", func(ctx context.Context, router adapter.Router, logger log.ContextLogger, tag string, options struct{}) (adapter.Outbound, error) {
++		return newSwapOutbound(tag), nil
++	})
++	manager := outbound.NewManager(registry, endpoint.NewManager(nil), "")
++	for _, tag := range tags {
++		require.NoError(t, manager.Create(context.Background(), nil, nil, tag, "test", &struct{}{}))
++	}
++	return manager
++}
++
++// An outbound takes the place of the one of its tag, a new tag goes after the others, and
++// a removed one is gone; who read the list before keeps it as it was.
++func TestSwapOutbounds(t *testing.T) {
++	manager := newSwapManager(t, "a", "b", "c")
++	before := manager.Outbounds()
++	oldB, _ := manager.Outbound("b")
++	oldC, _ := manager.Outbound("c")
++	newB, d := newSwapOutbound("b"), newSwapOutbound("d")
++
++	previous, err := manager.SwapOutbounds([]adapter.Outbound{d, newB}, []string{"c"})
++	require.NoError(t, err)
++	require.ElementsMatch(t, []adapter.Outbound{oldB, oldC}, previous)
++	require.Equal(t, []string{"a", "b", "d"}, tagsOf(manager.Outbounds()))
++	found, loaded := manager.Outbound("b")
++	require.True(t, loaded)
++	require.Same(t, adapter.Outbound(newB), found)
++	_, loaded = manager.Outbound("c")
++	require.False(t, loaded)
++	require.Equal(t, []string{"a", "b", "c"}, tagsOf(before))
++	require.Same(t, oldB, before[1])
++
++	// the default outbound is replaced, never removed
++	newA := newSwapOutbound("a")
++	_, err = manager.SwapOutbounds([]adapter.Outbound{newA}, nil)
++	require.NoError(t, err)
++	require.Same(t, adapter.Outbound(newA), manager.Default())
++	_, err = manager.SwapOutbounds(nil, []string{"a"})
++	require.ErrorContains(t, err, "default outbound")
++
++	// what cannot be done changes nothing
++	for _, testCase := range []struct {
++		put    []adapter.Outbound
++		remove []string
++	}{
++		{[]adapter.Outbound{newSwapOutbound("e"), newSwapOutbound("e")}, nil},
++		{[]adapter.Outbound{newSwapOutbound("b")}, []string{"b"}},
++		{nil, []string{"missing"}},
++		{nil, []string{"d", "d"}},
++	} {
++		listed := manager.Outbounds()
++		_, err = manager.SwapOutbounds(testCase.put, testCase.remove)
++		require.Error(t, err)
++		require.Equal(t, listed, manager.Outbounds())
++	}
++}
++
++// NewOutbound builds what Create would, and puts nothing in the manager.
++func TestNewOutbound(t *testing.T) {
++	manager := newSwapManager(t, "a")
++	created, err := manager.NewOutbound(context.Background(), nil, nil, "a", "test", &struct{}{})
++	require.NoError(t, err)
++	require.Equal(t, "a", created.Tag())
++	found, _ := manager.Outbound("a")
++	require.NotSame(t, created, found)
++	_, err = manager.NewOutbound(context.Background(), nil, nil, "", "test", &struct{}{})
++	require.Error(t, err)
++}
+diff --git a/box.go b/box.go
+index fa5c5a511..60e450dbd 100644
+--- a/box.go
++++ b/box.go
+@@ -59,6 +59,7 @@ type Box struct {
+ 	internalService     []adapter.LifecycleService
+ 	ntpService          *ntp.Service
+ 	scope               *adapter.Scope
++	hot                 hotOutbounds // outbounds changed while the box runs (podkop-engine)
+ }
+ 
+ type Options struct {
+diff --git a/box_podkop.go b/box_podkop.go
+new file mode 100644
+index 000000000..2c5faa6fa
+--- /dev/null
++++ b/box_podkop.go
+@@ -0,0 +1,570 @@
++package box
++
++import (
++	"slices"
++	"sync"
++	"time"
++
++	"github.com/sagernet/sing-box/adapter"
++	"github.com/sagernet/sing-box/common/trafficcontrol"
++	"github.com/sagernet/sing-box/common/urltest"
++	"github.com/sagernet/sing-box/option"
++	E "github.com/sagernet/sing/common/exceptions"
++	F "github.com/sagernet/sing/common/format"
++	N "github.com/sagernet/sing/common/network"
++	"github.com/sagernet/sing/service"
++)
++
++// Outbounds changed while the box runs (podkop-engine).
++//
++// The router, the Clash API and the reference manager find an outbound by its tag for every
++// connection. UpdateOutbounds builds the new outbounds, each in a scope of its own, starts
++// them and puts them in the manager under their tags; a connection routed after that goes
++// through them, and one routed before keeps the objects of its chain. The outbounds that
++// were replaced or taken out are kept until no connection goes through them (drainOutbounds).
++
++var (
++	// drainMin is how long an outbound that was replaced or taken out is kept at least: a dial
++	// no list shows may still use it (a download through a server, a test).
++	drainMin = 2 * time.Minute
++	// drainMax is how long it is kept at most: a connection older than that through it is cut
++	// when its transport is shared (gRPC, HTTP/2, XHTTP, QUIC, multiplex).
++	drainMax = 24 * time.Hour
++	// drainEvery is how often the connections are looked at.
++	drainEvery = 30 * time.Second
++)
++
++// ErrTooManyKept is what UpdateOutbounds returns when more outbounds of the changes before
++// than its limit still carry connections: a new box lets them all go.
++var ErrTooManyKept = E.New("too many outbounds of the changes before still carry connections")
++
++// OutboundUpdate tells what UpdateOutbounds changed.
++type OutboundUpdate struct {
++	Added    int
++	Replaced int
++	Removed  int
++	// Kept is how many of the outbounds replaced or taken out, by this change and those
++	// before, are not closed yet.
++	Kept int
++}
++
++// hotOutbounds is what UpdateOutbounds keeps between its calls. access is held for a whole
++// update.
++type hotOutbounds struct {
++	access sync.Mutex
++	// scopes are those of the outbounds UpdateOutbounds started: in the manager, or kept
++	scopes map[adapter.Outbound]*adapter.Scope
++	kept   []*keptOutbound
++	// draining tells that drainOutbounds runs, closing that a cleanup of the box closes the
++	// outbounds of scopes, closed that it did
++	draining bool
++	closing  bool
++	closed   bool
++}
++
++type keptOutbound struct {
++	outbound adapter.Outbound
++	since    time.Time
++	// needs are what it goes through while a connection goes through it: the outbound it
++	// dials through, the member a selector chose. A urltest group tells its own
++	// (memberUser).
++	needs []adapter.Outbound
++}
++
++// What the groups do in an update (protocol/group).
++type (
++	// outboundSuccessor takes over what the outbound it replaces knew; called after the
++	// start stage, before it is started
++	outboundSuccessor interface {
++		TakeOver(previous adapter.Outbound)
++	}
++	// retiringOutbound stops what it does on its own once it is replaced or taken out
++	retiringOutbound interface {
++		Retire()
++	}
++	// memberReleaser lets go of its members, drainMin after it was replaced or taken out:
++	// a connection holds the outbounds of its chain as long as the Clash API lists it, and
++	// a group must not hold all its members with it
++	memberReleaser interface {
++		ReleaseMembers()
++	}
++	// memberUser tells the members the connections it dialed go through now
++	memberUser interface {
++		MembersInUse() []adapter.Outbound
++	}
++)
++
++// UpdateOutbounds changes the outbounds of the started box while it runs (podkop-engine).
++// Each of outbounds is built, started after those of its dependencies among them, and takes
++// the place of the outbound of its tag, or is added; the outbounds of the tags in remove are
++// taken out. A urltest group that is replaced stops testing and choosing, and the one that
++// replaces it takes over its choice and tests only the members without a test result. An
++// outbound replaced or taken out is closed once no connection goes through it, at least
++// drainMin and at most drainMax after.
++//
++// An outbound that stays must not depend on one that is replaced or taken out: it keeps the
++// one it found at its start. Such an update is refused, and so is one while more than limit
++// outbounds that are not groups are kept (0: no limit, ErrTooManyKept). The caller makes sure
++// that no DNS server or HTTP client dials through an outbound that changes, for the same
++// reason. Nothing is changed by an update that is refused or fails: the outbounds of before
++// are put back and the new ones closed.
++func (s *Box) UpdateOutbounds(outbounds []option.Outbound, remove []string, limit int) (OutboundUpdate, error) {
++	hot := &s.hot
++	hot.access.Lock()
++	defer hot.access.Unlock()
++	var update OutboundUpdate
++	ctx := s.scope.Context()
++	if !hot.closing && !hot.closed {
++		hot.closing = true
++		s.scope.Add(s.closeHotOutbounds)
++	}
++	// after the cleanup is in: a box that began to close since has its context canceled
++	if hot.closed || ctx.Err() != nil {
++		return update, E.New("sing-box is closed")
++	}
++	if limit > 0 && hot.keptServers() > limit {
++		return update, ErrTooManyKept
++	}
++	current := make(map[string]adapter.Outbound)
++	for _, outbound := range s.outbound.Outbounds() {
++		current[outbound.Tag()] = outbound
++	}
++	given := make(map[string]bool, len(outbounds))
++	changed := make(map[string]bool, len(outbounds)+len(remove))
++	for i, options := range outbounds {
++		switch {
++		case options.Tag == "":
++			return update, E.New("outbound[", i, "]: missing tag")
++		case given[options.Tag]:
++			return update, E.New("duplicate outbound tag: ", options.Tag)
++		}
++		given[options.Tag] = true
++		if _, exists := current[options.Tag]; exists {
++			changed[options.Tag] = true
++		} else if _, isEndpoint := s.endpoint.Get(options.Tag); isEndpoint {
++			return update, E.New("outbound tag is that of an endpoint: ", options.Tag)
++		}
++	}
++	for _, tag := range remove {
++		if given[tag] || changed[tag] {
++			return update, E.New("outbound ", tag, " is given and removed")
++		}
++		if _, exists := current[tag]; !exists {
++			return update, E.New("outbound to remove not found: ", tag)
++		}
++		changed[tag] = true
++	}
++	stays := make([]adapter.Outbound, 0, len(current))
++	for _, outbound := range s.outbound.Outbounds() {
++		if !changed[outbound.Tag()] && !given[outbound.Tag()] {
++			stays = append(stays, outbound)
++		}
++	}
++	for _, endpoint := range s.endpoint.Endpoints() {
++		stays = append(stays, endpoint)
++	}
++	for _, outbound := range stays {
++		for _, dependency := range outbound.Dependencies() {
++			if changed[dependency] {
++				return update, E.New("outbound ", outbound.Tag(), " goes through ", dependency, ", which changes: it has to be given too")
++			}
++		}
++	}
++	// what the outbounds that go need while they are kept: the objects of now
++	needs := make(map[adapter.Outbound][]adapter.Outbound)
++	for tag := range changed {
++		outbound := current[tag]
++		needs[outbound] = outboundNeeds(outbound, current)
++	}
++
++	entries := make([]*hotEntry, 0, len(outbounds))
++	closeEntries := func() {
++		for _, entry := range slices.Backward(entries) {
++			// a group that was not started registered no close of its own
++			if retiring, isRetiring := entry.outbound.(retiringOutbound); isRetiring {
++				retiring.Retire()
++			}
++			err := entry.scope.Close()
++			if err != nil {
++				s.logger.Warn("close outbound/", entry.outbound.Type(), "[", entry.outbound.Tag(), "]: ", err)
++			}
++		}
++	}
++	for _, options := range outbounds {
++		scope := adapter.NewScope(ctx, s.logFactory.Logger())
++		outboundCtx := adapter.WithContext(scope.Context(), &adapter.InboundContext{Outbound: options.Tag})
++		outbound, err := s.outbound.NewOutbound(outboundCtx, s.router, s.logFactory.NewLogger(F.ToString("outbound/", options.Type, "[", options.Tag, "]")),
++			options.Tag, options.Type, options.Options)
++		if err != nil {
++			scope.Close()
++			closeEntries()
++			return update, E.Cause(err, "initialize outbound[", options.Tag, "]")
++		}
++		entries = append(entries, &hotEntry{outbound: outbound, scope: scope, previous: current[options.Tag]})
++	}
++	// a new outbound must not go through one taken out: it would find it at its start, still
++	// in the manager, and keep it
++	removing := make(map[string]bool, len(remove))
++	for _, tag := range remove {
++		removing[tag] = true
++	}
++	for _, entry := range entries {
++		for _, dependency := range entry.outbound.Dependencies() {
++			if removing[dependency] {
++				closeEntries()
++				return update, E.New("outbound ", entry.outbound.Tag(), " goes through ", dependency, ", which is removed")
++			}
++		}
++	}
++	layers, err := hotLayers(entries)
++	if err != nil {
++		closeEntries()
++		return update, err
++	}
++
++	var (
++		previous []adapter.Outbound
++		added    []string
++		removed  []adapter.Outbound
++	)
++	rollback := func(cause error) error {
++		_, swapErr := s.outbound.SwapOutbounds(append(previous, removed...), added)
++		if swapErr != nil {
++			s.logger.Error("put back the outbounds of before: ", swapErr)
++		}
++		closeEntries()
++		return cause
++	}
++	for _, layer := range layers {
++		put := make([]adapter.Outbound, len(layer))
++		for i, entry := range layer {
++			for _, stage := range []adapter.StartStage{adapter.StartStateInitialize, adapter.StartStateStart} {
++				err = entry.start(stage)
++				if err != nil {
++					return update, rollback(err)
++				}
++			}
++			put[i] = entry.outbound
++		}
++		replaced, err := s.outbound.SwapOutbounds(put, nil)
++		if err != nil {
++			return update, rollback(err)
++		}
++		previous = append(previous, replaced...)
++		for _, entry := range layer {
++			if entry.previous == nil {
++				added = append(added, entry.outbound.Tag())
++			}
++		}
++	}
++	if len(remove) > 0 {
++		removed, err = s.outbound.SwapOutbounds(nil, remove)
++		if err != nil {
++			return update, rollback(err)
++		}
++	}
++	// What the groups found through an outbound that is replaced or taken out is not the result of
++	// the one that takes its tag: forgotten before the new groups look at the results, so they test
++	// it. A round of a group being replaced may have stored one up to now.
++	if history := service.PtrFromContext[urltest.HistoryStorage](ctx); history != nil {
++		for _, outbound := range append(slices.Clone(previous), removed...) {
++			if _, isGroup := outbound.(adapter.OutboundGroup); !isGroup {
++				history.DeleteURLTestHistory(outbound.Tag())
++			}
++		}
++	}
++	for _, entry := range entries {
++		if successor, isSuccessor := entry.outbound.(outboundSuccessor); isSuccessor && entry.previous != nil {
++			successor.TakeOver(entry.previous)
++		}
++	}
++	for _, layer := range layers {
++		for _, entry := range layer {
++			for _, stage := range []adapter.StartStage{adapter.StartStatePostStart, adapter.StartStateStarted} {
++				err = entry.start(stage)
++				if err != nil {
++					return update, rollback(err)
++				}
++			}
++		}
++	}
++
++	if hot.scopes == nil {
++		hot.scopes = make(map[adapter.Outbound]*adapter.Scope)
++	}
++	for _, entry := range entries {
++		hot.scopes[entry.outbound] = entry.scope
++	}
++	now := time.Now()
++	retired := append(previous, removed...)
++	for _, outbound := range retired {
++		if retiring, isRetiring := outbound.(retiringOutbound); isRetiring {
++			retiring.Retire()
++		}
++		hot.kept = append(hot.kept, &keptOutbound{outbound: outbound, since: now, needs: needs[outbound]})
++	}
++	time.AfterFunc(drainMin, func() {
++		for _, outbound := range retired {
++			if releaser, isReleaser := outbound.(memberReleaser); isReleaser {
++				releaser.ReleaseMembers()
++			}
++		}
++	})
++	if !hot.draining && len(hot.kept) > 0 {
++		hot.draining = true
++		go s.drainOutbounds(drainEvery)
++	}
++	// the reference manager looks at the outbounds again: which keep their idle connections
++	if history := service.PtrFromContext[urltest.HistoryStorage](ctx); history != nil {
++		history.NotifyUpdated()
++	}
++	update.Added = len(added)
++	update.Replaced = len(previous)
++	update.Removed = len(removed)
++	update.Kept = len(hot.kept)
++	return update, nil
++}
++
++type hotEntry struct {
++	outbound adapter.Outbound
++	scope    *adapter.Scope
++	// previous is the outbound of the tag before, nil for a new tag
++	previous adapter.Outbound
++}
++
++func (e *hotEntry) start(stage adapter.StartStage) error {
++	lifecycle, isLifecycle := e.outbound.(adapter.Lifecycle)
++	if !isLifecycle {
++		return nil
++	}
++	return e.scope.Start("outbound/"+e.outbound.Type()+"["+e.outbound.Tag()+"]", lifecycle, stage)
++}
++
++// hotLayers orders the entries by their dependencies among them: an entry is in a layer
++// after those of what it depends on.
++func hotLayers(entries []*hotEntry) ([][]*hotEntry, error) {
++	byTag := make(map[string]*hotEntry, len(entries))
++	for _, entry := range entries {
++		byTag[entry.outbound.Tag()] = entry
++	}
++	layerOf := make(map[*hotEntry]int, len(entries))
++	var place func(entry *hotEntry, path []string) (int, error)
++	place = func(entry *hotEntry, path []string) (int, error) {
++		if layer, placed := layerOf[entry]; placed {
++			if layer < 0 {
++				return 0, E.New("circular outbound dependency: ", path)
++			}
++			return layer, nil
++		}
++		layerOf[entry] = -1
++		layer := 0
++		for _, dependency := range entry.outbound.Dependencies() {
++			needed, isEntry := byTag[dependency]
++			if !isEntry {
++				continue
++			}
++			neededLayer, err := place(needed, append(path, dependency))
++			if err != nil {
++				return 0, err
++			}
++			layer = max(layer, neededLayer+1)
++		}
++		layerOf[entry] = layer
++		return layer, nil
++	}
++	var layers [][]*hotEntry
++	for _, entry := range entries {
++		layer, err := place(entry, []string{entry.outbound.Tag()})
++		if err != nil {
++			return nil, err
++		}
++		for len(layers) <= layer {
++			layers = append(layers, nil)
++		}
++		layers[layer] = append(layers[layer], entry)
++	}
++	return layers, nil
++}
++
++// outboundNeeds is what an outbound that goes goes through while it is kept, of the
++// outbounds of now (keptOutbound.needs).
++func outboundNeeds(outbound adapter.Outbound, current map[string]adapter.Outbound) []adapter.Outbound {
++	if _, isUser := outbound.(memberUser); isUser {
++		return nil
++	}
++	var needs []adapter.Outbound
++	if group, isGroup := outbound.(adapter.OutboundGroup); isGroup {
++		for _, network := range []string{N.NetworkTCP, N.NetworkUDP} {
++			if selected := group.Selected(network); selected != nil && !slices.Contains(needs, selected) {
++				needs = append(needs, selected)
++			}
++		}
++		return needs
++	}
++	for _, dependency := range outbound.Dependencies() {
++		if needed, exists := current[dependency]; exists {
++			needs = append(needs, needed)
++		}
++	}
++	return needs
++}
++
++// keptServers counts the kept outbounds that are not groups: those that hold the memory.
++func (h *hotOutbounds) keptServers() int {
++	var count int
++	for _, kept := range h.kept {
++		if _, isGroup := kept.outbound.(adapter.OutboundGroup); !isGroup {
++			count++
++		}
++	}
++	return count
++}
++
++// drainOutbounds closes the kept outbounds that no connection goes through any more, every so
++// often, until none is kept or the box closes.
++func (s *Box) drainOutbounds(every time.Duration) {
++	ticker := time.NewTicker(every)
++	defer ticker.Stop()
++	done := s.scope.Context().Done()
++	for {
++		select {
++		case <-done:
++			return
++		case <-ticker.C:
++		}
++		if !s.drainOnce(time.Now()) {
++			return
++		}
++	}
++}
++
++// drainOnce closes the kept outbounds that may be closed at now, and tells whether any is
++// still kept.
++func (s *Box) drainOnce(now time.Time) bool {
++	hot := &s.hot
++	hot.access.Lock()
++	if hot.closed {
++		hot.draining = false
++		hot.access.Unlock()
++		return false
++	}
++	held, known := s.heldOutbounds(hot.kept)
++	var (
++		closing []*keptOutbound
++		scopes  []*adapter.Scope
++		cut     int
++		kept    = make([]*keptOutbound, 0, len(hot.kept))
++	)
++	for _, outbound := range hot.kept {
++		age := now.Sub(outbound.since)
++		if age < drainMin || age < drainMax && (!known || held[outbound.outbound]) {
++			kept = append(kept, outbound)
++			continue
++		}
++		if held[outbound.outbound] {
++			cut++
++		}
++		closing = append(closing, outbound)
++	}
++	// the groups first: what went through a member is closed before it
++	slices.SortStableFunc(closing, func(a, b *keptOutbound) int {
++		_, aGroup := a.outbound.(adapter.OutboundGroup)
++		_, bGroup := b.outbound.(adapter.OutboundGroup)
++		switch {
++		case aGroup && !bGroup:
++			return -1
++		case bGroup && !aGroup:
++			return 1
++		}
++		return 0
++	})
++	for _, outbound := range closing {
++		scopes = append(scopes, hot.scopes[outbound.outbound])
++		delete(hot.scopes, outbound.outbound)
++	}
++	hot.kept = kept
++	hot.draining = len(kept) > 0
++	hot.access.Unlock()
++	for i, outbound := range closing {
++		var err error
++		if scopes[i] != nil {
++			err = scopes[i].Close()
++		} else if lifecycle, isLifecycle := outbound.outbound.(adapter.Lifecycle); isLifecycle {
++			_, err = s.scope.CloseComponent(lifecycle)
++		}
++		if err != nil {
++			s.logger.Warn("close outbound/", outbound.outbound.Type(), "[", outbound.outbound.Tag(), "]: ", err)
++		}
++	}
++	if cut > 0 {
++		s.logger.Info("closed ", cut, " replaced outbounds that still carried connections, ", drainMax, " after the change")
++	}
++	if len(closing) > 0 {
++		s.logger.Debug("closed ", len(closing), " replaced outbounds, ", len(kept), " still kept")
++	}
++	return len(kept) > 0
++}
++
++// heldOutbounds finds the kept outbounds a connection goes through: those in the chain of an
++// open connection, a kept urltest group that dialed a connection that is open and the member
++// it went through, and what these go through (keptOutbound.needs). It tells false when no connection is
++// tracked (no Clash API): every kept outbound is held then.
++func (s *Box) heldOutbounds(kept []*keptOutbound) (map[adapter.Outbound]bool, bool) {
++	connections := service.PtrFromContext[trafficcontrol.Manager](s.scope.Context())
++	if connections == nil {
++		return nil, false
++	}
++	index := make(map[adapter.Outbound]*keptOutbound, len(kept))
++	for _, outbound := range kept {
++		index[outbound.outbound] = outbound
++	}
++	held := make(map[adapter.Outbound]bool)
++	var queue []*keptOutbound
++	hold := func(outbound adapter.Outbound) {
++		if keptOutbound, isKept := index[outbound]; isKept && !held[outbound] {
++			held[outbound] = true
++			queue = append(queue, keptOutbound)
++		}
++	}
++	for _, connection := range connections.Connections() {
++		for _, outbound := range connection.Metadata.OutboundChain {
++			hold(outbound)
++		}
++	}
++	for _, outbound := range kept {
++		if user, isUser := outbound.outbound.(memberUser); isUser {
++			// the group too: it is asked again at the next look
++			if members := user.MembersInUse(); len(members) > 0 {
++				hold(outbound.outbound)
++				for _, member := range members {
++					hold(member)
++				}
++			}
++		}
++	}
++	for len(queue) > 0 {
++		outbound := queue[len(queue)-1]
++		queue = queue[:len(queue)-1]
++		for _, needed := range outbound.needs {
++			hold(needed)
++		}
++	}
++	return held, true
++}
++
++// closeHotOutbounds closes the outbounds UpdateOutbounds started, with the box: the scope of
++// the box does not hold them.
++func (s *Box) closeHotOutbounds() error {
++	hot := &s.hot
++	hot.access.Lock()
++	hot.closed = true
++	scopes := hot.scopes
++	hot.scopes = nil
++	hot.kept = nil
++	hot.access.Unlock()
++	var errors []error
++	for _, scope := range scopes {
++		errors = append(errors, scope.Close())
++	}
++	return E.Errors(errors...)
++}
+diff --git a/box_podkop_test.go b/box_podkop_test.go
+new file mode 100644
+index 000000000..8ef800831
+--- /dev/null
++++ b/box_podkop_test.go
+@@ -0,0 +1,381 @@
++package box_test
++
++import (
++	"context"
++	"net"
++	"net/http"
++	"net/http/httptest"
++	"os"
++	"strings"
++	"sync/atomic"
++	"testing"
++	"time"
++
++	"github.com/sagernet/sing-box"
++	"github.com/sagernet/sing-box/adapter"
++	"github.com/sagernet/sing-box/adapter/outbound"
++	"github.com/sagernet/sing-box/common/urltest"
++	"github.com/sagernet/sing-box/experimental/deprecated"
++	"github.com/sagernet/sing-box/include"
++	"github.com/sagernet/sing-box/log"
++	"github.com/sagernet/sing-box/option"
++	E "github.com/sagernet/sing/common/exceptions"
++	"github.com/sagernet/sing/common/json"
++	M "github.com/sagernet/sing/common/metadata"
++	N "github.com/sagernet/sing/common/network"
++	"github.com/sagernet/sing/service"
++
++	"github.com/stretchr/testify/require"
++)
++
++// testServer stands for a server: it dials the destination itself, can be told to fail its
++// start, and records its close.
++type testServer struct {
++	outbound.Adapter
++	fail   bool
++	closed atomic.Bool
++}
++
++type testServerOptions struct {
++	Fail    bool `json:"fail,omitempty"`
++	Version int  `json:"version,omitempty"`
++}
++
++func newTestServer(ctx context.Context, router adapter.Router, logger log.ContextLogger, tag string, options testServerOptions) (adapter.Outbound, error) {
++	return &testServer{Adapter: outbound.NewAdapter("testserver", tag, []string{N.NetworkTCP, N.NetworkUDP}, nil), fail: options.Fail}, nil
++}
++
++func (s *testServer) Start(stage adapter.StartStage, scope *adapter.Scope) error {
++	switch stage {
++	case adapter.StartStateInitialize:
++		scope.Add(func() error {
++			s.closed.Store(true)
++			return nil
++		})
++	case adapter.StartStateStart:
++		if s.fail {
++			return E.New("this server does not start")
++		}
++	}
++	return nil
++}
++
++func (s *testServer) DialContext(ctx context.Context, network string, destination M.Socksaddr) (net.Conn, error) {
++	return (&net.Dialer{}).DialContext(ctx, network, destination.String())
++}
++
++func (s *testServer) ListenPacket(context.Context, M.Socksaddr) (net.PacketConn, error) {
++	return nil, os.ErrInvalid
++}
++
++type quietWriter struct{}
++
++func (quietWriter) WriteMessage(log.Level, string) {}
++
++// hotTest is a started box of the servers s1 and s2, a urltest group g of them and a selector
++// sel of the group and the servers, as podkop makes a section of a group.
++type hotTest struct {
++	t       *testing.T
++	ctx     context.Context
++	box     *box.Box
++	history *urltest.HistoryStorage
++	link    string
++	target  string
++}
++
++func newHotTest(t *testing.T) *hotTest {
++	t.Cleanup(box.DrainEvery(time.Hour))
++	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		w.WriteHeader(http.StatusNoContent)
++	}))
++	t.Cleanup(server.Close)
++	// what the connections of the tests go to: it holds them open until they are closed
++	listener, err := net.Listen("tcp", "127.0.0.1:0")
++	require.NoError(t, err)
++	t.Cleanup(func() { listener.Close() })
++	go func() {
++		for {
++			conn, err := listener.Accept()
++			if err != nil {
++				return
++			}
++			go func() {
++				conn.Read(make([]byte, 1))
++				conn.Close()
++			}()
++		}
++	}()
++	registry := include.OutboundRegistry()
++	outbound.Register[testServerOptions](registry, "testserver", newTestServer)
++	history := urltest.NewHistoryStorage()
++	ctx := service.ContextWithPtr(service.ContextWith(context.Background(), deprecated.NewStderrManager(log.StdLogger())), history)
++	ctx = box.Context(ctx, include.InboundRegistry(), registry, include.EndpointRegistry(), include.DNSTransportRegistry(), include.ServiceRegistry(), include.CertificateProviderRegistry())
++	test := &hotTest{t: t, ctx: ctx, history: history, link: server.URL, target: listener.Addr().String()}
++	options, err := json.UnmarshalExtendedContext[option.Options](ctx, []byte(`{
++		"log": {"level": "error"},
++		"outbounds": [
++			{"type": "direct", "tag": "direct-out"},
++			{"type": "testserver", "tag": "s1"},
++			{"type": "testserver", "tag": "s2"},
++			`+test.group("g", "s1", "s2")+`,
++			{"type": "selector", "tag": "sel", "outbounds": ["g", "s1", "s2"], "default": "g"}
++		]
++	}`))
++	require.NoError(t, err)
++	instance, err := box.New(box.Options{Context: ctx, Options: options, PlatformLogWriter: quietWriter{}})
++	require.NoError(t, err)
++	require.NoError(t, instance.Start())
++	t.Cleanup(func() { instance.Close() })
++	test.box = instance
++	require.Eventually(t, func() bool {
++		return test.tested("s1") && test.tested("s2")
++	}, 5*time.Second, 10*time.Millisecond)
++	test.outbound("g").(interface{ CheckOutbounds() }).CheckOutbounds()
++	return test
++}
++
++func (h *hotTest) group(tag string, members ...string) string {
++	return `{"type": "urltest", "tag": "` + tag + `", "outbounds": ["` + strings.Join(members, `", "`) + `"], "url": "` + h.link + `", "interval": "1m"}`
++}
++
++func (h *hotTest) outbound(tag string) adapter.Outbound {
++	found, loaded := h.box.Outbound().Outbound(tag)
++	require.True(h.t, loaded, tag)
++	return found
++}
++
++func (h *hotTest) server(tag string) *testServer {
++	return h.outbound(tag).(*testServer)
++}
++
++func (h *hotTest) group1(tag string) adapter.URLTestGroup {
++	return h.outbound(tag).(adapter.URLTestGroup)
++}
++
++func (h *hotTest) tested(tag string) bool {
++	return h.history.LoadURLTestHistory(tag) != nil
++}
++
++// parse reads outbounds written as in a configuration.
++func (h *hotTest) parse(outbounds string) []option.Outbound {
++	options, err := json.UnmarshalExtendedContext[option.Options](h.ctx, []byte(`{"outbounds": [`+outbounds+`]}`))
++	require.NoError(h.t, err)
++	return options.Outbounds
++}
++
++// update gives the outbounds, written as in a configuration.
++func (h *hotTest) update(outbounds string, remove []string, limit int) (box.OutboundUpdate, error) {
++	return h.box.UpdateOutbounds(h.parse(outbounds), remove, limit)
++}
++
++// replaceS2 is the change of a server under its tag: s2, the group and the selector are
++// replaced, s3 added, s1 stays.
++func (h *hotTest) replaceS2() box.OutboundUpdate {
++	update, err := h.update(`{"type": "testserver", "tag": "s2", "version": 2}, {"type": "testserver", "tag": "s3"}, `+
++		h.group("g", "s1", "s2", "s3")+`, {"type": "selector", "tag": "sel", "outbounds": ["g", "s1", "s2", "s3"], "default": "g"}`, nil, 0)
++	require.NoError(h.t, err)
++	return update
++}
++
++func (h *hotTest) dial(through adapter.Outbound) net.Conn {
++	conn, err := through.DialContext(context.Background(), N.NetworkTCP, M.ParseSocksaddr(h.target))
++	require.NoError(h.t, err)
++	h.t.Cleanup(func() { conn.Close() })
++	return conn
++}
++
++// track lists a connection with the chain in the Clash API, as the router does.
++func (h *hotTest) track(chain ...adapter.Outbound) net.Conn {
++	client, server := net.Pipe()
++	h.t.Cleanup(func() { server.Close() })
++	tracked := h.box.TrafficManager().RoutedConnection(context.Background(), client, adapter.InboundContext{OutboundChain: chain}, nil, chain[0])
++	h.t.Cleanup(func() { tracked.Close() })
++	return tracked
++}
++
++// The new outbounds take the tags; the server that did not change stays the same object; the
++// group that is replaced stops, and the new one keeps its choice of that server and tests the
++// servers without a result.
++func TestUpdateOutbounds(t *testing.T) {
++	h := newHotTest(t)
++	s1, s2, g, sel := h.outbound("s1"), h.outbound("s2"), h.outbound("g"), h.outbound("sel")
++	chosen := g.(adapter.OutboundGroup).Selected(N.NetworkTCP)
++	require.NotNil(t, chosen)
++	h.history.DeleteURLTestHistory("s2") // what the backend does for a server that changed
++
++	update := h.replaceS2()
++	require.Equal(t, box.OutboundUpdate{Added: 1, Replaced: 3, Removed: 0, Kept: 3}, update)
++	require.Same(t, s1, h.outbound("s1"))
++	require.NotSame(t, s2, h.outbound("s2"))
++	require.NotSame(t, g, h.outbound("g"))
++	require.NotSame(t, sel, h.outbound("sel"))
++	require.Equal(t, []string{"g", "s1", "s2", "s3"}, h.outbound("sel").(adapter.OutboundGroup).All())
++	if chosen == s1 {
++		require.Same(t, s1, h.group1("g").Selected(N.NetworkTCP), "the choice of the group before")
++	}
++	_, err := g.(adapter.URLTestGroup).URLTest(context.Background())
++	require.Error(t, err, "the group before is stopped")
++	require.Eventually(t, func() bool { return h.tested("s3") && h.tested("s2") }, 5*time.Second, 10*time.Millisecond)
++
++	// what goes through the new selector goes through the new group
++	h.dial(h.outbound("sel"))
++	require.NotEmpty(t, h.outbound("g").(interface{ MembersInUse() []adapter.Outbound }).MembersInUse())
++
++	// a server taken out, and the group without it
++	update, err = h.update(h.group("g", "s2", "s3")+`, {"type": "selector", "tag": "sel", "outbounds": ["g", "s2", "s3"], "default": "g"}`, []string{"s1"}, 0)
++	require.NoError(t, err)
++	require.Equal(t, box.OutboundUpdate{Added: 0, Replaced: 2, Removed: 1, Kept: 6}, update)
++	_, loaded := h.box.Outbound().Outbound("s1")
++	require.False(t, loaded)
++}
++
++// What the groups found through an outbound that is replaced is not kept for the one that takes
++// its tag: the new group tests it, while an outbound that stays keeps its result.
++func TestUpdateOutboundsForgetsTheReplaced(t *testing.T) {
++	h := newHotTest(t)
++	s1Before, s2Before := h.history.LoadURLTestHistory("s1"), h.history.LoadURLTestHistory("s2")
++	require.NotNil(t, s2Before)
++	h.replaceS2()
++	require.Eventually(t, func() bool {
++		result := h.history.LoadURLTestHistory("s2")
++		return result != nil && result.Time.After(s2Before.Time)
++	}, 5*time.Second, 10*time.Millisecond, "s2 tested anew")
++	require.Equal(t, s1Before.Time, h.history.LoadURLTestHistory("s1").Time, "s1 stays and is not tested")
++}
++
++// An update that would leave an outbound with one that goes is refused before anything is
++// built, and changes nothing.
++func TestUpdateOutboundsRefused(t *testing.T) {
++	h := newHotTest(t)
++	s2, g := h.outbound("s2"), h.outbound("g")
++	_, err := h.update(`{"type": "testserver", "tag": "s2", "version": 2}`, nil, 0)
++	require.ErrorContains(t, err, "goes through s2")
++	_, err = h.update(``, []string{"s2"}, 0)
++	require.ErrorContains(t, err, "goes through s2")
++	_, err = h.box.UpdateOutbounds(append(h.parse(`{"type": "testserver", "tag": "s3"}`), h.parse(`{"type": "testserver", "tag": "s3"}`)...), nil, 0)
++	require.ErrorContains(t, err, "duplicate")
++	_, err = h.update(`{"type": "testserver", "tag": "s3"}`, []string{"missing"}, 0)
++	require.ErrorContains(t, err, "not found")
++	// a new group of a server taken out would keep the server it found at its start
++	_, err = h.update(h.group("g", "s1", "s2")+`, {"type": "selector", "tag": "sel", "outbounds": ["g", "s1"], "default": "g"}`, []string{"s2"}, 0)
++	require.ErrorContains(t, err, "goes through s2, which is removed")
++	require.Same(t, s2, h.outbound("s2"))
++	require.Same(t, g, h.outbound("g"))
++	require.Zero(t, h.box.KeptOutbounds())
++}
++
++// An update that fails puts the outbounds of before back and closes the new ones, whether it
++// fails in the first layer or after some were in place.
++func TestUpdateOutboundsRollsBack(t *testing.T) {
++	h := newHotTest(t)
++	s2, g, sel := h.outbound("s2"), h.outbound("g"), h.outbound("sel")
++
++	_, err := h.update(`{"type": "testserver", "tag": "s2", "fail": true}, `+h.group("g", "s1", "s2")+
++		`, {"type": "selector", "tag": "sel", "outbounds": ["g", "s1", "s2"], "default": "g"}`, nil, 0)
++	require.ErrorContains(t, err, "does not start")
++	require.Same(t, s2, h.outbound("s2"))
++	require.Same(t, g, h.outbound("g"))
++	require.Same(t, sel, h.outbound("sel"))
++
++	// the selector fails after the server and the group are in place
++	_, err = h.update(`{"type": "testserver", "tag": "s3"}, `+h.group("g", "s1", "s3")+
++		`, {"type": "selector", "tag": "sel", "outbounds": ["g", "s1", "missing"], "default": "g"}`, nil, 0)
++	require.ErrorContains(t, err, "missing")
++	_, loaded := h.box.Outbound().Outbound("s3")
++	require.False(t, loaded, "the server added is taken out again")
++	require.Same(t, g, h.outbound("g"))
++	require.Same(t, sel, h.outbound("sel"))
++	require.Zero(t, h.box.KeptOutbounds())
++	// the group before still works
++	_, err = g.(adapter.URLTestGroup).URLTest(context.Background())
++	require.NoError(t, err)
++}
++
++// An outbound replaced is kept while a connection in the list goes through it, and not
++// before drainMin is over; then closed, the groups too.
++func TestDrainKeepsWhatCarriesConnections(t *testing.T) {
++	h := newHotTest(t)
++	s2, g, sel := h.server("s2"), h.outbound("g"), h.outbound("sel")
++	h.replaceS2()
++	tracked := h.track(sel, g, s2)
++
++	now := time.Now()
++	require.True(t, h.box.DrainOnce(now.Add(box.DrainMin/2)))
++	require.Equal(t, 3, h.box.KeptOutbounds(), "not before drainMin")
++	require.True(t, h.box.DrainOnce(now.Add(box.DrainMin+time.Second)))
++	require.Equal(t, 3, h.box.KeptOutbounds(), "a connection goes through them")
++	require.False(t, s2.closed.Load())
++
++	tracked.Close()
++	require.False(t, h.box.DrainOnce(now.Add(box.DrainMin+time.Second)))
++	require.Zero(t, h.box.KeptOutbounds())
++	require.True(t, s2.closed.Load(), "closed alone, out of the scope of the box")
++	require.False(t, h.server("s1").closed.Load())
++}
++
++// The member a group dialed is kept while the connection is open, whatever the chain of the
++// connection says.
++func TestDrainFollowsTheDialsOfAGroup(t *testing.T) {
++	h := newHotTest(t)
++	g := h.outbound("g")
++	conn := h.dial(g)
++	used := g.(interface{ MembersInUse() []adapter.Outbound }).MembersInUse()
++	require.Len(t, used, 1)
++	member := used[0].(*testServer)
++
++	_, err := h.update(`{"type": "testserver", "tag": "s1", "version": 2}, {"type": "testserver", "tag": "s2", "version": 2}, `+
++		h.group("g", "s1", "s2")+`, {"type": "selector", "tag": "sel", "outbounds": ["g", "s1", "s2"], "default": "g"}`, nil, 0)
++	require.NoError(t, err)
++	later := time.Now().Add(box.DrainMin + time.Second)
++	require.True(t, h.box.DrainOnce(later))
++	require.True(t, h.box.DrainOnce(later), "asked again")
++	require.False(t, member.closed.Load())
++	require.Equal(t, 2, h.box.KeptOutbounds(), "the group and its member; the other server and the selector are closed")
++
++	conn.Close()
++	require.False(t, h.box.DrainOnce(later))
++	require.True(t, member.closed.Load())
++}
++
++// After drainMax an outbound is closed though a connection goes through it.
++func TestDrainMax(t *testing.T) {
++	h := newHotTest(t)
++	s2, g, sel := h.server("s2"), h.outbound("g"), h.outbound("sel")
++	h.replaceS2()
++	h.track(sel, g, s2)
++	require.False(t, h.box.DrainOnce(time.Now().Add(box.DrainMax+time.Second)))
++	require.True(t, s2.closed.Load())
++}
++
++// An outbound UpdateOutbounds started is closed by its own scope when it is replaced in turn,
++// and with the box when it is still in place.
++func TestHotOutboundsClosed(t *testing.T) {
++	h := newHotTest(t)
++	h.replaceS2()
++	s2, s3 := h.server("s2"), h.server("s3")
++	_, err := h.update(`{"type": "testserver", "tag": "s2", "version": 3}, `+h.group("g", "s1", "s2", "s3")+
++		`, {"type": "selector", "tag": "sel", "outbounds": ["g", "s1", "s2", "s3"], "default": "g"}`, nil, 0)
++	require.NoError(t, err)
++	require.False(t, h.box.DrainOnce(time.Now().Add(box.DrainMin+time.Second)))
++	require.True(t, s2.closed.Load())
++	require.False(t, s3.closed.Load())
++	last := h.server("s2")
++	require.NoError(t, h.box.Close())
++	require.True(t, last.closed.Load())
++	require.True(t, s3.closed.Load())
++	_, err = h.update(`{"type": "testserver", "tag": "s4"}`, nil, 0)
++	require.ErrorContains(t, err, "closed")
++}
++
++// Beyond the limit of the servers kept the update is refused: the caller makes a new box.
++func TestUpdateOutboundsLimit(t *testing.T) {
++	h := newHotTest(t)
++	h.replaceS2()
++	_, err := h.update(`{"type": "testserver", "tag": "s4"}`, nil, 1)
++	require.NoError(t, err, "one server kept")
++	h.replaceS2()
++	_, err = h.update(`{"type": "testserver", "tag": "s5"}`, nil, 1)
++	require.ErrorIs(t, err, box.ErrTooManyKept)
++	_, loaded := h.box.Outbound().Outbound("s5")
++	require.False(t, loaded)
++}
+diff --git a/export_podkop_test.go b/export_podkop_test.go
+new file mode 100644
+index 000000000..5e1e7a413
+--- /dev/null
++++ b/export_podkop_test.go
+@@ -0,0 +1,33 @@
++package box
++
++import (
++	"time"
++
++	"github.com/sagernet/sing-box/common/trafficcontrol"
++	"github.com/sagernet/sing/service"
++)
++
++// What the tests of UpdateOutbounds (box_podkop_test.go) look at.
++
++func (s *Box) DrainOnce(now time.Time) bool {
++	return s.drainOnce(now)
++}
++
++func (s *Box) KeptOutbounds() int {
++	s.hot.access.Lock()
++	defer s.hot.access.Unlock()
++	return len(s.hot.kept)
++}
++
++func (s *Box) TrafficManager() *trafficcontrol.Manager {
++	return service.PtrFromContext[trafficcontrol.Manager](s.scope.Context())
++}
++
++// DrainEvery sets how often the kept outbounds are looked at, until restore is called.
++func DrainEvery(every time.Duration) (restore func()) {
++	before := drainEvery
++	drainEvery = every
++	return func() { drainEvery = before }
++}
++
++var DrainMin, DrainMax = drainMin, drainMax
+diff --git a/include/podkop_slim_stub.go b/include/podkop_slim_stub.go
+index 037903a40..875f8559c 100644
+--- a/include/podkop_slim_stub.go
++++ b/include/podkop_slim_stub.go
+@@ -13,6 +13,7 @@ import (
+ 	C "github.com/sagernet/sing-box/constant"
+ 	"github.com/sagernet/sing-box/dns"
+ 	"github.com/sagernet/sing-box/log"
++	"github.com/sagernet/sing-box/protocol/block"
+ 	E "github.com/sagernet/sing/common/exceptions"
+ )
+ 
+@@ -42,7 +43,9 @@ func registerNonPodkopInbounds(registry *inbound.Registry) {
+ 
+ func registerNonPodkopOutbounds(registry *outbound.Registry) {
+ 	stubOutbound(registry, C.TypeBridge, notIncludedSlim)
+-	stubOutbound(registry, C.TypeBlock, notIncludedSlim+", use the rule action reject")
++	// a section whose group has no server refuses its connections through a selector of a
++	// block outbound: the selector changes while the box runs, a rule does not
++	block.RegisterOutbound(registry)
+ }
+ 
+ func registerNonPodkopDNSTransports(registry *dns.TransportRegistry) {
+diff --git a/include/podkop_test.go b/include/podkop_test.go
+index 4d851a3b4..e8892b9c7 100644
+--- a/include/podkop_test.go
++++ b/include/podkop_test.go
+@@ -59,6 +59,7 @@ func TestPodkopConfigurationLoads(t *testing.T) {
+ 			{"type": "hysteria2", "tag": "hy2-out", ` + testServerTLS + `, "password": "p"},
+ 			{"type": "tuic", "tag": "tuic-out", ` + testServerTLS + `, ` + testUUID + `},
+ 			{"type": "selector", "tag": "select", "outbounds": ["direct-out", "vless-out"]},
++			{"type": "block", "tag": "block-out"},
+ 			{"type": "http", "tag": "http-out", ` + testServer + `},
+ 			{"type": "urltest", "tag": "auto", "outbounds": ["vless-out", "hy2-out"]}
+ 		]
+@@ -75,7 +76,6 @@ func TestPodkopSlimStubs(t *testing.T) {
+ 		{`{"inbounds": [{"type": "vless", "listen": "127.0.0.1", "listen_port": 0}]}`, "vless inbound is not included in this build (podkop_slim)"},
+ 		{`{"inbounds": [{"type": "hysteria2", "listen": "127.0.0.1", "listen_port": 0}]}`, "hysteria2 inbound is not included in this build (podkop_slim)"},
+ 		{`{"inbounds": [{"type": "tun"}]}`, "tun inbound is not included in this build (podkop_slim)"},
+-		{`{"outbounds": [{"type": "block", "tag": "block"}]}`, "block outbound is not included in this build (podkop_slim), use the rule action reject"},
+ 		{`{"dns": {"servers": [{"type": "quic", "tag": "doq", "server": "127.0.0.1"}]}}`, "quic DNS server is not included in this build (podkop_slim)"},
+ 		{`{"services": [{"type": "ssm-api", "servers": {"/": "ss-in"}}]}`, "ssm-api service is not included in this build (podkop_slim)"},
+ 	} {
+diff --git a/protocol/group/swap.go b/protocol/group/swap.go
+new file mode 100644
+index 000000000..e22558b18
+--- /dev/null
++++ b/protocol/group/swap.go
+@@ -0,0 +1,207 @@
++package group
++
++import (
++	"net"
++	"sync"
++	"time"
++
++	"github.com/sagernet/sing-box/adapter"
++	"github.com/sagernet/sing/common/bufio"
++	N "github.com/sagernet/sing/common/network"
++)
++
++// What a group does when another takes its tag while the box runs (podkop-engine,
++// box.UpdateOutbounds). The group that is replaced still carries the connections it dialed,
++// and those the router gave it just before; it no longer tests, chooses or judges a member
++// (Retire), tells which members its open connections go through (MembersInUse), and a while
++// after lets go of the others (ReleaseMembers): the Clash API lists a connection with the
++// outbounds of its chain long after the change, and a group must not keep every server it
++// had with it. The group that replaces it starts from what it knew (TakeOver).
++
++// hotRoundConcurrency is how many members the first round of a group that took over tests
++// at a time: a burst of TLS hellos to many servers at once is what a censor stalls.
++const hotRoundConcurrency = 3
++
++// TakeOver gives the group what the group it replaces knew: the member it chose, when this
++// group has the same one, and the members the download test froze, of those it has too. Its
++// first round tests only the members without a test result. Called after the start stage,
++// before the group is started.
++func (s *URLTest) TakeOver(previous adapter.Outbound) {
++	old, isURLTest := previous.(*URLTest)
++	if !isURLTest || old.group == nil || s.group == nil {
++		return
++	}
++	g, from := s.group, old.group
++	members := make(map[adapter.Outbound]bool, len(g.members))
++	for _, member := range g.members {
++		members[member] = true
++	}
++	shared := make(map[adapter.Outbound]bool)
++	sharedTags := make(map[string]bool)
++	for _, member := range from.members {
++		if members[member] {
++			shared[member] = true
++			sharedTags[member.Tag()] = true
++		}
++	}
++	if selected := from.selectedOutboundTCP.Load(); selected != nil && shared[selected] {
++		g.selectedOutboundTCP.Store(selected)
++	}
++	if selected := from.selectedOutboundUDP.Load(); selected != nil && shared[selected] {
++		g.selectedOutboundUDP.Store(selected)
++	}
++	if frozen := from.frozen.Load(); len(frozen) > 0 {
++		kept := make(map[string]time.Time)
++		for tag, at := range frozen {
++			if sharedTags[tag] {
++				kept[tag] = at
++			}
++		}
++		g.frozen.Store(kept)
++	}
++	g.hotStart = true
++}
++
++// Retire stops the group for good: no round, no selection, no judgement of a member from a
++// connection that failed. The connections it carries go on through the members they have.
++func (s *URLTest) Retire() {
++	if s.group != nil {
++		s.group.Close()
++	}
++}
++
++// ReleaseMembers lets go of the members but the chosen ones. Nothing dials through the group
++// any more: the router finds the one that took the tag.
++func (s *URLTest) ReleaseMembers() {
++	g := s.group
++	if g == nil {
++		return
++	}
++	g.access.Lock()
++	g.outbounds, g.fallbacks, g.members = nil, nil, nil
++	g.access.Unlock()
++	g.frozen.Store(nil)
++}
++
++// MembersInUse are the members the connections the group dialed that are open go through.
++func (s *URLTest) MembersInUse() []adapter.Outbound {
++	g := s.group
++	if g == nil {
++		return nil
++	}
++	g.useAccess.Lock()
++	defer g.useAccess.Unlock()
++	members := make([]adapter.Outbound, 0, len(g.uses))
++	for member := range g.uses {
++		members = append(members, member)
++	}
++	return members
++}
++
++// ReleaseMembers lets go of the members but the chosen one, a while after another selector
++// took the tag: nothing asks this one for a member by its tag any more.
++func (s *Selector) ReleaseMembers() {
++	s.outbounds = make(map[string]adapter.Outbound)
++}
++
++// checkUntested is the first round of a group that took over (TakeOver): only the members
++// without a test result are tested, hotRoundConcurrency at a time; the others were tested by
++// the group before, which shares the history.
++func (g *URLTestGroup) checkUntested() {
++	var untested []adapter.Outbound
++	for _, member := range g.members {
++		if g.history.LoadURLTestHistory(RealTag(member, N.NetworkTCP)) == nil {
++			untested = append(untested, member)
++		}
++	}
++	if len(untested) > 0 {
++		_, _ = g.urlTestMembers(g.ctx, untested, hotRoundConcurrency, true, true)
++	}
++	g.performUpdateCheck()
++}
++
++// use counts a connection through member until the function it returns is called.
++func (g *URLTestGroup) use(member adapter.Outbound) func() {
++	g.useAccess.Lock()
++	if g.uses == nil {
++		g.uses = make(map[adapter.Outbound]int)
++	}
++	g.uses[member]++
++	g.useAccess.Unlock()
++	return func() {
++		g.useAccess.Lock()
++		if g.uses[member] <= 1 {
++			delete(g.uses, member)
++		} else {
++			g.uses[member]--
++		}
++		g.useAccess.Unlock()
++	}
++}
++
++// useConn is a connection the group dialed through a member: in the interrupt list of the
++// group, as interrupt.Conn would be, and a use of the member while it is open.
++type useConn struct {
++	net.Conn
++	done func()
++	once sync.Once
++}
++
++func (g *URLTestGroup) newUseConn(member adapter.Outbound, conn net.Conn, isExternal bool) net.Conn {
++	remove := g.interruptGroup.Add(conn, isExternal)
++	release := g.use(member)
++	return &useConn{Conn: conn, done: func() {
++		remove()
++		release()
++	}}
++}
++
++func (c *useConn) Close() error {
++	c.once.Do(c.done)
++	return c.Conn.Close()
++}
++
++func (c *useConn) ReaderReplaceable() bool {
++	return true
++}
++
++func (c *useConn) WriterReplaceable() bool {
++	return true
++}
++
++func (c *useConn) Upstream() any {
++	return c.Conn
++}
++
++// usePacketConn is useConn of a packet connection, as interrupt.PacketConn.
++type usePacketConn struct {
++	N.NetPacketConn
++	done func()
++	once sync.Once
++}
++
++func (g *URLTestGroup) newUsePacketConn(member adapter.Outbound, conn net.PacketConn, isExternal bool) net.PacketConn {
++	remove := g.interruptGroup.Add(conn, isExternal)
++	release := g.use(member)
++	return &usePacketConn{NetPacketConn: bufio.NewPacketConn(conn), done: func() {
++		remove()
++		release()
++	}}
++}
++
++func (c *usePacketConn) Close() error {
++	c.once.Do(c.done)
++	return c.NetPacketConn.Close()
++}
++
++func (c *usePacketConn) ReaderReplaceable() bool {
++	return true
++}
++
++func (c *usePacketConn) WriterReplaceable() bool {
++	return true
++}
++
++func (c *usePacketConn) Upstream() any {
++	return c.NetPacketConn
++}
+diff --git a/protocol/group/swap_test.go b/protocol/group/swap_test.go
+new file mode 100644
+index 000000000..4353e9c4f
+--- /dev/null
++++ b/protocol/group/swap_test.go
+@@ -0,0 +1,222 @@
++package group
++
++import (
++	"context"
++	"net"
++	"net/http"
++	"net/http/httptest"
++	"sync/atomic"
++	"testing"
++	"time"
++
++	"github.com/sagernet/sing-box/adapter"
++	"github.com/sagernet/sing-box/common/interrupt"
++	"github.com/sagernet/sing-box/common/urltest"
++	C "github.com/sagernet/sing-box/constant"
++	"github.com/sagernet/sing-box/log"
++	M "github.com/sagernet/sing/common/metadata"
++	N "github.com/sagernet/sing/common/network"
++	"github.com/sagernet/sing/service"
++	"github.com/sagernet/sing/service/pause"
++
++	"github.com/stretchr/testify/require"
++)
++
++// newSwapGroup makes a group of the members on a shared history, as the groups of one box
++// have it.
++func newSwapGroup(t *testing.T, history *urltest.HistoryStorage, link string, members ...adapter.Outbound) *URLTest {
++	ctx := service.ContextWith[pause.Manager](service.ContextWithPtr(context.Background(), history), &testPause{})
++	group, err := NewURLTestGroup(ctx, nil, log.NewNOPFactory().Logger(), members, nil, link, "", time.Minute, 50, 0, false)
++	require.NoError(t, err)
++	t.Cleanup(func() { group.Close() })
++	return &URLTest{group: group, logger: log.NewNOPFactory().NewLogger("urltest")}
++}
++
++// The group that takes the tag keeps the choice of the one before when it has the same
++// member, the members it froze of those, and tests only the members without a result.
++func TestURLTestTakeOver(t *testing.T) {
++	link, _ := testURL(t, 0)
++	history := urltest.NewHistoryStorage()
++	a := newTestMember(C.TypeVLESS, "a", dialWorking)
++	b := newTestMember(C.TypeVLESS, "b", dialWorking)
++	history.StoreURLTestHistory("a", &adapter.URLTestHistory{Time: time.Now(), Delay: 300})
++	history.StoreURLTestHistory("b", &adapter.URLTestHistory{Time: time.Now(), Delay: 280})
++	old := newSwapGroup(t, history, link, a, b)
++	old.group.performUpdateCheck()
++	require.Equal(t, "a", old.group.selectedOutboundTCP.Load().Tag())
++	old.group.setFrozen("a", time.Now())
++	old.group.setFrozen("b", time.Now())
++
++	// b is another object under its tag now, c is new and faster than a by far once tested
++	b2 := newTestMember(C.TypeVLESS, "b", dialWorking)
++	c := newTestMember(C.TypeVLESS, "c", dialWorking)
++	next := newSwapGroup(t, history, link, a, b2, c)
++	next.TakeOver(old)
++	require.Same(t, adapter.Outbound(a), next.group.selectedOutboundTCP.Load())
++	require.Same(t, adapter.Outbound(a), next.group.selectedOutboundUDP.Load())
++	require.Contains(t, next.group.frozen.Load(), "a")
++	require.NotContains(t, next.group.frozen.Load(), "b", "b is another server now")
++
++	history.DeleteURLTestHistory("b") // as the backend forgets the result of a changed server
++	next.group.PostStart()
++	require.Eventually(t, func() bool {
++		return history.LoadURLTestHistory("c") != nil && history.LoadURLTestHistory("b") != nil
++	}, 5*time.Second, 10*time.Millisecond)
++	require.Zero(t, a.dials.Load(), "a has a result: not tested")
++	require.NotZero(t, b2.dials.Load())
++
++	// a group of another type, or one not started, is no source
++	other := newSwapGroup(t, urltest.NewHistoryStorage(), link, c)
++	other.TakeOver(&Selector{})
++	require.Nil(t, other.group.selectedOutboundTCP.Load())
++	require.False(t, other.group.hotStart)
++}
++
++// The first round of a group that took over tests the members without a result a few at a
++// time.
++func TestURLTestTakeOverRoundIsGentle(t *testing.T) {
++	var running, most atomic.Int32
++	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		now := running.Add(1)
++		defer running.Add(-1)
++		for {
++			seen := most.Load()
++			if now <= seen || most.CompareAndSwap(seen, now) {
++				break
++			}
++		}
++		time.Sleep(100 * time.Millisecond)
++		w.WriteHeader(http.StatusNoContent)
++	}))
++	t.Cleanup(server.Close)
++	history := urltest.NewHistoryStorage()
++	var outbounds []adapter.Outbound
++	for _, tag := range []string{"m1", "m2", "m3", "m4", "m5", "m6", "m7"} {
++		outbounds = append(outbounds, newTestMember(C.TypeVLESS, tag, dialWorking))
++	}
++	old := newSwapGroup(t, history, server.URL, outbounds[0])
++	next := newSwapGroup(t, history, server.URL, outbounds...)
++	next.TakeOver(old)
++	next.group.PostStart()
++	require.Eventually(t, func() bool {
++		for _, member := range outbounds {
++			if history.LoadURLTestHistory(member.Tag()) == nil {
++				return false
++			}
++		}
++		return true
++	}, 10*time.Second, 10*time.Millisecond)
++	require.Equal(t, int32(hotRoundConcurrency), most.Load())
++}
++
++// A group that was replaced tests, chooses and judges no more, and its rounds in progress
++// leave no result.
++func TestURLTestRetire(t *testing.T) {
++	link, requests := testURL(t, 200*time.Millisecond)
++	history := urltest.NewHistoryStorage()
++	a := newTestMember(C.TypeVLESS, "a", dialWorking)
++	group := newSwapGroup(t, history, link, a)
++	group.group.PostStart()
++	group.group.Touch()
++	require.Eventually(t, func() bool { return requests.Load() > 0 }, 2*time.Second, 5*time.Millisecond)
++
++	group.Retire()
++	require.NoError(t, group.group.Close(), "a second close does nothing")
++	group.group.Touch()
++	group.group.access.Lock()
++	ticker := group.group.ticker
++	group.group.access.Unlock()
++	require.Nil(t, ticker, "no ticker after the close")
++	time.Sleep(400 * time.Millisecond)
++	require.Nil(t, history.LoadURLTestHistory("a"), "the round in progress wrote nothing")
++
++	_, err := group.URLTest(context.Background())
++	require.Error(t, err)
++	group.group.CheckOutbounds(context.Background(), true)
++	before := requests.Load()
++	time.Sleep(50 * time.Millisecond)
++	require.Equal(t, before, requests.Load(), "no round")
++
++	history.StoreURLTestHistory("a", &adapter.URLTestHistory{Time: time.Now(), Delay: 10})
++	group.group.memberFailed(context.Background(), a, N.NetworkTCP, net.ErrClosed, time.Now())
++	group.group.memberFailed(context.Background(), a, N.NetworkTCP, &net.OpError{Op: "dial", Err: errRefusedForTest}, time.Now())
++	require.NotNil(t, history.LoadURLTestHistory("a"), "a failure judges nothing")
++	require.False(t, group.group.updatePending.Load())
++}
++
++var errRefusedForTest = &net.AddrError{Err: "refused", Addr: "test"}
++
++// The connections the group dialed count for their member while they are open, whether the
++// group closes them (Interrupt) or their user does.
++func TestURLTestMembersInUse(t *testing.T) {
++	link, _ := testURL(t, 0)
++	listener, err := net.Listen("tcp", "127.0.0.1:0")
++	require.NoError(t, err)
++	t.Cleanup(func() { listener.Close() })
++	go func() {
++		for {
++			conn, err := listener.Accept()
++			if err != nil {
++				return
++			}
++			defer conn.Close()
++		}
++	}()
++	history := urltest.NewHistoryStorage()
++	a := newTestMember(C.TypeVLESS, "a", dialWorking)
++	b := newTestMember(C.TypeVLESS, "b", dialWorking)
++	history.StoreURLTestHistory("a", &adapter.URLTestHistory{Time: time.Now(), Delay: 10})
++	history.StoreURLTestHistory("b", &adapter.URLTestHistory{Time: time.Now(), Delay: 500})
++	group := newSwapGroup(t, history, link, a, b)
++	group.group.performUpdateCheck()
++	destination := M.ParseSocksaddr(listener.Addr().String())
++
++	first, err := group.DialContext(context.Background(), N.NetworkTCP, destination)
++	require.NoError(t, err)
++	second, err := group.DialContext(context.Background(), N.NetworkTCP, destination)
++	require.NoError(t, err)
++	require.Equal(t, []adapter.Outbound{a}, group.MembersInUse())
++	require.NoError(t, first.Close())
++	first.Close() // a second close counts once
++	require.Equal(t, []adapter.Outbound{a}, group.MembersInUse())
++
++	// the group closes what it dialed when it switches: the user closes its end after
++	group.group.interruptGroup.Interrupt(true)
++	require.Equal(t, []adapter.Outbound{a}, group.MembersInUse())
++	second.Close()
++	require.Empty(t, group.MembersInUse())
++
++	// what the group dials past its choice while that waits counts for the member it dialed
++	history.DeleteURLTestHistory("a")
++	group.group.downloadLink = "http://127.0.0.1:1/"
++	third, err := group.DialContext(context.Background(), N.NetworkTCP, destination)
++	require.NoError(t, err)
++	t.Cleanup(func() { third.Close() })
++	require.Equal(t, []adapter.Outbound{b}, group.MembersInUse())
++	require.Equal(t, "a", group.group.selectedOutboundTCP.Load().Tag(), "the chain names a")
++}
++
++// A group that was replaced lets go of its members but those it chose; a selector of all but
++// the one it chose.
++func TestReleaseMembers(t *testing.T) {
++	link, _ := testURL(t, 0)
++	history := urltest.NewHistoryStorage()
++	a := newTestMember(C.TypeVLESS, "a", dialWorking)
++	b := newTestMember(C.TypeVLESS, "b", dialWorking)
++	history.StoreURLTestHistory("a", &adapter.URLTestHistory{Time: time.Now(), Delay: 10})
++	group := newSwapGroup(t, history, link, a, b)
++	group.group.performUpdateCheck()
++	group.Retire()
++	group.ReleaseMembers()
++	require.Nil(t, group.group.members)
++	require.Nil(t, group.group.outbounds)
++	require.Same(t, adapter.Outbound(a), group.group.selectedOutboundTCP.Load())
++	require.Same(t, adapter.Outbound(a), group.Selected(N.NetworkTCP))
++
++	selector := &Selector{outbounds: map[string]adapter.Outbound{"a": a, "b": b}, tags: []string{"a", "b"}, interruptGroup: interrupt.NewGroup()}
++	selector.selected.Store(a)
++	selector.ReleaseMembers()
++	require.Empty(t, selector.outbounds)
++	require.False(t, selector.SelectOutbound("b"))
++	require.Same(t, adapter.Outbound(a), selector.Selected(N.NetworkTCP))
++}
+diff --git a/protocol/group/urltest.go b/protocol/group/urltest.go
+index 5d2520cb6..95d587523 100644
+--- a/protocol/group/urltest.go
++++ b/protocol/group/urltest.go
+@@ -271,7 +271,7 @@ func (s *URLTest) DialContext(ctx context.Context, network string, destination M
+ 				conn = watched
+ 			}
+ 		}
+-		return s.group.interruptGroup.NewConn(conn, interrupt.IsExternalConnectionFromContext(ctx)), nil
++		return s.group.newUseConn(outbound, conn, interrupt.IsExternalConnectionFromContext(ctx)), nil
+ 	}
+ 	s.group.memberFailed(ctx, outbound, N.NetworkName(network), err, start)
+ 	return nil, memberError(outbound, err)
+@@ -295,7 +295,7 @@ func (s *URLTest) ListenPacket(ctx context.Context, destination M.Socksaddr) (ne
+ 	}
+ 	conn, err := outbound.ListenPacket(ctx, destination)
+ 	if err == nil {
+-		return s.group.interruptGroup.NewPacketConn(conn, interrupt.IsExternalConnectionFromContext(ctx)), nil
++		return s.group.newUsePacketConn(outbound, conn, interrupt.IsExternalConnectionFromContext(ctx)), nil
+ 	}
+ 	s.group.memberFailed(ctx, outbound, N.NetworkUDP, err, time.Time{})
+ 	return nil, memberError(outbound, err)
+@@ -344,6 +344,16 @@ type URLTestGroup struct {
+ 	frozen          common.TypedValue[map[string]time.Time] // member tag → when it last failed the download test
+ 	responses       sync.Map                                // member tag → *memberResponses
+ 	responsesClosed atomic.Bool
++	// cancel ends the rounds, the selection and the tests of the group at its close, and
++	// closed tells it was closed: set under access, so that Touch starts no ticker after
++	// (podkop-engine)
++	cancel context.CancelFunc
++	closed atomic.Bool
++	// hotStart makes the first round test only the members without a result (TakeOver)
++	hotStart bool
++	// uses are the connections the group dialed that are open, by member (MembersInUse)
++	useAccess sync.Mutex
++	uses      map[adapter.Outbound]int
+ }
+ 
+ func NewURLTestGroup(ctx context.Context, outboundManager adapter.OutboundManager, logger log.Logger, outbounds []adapter.Outbound, fallbacks []adapter.Outbound, link string, downloadLink string, interval time.Duration, tolerance uint16, idleTimeout time.Duration, interruptExternalConnections bool) (*URLTestGroup, error) {
+@@ -363,8 +373,10 @@ func NewURLTestGroup(ctx context.Context, outboundManager adapter.OutboundManage
+ 	if history == nil {
+ 		return nil, E.New("missing URL test history storage")
+ 	}
++	ctx, cancel := context.WithCancel(ctx)
+ 	group := &URLTestGroup{
+ 		ctx:                          ctx,
++		cancel:                       cancel,
+ 		outbound:                     outboundManager,
+ 		logger:                       logger,
+ 		outbounds:                    outbounds,
+@@ -381,6 +393,7 @@ func NewURLTestGroup(ctx context.Context, outboundManager adapter.OutboundManage
+ 		interruptExternalConnections: interruptExternalConnections,
+ 		epoch:                        time.Now(),
+ 		downloadLink:                 downloadLink,
++		uses:                         make(map[adapter.Outbound]int),
+ 	}
+ 	group.watchPause(group.pause)
+ 	return group, nil
+@@ -389,8 +402,15 @@ func NewURLTestGroup(ctx context.Context, outboundManager adapter.OutboundManage
+ func (g *URLTestGroup) PostStart() {
+ 	g.access.Lock()
+ 	defer g.access.Unlock()
++	if g.closed.Load() {
++		return
++	}
+ 	g.started = true
+ 	g.lastActive.Store(time.Now())
++	if g.hotStart {
++		go g.checkUntested()
++		return
++	}
+ 	go g.CheckOutbounds(g.ctx, false)
+ }
+ 
+@@ -400,6 +420,9 @@ func (g *URLTestGroup) Touch() {
+ 	}
+ 	g.access.Lock()
+ 	defer g.access.Unlock()
++	if g.closed.Load() {
++		return
++	}
+ 	if g.ticker != nil {
+ 		g.lastActive.Store(time.Now())
+ 		g.probeUnseenNetwork()
+@@ -416,6 +439,12 @@ func (g *URLTestGroup) Close() error {
+ 	g.responsesClosed.Store(true)
+ 	g.access.Lock()
+ 	defer g.access.Unlock()
++	if g.closed.Swap(true) {
++		return nil
++	}
++	if g.cancel != nil {
++		g.cancel()
++	}
+ 	if g.networkCallback != nil {
+ 		g.pause.UnregisterCallback(g.networkCallback)
+ 		g.networkCallback = nil
+@@ -543,6 +572,14 @@ func (g *URLTestGroup) CheckOutbounds(ctx context.Context, force bool) {
+ // URLTest is the Clash API's round: it does not wait for the selection, which may run a
+ // download test, nor for those of the nested urltest groups.
+ func (g *URLTestGroup) URLTest(ctx context.Context) (map[string]uint16, error) {
++	if g.closed.Load() {
++		return nil, E.New("the group is closed")
++	}
++	// the round ends with the group too: a group that was replaced must not write results
++	// for the tags another group tests now (podkop-engine)
++	ctx, cancel := context.WithCancel(ctx)
++	defer cancel()
++	defer context.AfterFunc(g.ctx, cancel)()
+ 	result, err := g.urlTestRound(ctx, true, false)
+ 	g.requestUpdateCheck()
+ 	return result, err
+@@ -558,6 +595,14 @@ func (g *URLTestGroup) urlTest(ctx context.Context, force bool) (map[string]uint
+ // With wait, a nested urltest group among the members selects within the round (see
+ // URLTestOutbounds).
+ func (g *URLTestGroup) urlTestRound(ctx context.Context, force bool, wait bool) (map[string]uint16, error) {
++	return g.urlTestMembers(ctx, g.members, urlTestConcurrency, force, wait)
++}
++
++// urlTestMembers is urlTestRound of some of the members, so many at a time.
++func (g *URLTestGroup) urlTestMembers(ctx context.Context, members []adapter.Outbound, concurrency int, force bool, wait bool) (map[string]uint16, error) {
++	if g.closed.Load() {
++		return make(map[string]uint16), nil
++	}
+ 	if g.checking.Swap(true) {
+ 		if force {
+ 			g.requestRecheck()
+@@ -574,7 +619,7 @@ func (g *URLTestGroup) urlTestRound(ctx context.Context, force bool, wait bool)
+ 			go g.CheckOutbounds(g.ctx, true)
+ 		}
+ 	}()
+-	return URLTestOutbounds(ctx, g.outbound, g.history, g.logger, g.members, g.link, g.interval, force, wait), nil
++	return urlTestOutbounds(ctx, g.outbound, g.history, g.logger, members, g.link, g.interval, force, wait, concurrency), nil
+ }
+ 
+ type urlTestResult struct {
+@@ -601,7 +646,14 @@ type urlTestBatch struct {
+ // choice. Without, the selection runs after the call returns: the Clash API answers its
+ // client in time, while the selection may run a download test of up to 15 s per candidate.
+ func URLTestOutbounds(ctx context.Context, outboundManager adapter.OutboundManager, history *urltest.HistoryStorage, logger log.Logger, outbounds []adapter.Outbound, link string, interval time.Duration, force bool, wait bool) map[string]uint16 {
+-	b, _ := batch.New(ctx, batch.WithConcurrencyNum[any](10))
++	return urlTestOutbounds(ctx, outboundManager, history, logger, outbounds, link, interval, force, wait, urlTestConcurrency)
++}
++
++// urlTestConcurrency is how many outbounds a round tests at a time.
++const urlTestConcurrency = 10
++
++func urlTestOutbounds(ctx context.Context, outboundManager adapter.OutboundManager, history *urltest.HistoryStorage, logger log.Logger, outbounds []adapter.Outbound, link string, interval time.Duration, force bool, wait bool, concurrency int) map[string]uint16 {
++	b, _ := batch.New(ctx, batch.WithConcurrencyNum[any](concurrency))
+ 	testBatch := &urlTestBatch{
+ 		ctx:      ctx,
+ 		outbound: outboundManager,
+@@ -673,6 +725,11 @@ func (b *urlTestBatch) test(outbounds []adapter.Outbound, link string, interval
+ 					b.logger.Debug("outbound ", tag, " unavailable: ", testResult.err)
+ 					b.history.DeleteURLTestHistory(tag)
+ 				} else {
++					if b.ctx.Err() != nil {
++						// the round ended with its group (podkop-engine): the tag may be
++						// another outbound's by now
++						return nil, nil
++					}
+ 					b.logger.Debug("outbound ", tag, " available: ", testResult.delay, "ms")
+ 					b.history.StoreURLTestHistory(tag, &adapter.URLTestHistory{
+ 						Time:  time.Now(),
+@@ -694,8 +751,13 @@ func (g *URLTestGroup) performUpdateCheck() {
+ 	g.updateSelection()
+ }
+ 
+-// updateSelection is performUpdateCheck under its lock.
++// updateSelection is performUpdateCheck under its lock. A group that was closed selects no
++// more (podkop-engine): its download test is canceled with it, and what it would choose then
++// was not tested.
+ func (g *URLTestGroup) updateSelection() {
++	if g.closed.Load() {
++		return
++	}
+ 	if g.downloadLink != "" {
+ 		// new dials already pass over a member without a test result while the selection
+ 		// waits (selectionPending), which the download test may make long
+@@ -706,7 +768,11 @@ func (g *URLTestGroup) updateSelection() {
+ 		selected bool
+ 	)
+ 	// the selection is read by every dial, which may run while it changes: stored atomically
+-	if outbound, exists := g.selectTested(); outbound != nil {
++	outbound, exists := g.selectTested()
++	if g.closed.Load() {
++		return
++	}
++	if outbound != nil {
+ 		if current := g.selectedOutboundTCP.Load(); current == nil || (exists && outbound != current) {
+ 			if current != nil {
+ 				updated = true
+@@ -729,6 +795,9 @@ func (g *URLTestGroup) updateSelection() {
+ 			selected = true
+ 		}
+ 	}
++	if g.closed.Load() {
++		return
++	}
+ 	if updated {
+ 		g.interruptGroup.Interrupt(g.interruptExternalConnections)
+ 	}
+diff --git a/protocol/group/urltest_failure.go b/protocol/group/urltest_failure.go
+index a49acb63c..b784dcce2 100644
+--- a/protocol/group/urltest_failure.go
++++ b/protocol/group/urltest_failure.go
+@@ -69,6 +69,11 @@ func serverOnlyDial(outbound adapter.Outbound) bool {
+ // memberFailed judges a failed dial through member, begun at start, or a failed handshake
+ // write (start is zero).
+ func (g *URLTestGroup) memberFailed(ctx context.Context, member adapter.Outbound, network string, err error, start time.Time) {
++	if g.closed.Load() {
++		// a group that was replaced judges nothing (podkop-engine): another tests the members
++		// now, and its members may be let go of
++		return
++	}
+ 	if g.networkPaused() {
+ 		// without a network every dial fails at once: that says nothing about the member
+ 		return
+@@ -269,7 +274,7 @@ func (g *URLTestGroup) succeededSince(tag string, start time.Time) bool {
+ // waits to run are covered by it, so at most one selection waits at any time (a selection
+ // may run long: the download test).
+ func (g *URLTestGroup) requestUpdateCheck() {
+-	if g.updatePending.Swap(true) {
++	if g.closed.Load() || g.updatePending.Swap(true) {
+ 		return
+ 	}
+ 	go func() {
+-- 
+2.53.0
+

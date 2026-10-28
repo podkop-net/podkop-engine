@@ -1,7 +1,7 @@
 From 66000c1d296064b9966236ec773b3c22a2954976 Mon Sep 17 00:00:00 2001
 From: FiyeroT <me@fiyero.xyz>
 Date: Mon, 26 Oct 2026 16:03:10 +0300
-Subject: [PATCH 166/171] decode-link: the help names the links of every
+Subject: [PATCH 166/174] decode-link: the help names the links of every
  protocol it reads
 
 ---

@@ -1,7 +1,7 @@
 From 590c70ce9ce27fc521e62d4384ec545942357db7 Mon Sep 17 00:00:00 2001
 From: FiyeroT <me@fiyero.xyz>
 Date: Thu, 8 Oct 2026 19:46:34 +0300
-Subject: [PATCH 104/171] urltest: a dial this host's network refused waits for
+Subject: [PATCH 104/174] urltest: a dial this host's network refused waits for
  the network monitor
 
 When the default route goes, the network monitor reports the missing

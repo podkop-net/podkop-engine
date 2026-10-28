@@ -1,7 +1,7 @@
 From 5e8df786e2ebf44d27fa7b9b6050f9365d416119 Mon Sep 17 00:00:00 2001
 From: FiyeroT <me@fiyero.xyz>
 Date: Sat, 10 Oct 2026 15:33:14 +0300
-Subject: [PATCH 118/171] vless: VLESS Encryption of Xray for the outbound,
+Subject: [PATCH 118/174] vless: VLESS Encryption of Xray for the outbound,
  with Vision over it
 
 A server of Xray that has "decryption" set takes no client without this layer: a link

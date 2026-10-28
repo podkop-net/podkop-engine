@@ -1,7 +1,7 @@
 From bbb0e4ed483453f2de6dfaadd77f0b399a0a1f9a Mon Sep 17 00:00:00 2001
 From: FiyeroT <me@fiyero.xyz>
 Date: Tue, 6 Oct 2026 06:09:39 +0300
-Subject: [PATCH 065/171] tools decode-link: one link, and an exit status
+Subject: [PATCH 065/174] tools decode-link: one link, and an exit status
  scripts can tell apart
 
 The command takes one link, as the argument or from the standard input: its

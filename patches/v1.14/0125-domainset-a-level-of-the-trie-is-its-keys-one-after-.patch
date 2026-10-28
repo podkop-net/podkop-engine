@@ -1,7 +1,7 @@
 From a53ff309b645e6203a456b7f0d9c3f8de913f68d Mon Sep 17 00:00:00 2001
 From: FiyeroT <me@fiyero.xyz>
 Date: Sun, 18 Oct 2026 14:17:41 +0300
-Subject: [PATCH 125/171] domainset: a level of the trie is its keys one after
+Subject: [PATCH 125/174] domainset: a level of the trie is its keys one after
  another and a bit a node
 
 The keys of a level are kept together, the ones that ended left out, and

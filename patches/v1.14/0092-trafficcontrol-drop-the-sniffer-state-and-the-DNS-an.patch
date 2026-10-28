@@ -1,7 +1,7 @@
 From 9c9bc81edfc2e9570c4c93dfa215885d9efdfc94 Mon Sep 17 00:00:00 2001
 From: FiyeroT <me@fiyero.xyz>
 Date: Thu, 8 Oct 2026 16:44:37 +0300
-Subject: [PATCH 092/171] trafficcontrol: drop the sniffer state and the DNS
+Subject: [PATCH 092/174] trafficcontrol: drop the sniffer state and the DNS
  answers from a tracker's metadata
 
 A tracker keeps a copy of the connection's metadata for as long as the connection

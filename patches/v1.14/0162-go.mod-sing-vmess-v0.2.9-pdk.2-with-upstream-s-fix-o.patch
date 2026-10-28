@@ -1,7 +1,7 @@
 From 71c29fad4b19d1909f5836ffb606ec1439333a38 Mon Sep 17 00:00:00 2001
 From: FiyeroT <me@fiyero.xyz>
 Date: Tue, 27 Oct 2026 16:34:38 +0300
-Subject: [PATCH 162/171] go.mod: sing-vmess v0.2.9-pdk.2, with upstream's fix
+Subject: [PATCH 162/174] go.mod: sing-vmess v0.2.9-pdk.2, with upstream's fix
  of the close after a direct write under Vision
 
 The fork of sing-vmess on the sing of sing-box 1.14.4: upstream's a0c5854 (Vision

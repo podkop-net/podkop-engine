@@ -1,0 +1,134 @@
+From 8848af6246a4f3122e031ba252a55fa426e934e0 Mon Sep 17 00:00:00 2001
+From: FiyeroT <me@fiyero.xyz>
+Date: Thu, 29 Oct 2026 01:38:43 +0300
+Subject: [PATCH 174/174] dialer: a detour finds the outbound of its tag at
+ every dial
+
+An outbound replaced while the box runs (box.UpdateOutbounds) is not kept
+for good by what dials through it: the HTTP client of the lists, a DNS
+server, the download leg of XHTTP. The outbound found first, which the
+start checked, stands while the tag has none.
+---
+ common/dialer/detour.go             |  5 ++-
+ common/dialer/detour_podkop.go      | 20 +++++++++
+ common/dialer/detour_podkop_test.go | 65 +++++++++++++++++++++++++++++
+ 3 files changed, 89 insertions(+), 1 deletion(-)
+ create mode 100644 common/dialer/detour_podkop.go
+ create mode 100644 common/dialer/detour_podkop_test.go
+
+diff --git a/common/dialer/detour.go b/common/dialer/detour.go
+index b2fc3efa0..7873fd1d6 100644
+--- a/common/dialer/detour.go
++++ b/common/dialer/detour.go
+@@ -51,7 +51,10 @@ func InitializeDetour(dialer N.Dialer) error {
+ 
+ func (d *DetourDialer) Dialer() (N.Dialer, error) {
+ 	d.initOnce.Do(d.init)
+-	return d.dialer, d.initErr
++	if d.initErr != nil {
++		return nil, d.initErr
++	}
++	return d.current(), nil
+ }
+ 
+ func (d *DetourDialer) init() {
+diff --git a/common/dialer/detour_podkop.go b/common/dialer/detour_podkop.go
+new file mode 100644
+index 000000000..4653c6f14
+--- /dev/null
++++ b/common/dialer/detour_podkop.go
+@@ -0,0 +1,20 @@
++package dialer
++
++import N "github.com/sagernet/sing/common/network"
++
++// current is the outbound of the tag of the detour now, found at every dial: one replaced while
++// the box runs (box.UpdateOutbounds) is not kept for good by those that dial through it, as the HTTP
++// client of the lists and the DNS servers do (podkop-engine). The outbound found first, which init
++// checked, stands while the tag has none.
++func (d *DetourDialer) current() N.Dialer {
++	if d.detour != "" {
++		if outbound, loaded := d.outboundManager.Outbound(d.detour); loaded {
++			return outbound
++		}
++		return d.dialer
++	}
++	if outbound := d.outboundManager.Default(); outbound != nil {
++		return outbound
++	}
++	return d.dialer
++}
+diff --git a/common/dialer/detour_podkop_test.go b/common/dialer/detour_podkop_test.go
+new file mode 100644
+index 000000000..68b4058fc
+--- /dev/null
++++ b/common/dialer/detour_podkop_test.go
+@@ -0,0 +1,65 @@
++package dialer
++
++import (
++	"context"
++	"net"
++	"os"
++	"testing"
++
++	"github.com/sagernet/sing-box/adapter"
++	M "github.com/sagernet/sing/common/metadata"
++
++	"github.com/stretchr/testify/require"
++)
++
++type namedOutbound struct {
++	adapter.Outbound
++	name string
++}
++
++func (o *namedOutbound) DialContext(context.Context, string, M.Socksaddr) (net.Conn, error) {
++	return nil, os.ErrInvalid
++}
++
++type swappingManager struct {
++	adapter.OutboundManager
++	byTag    map[string]adapter.Outbound
++	fallback adapter.Outbound
++}
++
++func (m *swappingManager) Outbound(tag string) (adapter.Outbound, bool) {
++	outbound, loaded := m.byTag[tag]
++	return outbound, loaded
++}
++
++func (m *swappingManager) Default() adapter.Outbound {
++	return m.fallback
++}
++
++// A detour dials through the outbound its tag has now: one replaced while the box runs is followed.
++func TestDetourFollowsTheTag(t *testing.T) {
++	first, second := &namedOutbound{name: "first"}, &namedOutbound{name: "second"}
++	manager := &swappingManager{byTag: map[string]adapter.Outbound{"proxy": first}, fallback: first}
++	detour := NewDetour(manager, "proxy", true).(*DetourDialer)
++	current, err := detour.Dialer()
++	require.NoError(t, err)
++	require.Same(t, first, current)
++	manager.byTag["proxy"] = second
++	current, err = detour.Dialer()
++	require.NoError(t, err)
++	require.Same(t, second, current, "the outbound of the tag now")
++	delete(manager.byTag, "proxy")
++	current, _ = detour.Dialer()
++	require.Same(t, first, current, "while the tag has none, the one found first")
++
++	byDefault := NewDefaultOutboundDetour(manager).(*DetourDialer)
++	current, _ = byDefault.Dialer()
++	require.Same(t, first, current)
++	manager.fallback = second
++	current, _ = byDefault.Dialer()
++	require.Same(t, second, current)
++
++	missing := NewDetour(&swappingManager{byTag: map[string]adapter.Outbound{}}, "nothing", true).(*DetourDialer)
++	_, err = missing.Dialer()
++	require.ErrorContains(t, err, "outbound detour not found")
++}
+-- 
+2.53.0
+

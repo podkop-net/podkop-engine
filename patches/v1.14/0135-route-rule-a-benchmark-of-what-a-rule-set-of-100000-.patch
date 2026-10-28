@@ -1,7 +1,7 @@
 From c4958ce9f00f77c4d4fc0ddb1da0a79e17e8eaee Mon Sep 17 00:00:00 2001
 From: FiyeroT <me@fiyero.xyz>
 Date: Sun, 18 Oct 2026 07:54:26 +0300
-Subject: [PATCH 135/171] route/rule: a benchmark of what a rule set of 100000
+Subject: [PATCH 135/174] route/rule: a benchmark of what a rule set of 100000
  names written as text costs to load
 
 Run with -memprofile: on x86 an op allocates 294 MiB, 78% of it in

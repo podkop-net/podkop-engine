@@ -1,7 +1,7 @@
 From b3781bc99698ba86b0b91b299461befc063f339d Mon Sep 17 00:00:00 2001
 From: FiyeroT <me@fiyero.xyz>
 Date: Tue, 6 Oct 2026 23:52:34 +0300
-Subject: [PATCH 067/171] xhttp: Close resets the transport instead of ending
+Subject: [PATCH 067/174] xhttp: Close resets the transport instead of ending
  it
 
 Client.Close marked its pools closed for good, and every dial after it failed with "use

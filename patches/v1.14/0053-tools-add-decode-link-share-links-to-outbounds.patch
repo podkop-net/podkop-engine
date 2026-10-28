@@ -1,7 +1,7 @@
 From a21a1de7ce7bccd975b753fc5ffb996c33d67dd4 Mon Sep 17 00:00:00 2001
 From: FiyeroT <me@fiyero.xyz>
 Date: Mon, 5 Oct 2026 15:26:04 +0300
-Subject: [PATCH 053/171] tools: add decode-link, share links to outbounds
+Subject: [PATCH 053/174] tools: add decode-link, share links to outbounds
 
 sing-box tools decode-link reads vless:// and trojan:// share links, as
 arguments or as lines of the standard input, and prints the outbound of each:

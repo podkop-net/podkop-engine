@@ -1,7 +1,7 @@
 From 4da83d81204242edc3298a12783928d3a26fe88f Mon Sep 17 00:00:00 2001
 From: FiyeroT <me@fiyero.xyz>
 Date: Tue, 27 Oct 2026 16:33:56 +0300
-Subject: [PATCH 170/171] route: a chain with a URL test is dialed through the
+Subject: [PATCH 170/174] route: a chain with a URL test is dialed through the
  URL test
 
 sing-box 1.14.4 resolves a group into the chain of outbounds a connection

@@ -1,7 +1,7 @@
 From 60bb116f879e7ece1b127a4c248234c11826efba Mon Sep 17 00:00:00 2001
 From: FiyeroT <me@fiyero.xyz>
 Date: Sat, 10 Oct 2026 17:02:44 +0300
-Subject: [PATCH 120/171] dns: every message of the provider DNS fallback is a
+Subject: [PATCH 120/174] dns: every message of the provider DNS fallback is a
  warning
 
 Whether a server has the fallback, the provider's servers read for it and

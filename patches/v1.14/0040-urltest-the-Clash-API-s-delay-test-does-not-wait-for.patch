@@ -1,7 +1,7 @@
 From 3ff536dae181ed1166d874a04c65a5b6900e335b Mon Sep 17 00:00:00 2001
 From: FiyeroT <me@fiyero.xyz>
 Date: Sun, 4 Oct 2026 08:45:40 +0300
-Subject: [PATCH 040/171] urltest: the Clash API's delay test does not wait for
+Subject: [PATCH 040/174] urltest: the Clash API's delay test does not wait for
  nested selections
 
 The Clash API's delay test of a group returns once the members are tested,

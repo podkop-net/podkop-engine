@@ -1,7 +1,7 @@
 From 11e6760c0ca9c3f5e46e894b432de9a83319a26f Mon Sep 17 00:00:00 2001
 From: FiyeroT <me@fiyero.xyz>
 Date: Tue, 13 Oct 2026 17:08:29 +0300
-Subject: [PATCH 130/171] fakeip: Peek tells the address of a domain without
+Subject: [PATCH 130/174] fakeip: Peek tells the address of a domain without
  giving it one
 
 Create gives an address to a domain that has none, and counts as a use of the

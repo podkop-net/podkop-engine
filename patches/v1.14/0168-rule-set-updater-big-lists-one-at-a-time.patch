@@ -1,7 +1,7 @@
 From a1068a5cfb902b4e5d812082c17eb61bba6f5a9b Mon Sep 17 00:00:00 2001
 From: FiyeroT <me@fiyero.xyz>
 Date: Mon, 26 Oct 2026 16:52:29 +0300
-Subject: [PATCH 168/171] rule-set updater: big lists one at a time
+Subject: [PATCH 168/174] rule-set updater: big lists one at a time
 
 An update of a list holds its download, builds the next list beside the one
 in use and saves it; five big lists due together took all of that at once.

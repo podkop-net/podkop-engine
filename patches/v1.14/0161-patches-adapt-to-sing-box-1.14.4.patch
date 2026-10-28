@@ -1,7 +1,7 @@
 From 41f832ef9f808029a722164f3533e2199550205b Mon Sep 17 00:00:00 2001
 From: FiyeroT <me@fiyero.xyz>
 Date: Mon, 26 Oct 2026 15:53:46 +0300
-Subject: [PATCH 161/171] patches: adapt to sing-box 1.14.4
+Subject: [PATCH 161/174] patches: adapt to sing-box 1.14.4
 
 sing-box 1.14.4 resolves a group into the chain of outbounds the connection
 is dialed through (OutboundGroup.Selected, RealTag by network) and marks

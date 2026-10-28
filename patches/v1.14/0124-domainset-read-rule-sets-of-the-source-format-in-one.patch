@@ -1,7 +1,7 @@
 From 046b5ba9e49f2ac45c95493901a56bfa79e1a92d Mon Sep 17 00:00:00 2001
 From: FiyeroT <me@fiyero.xyz>
 Date: Sun, 18 Oct 2026 12:02:13 +0300
-Subject: [PATCH 124/171] domainset: read rule sets of the source format in one
+Subject: [PATCH 124/174] domainset: read rule sets of the source format in one
  pass, build the trie by radix
 
 The domain lists of a rule set are now one module, common/domainset:

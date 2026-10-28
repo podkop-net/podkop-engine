@@ -1,7 +1,7 @@
 From f173a8b745f99c5a8fac08ab38d94ab424ddfa12 Mon Sep 17 00:00:00 2001
 From: FiyeroT <me@fiyero.xyz>
 Date: Sat, 3 Oct 2026 18:18:20 +0300
-Subject: [PATCH 028/171] urltest: a timeout that also reports itself closed is
+Subject: [PATCH 028/174] urltest: a timeout that also reports itself closed is
  the member's failure
 
 The dial failure of a member was not judged when the error matched

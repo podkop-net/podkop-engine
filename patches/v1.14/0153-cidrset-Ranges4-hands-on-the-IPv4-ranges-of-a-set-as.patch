@@ -1,7 +1,7 @@
 From f0e7f57f73b75f3f6b2648423bf0ffaa7b2e4e9d Mon Sep 17 00:00:00 2001
 From: FiyeroT <me@fiyero.xyz>
 Date: Sat, 24 Oct 2026 09:41:46 +0300
-Subject: [PATCH 153/171] cidrset: Ranges4 hands on the IPv4 ranges of a set as
+Subject: [PATCH 153/174] cidrset: Ranges4 hands on the IPv4 ranges of a set as
  they are kept
 
 The ranges of IPv4 of a set, packed (first address in the high 32 bits,
