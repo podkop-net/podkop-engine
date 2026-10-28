@@ -7,7 +7,7 @@
 `podkop-engine_1.14.4-r19_openwrt_aarch64_cortex-a53.ipk`.
 
 С r9 (1.13, 1.14) пакетов два, ставится один: `podkop-engine` — протоколы, которые использует
-podkop, TUIC и (с r15) http; `podkop-engine-full` — плюс все остальные выходы для «Outbound
+podkop, TUIC, (с r15) http и (1.14, с r19) block; `podkop-engine-full` — плюс все остальные выходы для «Outbound
 Config» (vmess, snell, tor, ssh, shadowtls, anytls, hysteria, NaiveProxy). Команды ниже одинаковы для
 обоих, меняется только имя файла, а в командах отката — имя пакета (`podkop-engine-full`
 вместо `podkop-engine`).
