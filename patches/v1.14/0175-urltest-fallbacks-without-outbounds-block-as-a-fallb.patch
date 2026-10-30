@@ -1,0 +1,223 @@
+From 6197fb6fb2417679c2dbe52926586905d8a3cef8 Mon Sep 17 00:00:00 2001
+From: FiyeroT <me@fiyero.xyz>
+Date: Thu, 29 Oct 2026 20:22:27 +0300
+Subject: [PATCH 175/177] urltest: fallbacks without outbounds, block as a
+ fallback, a bound on tests at once
+
+A URL test may have fallbacks and no outbounds: what is left of a rule whose
+provider took every server away. A block fallback answers by refusing: it is
+chosen when nothing before it answers, never tested, and its refusals are no
+failures of a member. No more than four URL tests run at once in the process:
+groups run their rounds at their own times, ten members at once, and bursts of
+TLS hellos are what operators' DPI freezes.
+---
+ protocol/group/urltest.go               |  12 ++-
+ protocol/group/urltest_failure.go       |  19 ++++-
+ protocol/group/urltest_fallback_test.go |   6 +-
+ protocol/group/urltest_r20_test.go      | 102 ++++++++++++++++++++++++
+ 4 files changed, 135 insertions(+), 4 deletions(-)
+ create mode 100644 protocol/group/urltest_r20_test.go
+
+diff --git a/protocol/group/urltest.go b/protocol/group/urltest.go
+index 95d587523..a6d30428c 100644
+--- a/protocol/group/urltest.go
++++ b/protocol/group/urltest.go
+@@ -72,7 +72,9 @@ func NewURLTest(ctx context.Context, router adapter.Router, logger log.ContextLo
+ 		idleTimeout:                  time.Duration(options.IdleTimeout),
+ 		interruptExternalConnections: options.InterruptExistConnections,
+ 	}
+-	if len(outbound.tags) == 0 {
++	// without outbounds the fallbacks are all there is (podkop-engine): a provider that took
++	// every server away leaves what the rule falls back on
++	if len(outbound.tags) == 0 && len(outbound.fallbackTags) == 0 {
+ 		return nil, E.New("missing tags")
+ 	}
+ 	for i, tag := range outbound.tags {
+@@ -504,6 +506,11 @@ func (g *URLTestGroup) selectAmong(network string, skip func(tag string, history
+ 			if !common.Contains(detour.Network(), network) {
+ 				continue
+ 			}
++			if detour.Type() == C.TypeBlock {
++				// a block fallback answers by refusing (podkop-engine): it is what the
++				// rule does when nothing before it answers, never tested
++				return detour, true
++			}
+ 			tag := RealTag(detour, network)
+ 			history := g.history.LoadURLTestHistory(tag)
+ 			if history == nil || (skip != nil && skip(tag, history)) {
+@@ -678,7 +685,8 @@ func urlTestOutbounds(ctx context.Context, outboundManager adapter.OutboundManag
+ func (b *urlTestBatch) test(outbounds []adapter.Outbound, link string, interval time.Duration, force bool) {
+ 	for _, detour := range outbounds {
+ 		tag := detour.Tag()
+-		if b.checked[tag] {
++		if b.checked[tag] || detour.Type() == C.TypeBlock {
++			// a block fallback refuses every test: it answers by being chosen (selectAmong)
+ 			continue
+ 		}
+ 		switch nested := detour.(type) {
+diff --git a/protocol/group/urltest_failure.go b/protocol/group/urltest_failure.go
+index b784dcce2..22ada984d 100644
+--- a/protocol/group/urltest_failure.go
++++ b/protocol/group/urltest_failure.go
+@@ -69,6 +69,10 @@ func serverOnlyDial(outbound adapter.Outbound) bool {
+ // memberFailed judges a failed dial through member, begun at start, or a failed handshake
+ // write (start is zero).
+ func (g *URLTestGroup) memberFailed(ctx context.Context, member adapter.Outbound, network string, err error, start time.Time) {
++	if member.Type() == C.TypeBlock {
++		// refusing is what a block fallback is chosen for (podkop-engine)
++		return
++	}
+ 	if g.closed.Load() {
+ 		// a group that was replaced judges nothing (podkop-engine): another tests the members
+ 		// now, and its members may be let go of
+@@ -371,8 +375,21 @@ func (g *URLTestGroup) confirmWith(confirms *map[string]*memberConfirm, tag stri
+ 	return true
+ }
+ 
+-// testOutbound runs one URL test of detour, bounded by the TCP timeout.
++// probeSlots bound how many URL tests run at once in the whole process (podkop-engine):
++// every group runs its rounds at its own time, ten members at once, so a router with a few
++// groups of large subscriptions would open tens of connections at a time. Bursts of TLS
++// hellos are what operators' DPI freezes, and a small CPU lags under them.
++var probeSlots = make(chan struct{}, 4)
++
++// testOutbound runs one URL test of detour, bounded by the TCP timeout once one of
++// probeSlots is free: the wait for the slot does not take the time of the test.
+ func testOutbound(ctx context.Context, link string, detour adapter.Outbound) (uint16, error) {
++	select {
++	case probeSlots <- struct{}{}:
++	case <-ctx.Done():
++		return 0, ctx.Err()
++	}
++	defer func() { <-probeSlots }()
+ 	ctx, cancel := context.WithTimeout(ctx, C.TCPTimeout)
+ 	defer cancel()
+ 	type result struct {
+diff --git a/protocol/group/urltest_fallback_test.go b/protocol/group/urltest_fallback_test.go
+index ba05756e2..c3b799e45 100644
+--- a/protocol/group/urltest_fallback_test.go
++++ b/protocol/group/urltest_fallback_test.go
+@@ -342,7 +342,11 @@ func TestURLTestFallbackOptions(t *testing.T) {
+ 	require.Error(t, err)
+ 	_, err = newGroup([]string{"a"}, []string{"f", "f"})
+ 	require.Error(t, err)
+-	_, err = newGroup(nil, []string{"f"})
++	// fallbacks alone make a group (podkop-engine r20); nothing at all does not
++	urlTest, err = newGroup(nil, []string{"f"})
++	require.NoError(t, err)
++	require.Equal(t, []string{"f"}, urlTest.All())
++	_, err = newGroup(nil, nil)
+ 	require.Error(t, err)
+ 	// sing-box 1.14.4 refuses a tag listed twice in the outbounds too
+ 	_, err = newGroup([]string{"a", "a"}, nil)
+diff --git a/protocol/group/urltest_r20_test.go b/protocol/group/urltest_r20_test.go
+new file mode 100644
+index 000000000..bf1d81fc9
+--- /dev/null
++++ b/protocol/group/urltest_r20_test.go
+@@ -0,0 +1,102 @@
++package group
++
++import (
++	"context"
++	"errors"
++	"net"
++	"sync"
++	"sync/atomic"
++	"testing"
++	"time"
++
++	"github.com/sagernet/sing-box/common/urltest"
++	C "github.com/sagernet/sing-box/constant"
++	"github.com/sagernet/sing-box/log"
++	"github.com/sagernet/sing-box/option"
++	M "github.com/sagernet/sing/common/metadata"
++	N "github.com/sagernet/sing/common/network"
++	"github.com/sagernet/sing/service"
++
++	"github.com/stretchr/testify/require"
++)
++
++// A URL test without outbounds takes its fallbacks: what is left of a rule whose provider
++// took every server away. With neither it is refused.
++func TestURLTestOfFallbacksOnly(t *testing.T) {
++	t.Parallel()
++	ctx := service.ContextWithPtr(context.Background(), urltest.NewHistoryStorage())
++	_, err := NewURLTest(ctx, nil, log.NewNOPFactory().NewLogger("urltest"), "t", option.URLTestOutboundOptions{Fallbacks: []string{"f1"}})
++	require.NoError(t, err)
++	_, err = NewURLTest(ctx, nil, log.NewNOPFactory().NewLogger("urltest"), "t", option.URLTestOutboundOptions{})
++	require.ErrorContains(t, err, "missing tags")
++
++	f1, f2 := newTestMember(C.TypeSOCKS, "f1", dialRefused), newTestMember(C.TypeSOCKS, "f2", dialRefused)
++	_, group := newTestFallbackGroup(t, "", "", nil, members(f1, f2), map[string]uint16{"f2": 100})
++	tcp, udp := selectedTags(group)
++	require.Equal(t, "f2", tcp)
++	require.Equal(t, "f2", udp)
++	setResult(group, "f2", 0)
++	group.performUpdateCheck()
++	tcp, _ = selectedTags(group)
++	require.Equal(t, "f2", tcp, "none answers: the one in use stays")
++}
++
++// A block fallback answers by refusing: chosen when nothing before it answers, never judged
++// failed for its refusals, given up as soon as a server answers again.
++func TestBlockFallbackAnswers(t *testing.T) {
++	t.Parallel()
++	server, dead := newTestMember(C.TypeSOCKS, "a", dialRefused), newTestMember(C.TypeSOCKS, "dead", dialRefused)
++	block := newTestMember(C.TypeBlock, "block", dialRefused)
++	_, group := newTestFallbackGroup(t, "", "", members(server), members(dead, block), map[string]uint16{"a": 100})
++	tcp, _ := selectedTags(group)
++	require.Equal(t, "a", tcp)
++	setResult(group, "a", 0)
++	group.performUpdateCheck()
++	tcp, udp := selectedTags(group)
++	require.Equal(t, "block", tcp)
++	require.Equal(t, "block", udp)
++	group.memberFailed(context.Background(), block, N.NetworkTCP, errors.New("refused"), time.Now())
++	tcp, _ = selectedTags(group)
++	require.Equal(t, "block", tcp, "a refusal of block is no failure")
++	setResult(group, "a", 120)
++	group.performUpdateCheck()
++	tcp, _ = selectedTags(group)
++	require.Equal(t, "a", tcp)
++}
++
++// No more URL tests than probeSlots run at once in the process. Not parallel: the slots are
++// those of the whole process.
++func TestProbeLimit(t *testing.T) {
++	var now, most atomic.Int32
++	release := make(chan struct{})
++	slow := newTestMember(C.TypeSOCKS, "slow", func(ctx context.Context, network string, destination M.Socksaddr) (net.Conn, error) {
++		running := now.Add(1)
++		defer now.Add(-1)
++		for {
++			seen := most.Load()
++			if running <= seen || most.CompareAndSwap(seen, running) {
++				break
++			}
++		}
++		select {
++		case <-release:
++		case <-ctx.Done():
++		}
++		return nil, errors.New("down")
++	})
++	var done sync.WaitGroup
++	for range 3 * cap(probeSlots) {
++		done.Add(1)
++		go func() {
++			defer done.Done()
++			_, _ = testOutbound(context.Background(), "http://www.example.com/generate_204", slow)
++		}()
++	}
++	require.Eventually(t, func() bool { return now.Load() == int32(cap(probeSlots)) }, 5*time.Second, 10*time.Millisecond)
++	time.Sleep(100 * time.Millisecond)
++	require.Equal(t, int32(cap(probeSlots)), most.Load())
++	close(release)
++	done.Wait()
++	require.Equal(t, int32(cap(probeSlots)), most.Load())
++	require.Equal(t, int32(3*cap(probeSlots)), slow.dials.Load())
++}
+-- 
+2.53.0
+

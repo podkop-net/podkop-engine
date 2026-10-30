@@ -1,7 +1,7 @@
 From 46615153864c15e54f2c2cfa2f0f9cba32fb63d8 Mon Sep 17 00:00:00 2001
 From: FiyeroT <me@fiyero.xyz>
 Date: Mon, 5 Oct 2026 22:36:13 +0300
-Subject: [PATCH 057/174] xhttp: the backoff holds back connections, not
+Subject: [PATCH 057/177] xhttp: the backoff holds back connections, not
  sessions
 
 During the backoff after failed connections a dial was refused whenever the

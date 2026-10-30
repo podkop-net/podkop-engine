@@ -1,0 +1,303 @@
+From f7cb7f2ab18e998c042663a9a4fdd6901c6960ce Mon Sep 17 00:00:00 2001
+From: FiyeroT <me@fiyero.xyz>
+Date: Fri, 30 Oct 2026 06:31:23 +0300
+Subject: [PATCH 177/177] urltest: what the review of r20 found
+
+Before a round a group of fallbacks alone takes its first fallback, not a
+block further down. The first round of a group that took over counts as a
+round when every member has a result already, and a round cut short does
+not count. While a block fallback is the choice, rounds come sooner than the
+interval (30 s, then twice as long each time, at most the interval; anew
+after the group rested): block is never tested and the dials it refuses
+reach no member, so the servers came back only at the next periodic round.
+A block fallback is taken without a download test. The test confirming that
+a member fails does not wait for the slots of the rounds.
+---
+ protocol/group/swap.go             |   3 +
+ protocol/group/urltest.go          |  69 ++++++++++++++++++--
+ protocol/group/urltest_download.go |   4 ++
+ protocol/group/urltest_failure.go  |  13 +++-
+ protocol/group/urltest_r20_test.go | 101 +++++++++++++++++++++++++++++
+ 5 files changed, 181 insertions(+), 9 deletions(-)
+
+diff --git a/protocol/group/swap.go b/protocol/group/swap.go
+index e22558b18..9b82af139 100644
+--- a/protocol/group/swap.go
++++ b/protocol/group/swap.go
+@@ -116,6 +116,9 @@ func (g *URLTestGroup) checkUntested() {
+ 	}
+ 	if len(untested) > 0 {
+ 		_, _ = g.urlTestMembers(g.ctx, untested, hotRoundConcurrency, true, true)
++	} else {
++		// every member has a result already: as good as a round (selectAmong falls back)
++		g.roundDone.Store(true)
+ 	}
+ 	g.performUpdateCheck()
+ }
+diff --git a/protocol/group/urltest.go b/protocol/group/urltest.go
+index 4ed5fefbf..d8bffcf4a 100644
+--- a/protocol/group/urltest.go
++++ b/protocol/group/urltest.go
+@@ -319,8 +319,10 @@ type URLTestGroup struct {
+ 	history                      *urltest.HistoryStorage
+ 	checking                     atomic.Bool
+ 	recheck                      atomic.Bool
+-	lastRound                    atomic.Int64 // when the last round began, since epoch
+-	roundDone                    atomic.Bool  // a round has tested the members (see selectAmong)
++	lastRound                    atomic.Int64  // when the last round began, since epoch
++	roundDone                    atomic.Bool   // a round has tested the members (see selectAmong)
++	blockRetry                   time.Duration // the delay of the round retryBlock armed last; under updateAccess
++	blockRetryTimer              *time.Timer   // that round while it waits; under updateAccess
+ 	selectedOutboundTCP          common.TypedValue[adapter.Outbound]
+ 	selectedOutboundUDP          common.TypedValue[adapter.Outbound]
+ 	interruptGroup               *interrupt.Group
+@@ -504,11 +506,12 @@ func (g *URLTestGroup) selectAmong(network string, skip func(tag string, history
+ 	}
+ 	if minOutbound == nil {
+ 		if !g.roundDone.Load() {
+-			// before a round has tested them the outbounds have no results, which is no
++			// before a round has tested them the members have no results, which is no
+ 			// reason to fall back (podkop-engine): at a start or after a swap a block
+ 			// fallback would refuse every connection, a direct one send it past the proxy.
+-			// The first of them, as without fallbacks.
+-			for _, detour := range g.outbounds {
++			// The first member, as without fallbacks; in a group of fallbacks alone the
++			// first fallback, not a block further down.
++			for _, detour := range g.members {
+ 				if common.Contains(detour.Network(), network) {
+ 					return detour, false
+ 				}
+@@ -639,7 +642,10 @@ func (g *URLTestGroup) urlTestMembers(ctx context.Context, members []adapter.Out
+ 		}
+ 	}()
+ 	result := urlTestOutbounds(ctx, g.outbound, g.history, g.logger, members, g.link, g.interval, force, wait, concurrency)
+-	g.roundDone.Store(true)
++	if ctx.Err() == nil {
++		// a round cut short (a delay test of the Clash API that timed out) tested only some
++		g.roundDone.Store(true)
++	}
+ 	return result, nil
+ }
+ 
+@@ -826,5 +832,56 @@ func (g *URLTestGroup) updateSelection() {
+ 	if selected {
+ 		g.history.NotifyUpdated()
+ 	}
++	g.retryBlock()
+ 	g.closeUnanswered()
+ }
++
++// blockRetryFirst is how soon a round follows a selection that left a block fallback chosen
++// (podkop-engine), twice as long each time it still does, at most an interval. Block is
++// never tested and the dials it refuses reach no member, so without these rounds the
++// servers would come back at the next periodic round only, minutes after the network that
++// failed them (an outage of the provider, a start before the WAN is up).
++var blockRetryFirst = 30 * time.Second
++
++// retryBlock arms that round while the TCP choice is a block fallback, and forgets the delay
++// once it is not. Called under updateAccess.
++func (g *URLTestGroup) retryBlock() {
++	current := g.selectedOutboundTCP.Load()
++	if current == nil || current.Type() != C.TypeBlock || !g.isFallback(current) {
++		g.blockRetry = 0
++		if g.blockRetryTimer != nil {
++			g.blockRetryTimer.Stop()
++			g.blockRetryTimer = nil
++		}
++		return
++	}
++	if g.blockRetryTimer != nil {
++		return
++	}
++	if g.blockRetry == 0 {
++		g.blockRetry = blockRetryFirst
++	} else {
++		g.blockRetry = min(2*g.blockRetry, g.interval)
++	}
++	var timer *time.Timer
++	timer = time.AfterFunc(g.blockRetry, func() {
++		g.updateAccess.Lock()
++		if g.blockRetryTimer == timer {
++			// a selection may have disarmed this timer and armed another while this waited
++			g.blockRetryTimer = nil
++		}
++		// an idle group is tested again when a dial comes (Touch), a paused network when it
++		// is back (watchPause); the retries then start over from the first delay
++		resting := g.closed.Load() || g.ctx.Err() != nil || g.networkPaused() || time.Since(g.lastActive.Load()) > g.idleTimeout
++		if resting {
++			g.blockRetry = 0
++		}
++		g.updateAccess.Unlock()
++		if !resting {
++			// not forced: the members without a result, the ones block stands for, are
++			// tested anyway, and a round in progress selects at its end
++			g.CheckOutbounds(g.ctx, false)
++		}
++	})
++	g.blockRetryTimer = timer
++}
+diff --git a/protocol/group/urltest_download.go b/protocol/group/urltest_download.go
+index cc1bcd4a3..52f1e372d 100644
+--- a/protocol/group/urltest_download.go
++++ b/protocol/group/urltest_download.go
+@@ -85,6 +85,10 @@ func (g *URLTestGroup) selectTested() (adapter.Outbound, bool) {
+ 		if candidate == nil || !exists {
+ 			break
+ 		}
++		if candidate.Type() == C.TypeBlock {
++			// a block fallback downloads nothing: it refuses (podkop-engine)
++			return candidate, true
++		}
+ 		tag := RealTag(candidate, N.NetworkTCP)
+ 		if candidate == current {
+ 			if _, wasFrozen := g.frozen.Load()[tag]; !wasFrozen {
+diff --git a/protocol/group/urltest_failure.go b/protocol/group/urltest_failure.go
+index 22ada984d..9ea6db852 100644
+--- a/protocol/group/urltest_failure.go
++++ b/protocol/group/urltest_failure.go
+@@ -345,7 +345,9 @@ func (g *URLTestGroup) confirmWith(confirms *map[string]*memberConfirm, tag stri
+ 	g.confirmAccess.Unlock()
+ 	go func() {
+ 		start := time.Now()
+-		_, err := testOutbound(g.ctx, g.link, member)
++		// past probeSlots: one test of a member whose connections fail, paced as above, is
++		// no burst, and behind the rounds it would keep the group on a dead member
++		_, err := probeOutbound(g.ctx, g.link, member)
+ 		now := time.Now()
+ 		g.confirmAccess.Lock()
+ 		state.running = false
+@@ -381,8 +383,8 @@ func (g *URLTestGroup) confirmWith(confirms *map[string]*memberConfirm, tag stri
+ // hellos are what operators' DPI freezes, and a small CPU lags under them.
+ var probeSlots = make(chan struct{}, 4)
+ 
+-// testOutbound runs one URL test of detour, bounded by the TCP timeout once one of
+-// probeSlots is free: the wait for the slot does not take the time of the test.
++// testOutbound runs one URL test of detour (probeOutbound) once one of probeSlots is free:
++// the wait for the slot does not take the time of the test.
+ func testOutbound(ctx context.Context, link string, detour adapter.Outbound) (uint16, error) {
+ 	select {
+ 	case probeSlots <- struct{}{}:
+@@ -390,6 +392,11 @@ func testOutbound(ctx context.Context, link string, detour adapter.Outbound) (ui
+ 		return 0, ctx.Err()
+ 	}
+ 	defer func() { <-probeSlots }()
++	return probeOutbound(ctx, link, detour)
++}
++
++// probeOutbound runs one URL test of detour, bounded by the TCP timeout.
++func probeOutbound(ctx context.Context, link string, detour adapter.Outbound) (uint16, error) {
+ 	ctx, cancel := context.WithTimeout(ctx, C.TCPTimeout)
+ 	defer cancel()
+ 	type result struct {
+diff --git a/protocol/group/urltest_r20_test.go b/protocol/group/urltest_r20_test.go
+index a9fb2413e..61d2f53ac 100644
+--- a/protocol/group/urltest_r20_test.go
++++ b/protocol/group/urltest_r20_test.go
+@@ -120,3 +120,104 @@ func TestNoFallbackBeforeARound(t *testing.T) {
+ 	require.Equal(t, "block", selected.Tag(), "tested and not answering: the fallback")
+ 	require.True(t, found)
+ }
++
++// Before a round a group of fallbacks alone takes its first fallback, not a block further
++// down: a rule whose servers are gone and whose fallbacks are direct, then block.
++func TestFallbacksOnlyBeforeARound(t *testing.T) {
++	t.Parallel()
++	history := urltest.NewHistoryStorage()
++	ctx := service.ContextWithPtr(context.Background(), history)
++	direct, block := newTestMember(C.TypeDirect, "direct", dialRefused), newTestMember(C.TypeBlock, "block", dialRefused)
++	manager := &testOutboundManager{members: map[string]adapter.Outbound{"direct": direct, "block": block}}
++	group, err := NewURLTestGroup(ctx, manager, log.NewNOPFactory().Logger(), nil, members(direct, block), "", "", time.Minute, 50, 0, false)
++	require.NoError(t, err)
++	for _, network := range []string{N.NetworkTCP, N.NetworkUDP} {
++		selected, found := group.Select(network)
++		require.Equal(t, "direct", selected.Tag(), network)
++		require.False(t, found)
++	}
++	group.roundDone.Store(true)
++	selected, found := group.Select(N.NetworkTCP)
++	require.Equal(t, "block", selected.Tag(), "tested, direct did not answer: block")
++	require.True(t, found)
++}
++
++// The first round of a group that took over, when every member has a result already, tests
++// nothing and still counts as a round: a member that fails after it gives way to a fallback.
++func TestTakeOverWithResultsIsARound(t *testing.T) {
++	t.Parallel()
++	a, f := newTestMember(C.TypeSOCKS, "a", dialRefused), newTestMember(C.TypeSOCKS, "f", dialRefused)
++	_, group := newTestFallbackGroup(t, "", "", members(a), members(f), map[string]uint16{"a": 100, "f": 200})
++	group.roundDone.Store(false)
++	group.checkUntested()
++	require.True(t, group.roundDone.Load())
++	require.Zero(t, a.dials.Load()+f.dials.Load(), "nothing to test")
++	setResult(group, "a", 0)
++	group.performUpdateCheck()
++	tcp, _ := selectedTags(group)
++	require.Equal(t, "f", tcp)
++}
++
++// A block fallback is taken without a download test: it downloads nothing.
++func TestBlockFallbackWithoutDownloadTest(t *testing.T) {
++	t.Parallel()
++	a, block := newTestMember(C.TypeSOCKS, "a", dialRefused), newTestMember(C.TypeBlock, "block", dialRefused)
++	_, group := newTestFallbackGroup(t, "", "http://www.example.com/64k", members(a), members(block), nil)
++	tcp, _ := selectedTags(group)
++	require.Equal(t, "block", tcp)
++	require.Zero(t, block.dials.Load())
++}
++
++// While a block fallback is the choice, rounds come sooner than the interval, so the servers
++// come back soon after the network that failed them. Not parallel: blockRetryFirst is the
++// package's.
++func TestBlockFallbackRetried(t *testing.T) {
++	first := blockRetryFirst
++	blockRetryFirst = 50 * time.Millisecond
++	t.Cleanup(func() { blockRetryFirst = first })
++	link, _ := testURL(t, 0)
++	var up atomic.Bool
++	a := newTestMember(C.TypeSOCKS, "a", func(ctx context.Context, network string, destination M.Socksaddr) (net.Conn, error) {
++		if !up.Load() {
++			return nil, errors.New("down")
++		}
++		return dialWorking(ctx, network, destination)
++	})
++	block := newTestMember(C.TypeBlock, "block", dialRefused)
++	ctx := service.ContextWithPtr(context.Background(), urltest.NewHistoryStorage())
++	manager := &testOutboundManager{members: map[string]adapter.Outbound{"a": a, "block": block}}
++	group, err := NewURLTestGroup(ctx, manager, log.NewNOPFactory().Logger(), members(a), members(block), link, "", 10*time.Minute, 50, 0, false)
++	require.NoError(t, err)
++	t.Cleanup(func() { _ = group.Close() })
++	group.lastActive.Store(time.Now())
++	group.CheckOutbounds(ctx, true)
++	tcp, _ := selectedTags(group)
++	require.Equal(t, "block", tcp)
++	require.Eventually(t, func() bool { return a.dials.Load() >= 3 }, 5*time.Second, 10*time.Millisecond, "rounds while block is chosen")
++	up.Store(true)
++	require.Eventually(t, func() bool {
++		tcp, _ := selectedTags(group)
++		return tcp == "a"
++	}, 5*time.Second, 10*time.Millisecond)
++	group.updateAccess.Lock()
++	armed := group.blockRetryTimer != nil
++	group.updateAccess.Unlock()
++	require.False(t, armed, "no more rounds once a server answers")
++}
++
++// A confirming test of a failing member does not wait for probeSlots: behind the rounds it
++// would keep the group on a dead member. Not parallel: the slots are those of the process.
++func TestConfirmPastProbeSlots(t *testing.T) {
++	for range cap(probeSlots) {
++		probeSlots <- struct{}{}
++	}
++	t.Cleanup(func() {
++		for range cap(probeSlots) {
++			<-probeSlots
++		}
++	})
++	a, f := newTestMember(C.TypeSOCKS, "a", dialRefused), newTestMember(C.TypeSOCKS, "f", dialRefused)
++	_, group := newTestFallbackGroup(t, "http://www.example.com/generate_204", "", members(a), members(f), map[string]uint16{"a": 100, "f": 200})
++	require.True(t, group.confirmFailure("a", a))
++	require.Eventually(t, func() bool { return a.dials.Load() > 0 }, 5*time.Second, 10*time.Millisecond)
++}
+-- 
+2.53.0
+

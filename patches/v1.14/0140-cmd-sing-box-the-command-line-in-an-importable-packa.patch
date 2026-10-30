@@ -1,7 +1,7 @@
 From 82a671ab88f8d9c823d3262c2d23d2628d913376 Mon Sep 17 00:00:00 2001
 From: FiyeroT <me@fiyero.xyz>
 Date: Mon, 19 Oct 2026 00:30:53 +0300
-Subject: [PATCH 140/174] cmd/sing-box: the command line in an importable
+Subject: [PATCH 140/177] cmd/sing-box: the command line in an importable
  package, cli
 
 The commands of sing-box were package main: no other program could run

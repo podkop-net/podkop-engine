@@ -1,7 +1,7 @@
 From dd1ab945bc75a2f9622f8c4d50661279367d3d18 Mon Sep 17 00:00:00 2001
 From: FiyeroT <me@fiyero.xyz>
 Date: Thu, 8 Oct 2026 18:01:43 +0300
-Subject: [PATCH 101/174] decode-link: options of sing-box by their paths, and
+Subject: [PATCH 101/177] decode-link: options of sing-box by their paths, and
  what a link may not set
 
 A link names an option that no link has a name for by its path in the configuration,

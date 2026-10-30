@@ -1,7 +1,7 @@
 From 384b5173c9ab6d4457e30af7cec3580bc53c6d91 Mon Sep 17 00:00:00 2001
 From: FiyeroT <me@fiyero.xyz>
 Date: Mon, 26 Oct 2026 16:52:29 +0300
-Subject: [PATCH 167/174] cachefile: the content of a remote rule set in a file
+Subject: [PATCH 167/177] cachefile: the content of a remote rule set in a file
  of its own
 
 In bbolt a list of megabytes took three times its size or more: a changed

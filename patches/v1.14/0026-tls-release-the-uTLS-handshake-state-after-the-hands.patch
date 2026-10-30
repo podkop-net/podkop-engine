@@ -1,7 +1,7 @@
 From 478cbe2048f5007038d2d33f3cf9f0c6f8b4d816 Mon Sep 17 00:00:00 2001
 From: FiyeroT <me@fiyero.xyz>
 Date: Sat, 3 Oct 2026 16:35:35 +0300
-Subject: [PATCH 026/174] tls: release the uTLS handshake state after the
+Subject: [PATCH 026/177] tls: release the uTLS handshake state after the
  handshake
 
 A uTLS or REALITY client connection kept the ClientHello, the private keys of

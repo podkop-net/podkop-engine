@@ -1,7 +1,7 @@
 From 48c08fec70f8046df5c6cc7ccf0f4a0bf50c4e76 Mon Sep 17 00:00:00 2001
 From: FiyeroT <me@fiyero.xyz>
 Date: Mon, 26 Oct 2026 16:03:10 +0300
-Subject: [PATCH 163/174] xhttp: the idle connections of the pool are closed on
+Subject: [PATCH 163/177] xhttp: the idle connections of the pool are closed on
  request
 
 sing-box 1.14 closes the idle connections of an outbound nothing references

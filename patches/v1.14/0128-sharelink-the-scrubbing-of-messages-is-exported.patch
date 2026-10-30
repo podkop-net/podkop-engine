@@ -1,7 +1,7 @@
 From fe08da04dfa884dd97bcf73676ee712fd7453a60 Mon Sep 17 00:00:00 2001
 From: FiyeroT <me@fiyero.xyz>
 Date: Mon, 12 Oct 2026 16:56:27 +0300
-Subject: [PATCH 128/174] sharelink: the scrubbing of messages is exported
+Subject: [PATCH 128/177] sharelink: the scrubbing of messages is exported
 
 PlainMessage and OneLine move from the decode-link command into the package:
 another caller that reports why a link cannot be used needs the same text

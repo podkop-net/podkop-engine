@@ -1,0 +1,108 @@
+From 829c42a05b1856eff268a51bcf5965189083b23c Mon Sep 17 00:00:00 2001
+From: FiyeroT <me@fiyero.xyz>
+Date: Thu, 29 Oct 2026 21:14:50 +0300
+Subject: [PATCH 176/177] urltest: no fallback before a round has tested the
+ outbounds
+
+At a start or after a swap no outbound has a result yet, which is no reason to
+fall back: a block fallback refused every connection until the first round
+ended, a direct one sent them past the proxy. Until a round has tested the
+members, the first outbound is the plain choice, as without fallbacks.
+---
+ protocol/group/urltest.go               | 16 +++++++++++++++-
+ protocol/group/urltest_fallback_test.go |  2 ++
+ protocol/group/urltest_r20_test.go      | 20 ++++++++++++++++++++
+ 3 files changed, 37 insertions(+), 1 deletion(-)
+
+diff --git a/protocol/group/urltest.go b/protocol/group/urltest.go
+index a6d30428c..4ed5fefbf 100644
+--- a/protocol/group/urltest.go
++++ b/protocol/group/urltest.go
+@@ -320,6 +320,7 @@ type URLTestGroup struct {
+ 	checking                     atomic.Bool
+ 	recheck                      atomic.Bool
+ 	lastRound                    atomic.Int64 // when the last round began, since epoch
++	roundDone                    atomic.Bool  // a round has tested the members (see selectAmong)
+ 	selectedOutboundTCP          common.TypedValue[adapter.Outbound]
+ 	selectedOutboundUDP          common.TypedValue[adapter.Outbound]
+ 	interruptGroup               *interrupt.Group
+@@ -502,6 +503,17 @@ func (g *URLTestGroup) selectAmong(network string, skip func(tag string, history
+ 		}
+ 	}
+ 	if minOutbound == nil {
++		if !g.roundDone.Load() {
++			// before a round has tested them the outbounds have no results, which is no
++			// reason to fall back (podkop-engine): at a start or after a swap a block
++			// fallback would refuse every connection, a direct one send it past the proxy.
++			// The first of them, as without fallbacks.
++			for _, detour := range g.outbounds {
++				if common.Contains(detour.Network(), network) {
++					return detour, false
++				}
++			}
++		}
+ 		for _, detour := range g.fallbacks {
+ 			if !common.Contains(detour.Network(), network) {
+ 				continue
+@@ -626,7 +638,9 @@ func (g *URLTestGroup) urlTestMembers(ctx context.Context, members []adapter.Out
+ 			go g.CheckOutbounds(g.ctx, true)
+ 		}
+ 	}()
+-	return urlTestOutbounds(ctx, g.outbound, g.history, g.logger, members, g.link, g.interval, force, wait, concurrency), nil
++	result := urlTestOutbounds(ctx, g.outbound, g.history, g.logger, members, g.link, g.interval, force, wait, concurrency)
++	g.roundDone.Store(true)
++	return result, nil
+ }
+ 
+ type urlTestResult struct {
+diff --git a/protocol/group/urltest_fallback_test.go b/protocol/group/urltest_fallback_test.go
+index c3b799e45..4df33cefc 100644
+--- a/protocol/group/urltest_fallback_test.go
++++ b/protocol/group/urltest_fallback_test.go
+@@ -35,6 +35,8 @@ func newTestFallbackGroup(t *testing.T, link, downloadLink string, outbounds, fa
+ 	}
+ 	group, err := NewURLTestGroup(ctx, manager, log.NewNOPFactory().Logger(), outbounds, fallbacks, link, downloadLink, time.Minute, 50, 0, false)
+ 	require.NoError(t, err)
++	// the results are those of a round (roundDone)
++	group.roundDone.Store(true)
+ 	group.performUpdateCheck()
+ 	return &URLTest{group: group, logger: log.NewNOPFactory().NewLogger("urltest")}, group
+ }
+diff --git a/protocol/group/urltest_r20_test.go b/protocol/group/urltest_r20_test.go
+index bf1d81fc9..a9fb2413e 100644
+--- a/protocol/group/urltest_r20_test.go
++++ b/protocol/group/urltest_r20_test.go
+@@ -9,6 +9,7 @@ import (
+ 	"testing"
+ 	"time"
+ 
++	"github.com/sagernet/sing-box/adapter"
+ 	"github.com/sagernet/sing-box/common/urltest"
+ 	C "github.com/sagernet/sing-box/constant"
+ 	"github.com/sagernet/sing-box/log"
+@@ -100,3 +101,22 @@ func TestProbeLimit(t *testing.T) {
+ 	require.Equal(t, int32(cap(probeSlots)), most.Load())
+ 	require.Equal(t, int32(3*cap(probeSlots)), slow.dials.Load())
+ }
++
++// Before a round has tested the members a fallback is not taken for want of their results: at
++// a start or after a swap a block fallback would refuse every connection.
++func TestNoFallbackBeforeARound(t *testing.T) {
++	t.Parallel()
++	history := urltest.NewHistoryStorage()
++	ctx := service.ContextWithPtr(context.Background(), history)
++	server, block := newTestMember(C.TypeSOCKS, "a", dialRefused), newTestMember(C.TypeBlock, "block", dialRefused)
++	manager := &testOutboundManager{members: map[string]adapter.Outbound{"a": server, "block": block}}
++	group, err := NewURLTestGroup(ctx, manager, log.NewNOPFactory().Logger(), members(server), members(block), "", "", time.Minute, 50, 0, false)
++	require.NoError(t, err)
++	selected, found := group.Select(N.NetworkTCP)
++	require.Equal(t, "a", selected.Tag())
++	require.False(t, found)
++	group.roundDone.Store(true)
++	selected, found = group.Select(N.NetworkTCP)
++	require.Equal(t, "block", selected.Tag(), "tested and not answering: the fallback")
++	require.True(t, found)
++}
+-- 
+2.53.0
+

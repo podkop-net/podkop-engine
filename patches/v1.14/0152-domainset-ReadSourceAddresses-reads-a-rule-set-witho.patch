@@ -1,7 +1,7 @@
 From 2c49493bde4a5cf77ed084be25cb66ef010dedb4 Mon Sep 17 00:00:00 2001
 From: FiyeroT <me@fiyero.xyz>
 Date: Sat, 24 Oct 2026 09:39:26 +0300
-Subject: [PATCH 152/174] domainset: ReadSourceAddresses reads a rule set
+Subject: [PATCH 152/177] domainset: ReadSourceAddresses reads a rule set
  without building its names
 
 For those who want the addresses of a rule set of the source format and

@@ -1,7 +1,7 @@
 From 8848af6246a4f3122e031ba252a55fa426e934e0 Mon Sep 17 00:00:00 2001
 From: FiyeroT <me@fiyero.xyz>
 Date: Thu, 29 Oct 2026 01:38:43 +0300
-Subject: [PATCH 174/174] dialer: a detour finds the outbound of its tag at
+Subject: [PATCH 174/177] dialer: a detour finds the outbound of its tag at
  every dial
 
 An outbound replaced while the box runs (box.UpdateOutbounds) is not kept

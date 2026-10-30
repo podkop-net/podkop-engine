@@ -1,7 +1,7 @@
 From ba0a329c8ef94eaecc855ceea495921d9fc83def Mon Sep 17 00:00:00 2001
 From: FiyeroT <me@fiyero.xyz>
 Date: Mon, 19 Oct 2026 20:58:05 +0300
-Subject: [PATCH 034/174] go.mod: take sing-vmess from the podkop-engine fork
+Subject: [PATCH 034/177] go.mod: take sing-vmess from the podkop-engine fork
  (v0.2.9-pdk.1)
 
 github.com/FiyeroT/sing-vmess v0.2.9-pdk.1 is the sing-vmess of this line plus one

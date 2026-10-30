@@ -1,7 +1,7 @@
 From 4afd29d33c390338bb96b66b90afabdfcbbb2ce7 Mon Sep 17 00:00:00 2001
 From: FiyeroT <me@fiyero.xyz>
 Date: Thu, 29 Oct 2026 01:38:43 +0300
-Subject: [PATCH 173/174] route: a connection a block outbound refused is
+Subject: [PATCH 173/177] route: a connection a block outbound refused is
  logged at debug
 
 As one the reject action refused: a section of podkop whose group has no

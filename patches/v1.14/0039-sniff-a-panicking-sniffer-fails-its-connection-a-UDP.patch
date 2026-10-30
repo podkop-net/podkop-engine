@@ -1,7 +1,7 @@
 From 15bb66148bddf5205604a4b153e13b0b5b97b437 Mon Sep 17 00:00:00 2001
 From: FiyeroT <me@fiyero.xyz>
 Date: Sun, 4 Oct 2026 08:40:40 +0300
-Subject: [PATCH 039/174] sniff: a panicking sniffer fails its connection, a
+Subject: [PATCH 039/177] sniff: a panicking sniffer fails its connection, a
  UDP sniff reads 16 packets
 
 Sniffers parse whatever a client in the LAN sends, and nothing recovered a

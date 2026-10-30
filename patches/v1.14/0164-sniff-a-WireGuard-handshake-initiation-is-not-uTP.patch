@@ -1,7 +1,7 @@
 From e433f648e56dc7066a096b1a874b3980bd13ed80 Mon Sep 17 00:00:00 2001
 From: FiyeroT <me@fiyero.xyz>
 Date: Mon, 26 Oct 2026 16:03:10 +0300
-Subject: [PATCH 164/174] sniff: a WireGuard handshake initiation is not uTP
+Subject: [PATCH 164/177] sniff: a WireGuard handshake initiation is not uTP
 
 The first packet of a plain WireGuard tunnel (148 bytes, the type 1 as four
 little-endian bytes) reads as a uTP data packet without extensions and with

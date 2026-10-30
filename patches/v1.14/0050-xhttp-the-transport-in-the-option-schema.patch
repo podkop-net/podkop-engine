@@ -1,7 +1,7 @@
 From ccc73d44e2d216ca68c67ea6f7c860bf9e15fde3 Mon Sep 17 00:00:00 2001
 From: FiyeroT <me@fiyero.xyz>
 Date: Mon, 5 Oct 2026 13:37:05 +0300
-Subject: [PATCH 050/174] xhttp: the transport in the option schema
+Subject: [PATCH 050/177] xhttp: the transport in the option schema
 
 ---
  option/v2ray_transport.go    |  3 ++-

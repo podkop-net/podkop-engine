@@ -1,7 +1,7 @@
 From 9f528a71a469a71ca873070ca575d5f0f866620e Mon Sep 17 00:00:00 2001
 From: FiyeroT <me@fiyero.xyz>
 Date: Sun, 18 Oct 2026 16:29:29 +0300
-Subject: [PATCH 127/174] cidrset: CIDR lists of rule sets as ranges of their
+Subject: [PATCH 127/177] cidrset: CIDR lists of rule sets as ranges of their
  own
 
 netipx.IPSet keeps a range as two netip.Addr, 48 bytes, and its builder

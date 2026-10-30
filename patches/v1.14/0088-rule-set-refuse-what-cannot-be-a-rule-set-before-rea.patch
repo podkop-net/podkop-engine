@@ -1,7 +1,7 @@
 From da13cdc3263dd5aec8bbd0b6da1aa455de7a5977 Mon Sep 17 00:00:00 2001
 From: FiyeroT <me@fiyero.xyz>
 Date: Thu, 8 Oct 2026 15:11:05 +0300
-Subject: [PATCH 088/174] rule-set: refuse what cannot be a rule-set before
+Subject: [PATCH 088/177] rule-set: refuse what cannot be a rule-set before
  reading it, say what came
 
 A 200 body was read whole, up to the 50 MB cap, before its size and format

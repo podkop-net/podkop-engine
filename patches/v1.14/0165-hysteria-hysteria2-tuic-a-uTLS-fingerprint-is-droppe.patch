@@ -1,7 +1,7 @@
 From dbe74957e1b2bfb2a93748c75b2a43e3fc7e867b Mon Sep 17 00:00:00 2001
 From: FiyeroT <me@fiyero.xyz>
 Date: Mon, 26 Oct 2026 16:03:10 +0300
-Subject: [PATCH 165/174] hysteria, hysteria2, tuic: a uTLS fingerprint is
+Subject: [PATCH 165/177] hysteria, hysteria2, tuic: a uTLS fingerprint is
  dropped with a warning
 
 quic-go makes the ClientHello itself, and the QUIC outbounds take the

@@ -1,7 +1,7 @@
 From 7392caf99a8543d239155b7104a8061922c17b72 Mon Sep 17 00:00:00 2001
 From: FiyeroT <me@fiyero.xyz>
 Date: Wed, 30 Sep 2026 23:36:29 +0300
-Subject: [PATCH 010/174] utls: keep the randomized fingerprint consistent
+Subject: [PATCH 010/177] utls: keep the randomized fingerprint consistent
 
 uTLS draws "X25519MLKEM768 in supported_groups" and "a key share for it" as
 independent coins in HelloRandomized. A seed that offers the group without its

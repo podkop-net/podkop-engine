@@ -1,7 +1,7 @@
 From bafd7d1502fa2108911c0a2725f1ebd13a48a4c1 Mon Sep 17 00:00:00 2001
 From: FiyeroT <me@fiyero.xyz>
 Date: Sun, 4 Oct 2026 08:17:57 +0300
-Subject: [PATCH 036/174] urltest: take the download test URL from the group's
+Subject: [PATCH 036/177] urltest: take the download test URL from the group's
  download_url
 
 The download test URL came only from SING_BOX_URLTEST_DOWNLOAD_URL, one for every

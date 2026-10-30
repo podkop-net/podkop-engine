@@ -1,7 +1,7 @@
 From cf3e1dc59668fdfe7ffbced562bdd464ce8db4ed Mon Sep 17 00:00:00 2001
 From: FiyeroT <me@fiyero.xyz>
 Date: Tue, 6 Oct 2026 23:55:40 +0300
-Subject: [PATCH 070/174] xhttp: refuse an uplink_http_method that is not a
+Subject: [PATCH 070/177] xhttp: refuse an uplink_http_method that is not a
  token
 
 The method was only put in upper case. A value with a space or another byte a method

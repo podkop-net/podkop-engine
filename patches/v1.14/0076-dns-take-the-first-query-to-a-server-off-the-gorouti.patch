@@ -1,7 +1,7 @@
 From 949fc49c07e7c7dfbf3b2a29d849f3bb73e24cfb Mon Sep 17 00:00:00 2001
 From: FiyeroT <me@fiyero.xyz>
 Date: Tue, 6 Oct 2026 23:40:13 +0300
-Subject: [PATCH 076/174] dns: take the first query to a server off the
+Subject: [PATCH 076/177] dns: take the first query to a server off the
  goroutine that reads client queries
 
 The first query to a DNS server decides whether the provider fallback applies to it and,

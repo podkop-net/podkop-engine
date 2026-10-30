@@ -1,7 +1,7 @@
 From 16cffb6063b4afc5a4e691ac1eb55568552be646 Mon Sep 17 00:00:00 2001
 From: FiyeroT <me@fiyero.xyz>
 Date: Tue, 13 Oct 2026 06:22:38 +0300
-Subject: [PATCH 129/174] route: remote rule-sets can be updated on request
+Subject: [PATCH 129/177] route: remote rule-sets can be updated on request
 
 RuleSetUpdater.UpdateNow updates every remote rule-set at once, whatever its
 update_interval, and returns how many there are, how many got a new list and
