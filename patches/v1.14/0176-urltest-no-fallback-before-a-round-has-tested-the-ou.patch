@@ -1,7 +1,7 @@
 From 829c42a05b1856eff268a51bcf5965189083b23c Mon Sep 17 00:00:00 2001
 From: FiyeroT <me@fiyero.xyz>
 Date: Thu, 29 Oct 2026 21:14:50 +0300
-Subject: [PATCH 176/177] urltest: no fallback before a round has tested the
+Subject: [PATCH 176/182] urltest: no fallback before a round has tested the
  outbounds
 
 At a start or after a swap no outbound has a result yet, which is no reason to

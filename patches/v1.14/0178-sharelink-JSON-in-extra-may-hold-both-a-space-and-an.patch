@@ -1,0 +1,84 @@
+From 37176b416204f33c6862c1f6b51e8e8dfc6e4432 Mon Sep 17 00:00:00 2001
+From: FiyeroT <me@fiyero.xyz>
+Date: Fri, 30 Oct 2026 12:56:02 +0300
+Subject: [PATCH 178/182] sharelink: JSON in extra may hold both a space and an
+ address
+
+The check against a second link on one line refused every value with a space
+and "://". The JSON in extra of XHTTP links holds them in its texts, a
+browser's User-Agent next to a Referer or an address, and a subscription of
+such links had no server to use: "the link parameter extra contains a space
+and another link".
+
+Valid JSON passes the check; a link after the JSON makes it invalid, and that
+is still refused without repeating the link.
+---
+ common/sharelink/link.go              |  6 ++++++
+ common/sharelink/link_review2_test.go | 20 ++++++++++++++++++++
+ 2 files changed, 26 insertions(+)
+
+diff --git a/common/sharelink/link.go b/common/sharelink/link.go
+index 054eb6aab..45f49b6b5 100644
+--- a/common/sharelink/link.go
++++ b/common/sharelink/link.go
+@@ -8,6 +8,7 @@
+ package sharelink
+ 
+ import (
++	"encoding/json"
+ 	"errors"
+ 	"net/url"
+ 	"sort"
+@@ -398,6 +399,11 @@ func (d *decoder) split(rest string) error {
+ 			// a name and a resolver joined with "+", which form decoding reads as a space
+ 			continue
+ 		}
++		if key == "extra" && json.Valid([]byte(value)) {
++			// JSON may hold both in its texts, a browser's User-Agent and a Referer;
++			// a link after it is no JSON
++			continue
++		}
+ 		if strings.Contains(value, "://") && strings.ContainsAny(value, " \t\r\n") {
+ 			return E.New("the link parameter ", d.names[key], " contains a space and another link")
+ 		}
+diff --git a/common/sharelink/link_review2_test.go b/common/sharelink/link_review2_test.go
+index ce7b1188e..86c1dea40 100644
+--- a/common/sharelink/link_review2_test.go
++++ b/common/sharelink/link_review2_test.go
+@@ -1,6 +1,7 @@
+ package sharelink
+ 
+ import (
++	"net/url"
+ 	"strings"
+ 	"testing"
+ 
+@@ -53,6 +54,25 @@ func TestParameterNamesThatAreNone(t *testing.T) {
+ 	require.False(t, plainName(""))
+ }
+ 
++// The JSON in extra may hold spaces and addresses at once: it is no second link on the line. A
++// link after the JSON is, and no message repeats it.
++func TestExtraHoldsSpacesAndAddresses(t *testing.T) {
++	t.Parallel()
++	const canary = "CANARY0f6d2c"
++	base := "vless://" + testUUID + "@example.org:443?type=xhttp&security=tls&sni=example.org&extra="
++	for name, extra := range map[string]string{
++		"a browser":     `{"headers":{"User-Agent":"Mozilla/5.0 (X11; Linux x86_64)","Referer":"https://example.org/a"}}`,
++		"several lines": "{\n  \"headers\": {\n    \"Referer\": \"https://example.org/a\"\n  }\n}\n",
++	} {
++		content, warnings := decodeJSON(t, base+url.QueryEscape(extra))
++		require.Contains(t, content, "https://example.org/a", name)
++		require.Empty(t, warnings, name)
++	}
++	_, _, err := Decode(base + url.QueryEscape(`{"headers":{"Referer":"https://example.org/a"}}`) + "%20vless://" + canary + "@h.example.org:443")
++	require.ErrorContains(t, err, "the link parameter extra contains a space and another link")
++	require.NotContains(t, err.Error(), canary)
++}
++
+ // The keys and the values of the JSON in extra are as free a text as the names of
+ // parameters: what is not a name is not repeated.
+ func TestExtraIsNotRepeated(t *testing.T) {
+-- 
+2.53.0
+
