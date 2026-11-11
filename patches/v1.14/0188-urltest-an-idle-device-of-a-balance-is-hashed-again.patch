@@ -1,0 +1,97 @@
+From 242cb1b8bf7d5a53f0ce6e76ecedfb5440902c40 Mon Sep 17 00:00:00 2001
+From: FiyeroT <me@fiyero.xyz>
+Date: Fri, 6 Nov 2026 09:23:59 +0300
+Subject: [PATCH 188/193] urltest: an idle device of a balance is hashed again
+
+A device that moved off a member that went down stayed on its new member
+for good while that one stayed in the balance: after one outage the devices
+piled up on the members left (the stand: 20 of 20 on s1 after s2 came
+back). A device is now hashed over the balance again once it has been idle
+for balance_idle; busy, or idle for less, it keeps its member while that is
+up.
+---
+ protocol/group/urltest_balance.go   | 15 +++++++-----
+ protocol/group/urltest_loss_test.go | 36 +++++++++++++++++++++++++++++
+ 2 files changed, 45 insertions(+), 6 deletions(-)
+
+diff --git a/protocol/group/urltest_balance.go b/protocol/group/urltest_balance.go
+index a8e159e44..20c0f138b 100644
+--- a/protocol/group/urltest_balance.go
++++ b/protocol/group/urltest_balance.go
+@@ -15,11 +15,11 @@ import (
+ // The mode balance (podkop-engine).
+ //
+ // The connections of a group are spread over its best members by their source address: a
+-// device keeps the member it was given, so that a site sees one address of it, and a new
+-// device is given one by rendezvous hashing over the members of the balance, which moves
+-// few devices when a member comes or goes. A device moves to another member only when its
+-// own is down, or, once it is out of the balance, when the device has opened no connection
+-// for balance_idle. On the stand the balance brought no speed: a device's connections over
++// device keeps the member it was given while it has connections and for balance_idle after,
++// so that a site sees one address of it, and is given one by rendezvous hashing over the
++// members of the balance, which moves few devices when a member comes or goes. A device
++// moves at once only when its member is down; otherwise it is hashed again once it has been
++// idle for balance_idle, which returns it to a member that came back. On the stand the balance brought no speed: a device's connections over
+ // two servers went no faster than over one, and a slow member made its devices slow; what
+ // it gives is the load of the servers spread, and counts of loss of several of them.
+ //
+@@ -150,8 +150,11 @@ func (g *URLTestGroup) balanced(ctx context.Context, network string) (adapter.Ou
+ 		device = &balanceDevice{}
+ 		b.devices[key] = device
+ 	}
++	// a device busy or idle for less than balance_idle keeps its member while it is up, in the
++	// balance or not; one idle longer is given the member its address falls on now, which
++	// brings the devices back to a member that was down, and spreads them again
+ 	keep := device.member != nil && slices.Contains(g.outbounds, device.member) && g.memberAlive(device.member) &&
+-		(slices.Contains(members, device.member) || device.active > 0 || now.Sub(device.last) < g.loss.balanceIdle)
++		(device.active > 0 || now.Sub(device.last) < g.loss.balanceIdle)
+ 	member := device.member
+ 	switch {
+ 	case keep && slices.Contains(member.Network(), network):
+diff --git a/protocol/group/urltest_loss_test.go b/protocol/group/urltest_loss_test.go
+index e5c01d746..6449f0de3 100644
+--- a/protocol/group/urltest_loss_test.go
++++ b/protocol/group/urltest_loss_test.go
+@@ -335,3 +335,39 @@ func TestLossModeStoppedDownloadHolds(t *testing.T) {
+ 	tcp, _ := selectedTags(group)
+ 	require.Equal(t, "a", tcp)
+ }
++
++// A device that moved off a member that went down comes back to it once the member is up and
++// the device has been idle; a busy device stays.
++func TestBalanceReturnsAfterIdle(t *testing.T) {
++	a, b := newTestMember(C.TypeSOCKS, "a", dialWorking), newTestMember(C.TypeSOCKS, "b", dialWorking)
++	urlTest, group := newModeGroup(t, modeBalance, members(a, b), map[string]uint16{"a": 100, "b": 110}, nil)
++	group.loss.balanceIdle = time.Hour
++	target := balanceTarget(t)
++	memberOf := func(source string) string {
++		conn, err := urlTest.DialContext(sourceContext(source), N.NetworkTCP, target)
++		require.NoError(t, err)
++		conn.Close()
++		return group.balance.devices[source].member.Tag()
++	}
++	var onB string
++	for i := 1; i < 200 && onB == ""; i++ {
++		if source := fmt.Sprint("10.2.0.", i); memberOf(source) == "b" {
++			onB = source
++		}
++	}
++	require.NotEmpty(t, onB)
++	setResult(group, "b", 0)
++	group.performUpdateCheck()
++	require.Equal(t, "a", memberOf(onB))
++	setResult(group, "b", 110)
++	group.performUpdateCheck()
++	require.Equal(t, "a", memberOf(onB), "not idle yet: it stays")
++	held, err := urlTest.DialContext(sourceContext(onB), N.NetworkTCP, target)
++	require.NoError(t, err)
++	group.loss.balanceIdle = 20 * time.Millisecond
++	time.Sleep(50 * time.Millisecond)
++	require.Equal(t, "a", memberOf(onB), "busy: it stays")
++	held.Close()
++	time.Sleep(50 * time.Millisecond)
++	require.Equal(t, "b", memberOf(onB))
++}
+-- 
+2.53.0
+

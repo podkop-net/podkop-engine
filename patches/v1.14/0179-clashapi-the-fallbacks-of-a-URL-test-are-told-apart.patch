@@ -1,7 +1,7 @@
 From 317bc0304e4de7944099e6ecdb3ae8ed10360659 Mon Sep 17 00:00:00 2001
 From: FiyeroT <me@fiyero.xyz>
 Date: Fri, 30 Oct 2026 20:56:05 +0300
-Subject: [PATCH 179/182] clashapi: the fallbacks of a URL test are told apart
+Subject: [PATCH 179/193] clashapi: the fallbacks of a URL test are told apart
 
 "all" of a URL test lists its outbounds, then its fallbacks, and a delay test
 of the group answers only the outbounds that answered. A client could not tell

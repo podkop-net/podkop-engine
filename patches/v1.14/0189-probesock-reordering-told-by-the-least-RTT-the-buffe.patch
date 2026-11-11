@@ -1,0 +1,440 @@
+From 2b4cfe8eb7a12c22e9d552be9e77a8c105e47381 Mon Sep 17 00:00:00 2001
+From: FiyeroT <me@fiyero.xyz>
+Date: Fri, 6 Nov 2026 09:56:39 +0300
+Subject: [PATCH 189/193] probesock: reordering told by the least RTT; the
+ buffer back after a probe
+
+- The holes a packet fills are told apart (reordering or loss) at the end
+  of the probe, by the least RTT of the connection (TCP_INFO), not by the
+  time of its connect: on a busy host the connect took long, the window
+  grew, and retransmissions were counted as reordering (the stand under a
+  build: 1.6 % counted of 3 %).
+- After a probe the connection gets a receive buffer of the system maximum
+  (SO_RCVBUFFORCE): a multiplexed transport (gRPC, HTTP/2, xhttp, mux) keeps
+  the connection a probe dialed in its pool and carries other connections
+  over it, which the window of 16 KB would hold to a crawl.
+- The debug line of a probe tells the bytes reordered.
+---
+ common/probesock/capture_linux.go      | 57 ++++++++++++++++++++++----
+ common/probesock/capture_linux_test.go |  7 ++++
+ common/probesock/capture_other.go      |  8 ++--
+ common/probesock/count.go              | 40 ++++++++++++------
+ common/probesock/count_test.go         | 28 +++++++++----
+ common/probesock/probesock.go          | 42 +++++++++++++------
+ protocol/group/urltest_loss.go         |  5 ++-
+ 7 files changed, 143 insertions(+), 44 deletions(-)
+
+diff --git a/common/probesock/capture_linux.go b/common/probesock/capture_linux.go
+index 2dc232fd2..3573ed26f 100644
+--- a/common/probesock/capture_linux.go
++++ b/common/probesock/capture_linux.go
+@@ -6,6 +6,9 @@ import (
+ 	"encoding/binary"
+ 	"net"
+ 	"net/netip"
++	"os"
++	"strconv"
++	"strings"
+ 	"sync"
+ 	"sync/atomic"
+ 	"syscall"
+@@ -28,6 +31,47 @@ func appendControl(base func(network, address string, conn syscall.RawConn) erro
+ 	})
+ }
+ 
++var (
++	bufferMaxOnce sync.Once
++	bufferMax     int
++)
++
++// systemBufferMax is the largest receive buffer the system grows a TCP connection to (the
++// last of net.ipv4.tcp_rmem), 4 MB when it cannot be read.
++func systemBufferMax() int {
++	bufferMaxOnce.Do(func() {
++		bufferMax = 4 << 20
++		content, err := os.ReadFile("/proc/sys/net/ipv4/tcp_rmem")
++		if err != nil {
++			return
++		}
++		fields := strings.Fields(string(content))
++		if len(fields) == 3 {
++			if value, err := strconv.Atoi(fields[2]); err == nil && value > 0 {
++				bufferMax = value
++			}
++		}
++	})
++	return bufferMax
++}
++
++// restoreBuffer sets the receive buffer of a probe connection to the system maximum: the
++// kernel doubles what it is given, as the maximum counts. SO_RCVBUFFORCE passes over
++// net.core.rmem_max (small on routers) for a process with CAP_NET_ADMIN.
++func restoreBuffer(conn *net.TCPConn) {
++	raw, err := conn.SyscallConn()
++	if err != nil {
++		return
++	}
++	value := systemBufferMax() / 2
++	_ = control.Raw(raw, func(fd uintptr) error {
++		if unix.SetsockoptInt(int(fd), unix.SOL_SOCKET, unix.SO_RCVBUFFORCE, value) != nil {
++			return unix.SetsockoptInt(int(fd), unix.SOL_SOCKET, unix.SO_RCVBUF, value)
++		}
++		return nil
++	})
++}
++
+ type connInfo struct {
+ 	mss    int
+ 	minRTT time.Duration
+@@ -71,7 +115,7 @@ type capture struct {
+ 	inIndex int // the interface the incoming packets are taken from: the first one seen
+ }
+ 
+-func startCapture(conn *net.TCPConn, window time.Duration) (*capture, error) {
++func startCapture(conn *net.TCPConn) (*capture, error) {
+ 	local, err := netip.ParseAddrPort(conn.LocalAddr().String())
+ 	if err != nil {
+ 		return nil, err
+@@ -88,7 +132,6 @@ func startCapture(conn *net.TCPConn, window time.Duration) (*capture, error) {
+ 		return nil, E.Cause(err, "open a packet socket")
+ 	}
+ 	c := &capture{fd: fd, local: local, remote: remote, done: make(chan struct{})}
+-	c.counter.window = window
+ 	err = c.setup()
+ 	if err != nil {
+ 		unix.Close(fd)
+@@ -261,11 +304,11 @@ func (c *capture) take(packet []byte, index int, at time.Time) {
+ 	c.counter.add(at, binary.BigEndian.Uint32(tcp[4:8]), payload)
+ }
+ 
+-// stop ends the capture once the packets already taken are read, and returns the counts and
+-// how many packets the socket dropped.
+-func (c *capture) stop() (Counts, int) {
++// stop ends the capture once the packets already taken are read, and returns what it
++// counted and how many packets the socket dropped.
++func (c *capture) stop() (*counter, int) {
+ 	if c.stopped.Swap(true) {
+-		return Counts{}, 0
++		return &counter{}, 0
+ 	}
+ 	<-c.done
+ 	dropped := 0
+@@ -275,5 +318,5 @@ func (c *capture) stop() (Counts, int) {
+ 	unix.Close(c.fd)
+ 	c.access.Lock()
+ 	defer c.access.Unlock()
+-	return c.counter.finish(), dropped
++	return &c.counter, dropped
+ }
+diff --git a/common/probesock/capture_linux_test.go b/common/probesock/capture_linux_test.go
+index 18aed9726..a263adcee 100644
+--- a/common/probesock/capture_linux_test.go
++++ b/common/probesock/capture_linux_test.go
+@@ -74,6 +74,13 @@ func TestCaptureLoopback(t *testing.T) {
+ 	require.NoError(t, err)
+ 	require.Zero(t, result.Dropped)
+ 	require.Equal(t, int64(size), result.Bytes)
++	// the probe done, the connection may carry other traffic: its buffer is large again
++	require.NoError(t, control.Raw(raw, func(fd uintptr) error {
++		var err error
++		buffer, err = unix.GetsockoptInt(int(fd), unix.SOL_SOCKET, unix.SO_RCVBUF)
++		return err
++	}))
++	require.GreaterOrEqual(t, buffer, systemBufferMax()/2)
+ 	require.Zero(t, result.Lost)
+ 	require.Zero(t, result.DupBytes)
+ 	require.Positive(t, result.Segments)
+diff --git a/common/probesock/capture_other.go b/common/probesock/capture_other.go
+index 40d6ba878..426b8514a 100644
+--- a/common/probesock/capture_other.go
++++ b/common/probesock/capture_other.go
+@@ -26,10 +26,12 @@ func tcpInfo(conn *net.TCPConn) (connInfo, error) {
+ 
+ type capture struct{}
+ 
+-func startCapture(conn *net.TCPConn, window time.Duration) (*capture, error) {
++func startCapture(conn *net.TCPConn) (*capture, error) {
+ 	return nil, E.New("the capture is not supported on this platform")
+ }
+ 
+-func (c *capture) stop() (Counts, int) {
+-	return Counts{}, 0
++func (c *capture) stop() (*counter, int) {
++	return &counter{}, 0
+ }
++
++func restoreBuffer(conn *net.TCPConn) {}
+diff --git a/common/probesock/count.go b/common/probesock/count.go
+index 1ac9fbe53..6b9d40fdc 100644
+--- a/common/probesock/count.go
++++ b/common/probesock/count.go
+@@ -43,13 +43,23 @@ type hole struct {
+ 	at         time.Time
+ }
+ 
++// fill is a piece of a hole a packet filled: how long the hole had been open, and its bytes.
++// The pieces are told apart (reordering or loss) only at the end, by the least RTT of the
++// connection: the time of its connect, which a busy host or server stretches, would call
++// retransmissions reordering.
++type fill struct {
++	packet int
++	age    time.Duration
++	bytes  int64
++}
++
+ // counter follows the incoming sequence of one connection, packet by packet.
+ type counter struct {
+-	window  time.Duration
+ 	started bool
+ 	base    uint32
+ 	highest int64
+ 	holes   []hole
++	fills   []fill
+ 	Counts
+ }
+ 
+@@ -79,7 +89,6 @@ func (c *counter) add(at time.Time, seq uint32, payload int) {
+ 	}
+ 	limit := min(end, c.highest)
+ 	covered := int64(0)
+-	filledLate := false
+ 	kept := c.holes[:0]
+ 	for _, h := range c.holes {
+ 		from, to := max(start, h.start), min(limit, h.end)
+@@ -88,12 +97,7 @@ func (c *counter) add(at time.Time, seq uint32, payload int) {
+ 			continue
+ 		}
+ 		covered += to - from
+-		if at.Sub(h.at) < c.window {
+-			c.ReorderBytes += to - from
+-		} else {
+-			c.LostBytes += to - from
+-			filledLate = true
+-		}
++		c.fills = append(c.fills, fill{packet: c.Packets, age: at.Sub(h.at), bytes: to - from})
+ 		if h.start < from {
+ 			kept = append(kept, hole{h.start, from, h.at})
+ 		}
+@@ -102,22 +106,32 @@ func (c *counter) add(at time.Time, seq uint32, payload int) {
+ 		}
+ 	}
+ 	c.holes = kept
+-	if filledLate {
+-		c.LostFills++
+-	}
+ 	c.DupBytes += (limit - start) - covered
+ 	if end > c.highest {
+ 		c.highest = end
+ 	}
+ }
+ 
+-// finish returns the counts of the connection so far.
+-func (c *counter) finish() Counts {
++// finish returns the counts of the connection so far, the holes filled within window
++// counted as reordering, the others as loss.
++func (c *counter) finish(window time.Duration) Counts {
+ 	counts := c.Counts
+ 	counts.Bytes = c.highest
+ 	for _, h := range c.holes {
+ 		counts.Unfilled += h.end - h.start
+ 	}
++	lastLate := -1
++	for _, piece := range c.fills {
++		if piece.age < window {
++			counts.ReorderBytes += piece.bytes
++			continue
++		}
++		counts.LostBytes += piece.bytes
++		if piece.packet != lastLate {
++			counts.LostFills++
++			lastLate = piece.packet
++		}
++	}
+ 	return counts
+ }
+ 
+diff --git a/common/probesock/count_test.go b/common/probesock/count_test.go
+index b115d5b14..a56e7ce20 100644
+--- a/common/probesock/count_test.go
++++ b/common/probesock/count_test.go
+@@ -12,15 +12,17 @@ func at(milliseconds int) time.Time {
+ }
+ 
+ func newCounter() *counter {
+-	return &counter{window: 10 * time.Millisecond}
++	return &counter{}
+ }
+ 
++const testWindow = 10 * time.Millisecond
++
+ func TestCounterInOrder(t *testing.T) {
+ 	c := newCounter()
+ 	for i := 0; i < 10; i++ {
+ 		c.add(at(i), uint32(5000+i*1000), 1000)
+ 	}
+-	counts := c.finish()
++	counts := c.finish(testWindow)
+ 	require.Equal(t, int64(10000), counts.Bytes)
+ 	require.Zero(t, counts.Holes)
+ 	require.Zero(t, counts.LostBytes)
+@@ -35,7 +37,7 @@ func TestCounterLoss(t *testing.T) {
+ 	c.add(at(2), 3000, 1000)
+ 	c.add(at(3), 4000, 1000)
+ 	c.add(at(100), 2000, 1000)
+-	counts := c.finish()
++	counts := c.finish(testWindow)
+ 	require.Equal(t, 1, counts.Holes)
+ 	require.Equal(t, int64(1000), counts.LostBytes)
+ 	require.Equal(t, 1, counts.LostFills)
+@@ -50,7 +52,7 @@ func TestCounterReorder(t *testing.T) {
+ 	c.add(at(0), 0, 1000)
+ 	c.add(at(1), 2000, 1000)
+ 	c.add(at(2), 1000, 1000)
+-	counts := c.finish()
++	counts := c.finish(testWindow)
+ 	require.Equal(t, int64(1000), counts.ReorderBytes)
+ 	require.Zero(t, counts.LostBytes)
+ 	require.Zero(t, counts.LostFills)
+@@ -61,7 +63,7 @@ func TestCounterDuplicateAndUnfilled(t *testing.T) {
+ 	c.add(at(0), 0, 1000)
+ 	c.add(at(1), 0, 1000)
+ 	c.add(at(2), 2000, 1000)
+-	counts := c.finish()
++	counts := c.finish(testWindow)
+ 	require.Equal(t, int64(1000), counts.DupBytes)
+ 	require.Equal(t, int64(1000), counts.Unfilled)
+ }
+@@ -73,7 +75,7 @@ func TestCounterPartialFills(t *testing.T) {
+ 	c.add(at(1), 3000, 1000)
+ 	c.add(at(50), 1000, 1000)
+ 	c.add(at(60), 2000, 1000)
+-	counts := c.finish()
++	counts := c.finish(testWindow)
+ 	require.Equal(t, int64(2000), counts.LostBytes)
+ 	require.Equal(t, 2, counts.LostFills)
+ 	segments, lost := counts.segments(1000)
+@@ -87,7 +89,7 @@ func TestCounterWrap(t *testing.T) {
+ 	c.add(at(0), 0xffffff00, 0x100)
+ 	c.add(at(1), 0, 1000)
+ 	c.add(at(2), 0x7fff0000, 1000)
+-	counts := c.finish()
++	counts := c.finish(testWindow)
+ 	require.Equal(t, int64(0x100+1000), counts.Bytes)
+ 	require.Zero(t, counts.Holes)
+ }
+@@ -105,3 +107,15 @@ func TestReorderWindow(t *testing.T) {
+ 	require.Equal(t, minReorderWindow, reorderWindow(time.Millisecond))
+ 	require.Equal(t, 25*time.Millisecond, reorderWindow(100*time.Millisecond))
+ }
++
++// The pieces are told apart by the window given at the end: a longer RTT makes a fill
++// reordering that a shorter one calls a loss.
++func TestCounterWindowAtTheEnd(t *testing.T) {
++	c := newCounter()
++	c.add(at(0), 0, 1000)
++	c.add(at(1), 2000, 1000)
++	c.add(at(30), 1000, 1000)
++	require.Equal(t, int64(1000), c.finish(20*time.Millisecond).LostBytes)
++	require.Equal(t, int64(1000), c.finish(40*time.Millisecond).ReorderBytes)
++	require.Zero(t, c.finish(40*time.Millisecond).LostBytes)
++}
+diff --git a/common/probesock/probesock.go b/common/probesock/probesock.go
+index 534b86835..26b8ca2ee 100644
+--- a/common/probesock/probesock.go
++++ b/common/probesock/probesock.go
+@@ -22,12 +22,27 @@ type contextKey struct{}
+ type Socket struct {
+ 	window int
+ 
+-	access  sync.Mutex
+-	taken   bool
+-	conn    *net.TCPConn
+-	connect time.Duration
+-	capture *capture
+-	err     error
++	access   sync.Mutex
++	taken    bool
++	conn     *net.TCPConn
++	connect  time.Duration
++	capture  *capture
++	err      error
++	restored bool
++}
++
++// restore gives the probe connection a receive buffer as large as the system lets a TCP
++// connection grow to, once the probe has run: a multiplexed transport (gRPC, HTTP/2, xhttp,
++// mux) keeps the connection a probe dialed in its pool and carries other connections over
++// it, which a window of 16 KB would hold to a crawl. The window scale was chosen at the
++// connect by the system maximum, not by the small buffer, so the window can grow again.
++// Called under access.
++func (s *Socket) restore() {
++	if s.conn == nil || s.restored {
++		return
++	}
++	s.restored = true
++	restoreBuffer(s.conn)
+ }
+ 
+ // With returns a context under which the first TCP dial is a probe connection with a
+@@ -94,7 +109,7 @@ func (s *Socket) Dial(ctx context.Context, dialer net.Dialer, network string, ad
+ 		return conn, nil
+ 	}
+ 	s.conn = tcpConn
+-	s.capture, s.err = startCapture(tcpConn, reorderWindow(connect))
++	s.capture, s.err = startCapture(tcpConn)
+ 	return conn, nil
+ }
+ 
+@@ -123,12 +138,9 @@ func (s *Socket) Finish() (Result, error) {
+ 		return result, E.New("no connection of its own")
+ 	}
+ 	if s.capture == nil {
++		s.restore()
+ 		return result, E.Cause(s.err, "capture")
+ 	}
+-	counts, dropped := s.capture.stop()
+-	s.capture = nil
+-	result.Counts = counts
+-	result.Dropped = dropped
+ 	result.RTT = s.connect
+ 	if info, err := tcpInfo(s.conn); err == nil {
+ 		result.MSS = info.mss
+@@ -136,7 +148,12 @@ func (s *Socket) Finish() (Result, error) {
+ 			result.RTT = info.minRTT
+ 		}
+ 	}
+-	result.Segments, result.Lost = counts.segments(result.MSS)
++	counter, dropped := s.capture.stop()
++	s.capture = nil
++	s.restore()
++	result.Counts = counter.finish(reorderWindow(result.RTT))
++	result.Dropped = dropped
++	result.Segments, result.Lost = result.Counts.segments(result.MSS)
+ 	return result, nil
+ }
+ 
+@@ -151,4 +168,5 @@ func (s *Socket) Close() {
+ 		s.capture.stop()
+ 		s.capture = nil
+ 	}
++	s.restore()
+ }
+diff --git a/protocol/group/urltest_loss.go b/protocol/group/urltest_loss.go
+index 4b980463c..498c5a3d0 100644
+--- a/protocol/group/urltest_loss.go
++++ b/protocol/group/urltest_loss.go
+@@ -268,8 +268,9 @@ func (g *URLTestGroup) probeLoss(tag string, member adapter.Outbound, size int64
+ 	switch {
+ 	case err == nil:
+ 		g.history.StoreLossSample(tag, sample)
+-		g.logger.Debug("outbound ", tag, " loss probe: ", sample.Lost, " of ", sample.Segments, " segments lost, RTT ",
+-			sample.RTT.Milliseconds(), "ms, ", sample.Received, " bytes in ", sample.Elapsed.Milliseconds(), "ms")
++		g.logger.Debug("outbound ", tag, " loss probe: ", sample.Lost, " of ", sample.Segments, " segments lost, ",
++			sample.Reordered, " bytes reordered, RTT ", sample.RTT.Milliseconds(), "ms, ", sample.Received, " bytes in ",
++			sample.Elapsed.Milliseconds(), "ms")
+ 		return true, nil
+ 	case errors.Is(err, urltest.ErrLossNotCounted):
+ 		g.history.StoreLossNotCounted(tag, time.Now())
+-- 
+2.53.0
+

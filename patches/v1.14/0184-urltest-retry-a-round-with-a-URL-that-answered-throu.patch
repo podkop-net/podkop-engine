@@ -1,0 +1,391 @@
+From aabe0bb427fa2e21be55ea031c2b80a5107b28df Mon Sep 17 00:00:00 2001
+From: FiyeroT <me@fiyero.xyz>
+Date: Wed, 4 Nov 2026 11:19:55 +0000
+Subject: [PATCH 184/193] urltest: retry a round with a URL that answered
+ through the member
+
+The retry of a round took the next URL of the list. A server whose hoster blocks two
+operators that are neighbours in the list failed the URL of the round and its retry in one
+round of each cycle: unavailable, and the group left it for that round (on the stand: 21
+switches an hour, 85 % of the time on the fastest server, with gstatic and cp.cloudflare
+blocked through it).
+
+- The history keeps, per member and URL, whether the last test with the URL answered.
+- The retry takes the first URL after the one of the round that answered through the
+  member last time, the next one when none did. Still two tests a round at most: a server
+  that is down is found as before. The URL of the round still goes round the list, so a
+  blocked URL is tested again in its round.
+- The one test that confirms a member whose connections fail takes the first URL, from the
+  URL of the round on, that answered through it last time: a URL its server cannot reach
+  no longer calls a working member down.
+- Only a minority of URLs is passed over: when more than half of them did not answer
+  through the member at their last test, the retry is the next URL and the confirmation the
+  URL of the round, as before. A server that reaches one operator of five is not kept
+  available by that one.
+- Tests cut short by the end of a round, and tests the Clash API asks for with its own URL,
+  are not kept.
+---
+ common/urltest/urltest.go            |  32 ++++++++
+ protocol/group/urltest.go            |  20 ++++-
+ protocol/group/urltest_failure.go    |   8 +-
+ protocol/group/urltest_probe.go      |  65 ++++++++++++++--
+ protocol/group/urltest_probe_test.go | 106 ++++++++++++++++++++++++++-
+ 5 files changed, 218 insertions(+), 13 deletions(-)
+
+diff --git a/common/urltest/urltest.go b/common/urltest/urltest.go
+index 70b3a04e6..eed8e46f5 100644
+--- a/common/urltest/urltest.go
++++ b/common/urltest/urltest.go
+@@ -33,6 +33,10 @@ type HistoryStorage struct {
+ 	// is their median, over keeps[tag] rounds
+ 	samples map[string][]Sample
+ 	keeps   map[string]int
++	// whether the last URL test of a tag with a URL answered, per URL (podkop-engine): a server
++	// may not reach one operator for good (its hoster blocks it), and a URL that answered
++	// through it last time is the one to try once more after the URL of a round did not
++	links map[string]map[string]bool
+ }
+ 
+ // Sample is the delay a URL test measured in a round (podkop-engine).
+@@ -56,6 +60,7 @@ func NewHistoryStorage() *HistoryStorage {
+ 		downloads:    make(map[string]DownloadResult),
+ 		samples:      make(map[string][]Sample),
+ 		keeps:        make(map[string]int),
++		links:        make(map[string]map[string]bool),
+ 	}
+ }
+ 
+@@ -89,10 +94,37 @@ func (s *HistoryStorage) DeleteURLTestHistory(tag string) {
+ 	delete(s.downloads, tag)
+ 	delete(s.samples, tag)
+ 	delete(s.keeps, tag)
++	delete(s.links, tag)
+ 	s.notifyUpdated()
+ 	s.access.Unlock()
+ }
+ 
++// StoreURLTestLinkResult keeps whether a URL test of a tag with link answered (podkop-engine).
++// A failure of the tag as a whole (StoreURLTestFailure) leaves these alone: which URLs answer
++// through a server is still known when it comes back.
++func (s *HistoryStorage) StoreURLTestLinkResult(tag string, link string, answered bool) {
++	s.access.Lock()
++	defer s.access.Unlock()
++	results := s.links[tag]
++	if results == nil {
++		results = make(map[string]bool)
++		s.links[tag] = results
++	}
++	results[link] = answered
++}
++
++// URLTestLinkAnswered tells whether the last URL test of a tag with link answered, and whether
++// one is known at all (podkop-engine).
++func (s *HistoryStorage) URLTestLinkAnswered(tag string, link string) (answered bool, known bool) {
++	if s == nil {
++		return false, false
++	}
++	s.access.RLock()
++	defer s.access.RUnlock()
++	answered, known = s.links[tag][link]
++	return
++}
++
+ func (s *HistoryStorage) StoreURLTestHistory(tag string, history *adapter.URLTestHistory) {
+ 	s.access.Lock()
+ 	s.delayHistory[tag] = history
+diff --git a/protocol/group/urltest.go b/protocol/group/urltest.go
+index a37813a79..353763938 100644
+--- a/protocol/group/urltest.go
++++ b/protocol/group/urltest.go
+@@ -714,6 +714,16 @@ func urlTestOutbounds(ctx context.Context, outboundManager adapter.OutboundManag
+ 	return testBatch.result
+ }
+ 
++// storeLinkResult keeps whether a test of a round with link answered through the member tag
++// (retryLink, confirmLink): not for a test the Clash API asked for with its own URL, nor for one
++// the end of the round or of the group cut short, which proves nothing of the URL.
++func (b *urlTestBatch) storeLinkResult(plan probePlan, tag string, link string, err error) {
++	if plan.keep == 0 || roundEnded(b.ctx) {
++		return
++	}
++	b.history.StoreURLTestLinkResult(tag, link, err == nil)
++}
++
+ // roundEnded tells whether the round of ctx is over (podkop-engine): canceled, or its deadline
+ // (a delay test of the Clash API) has come. The timer of the context closes it a moment after
+ // the deadline, and until then Err is nil while the tests the deadline cut fail already: a dial
+@@ -772,10 +782,14 @@ func (b *urlTestBatch) test(outbounds []adapter.Outbound, plan probePlan, interv
+ 			b.batch.Go(tag, func() (any, error) {
+ 				var testResult urlTestResult
+ 				testResult.delay, testResult.err = testOutbound(b.ctx, b.outbound, plan.links[0], detour)
+-				if testResult.err != nil && len(plan.links) > 1 && !roundEnded(b.ctx) {
++				b.storeLinkResult(plan, tag, plan.links[0], testResult.err)
++				if testResult.err != nil && !roundEnded(b.ctx) {
+ 					// one URL that does not answer through a member is not the member down
+-					b.logger.Debug("outbound ", tag, " did not answer ", plan.links[0], ": ", testResult.err, "; trying ", plan.links[1])
+-					testResult.delay, testResult.err = testOutbound(b.ctx, b.outbound, plan.links[1], detour)
++					if retry := plan.retryLink(b.history, tag); retry != "" {
++						b.logger.Debug("outbound ", tag, " did not answer ", plan.links[0], ": ", testResult.err, "; trying ", retry)
++						testResult.delay, testResult.err = testOutbound(b.ctx, b.outbound, retry, detour)
++						b.storeLinkResult(plan, tag, retry, testResult.err)
++					}
+ 				}
+ 				// a test the Clash API asked for (plan.keep 0) leaves a member whose delay is the
+ 				// median of the rounds as it is: one test with the URL of the client is no round
+diff --git a/protocol/group/urltest_failure.go b/protocol/group/urltest_failure.go
+index 033e89ad8..2bc563363 100644
+--- a/protocol/group/urltest_failure.go
++++ b/protocol/group/urltest_failure.go
+@@ -354,8 +354,14 @@ func (g *URLTestGroup) confirmWith(confirms *map[string]*memberConfirm, tag stri
+ 			return
+ 		}
+ 		start := time.Now()
+-		_, err := probeOutbound(g.ctx, roundPlan(g.links, g.interval, time.Now()).links[0], member)
++		// a URL that answered through the member last time: one its server cannot reach
++		// would call it down while its connections fail for another reason
++		link := roundPlan(g.links, g.interval, start).confirmLink(g.history, tag)
++		_, err := probeOutbound(g.ctx, link, member)
+ 		now := time.Now()
++		if g.ctx.Err() == nil && !g.networkPaused() && !g.networkChangedSince(start) {
++			g.history.StoreURLTestLinkResult(tag, link, err == nil)
++		}
+ 		g.confirmAccess.Lock()
+ 		state.running = false
+ 		if err == nil {
+diff --git a/protocol/group/urltest_probe.go b/protocol/group/urltest_probe.go
+index 4ff96f450..a4caadccd 100644
+--- a/protocol/group/urltest_probe.go
++++ b/protocol/group/urltest_probe.go
+@@ -7,6 +7,7 @@ import (
+ 	"time"
+ 
+ 	"github.com/sagernet/sing-box/adapter"
++	"github.com/sagernet/sing-box/common/urltest"
+ 	"github.com/sagernet/sing-box/option"
+ )
+ 
+@@ -182,9 +183,10 @@ func firstHop(manager adapter.OutboundManager, detour adapter.Outbound) any {
+ 
+ // probePlan is what a round tests its members with (podkop-engine).
+ type probePlan struct {
+-	// links[0] is the URL of the round; links[1], when there is one, is tried once after a
+-	// test with it fails: a member is unavailable when two URLs of the list do not answer
+-	// through it, not one (a server's hoster may block one of them)
++	// links are the URLs of the group from the one of the round on, in the order of the list:
++	// links[0] is the URL of the round. A member that does not answer it is tested once more,
++	// with retryLink: a member is unavailable when two URLs of the list do not answer through
++	// it, not one (a server's hoster may block one of them)
+ 	links []string
+ 	round int64
+ 	// keep is how many rounds the delay of a member is the median of
+@@ -205,13 +207,64 @@ func roundPlan(links []string, interval time.Duration, now time.Time) probePlan
+ 		round = now.UnixNano() / int64(interval)
+ 	}
+ 	first := int(round % int64(len(links)))
+-	plan := probePlan{links: []string{links[first]}, round: round, keep: len(links)}
+-	if len(links) > 1 {
+-		plan.links = append(plan.links, links[(first+1)%len(links)])
++	plan := probePlan{links: make([]string, 0, len(links)), round: round, keep: len(links)}
++	for i := range links {
++		plan.links = append(plan.links, links[(first+i)%len(links)])
+ 	}
+ 	return plan
+ }
+ 
++// retryLink is the URL a member that did not answer the URL of the round is tested with once
++// more: the first of the others, from the URL of the round on, that answered through the
++// member at its last test with it; the next one when none did or none is known (the first
++// rounds, a member that was down), and when most URLs of the list did not answer through it
++// at their last test (mostFailed). A server that does not reach two operators for good would
++// otherwise fail the URL of the round and the next one in one round of each cycle where the
++// two are neighbours in the list, and the group leave it for a round each time; a server that
++// reaches few of them is judged as before. "" without a second URL.
++func (p probePlan) retryLink(history *urltest.HistoryStorage, tag string) string {
++	if len(p.links) < 2 {
++		return ""
++	}
++	if !p.mostFailed(history, tag) {
++		for _, link := range p.links[1:] {
++			if answered, known := history.URLTestLinkAnswered(tag, link); known && answered {
++				return link
++			}
++		}
++	}
++	return p.links[1]
++}
++
++// confirmLink is the URL of the one test that confirms a member whose connections fail: the
++// first, from the URL of the round on, that answered through the member at its last test with
++// it, the URL of the round when none did or when most did not (mostFailed). A URL the member's
++// server cannot reach would otherwise call a working member down.
++func (p probePlan) confirmLink(history *urltest.HistoryStorage, tag string) string {
++	if !p.mostFailed(history, tag) {
++		for _, link := range p.links {
++			if answered, known := history.URLTestLinkAnswered(tag, link); known && answered {
++				return link
++			}
++		}
++	}
++	return p.links[0]
++}
++
++// mostFailed tells whether more than half of the URLs of the plan did not answer through the
++// member at their last test with it: a minority of URLs its server cannot reach is passed
++// over (retryLink, confirmLink), more is no longer a block of some operators but a server that
++// works badly, or one that was down.
++func (p probePlan) mostFailed(history *urltest.HistoryStorage, tag string) bool {
++	failed := 0
++	for _, link := range p.links {
++		if answered, known := history.URLTestLinkAnswered(tag, link); known && !answered {
++			failed++
++		}
++	}
++	return 2*failed > len(p.links)
++}
++
+ // testLinks are the URLs of the tests of a group: urls, or url, without empty and repeated ones;
+ // none for the default (urltest.URLTest).
+ func testLinks(options option.URLTestOutboundOptions) []string {
+diff --git a/protocol/group/urltest_probe_test.go b/protocol/group/urltest_probe_test.go
+index dcd0f9394..2bac35a4d 100644
+--- a/protocol/group/urltest_probe_test.go
++++ b/protocol/group/urltest_probe_test.go
+@@ -3,6 +3,7 @@ package group
+ import (
+ 	"context"
+ 	"errors"
++	"fmt"
+ 	"net"
+ 	"os"
+ 	"sync"
+@@ -151,8 +152,8 @@ func TestFirstHop(t *testing.T) {
+ 	require.Equal(t, adapter.Outbound(a), firstHop(nil, a))
+ }
+ 
+-// The rounds take the URLs in turn by the clock, the next one as the retry; the median is of
+-// as many rounds as there are URLs.
++// The rounds take the URLs in turn by the clock, the others after the URL of the round in the
++// order of the list; the median is of as many rounds as there are URLs.
+ func TestRoundPlan(t *testing.T) {
+ 	links := []string{"https://a/", "https://b/", "https://c/"}
+ 	base := time.Unix(1_800_000_000, 0).Truncate(time.Minute)
+@@ -160,9 +161,11 @@ func TestRoundPlan(t *testing.T) {
+ 	for i := range 4 {
+ 		plan := roundPlan(links, time.Minute, base.Add(time.Duration(i)*time.Minute+time.Second))
+ 		require.Equal(t, 3, plan.keep)
+-		require.Len(t, plan.links, 2)
++		require.Len(t, plan.links, 3)
++		require.ElementsMatch(t, links, plan.links)
+ 		seen = append(seen, plan.links[0])
+ 		require.Equal(t, links[(indexOf(links, plan.links[0])+1)%3], plan.links[1])
++		require.Equal(t, links[(indexOf(links, plan.links[0])+2)%3], plan.links[2])
+ 	}
+ 	require.Equal(t, seen[0], seen[3])
+ 	require.ElementsMatch(t, links, seen[:3])
+@@ -175,6 +178,103 @@ func TestRoundPlan(t *testing.T) {
+ 	require.Equal(t, []string{""}, none.links)
+ }
+ 
++// The retry of a round takes the first URL after the one of the round that answered through
++// the member last time, the next one when none did; the confirmation of a member whose
++// connections fail takes the first that answered, from the URL of the round on.
++func TestRetryAndConfirmLinks(t *testing.T) {
++	history := urltest.NewHistoryStorage()
++	plan := probePlan{links: []string{"https://a/", "https://b/", "https://c/", "https://d/"}, keep: 4}
++	require.Equal(t, "https://b/", plan.retryLink(history, "m"), "nothing known: the next one")
++	require.Equal(t, "https://a/", plan.confirmLink(history, "m"), "nothing known: the URL of the round")
++	history.StoreURLTestLinkResult("m", "https://b/", false)
++	history.StoreURLTestLinkResult("m", "https://c/", true)
++	require.Equal(t, "https://c/", plan.retryLink(history, "m"))
++	require.Equal(t, "https://c/", plan.confirmLink(history, "m"))
++	require.Equal(t, "https://b/", plan.retryLink(history, "other"), "per member")
++	history.StoreURLTestLinkResult("m", "https://c/", false)
++	history.StoreURLTestLinkResult("m", "https://d/", false)
++	require.Equal(t, "https://b/", plan.retryLink(history, "m"), "none answered: the next one")
++	history.StoreURLTestLinkResult("m", "https://a/", true)
++	require.Equal(t, "https://a/", plan.confirmLink(history, "m"))
++	// a failure of the member keeps what is known of its URLs; its history going away does not
++	history.StoreURLTestFailure("m", time.Now())
++	_, known := history.URLTestLinkAnswered("m", "https://a/")
++	require.True(t, known)
++	history.DeleteURLTestHistory("m")
++	_, known = history.URLTestLinkAnswered("m", "https://a/")
++	require.False(t, known)
++	require.Equal(t, "", probePlan{links: []string{"https://a/"}, keep: 1}.retryLink(history, "m"))
++
++	// a minority of URLs that did not answer is passed over; most is judged as before
++	five := probePlan{links: []string{"https://0/", "https://1/", "https://2/", "https://3/", "https://4/"}, keep: 5}
++	history.StoreURLTestLinkResult("n", "https://1/", false)
++	history.StoreURLTestLinkResult("n", "https://2/", true)
++	history.StoreURLTestLinkResult("n", "https://3/", false)
++	require.Equal(t, "https://2/", five.retryLink(history, "n"), "two of five failed")
++	require.Equal(t, "https://2/", five.confirmLink(history, "n"))
++	history.StoreURLTestLinkResult("n", "https://4/", false)
++	require.Equal(t, "https://1/", five.retryLink(history, "n"), "three of five failed: the next one")
++	require.Equal(t, "https://0/", five.confirmLink(history, "n"), "three of five failed: the URL of the round")
++}
++
++// A server that reaches no URL of two operators that are neighbours in the list (its hoster
++// blocks both): with the next URL as the retry it was unavailable in one round of each cycle,
++// and the group left it for that round. It costs the first round only, before anything is
++// known of its URLs.
++func TestNeighbourLinksDownCostTheFirstRoundOnly(t *testing.T) {
++	var links []string
++	for i := range 2 {
++		links = append(links, fmt.Sprintf("http://127.0.0.1:1/blocked%d", i))
++	}
++	for range 3 {
++		link, _ := testURL(t, 0)
++		links = append(links, link)
++	}
++	member := newTestMember(C.TypeVLESS, "a", dialWorking)
++	history := urltest.NewHistoryStorage()
++	var unavailable []int
++	for round := range 10 {
++		plan := roundPlan(links, time.Minute, time.Unix(0, 0).Add(time.Duration(round)*time.Minute))
++		result := urlTestOutbounds(context.Background(), nil, history, log.NewNOPFactory().Logger(), []adapter.Outbound{member}, plan, time.Minute, true, true, 1)
++		if _, ok := result["a"]; !ok {
++			unavailable = append(unavailable, round)
++		}
++	}
++	require.Equal(t, []int{0}, unavailable)
++	// a server that is down fails every URL: unavailable in every round, two tests a round
++	dead := newTestMember(C.TypeVLESS, "dead", dialRefused)
++	for round := range 5 {
++		plan := roundPlan(links, time.Minute, time.Unix(0, 0).Add(time.Duration(round)*time.Minute))
++		result := urlTestOutbounds(context.Background(), nil, history, log.NewNOPFactory().Logger(), []adapter.Outbound{dead}, plan, time.Minute, true, true, 1)
++		require.NotContains(t, result, "dead")
++		require.Equal(t, int32(2*(round+1)), dead.dials.Load(), "two tests a round")
++	}
++}
++
++// A server that reaches only two URLs of five is judged as before the history of its URLs:
++// unavailable in the rounds where the URL of the round and the next one do not answer.
++func TestMostLinksDownIsJudgedAsBefore(t *testing.T) {
++	var links []string
++	for i := range 3 {
++		links = append(links, fmt.Sprintf("http://127.0.0.1:1/blocked%d", i))
++	}
++	for range 2 {
++		link, _ := testURL(t, 0)
++		links = append(links, link)
++	}
++	member := newTestMember(C.TypeVLESS, "a", dialWorking)
++	history := urltest.NewHistoryStorage()
++	var unavailable []int
++	for round := range 10 {
++		plan := roundPlan(links, time.Minute, time.Unix(0, 0).Add(time.Duration(round)*time.Minute))
++		result := urlTestOutbounds(context.Background(), nil, history, log.NewNOPFactory().Logger(), []adapter.Outbound{member}, plan, time.Minute, true, true, 1)
++		if _, ok := result["a"]; !ok {
++			unavailable = append(unavailable, round)
++		}
++	}
++	require.Equal(t, []int{0, 1, 5, 6}, unavailable)
++}
++
+ func indexOf(links []string, link string) int {
+ 	for i, it := range links {
+ 		if it == link {
+-- 
+2.53.0
+

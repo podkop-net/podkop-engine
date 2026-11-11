@@ -1,7 +1,7 @@
 From 6197fb6fb2417679c2dbe52926586905d8a3cef8 Mon Sep 17 00:00:00 2001
 From: FiyeroT <me@fiyero.xyz>
 Date: Thu, 29 Oct 2026 20:22:27 +0300
-Subject: [PATCH 175/182] urltest: fallbacks without outbounds, block as a
+Subject: [PATCH 175/193] urltest: fallbacks without outbounds, block as a
  fallback, a bound on tests at once
 
 A URL test may have fallbacks and no outbounds: what is left of a rule whose

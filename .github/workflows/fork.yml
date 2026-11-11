@@ -1,0 +1,25 @@
+name: fork
+
+# The fork must be the upstream tag plus patches/ and nothing else (scripts/check-fork.sh).
+# Runs on every change of the patches or versions.env, and as the first gate of build.yml.
+on:
+  push:
+    paths: ["patches/**", "versions.env", "scripts/check-fork.sh", ".github/workflows/fork.yml"]
+  pull_request:
+    paths: ["patches/**", "versions.env", "scripts/check-fork.sh", ".github/workflows/fork.yml"]
+  workflow_call:
+    inputs:
+      lines:
+        type: string
+        default: ""
+
+permissions:
+  contents: read
+
+jobs:
+  fork:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: tag + patches == fork commit
+        run: scripts/check-fork.sh ${{ inputs.lines }}

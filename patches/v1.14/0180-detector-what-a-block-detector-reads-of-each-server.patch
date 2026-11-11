@@ -1,7 +1,7 @@
 From 00935b403b9c54e6eb39afc545bb793a27bbad18 Mon Sep 17 00:00:00 2001
 From: FiyeroT <me@fiyero.xyz>
 Date: Tue, 3 Nov 2026 03:57:45 +0300
-Subject: [PATCH 180/182] detector: what a block detector reads of each server
+Subject: [PATCH 180/193] detector: what a block detector reads of each server
 
 The handshakes of REALITY and the uTLS fingerprint fallback record, per server, whether
 no ClientHello got an answer, whether the server answered and the handshake failed, and

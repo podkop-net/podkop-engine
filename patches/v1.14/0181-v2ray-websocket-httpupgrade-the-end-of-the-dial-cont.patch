@@ -1,7 +1,7 @@
 From 7e0d5bf4ae16175f20e6a35b71b7435814ab3f38 Mon Sep 17 00:00:00 2001
 From: FiyeroT <me@fiyero.xyz>
 Date: Tue, 3 Nov 2026 03:57:45 +0300
-Subject: [PATCH 181/182] v2ray websocket, httpupgrade: the end of the dial
+Subject: [PATCH 181/193] v2ray websocket, httpupgrade: the end of the dial
  context reaches the upgrade
 
 The HTTP upgrade read had no deadline, so a server that took the connection and never

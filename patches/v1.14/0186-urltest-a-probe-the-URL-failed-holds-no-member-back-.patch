@@ -1,0 +1,256 @@
+From e7034df026148577d096dea1a7dbb0e67baa1f11 Mon Sep 17 00:00:00 2001
+From: FiyeroT <me@fiyero.xyz>
+Date: Fri, 6 Nov 2026 08:47:24 +0300
+Subject: [PATCH 186/193] urltest: a probe the URL failed holds no member back;
+ one member a device
+
+- A loss probe before a switch holds the candidate back only when its body
+  began and stopped (ErrDownloadStopped); a status, no body, or a body
+  shorter than asked proves nothing about the member, and a loss URL that
+  fails would otherwise keep the group on its member for good.
+- The probe connection is the first dial under the context that connects:
+  a failed address of the server leaves the mark to the next one.
+- A device of a balance is its source address alone: its TCP and its UDP
+  (HTTPS and QUIC of a site) go by one member; a connection of a network
+  its member does not carry goes by another without moving the device.
+---
+ common/probesock/probesock.go       |  8 +++--
+ common/urltest/loss.go              | 16 ++++++++--
+ protocol/group/urltest_balance.go   | 30 ++++++++++---------
+ protocol/group/urltest_download.go  |  5 ++--
+ protocol/group/urltest_loss_test.go | 46 ++++++++++++++++++++++++++---
+ 5 files changed, 80 insertions(+), 25 deletions(-)
+
+diff --git a/common/probesock/probesock.go b/common/probesock/probesock.go
+index 9f40f4ed1..534b86835 100644
+--- a/common/probesock/probesock.go
++++ b/common/probesock/probesock.go
+@@ -66,8 +66,8 @@ func (s *Socket) take() bool {
+ 	return true
+ }
+ 
+-// Dial dials address with dialer. The first dial under the context is the probe
+-// connection: its receive buffer is set before the connect, when the window scale is
++// Dial dials address with dialer. The first dial under the context that connects is the
++// probe connection: its receive buffer is set before the connect, when the window scale is
+ // chosen, and its packets are captured from the connect on (no data moves before the
+ // connect returns). Every later dial is an ordinary one.
+ func (s *Socket) Dial(ctx context.Context, dialer net.Dialer, network string, address string) (net.Conn, error) {
+@@ -78,6 +78,10 @@ func (s *Socket) Dial(ctx context.Context, dialer net.Dialer, network string, ad
+ 	start := time.Now()
+ 	conn, err := dialer.DialContext(ctx, network, address)
+ 	if err != nil {
++		// the next address of the server, dialed after this one, is the probe connection
++		s.access.Lock()
++		s.taken = false
++		s.access.Unlock()
+ 		return nil, err
+ 	}
+ 	connect := time.Since(start)
+diff --git a/common/urltest/loss.go b/common/urltest/loss.go
+index 23e3ccb79..f280e3525 100644
+--- a/common/urltest/loss.go
++++ b/common/urltest/loss.go
+@@ -53,7 +53,10 @@ type LossSample struct {
+ 
+ // LossProbe downloads size bytes of link through detour over a probe connection and returns
+ // what its packets showed. An error wrapping ErrLossNotCounted tells a download that went
+-// but could not be counted; another error, a download that did not go.
++// but could not be counted; one wrapping ErrDownloadStopped, a body that began and stopped
++// on the way (the member's failure, as in the download test); another error, a probe that
++// could not run (the URL answered with a status, the dial failed), which proves nothing
++// about the member.
+ func LossProbe(ctx context.Context, link string, size int64, detour N.Dialer) (LossSample, error) {
+ 	var sample LossSample
+ 	linkURL, err := url.Parse(link)
+@@ -97,8 +100,15 @@ func LossProbe(ctx context.Context, link string, size int64, detour N.Dialer) (L
+ 	received, err := io.CopyN(io.Discard, resp.Body, size)
+ 	sample.Elapsed = time.Since(start)
+ 	sample.Received = received
+-	if err != nil && !(errors.Is(err, io.EOF) && received > 0 && received == resp.ContentLength) {
+-		return sample, E.Cause(err, "after ", received, " bytes")
++	if err != nil {
++		switch {
++		case received == 0:
++			return sample, E.Cause(err, "no body")
++		case errors.Is(err, io.EOF):
++			// the whole body, shorter than asked: counted as it is
++		default:
++			return sample, E.Cause(errors.Join(ErrDownloadStopped, err), "after ", received, " bytes")
++		}
+ 	}
+ 	result, err := socket.Finish()
+ 	if err != nil {
+diff --git a/protocol/group/urltest_balance.go b/protocol/group/urltest_balance.go
+index ee90d2fdc..e79c5ed49 100644
+--- a/protocol/group/urltest_balance.go
++++ b/protocol/group/urltest_balance.go
+@@ -4,7 +4,6 @@ import (
+ 	"context"
+ 	"hash/fnv"
+ 	"slices"
+-	"strings"
+ 	"sync"
+ 	"time"
+ 
+@@ -92,13 +91,13 @@ func (g *URLTestGroup) updateBalance() {
+ 	}
+ }
+ 
+-// balanceKey is the device a connection comes from: its source address.
+-func balanceKey(ctx context.Context, network string) string {
+-	key := network
++// balanceKey is the device a connection comes from: its source address, the same for its TCP
++// and its UDP, so that a site sees one address of it over both (HTTPS and QUIC).
++func balanceKey(ctx context.Context) string {
+ 	if metadata := adapter.ContextFrom(ctx); metadata != nil && metadata.Source.Addr.IsValid() {
+-		key += " " + metadata.Source.Addr.Unmap().String()
++		return metadata.Source.Addr.Unmap().String()
+ 	}
+-	return key
++	return ""
+ }
+ 
+ // rendezvous is the member of the members the key falls on.
+@@ -126,7 +125,7 @@ func (g *URLTestGroup) balanced(ctx context.Context, network string) (adapter.Ou
+ 	if b == nil {
+ 		return nil, nil
+ 	}
+-	key := balanceKey(ctx, network)
++	key := balanceKey(ctx)
+ 	now := time.Now()
+ 	b.access.Lock()
+ 	defer b.access.Unlock()
+@@ -152,12 +151,18 @@ func (g *URLTestGroup) balanced(ctx context.Context, network string) (adapter.Ou
+ 	}
+ 	keep := device.member != nil && slices.Contains(g.outbounds, device.member) && g.memberAlive(device.member) &&
+ 		(slices.Contains(members, device.member) || device.active > 0 || now.Sub(device.last) < g.loss.balanceIdle)
+-	if !keep {
+-		device.member = rendezvous(key, members)
++	member := device.member
++	switch {
++	case keep && slices.Contains(member.Network(), network):
++	case keep:
++		// its member carries no UDP: this connection goes by another, the device keeps its own
++		member = rendezvous(key, members)
++	default:
++		member = rendezvous(key, members)
++		device.member = member
+ 	}
+ 	device.active++
+ 	device.last = now
+-	member := device.member
+ 	var once sync.Once
+ 	return member, func() {
+ 		once.Do(func() {
+@@ -196,10 +201,7 @@ func (s *URLTest) Balance() []BalanceMember {
+ 		members[i].Tag = member.Tag()
+ 		index[member] = i
+ 	}
+-	for key, device := range b.devices {
+-		if !strings.HasPrefix(key, N.NetworkTCP) {
+-			continue
+-		}
++	for _, device := range b.devices {
+ 		if i, inBalance := index[device.member]; inBalance && device.active > 0 {
+ 			members[i].Devices++
+ 		}
+diff --git a/protocol/group/urltest_download.go b/protocol/group/urltest_download.go
+index 28a622174..7f331c16a 100644
+--- a/protocol/group/urltest_download.go
++++ b/protocol/group/urltest_download.go
+@@ -122,8 +122,9 @@ func (g *URLTestGroup) selectTested() (adapter.Outbound, bool) {
+ 			// again, and the candidate may lose its place to the member in use or another
+ 			switchProbes--
+ 			probed[tag] = true
+-			if _, err := g.probeLoss(tag, candidate, urltest.LossProbeLarge, false); err != nil {
+-				// it did not download what the probe asked: not now
++			if _, err := g.probeLoss(tag, candidate, urltest.LossProbeLarge, false); errors.Is(err, urltest.ErrDownloadStopped) {
++				// its download stopped on the way: not now. A probe that could not run (the
++				// URL's status, no body) holds it back from nothing
+ 				tried[tag] = true
+ 			}
+ 			continue
+diff --git a/protocol/group/urltest_loss_test.go b/protocol/group/urltest_loss_test.go
+index 89e84b473..5fff7c273 100644
+--- a/protocol/group/urltest_loss_test.go
++++ b/protocol/group/urltest_loss_test.go
+@@ -225,7 +225,7 @@ func TestBalanceSpreadsAndKeeps(t *testing.T) {
+ 		source := fmt.Sprint("10.0.0.", i)
+ 		conn, err := urlTest.DialContext(sourceContext(source), N.NetworkTCP, target)
+ 		require.NoError(t, err)
+-		member := group.balance.devices["tcp "+source].member.Tag()
++		member := group.balance.devices[source].member.Tag()
+ 		given[source] = member
+ 		used[member]++
+ 		conn.Close()
+@@ -235,7 +235,7 @@ func TestBalanceSpreadsAndKeeps(t *testing.T) {
+ 	for source, member := range given {
+ 		conn, err := urlTest.DialContext(sourceContext(source), N.NetworkTCP, target)
+ 		require.NoError(t, err)
+-		require.Equal(t, member, group.balance.devices["tcp "+source].member.Tag())
++		require.Equal(t, member, group.balance.devices[source].member.Tag())
+ 		conn.Close()
+ 	}
+ }
+@@ -251,7 +251,7 @@ func TestBalanceMoves(t *testing.T) {
+ 		conn, err := urlTest.DialContext(sourceContext(source), N.NetworkTCP, target)
+ 		require.NoError(t, err)
+ 		conn.Close()
+-		return group.balance.devices["tcp "+source].member.Tag()
++		return group.balance.devices[source].member.Tag()
+ 	}
+ 	// a device on each member
+ 	sources := make(map[string]string)
+@@ -278,9 +278,47 @@ func TestBalanceMoves(t *testing.T) {
+ 	}
+ 	held, err := urlTest.DialContext(sourceContext(sources["a"]), N.NetworkTCP, target)
+ 	require.NoError(t, err)
+-	require.Equal(t, "a", group.balance.devices["tcp "+sources["a"]].member.Tag())
++	require.Equal(t, "a", group.balance.devices[sources["a"]].member.Tag())
+ 	held.Close()
+ 	group.loss.balanceIdle = 20 * time.Millisecond
+ 	time.Sleep(50 * time.Millisecond)
+ 	require.NotEqual(t, "a", memberOf(sources["a"]))
+ }
++
++// A loss URL that answers with a status proves nothing about a member: the switch goes by the
++// delay, as without the probe.
++func TestLossModeBrokenURLDoesNotHold(t *testing.T) {
++	requests := 0
++	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		requests++
++		w.WriteHeader(http.StatusForbidden)
++	}))
++	t.Cleanup(server.Close)
++	a, b := newTestMember(C.TypeSOCKS, "a", dialProbe), newTestMember(C.TypeSOCKS, "b", dialProbe)
++	_, group := newModeGroup(t, modeLoss, members(a, b), map[string]uint16{"a": 100, "b": 300}, nil)
++	group.loss.link = server.URL
++	setResult(group, "b", 20)
++	group.performUpdateCheck()
++	tcp, _ := selectedTags(group)
++	require.Equal(t, "b", tcp)
++	require.Equal(t, 1, requests)
++}
++
++// A body that stops on the way holds the member back for this selection.
++func TestLossModeStoppedDownloadHolds(t *testing.T) {
++	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		w.Header().Set("Content-Length", fmt.Sprint(urltest.LossProbeLarge))
++		w.Write(make([]byte, 64<<10))
++		w.(http.Flusher).Flush()
++		conn, _, _ := w.(http.Hijacker).Hijack()
++		conn.Close()
++	}))
++	t.Cleanup(server.Close)
++	a, b := newTestMember(C.TypeSOCKS, "a", dialProbe), newTestMember(C.TypeSOCKS, "b", dialProbe)
++	_, group := newModeGroup(t, modeLoss, members(a, b), map[string]uint16{"a": 100, "b": 300}, nil)
++	group.loss.link = server.URL
++	setResult(group, "b", 20)
++	group.performUpdateCheck()
++	tcp, _ := selectedTags(group)
++	require.Equal(t, "a", tcp)
++}
+-- 
+2.53.0
+

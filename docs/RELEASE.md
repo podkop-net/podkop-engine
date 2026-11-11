@@ -16,6 +16,10 @@
    git am -3 /path/podkop-engine/patches/v1.14/*.patch     # конфликты — поправить, git am --continue
    git format-patch v1.14.4 -o /path/podkop-engine/patches/v1.14/   # заменить старые файлы
    ```
+   Форк — это тег плюс патчи и ничего больше: ветка `podkop-engine-<ветка>` в podkop-net/sing-box
+   продвигается только коммитами, которые становятся патчами этого репозитория. Новые коммиты
+   форка — новые файлы в конце серии (`git format-patch v1.14.4..<коммит>`); старые файлы при этом
+   меняются только в счётчике `[PATCH n/N]`.
    Для патча include (0035 в r9) проверить, не появились ли в `include/registry.go` новые
    регистрации: новый тип выхода — в `include/podkop_full.go` и `podkop_full_stub.go`, новый вход,
    DNS-сервер или служба — в `podkop_slim.go` и `podkop_slim_stub.go` (иначе он молча попадёт в
@@ -41,6 +45,14 @@
 2. **versions.env**: `SB_<ветка>_VERSION`, `SB_<ветка>_HASH`
    (`curl -sL https://codeload.github.com/SagerNet/sing-box/tar.gz/v<версия> | sha256sum`),
    `SB_<ветка>_RELEASE` — номер выпуска podkop-engine, общий для линий, которые в нём собираются (1.13.21-r18 и 1.14.4-r18), и для новой версии upstream тоже.
+   `SB_<ветка>_FORK_COMMIT` — полный хеш коммита форка, равного тегу + патчам. Проверка
+   (та же выполняется в CI, workflow `fork`, и первой задачей `build`):
+   ```sh
+   scripts/check-fork.sh -C /path/sing-box      # или без -C: скачает тег и коммит с глубиной 1
+   ```
+   podkop-experimental закрепляет в `go.mod` (`replace github.com/sagernet/sing-box => github.com/podkop-net/sing-box <коммит>`)
+   только `SB_1_14_FORK_COMMIT` выпущенного тега podkop-engine. Для быстрых итераций —
+   пре-релиз `v<версия>-r<N>-rcM` (черновик → публикация как pre-release), но не коммит форка без тега.
    Если upstream поднял требуемый Go выше закреплённого — обновить `GOLANG_FEED_COMMIT`
    (последний коммит `lang/golang` в нужной ветке openwrt/packages).
 

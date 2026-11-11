@@ -24,7 +24,13 @@ permissions:
   contents: write
 
 jobs:
+  fork:
+    uses: ./.github/workflows/fork.yml
+    with:
+      lines: ${{ inputs.lines }}
+
   matrix:
+    needs: fork
     runs-on: ubuntu-latest
     outputs:
       matrix: ${{ steps.gen.outputs.matrix }}

@@ -1,0 +1,82 @@
+From 738022b359a259266c6eaeedfeeca5f8edd424a0 Mon Sep 17 00:00:00 2001
+From: FiyeroT <me@fiyero.xyz>
+Date: Fri, 6 Nov 2026 11:06:35 +0300
+Subject: [PATCH 191/193] probesock: the buffer of a probe connection let go at
+ the most the tuning reaches, not twice it
+
+---
+ common/probesock/capture_linux.go      | 17 ++++++++++++-----
+ common/probesock/capture_linux_test.go | 10 +++++++++-
+ 2 files changed, 21 insertions(+), 6 deletions(-)
+
+diff --git a/common/probesock/capture_linux.go b/common/probesock/capture_linux.go
+index 1fb5364d4..0a90eb143 100644
+--- a/common/probesock/capture_linux.go
++++ b/common/probesock/capture_linux.go
+@@ -29,21 +29,27 @@ import (
+ // alone: the kernel's tuning of a buffer the user did not set moves the clamp along with it.
+ // The connection keeps the buffer it is given (restoreWindow).
+ func clampWindow(conn *net.TCPConn, window int) error {
++	return holdWindow(conn, window, window)
++}
++
++// holdWindow sets the receive buffer of a connection to buffer bytes (the kernel doubles what it
++// is given, as the bookkeeping counts) and the clamp of its window to window bytes.
++func holdWindow(conn *net.TCPConn, buffer int, window int) error {
+ 	raw, err := conn.SyscallConn()
+ 	if err != nil {
+ 		return err
+ 	}
+ 	return control.Raw(raw, func(fd uintptr) error {
+-		if err := setBuffer(int(fd), window); err != nil {
++		if err := setBuffer(int(fd), buffer); err != nil {
+ 			return err
+ 		}
+ 		return unix.SetsockoptInt(int(fd), unix.IPPROTO_TCP, unix.TCP_WINDOW_CLAMP, window)
+ 	})
+ }
+ 
+-// setBuffer sets the receive buffer of a socket to size bytes (the kernel doubles what it is
+-// given, as the bookkeeping counts): SO_RCVBUFFORCE passes over net.core.rmem_max, small on
+-// routers, for a process with CAP_NET_ADMIN.
++// setBuffer sets the receive buffer of a socket to size bytes, doubled by the kernel:
++// SO_RCVBUFFORCE passes over net.core.rmem_max, small on routers, for a process with
++// CAP_NET_ADMIN.
+ func setBuffer(fd int, size int) error {
+ 	if unix.SetsockoptInt(fd, unix.SOL_SOCKET, unix.SO_RCVBUFFORCE, size) == nil {
+ 		return nil
+@@ -82,7 +88,8 @@ func systemBufferMax() int {
+ // stays set (no tuning), at the most the tuning would reach: memory is taken only by data that
+ // waits to be read.
+ func restoreWindow(conn *net.TCPConn) {
+-	_ = clampWindow(conn, systemBufferMax())
++	// half given, as the kernel doubles it: the buffer the tuning would grow it to at most
++	_ = holdWindow(conn, systemBufferMax()/2, systemBufferMax())
+ }
+ 
+ type connInfo struct {
+diff --git a/common/probesock/capture_linux_test.go b/common/probesock/capture_linux_test.go
+index 242a5e144..20fcefbfd 100644
+--- a/common/probesock/capture_linux_test.go
++++ b/common/probesock/capture_linux_test.go
+@@ -78,8 +78,16 @@ func TestCaptureLoopback(t *testing.T) {
+ 	require.NoError(t, err)
+ 	require.Zero(t, result.Dropped)
+ 	require.Equal(t, int64(size), result.Bytes)
+-	// the probe done, the connection may carry other traffic: its window may grow again
++	// the probe done, the connection may carry other traffic: its window may grow again, its
++	// buffer no larger than the kernel's tuning would make it
+ 	require.Equal(t, systemBufferMax(), clamp())
++	require.NoError(t, control.Raw(raw, func(fd uintptr) error {
++		buffer, err := unix.GetsockoptInt(int(fd), unix.SOL_SOCKET, unix.SO_RCVBUF)
++		if err == nil && buffer > systemBufferMax() {
++			t.Errorf("the buffer is %d, the tuning stops at %d", buffer, systemBufferMax())
++		}
++		return err
++	}))
+ 	require.Zero(t, result.Lost)
+ 	require.Zero(t, result.DupBytes)
+ 	require.Positive(t, result.Segments)
+-- 
+2.53.0
+

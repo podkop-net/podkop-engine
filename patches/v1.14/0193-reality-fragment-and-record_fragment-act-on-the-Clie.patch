@@ -1,0 +1,129 @@
+From b938287925fc744f110d0dd2e32db7fc0c3f1559 Mon Sep 17 00:00:00 2001
+From: FiyeroT <me@fiyero.xyz>
+Date: Wed, 11 Nov 2026 22:41:58 +0300
+Subject: [PATCH 193/193] reality: fragment and record_fragment act on the
+ ClientHello
+
+The REALITY client built its uTLS connection without the wrapper of tlsfragment, so
+fragment and record_fragment were taken and silently ignored there. The connection is now
+wrapped as UTLSClientConfig.Client does it. The record layer is below the handshake: the
+server reassembles the same ClientHello, and the REALITY authentication in it verifies
+(Xray-core REALITY reads the ClientHello through the record layer of crypto/tls).
+---
+ common/tls/reality_client.go               |  8 +++
+ common/tls/reality_record_fragment_test.go | 77 ++++++++++++++++++++++
+ 2 files changed, 85 insertions(+)
+ create mode 100644 common/tls/reality_record_fragment_test.go
+
+diff --git a/common/tls/reality_client.go b/common/tls/reality_client.go
+index d8b07ecae..82d390c57 100644
+--- a/common/tls/reality_client.go
++++ b/common/tls/reality_client.go
+@@ -30,6 +30,7 @@ import (
+ 	"unsafe"
+ 
+ 	"github.com/sagernet/sing-box/adapter"
++	tf "github.com/sagernet/sing-box/common/tlsfragment"
+ 	C "github.com/sagernet/sing-box/constant"
+ 	"github.com/sagernet/sing-box/option"
+ 	"github.com/sagernet/sing/common/debug"
+@@ -292,6 +293,13 @@ func (e *RealityClientConfig) ClientHandshake(ctx context.Context, conn net.Conn
+ 	uConfig.InsecureSkipVerify = true
+ 	uConfig.SessionTicketsDisabled = true
+ 	uConfig.VerifyPeerCertificate = verifier.VerifyPeerCertificate
++	// fragment and record_fragment act on this connection too: upstream wraps only the uTLS
++	// client (UTLSClientConfig.Client), so on REALITY both were silently ignored. The record
++	// layer is below the handshake: the server reassembles the same ClientHello and the
++	// REALITY authentication in it still verifies (podkop-engine).
++	if e.uClient.fragment || e.uClient.recordFragment {
++		conn = tf.NewConn(conn, e.uClient.ctx, e.uClient.fragment, e.uClient.recordFragment, e.uClient.fragmentFallbackDelay)
++	}
+ 	// the forged ClientHello goes before the real one on the same connection, as with any
+ 	// other TLS client; REALITY authenticates by the real one
+ 	conn, err := applyTLSSpoof(conn, e.uClient.spoof, e.uClient.spoofMethod)
+diff --git a/common/tls/reality_record_fragment_test.go b/common/tls/reality_record_fragment_test.go
+new file mode 100644
+index 000000000..73c267a15
+--- /dev/null
++++ b/common/tls/reality_record_fragment_test.go
+@@ -0,0 +1,77 @@
++//go:build with_utls
++
++package tls
++
++import (
++	"context"
++	"encoding/binary"
++	"io"
++	"net"
++	"testing"
++	"time"
++
++	"github.com/stretchr/testify/require"
++)
++
++// helloRecords reads the TLS records a client writes up to the end of its ClientHello and
++// returns their payload lengths and the length of the ClientHello message (4-byte handshake
++// header included).
++func helloRecords(t *testing.T, server net.Conn) (records []int, hello int) {
++	t.Helper()
++	require.NoError(t, server.SetReadDeadline(time.Now().Add(10*time.Second)))
++	got := 0
++	for hello == 0 || got < hello {
++		header := make([]byte, 5)
++		_, err := io.ReadFull(server, header)
++		require.NoError(t, err)
++		require.Equal(t, byte(0x16), header[0], "a handshake record")
++		payload := make([]byte, binary.BigEndian.Uint16(header[3:5]))
++		_, err = io.ReadFull(server, payload)
++		require.NoError(t, err)
++		if hello == 0 {
++			require.Equal(t, byte(0x01), payload[0], "the record starts with a ClientHello")
++			hello = 4 + int(payload[1])<<16 + int(payload[2])<<8 + int(payload[3])
++		}
++		records = append(records, len(payload))
++		got += len(payload)
++	}
++	require.Equal(t, hello, got, "the records carry exactly the ClientHello")
++	return records, hello
++}
++
++// record_fragment splits the ClientHello of a REALITY client into several TLS records, as it
++// does for a uTLS client; without it the ClientHello is one record (podkop-engine).
++func TestRealityRecordFragment(t *testing.T) {
++	for _, fragment := range []bool{false, true} {
++		logger, _ := newWarnLogger(t)
++		options := realityOptionsForTest("chrome", true)
++		options.RecordFragment = fragment
++		config, err := NewClient(context.Background(), logger, "192.0.2.1", options)
++		require.NoError(t, err)
++		_, isReality := config.(*RealityClientConfig)
++		require.True(t, isReality)
++
++		client, server := net.Pipe()
++		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
++		done := make(chan struct{})
++		go func() {
++			defer close(done)
++			// the handshake fails once the test closes the server end: only the hello matters
++			_, _ = ClientHandshake(ctx, client, config.Clone())
++		}()
++		records, hello := helloRecords(t, server)
++		server.Close()
++		<-done
++		cancel()
++		client.Close()
++
++		if fragment {
++			require.Greater(t, len(records), 1, "record_fragment splits the ClientHello")
++			for _, length := range records {
++				require.Less(t, length, hello)
++			}
++		} else {
++			require.Equal(t, []int{hello}, records, "one record without record_fragment")
++		}
++	}
++}
+-- 
+2.53.0
+

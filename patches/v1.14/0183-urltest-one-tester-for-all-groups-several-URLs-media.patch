@@ -1,0 +1,999 @@
+From 48e4fbe65c40296fa03f2354b739b27d60df4287 Mon Sep 17 00:00:00 2001
+From: FiyeroT <me@fiyero.xyz>
+Date: Wed, 4 Nov 2026 09:58:56 +0300
+Subject: [PATCH 183/193] urltest: one tester for all groups, several URLs,
+ median of a cycle
+
+- urls: the URLs of the tests, one a round in turn, numbered by the clock so that
+  every group of the process tests with the same URL in the same round. A member
+  that does not answer the URL of the round is tested once with the next one: it is
+  unavailable when two URLs do not answer, not one.
+- The delay of a member is the median of the last rounds, as many as there are URLs
+  (one per operator), kept in the history storage of the process: a URL that did not
+  answer leaves no sample, one stray test does not move the choice. A failure drops
+  the samples. A delay test the Clash API asks for, with its own URL, answers its
+  client and leaves such a median alone.
+- One URL tester for the process: a test of an outbound with a URL another group
+  asked for is waited for, not run again; tests whose connections begin at the same
+  first server (the outbound itself, or the end of its chain of detours) begin 2 s
+  apart, so twenty members behind one detour do not send it a burst of TLS hellos;
+  tests through different first servers run at once. The test of a member whose
+  connections fail and the download test wait for its first server too.
+---
+ common/urltest/urltest.go            |  80 ++++++++
+ experimental/clashapi/proxies.go     |   8 +-
+ option/group.go                      |   3 +
+ protocol/group/urltest.go            |  56 ++++--
+ protocol/group/urltest_download.go   |   4 +
+ protocol/group/urltest_failure.go    |  28 +--
+ protocol/group/urltest_probe.go      | 240 +++++++++++++++++++++++
+ protocol/group/urltest_probe_test.go | 272 +++++++++++++++++++++++++++
+ protocol/group/urltest_r20_test.go   |  16 +-
+ 9 files changed, 671 insertions(+), 36 deletions(-)
+ create mode 100644 protocol/group/urltest_probe.go
+ create mode 100644 protocol/group/urltest_probe_test.go
+
+diff --git a/common/urltest/urltest.go b/common/urltest/urltest.go
+index 7e0f90eae..70b3a04e6 100644
+--- a/common/urltest/urltest.go
++++ b/common/urltest/urltest.go
+@@ -6,6 +6,7 @@ import (
+ 	"net"
+ 	"net/http"
+ 	"net/url"
++	"slices"
+ 	"sync"
+ 	"time"
+ 
+@@ -28,6 +29,16 @@ type HistoryStorage struct {
+ 	failures    map[string]time.Time
+ 	downloads   map[string]DownloadResult
+ 	updateHooks []*observable.Subscriber[struct{}]
++	// the delays of a tag the URL tests of the last rounds measured (podkop-engine): its delay
++	// is their median, over keeps[tag] rounds
++	samples map[string][]Sample
++	keeps   map[string]int
++}
++
++// Sample is the delay a URL test measured in a round (podkop-engine).
++type Sample struct {
++	Round int64
++	Delay uint16
+ }
+ 
+ // DownloadResult is what a download test that could run found (podkop-engine).
+@@ -43,6 +54,8 @@ func NewHistoryStorage() *HistoryStorage {
+ 		delayHistory: make(map[string]*adapter.URLTestHistory),
+ 		failures:     make(map[string]time.Time),
+ 		downloads:    make(map[string]DownloadResult),
++		samples:      make(map[string][]Sample),
++		keeps:        make(map[string]int),
+ 	}
+ }
+ 
+@@ -74,6 +87,8 @@ func (s *HistoryStorage) DeleteURLTestHistory(tag string) {
+ 	delete(s.delayHistory, tag)
+ 	delete(s.failures, tag)
+ 	delete(s.downloads, tag)
++	delete(s.samples, tag)
++	delete(s.keeps, tag)
+ 	s.notifyUpdated()
+ 	s.access.Unlock()
+ }
+@@ -91,11 +106,76 @@ func (s *HistoryStorage) StoreURLTestHistory(tag string, history *adapter.URLTes
+ func (s *HistoryStorage) StoreURLTestFailure(tag string, at time.Time) {
+ 	s.access.Lock()
+ 	delete(s.delayHistory, tag)
++	// what it measured before it went down says nothing of it when it comes back
++	delete(s.samples, tag)
++	delete(s.keeps, tag)
+ 	s.failures[tag] = at
+ 	s.notifyUpdated()
+ 	s.access.Unlock()
+ }
+ 
++// StoreURLTestSample keeps the delay a URL test of a tag measured in a round and returns the
++// median of the delays of the last keep rounds, this one among them (podkop-engine). The rounds
++// of a group test its members with its URLs in turn, one a round: the median over as many
++// rounds as there are URLs is the delay to every operator of them, which the delay to one of
++// them is not (a server's way to one operator may be hundreds of milliseconds longer than to
++// another), and one stray test does not move it. A round whose URL did not answer through
++// the member has no sample: it is left out, not counted as slow. A later sample of the same
++// round replaces the earlier one. The median of an even number is the mean of the two
++// middle ones.
++func (s *HistoryStorage) StoreURLTestSample(tag string, round int64, keep int, delay uint16) uint16 {
++	if keep < 1 {
++		keep = 1
++	}
++	s.access.Lock()
++	defer s.access.Unlock()
++	kept := make([]Sample, 0, keep)
++	for _, sample := range s.samples[tag] {
++		// a round ahead of this one is of another schedule (a group that was replaced)
++		if sample.Round > round-int64(keep) && sample.Round < round {
++			kept = append(kept, sample)
++		}
++	}
++	kept = append(kept, Sample{Round: round, Delay: delay})
++	s.samples[tag] = kept
++	s.keeps[tag] = keep
++	return median(kept)
++}
++
++// URLTestSmoothed tells whether the delay of a tag is the median of several rounds
++// (StoreURLTestSample): one test outside the rounds must not replace it (podkop-engine).
++func (s *HistoryStorage) URLTestSmoothed(tag string) bool {
++	if s == nil {
++		return false
++	}
++	s.access.RLock()
++	defer s.access.RUnlock()
++	return s.keeps[tag] > 1 && len(s.samples[tag]) > 0
++}
++
++// LoadURLTestSamples returns the delays StoreURLTestSample keeps of a tag (podkop-engine).
++func (s *HistoryStorage) LoadURLTestSamples(tag string) []Sample {
++	if s == nil {
++		return nil
++	}
++	s.access.RLock()
++	defer s.access.RUnlock()
++	return slices.Clone(s.samples[tag])
++}
++
++func median(samples []Sample) uint16 {
++	delays := make([]int, len(samples))
++	for i, sample := range samples {
++		delays[i] = int(sample.Delay)
++	}
++	slices.Sort(delays)
++	middle := len(delays) / 2
++	if len(delays)%2 == 1 {
++		return uint16(delays[middle])
++	}
++	return uint16((delays[middle-1] + delays[middle] + 1) / 2)
++}
++
+ // LoadURLTestFailure returns when the last URL test of a tag failed, if it has passed none since
+ // (podkop-engine).
+ func (s *HistoryStorage) LoadURLTestFailure(tag string) (at time.Time, loaded bool) {
+diff --git a/experimental/clashapi/proxies.go b/experimental/clashapi/proxies.go
+index 0fa4ddc57..654772f70 100644
+--- a/experimental/clashapi/proxies.go
++++ b/experimental/clashapi/proxies.go
+@@ -237,9 +237,13 @@ func getProxyDelay(server *Server) func(w http.ResponseWriter, r *http.Request)
+ 		delay, err := urltest.URLTest(ctx, url, proxy)
+ 		defer func() {
+ 			realTag := group.RealTag(proxy, N.NetworkTCP)
+-			if err != nil {
++			switch {
++			case server.urlTestHistory.URLTestSmoothed(realTag):
++				// a member whose delay is the median of the rounds of its groups keeps it: one
++				// test with the URL of the client is no round (podkop-engine)
++			case err != nil:
+ 				server.urlTestHistory.StoreURLTestFailure(realTag, time.Now())
+-			} else {
++			default:
+ 				server.urlTestHistory.StoreURLTestHistory(realTag, &adapter.URLTestHistory{
+ 					Time:  time.Now(),
+ 					Delay: delay,
+diff --git a/option/group.go b/option/group.go
+index ac02ff794..1ec9f07d9 100644
+--- a/option/group.go
++++ b/option/group.go
+@@ -17,4 +17,7 @@ type URLTestOutboundOptions struct {
+ 	Tolerance                 uint16             `json:"tolerance,omitempty"`
+ 	IdleTimeout               badoption.Duration `json:"idle_timeout,omitempty"`
+ 	InterruptExistConnections bool               `json:"interrupt_exist_connections,omitempty"`
++	// URLs are the URLs of the tests, one a round in turn; url is left out when they are set
++	// (podkop-engine)
++	URLs badoption.Listable[string] `json:"urls,omitempty"`
+ }
+diff --git a/protocol/group/urltest.go b/protocol/group/urltest.go
+index 54ce43982..a37813a79 100644
+--- a/protocol/group/urltest.go
++++ b/protocol/group/urltest.go
+@@ -45,7 +45,7 @@ type URLTest struct {
+ 	tags                         []string
+ 	fallbackTags                 []string
+ 	all                          []string
+-	link                         string
++	links                        []string
+ 	downloadLink                 string
+ 	interval                     time.Duration
+ 	tolerance                    uint16
+@@ -66,7 +66,7 @@ func NewURLTest(ctx context.Context, router adapter.Router, logger log.ContextLo
+ 		tags:                         options.Outbounds,
+ 		fallbackTags:                 options.Fallbacks,
+ 		all:                          all,
+-		link:                         options.URL,
++		links:                        testLinks(options),
+ 		interval:                     time.Duration(options.Interval),
+ 		tolerance:                    options.Tolerance,
+ 		idleTimeout:                  time.Duration(options.IdleTimeout),
+@@ -94,6 +94,11 @@ func NewURLTest(ctx context.Context, router adapter.Router, logger log.ContextLo
+ 			listed[member] = true
+ 		}
+ 	}
++	for _, link := range outbound.links {
++		if err := checkTestLink(link); err != nil {
++			return nil, err
++		}
++	}
+ 	var err error
+ 	outbound.downloadLink, err = groupDownloadLink(options.DownloadURL)
+ 	if err != nil {
+@@ -128,10 +133,11 @@ func (s *URLTest) Start(stage adapter.StartStage, scope *adapter.Scope) error {
+ 			}
+ 			fallbacks = append(fallbacks, detour)
+ 		}
+-		group, err := NewURLTestGroup(s.ctx, s.outbound, s.logger, outbounds, fallbacks, s.link, s.downloadLink, s.interval, s.tolerance, s.idleTimeout, s.interruptExternalConnections)
++		group, err := NewURLTestGroup(s.ctx, s.outbound, s.logger, outbounds, fallbacks, "", s.downloadLink, s.interval, s.tolerance, s.idleTimeout, s.interruptExternalConnections)
+ 		if err != nil {
+ 			return err
+ 		}
++		group.links = s.links
+ 		s.group = group
+ 	case adapter.StartStateStarted:
+ 		s.group.PostStart()
+@@ -317,7 +323,7 @@ type URLTestGroup struct {
+ 	outbounds                    []adapter.Outbound
+ 	fallbacks                    []adapter.Outbound
+ 	members                      []adapter.Outbound // the outbounds, then the fallbacks: what a round tests
+-	link                         string
++	links                        []string           // the URLs of the tests, one a round in turn (roundPlan)
+ 	interval                     time.Duration
+ 	tolerance                    uint16
+ 	idleTimeout                  time.Duration
+@@ -392,7 +398,7 @@ func NewURLTestGroup(ctx context.Context, outboundManager adapter.OutboundManage
+ 		outbounds:                    outbounds,
+ 		fallbacks:                    fallbacks,
+ 		members:                      slices.Concat(outbounds, fallbacks),
+-		link:                         link,
++		links:                        linkList(link),
+ 		interval:                     interval,
+ 		tolerance:                    tolerance,
+ 		idleTimeout:                  idleTimeout,
+@@ -646,7 +652,7 @@ func (g *URLTestGroup) urlTestMembers(ctx context.Context, members []adapter.Out
+ 			go g.CheckOutbounds(g.ctx, true)
+ 		}
+ 	}()
+-	result := urlTestOutbounds(ctx, g.outbound, g.history, g.logger, members, g.link, g.interval, force, wait, concurrency)
++	result := urlTestOutbounds(ctx, g.outbound, g.history, g.logger, members, roundPlan(g.links, g.interval, time.Now()), g.interval, force, wait, concurrency)
+ 	if ctx.Err() == nil {
+ 		// a round cut short (a delay test of the Clash API that timed out) tested only some
+ 		g.roundDone.Store(true)
+@@ -678,13 +684,14 @@ type urlTestBatch struct {
+ // choice. Without, the selection runs after the call returns: the Clash API answers its
+ // client in time, while the selection may run a download test of up to 15 s per candidate.
+ func URLTestOutbounds(ctx context.Context, outboundManager adapter.OutboundManager, history *urltest.HistoryStorage, logger log.Logger, outbounds []adapter.Outbound, link string, interval time.Duration, force bool, wait bool) map[string]uint16 {
+-	return urlTestOutbounds(ctx, outboundManager, history, logger, outbounds, link, interval, force, wait, urlTestConcurrency)
++	// a test the Clash API asks for has its own URL, and the delay it stores is the one measured
++	return urlTestOutbounds(ctx, outboundManager, history, logger, outbounds, probePlan{links: []string{link}}, interval, force, wait, urlTestConcurrency)
+ }
+ 
+ // urlTestConcurrency is how many outbounds a round tests at a time.
+ const urlTestConcurrency = 10
+ 
+-func urlTestOutbounds(ctx context.Context, outboundManager adapter.OutboundManager, history *urltest.HistoryStorage, logger log.Logger, outbounds []adapter.Outbound, link string, interval time.Duration, force bool, wait bool, concurrency int) map[string]uint16 {
++func urlTestOutbounds(ctx context.Context, outboundManager adapter.OutboundManager, history *urltest.HistoryStorage, logger log.Logger, outbounds []adapter.Outbound, plan probePlan, interval time.Duration, force bool, wait bool, concurrency int) map[string]uint16 {
+ 	b, _ := batch.New(ctx, batch.WithConcurrencyNum[any](concurrency))
+ 	testBatch := &urlTestBatch{
+ 		ctx:      ctx,
+@@ -696,7 +703,7 @@ func urlTestOutbounds(ctx context.Context, outboundManager adapter.OutboundManag
+ 		wait:     wait,
+ 		result:   make(map[string]uint16),
+ 	}
+-	testBatch.test(outbounds, link, interval, force)
++	testBatch.test(outbounds, plan, interval, force)
+ 	b.Wait()
+ 	for _, outboundGroup := range testBatch.groups {
+ 		groupHistory := history.LoadURLTestHistory(RealTag(outboundGroup, N.NetworkTCP))
+@@ -721,7 +728,7 @@ func roundEnded(ctx context.Context) bool {
+ 	return hasDeadline && !time.Now().Before(deadline)
+ }
+ 
+-func (b *urlTestBatch) test(outbounds []adapter.Outbound, link string, interval time.Duration, force bool) {
++func (b *urlTestBatch) test(outbounds []adapter.Outbound, plan probePlan, interval time.Duration, force bool) {
+ 	for _, detour := range outbounds {
+ 		tag := detour.Tag()
+ 		if b.checked[tag] || detour.Type() == C.TypeBlock {
+@@ -751,7 +758,7 @@ func (b *urlTestBatch) test(outbounds []adapter.Outbound, link string, interval
+ 			b.test(common.FilterNotNil(common.Map(nested.All(), func(it string) adapter.Outbound {
+ 				member, _ := b.outbound.Outbound(it)
+ 				return member
+-			})), link, interval, force)
++			})), plan, interval, force)
+ 		default:
+ 			// A member that some group tested within this round is not tested again. The
+ 			// group's own test from the previous round must not count: it finished at most
+@@ -764,24 +771,43 @@ func (b *urlTestBatch) test(outbounds []adapter.Outbound, link string, interval
+ 			b.checked[tag] = true
+ 			b.batch.Go(tag, func() (any, error) {
+ 				var testResult urlTestResult
+-				testResult.delay, testResult.err = testOutbound(b.ctx, link, detour)
++				testResult.delay, testResult.err = testOutbound(b.ctx, b.outbound, plan.links[0], detour)
++				if testResult.err != nil && len(plan.links) > 1 && !roundEnded(b.ctx) {
++					// one URL that does not answer through a member is not the member down
++					b.logger.Debug("outbound ", tag, " did not answer ", plan.links[0], ": ", testResult.err, "; trying ", plan.links[1])
++					testResult.delay, testResult.err = testOutbound(b.ctx, b.outbound, plan.links[1], detour)
++				}
++				// a test the Clash API asked for (plan.keep 0) leaves a member whose delay is the
++				// median of the rounds as it is: one test with the URL of the client is no round
++				byClient := plan.keep == 0 && b.history.URLTestSmoothed(tag)
+ 				if testResult.err != nil {
+-					if roundEnded(b.ctx) {
++					if roundEnded(b.ctx) || byClient {
+ 						return nil, nil
+ 					}
+ 					b.logger.Debug("outbound ", tag, " unavailable: ", testResult.err)
+ 					b.history.StoreURLTestFailure(tag, time.Now())
++				} else if byClient {
++					b.access.Lock()
++					b.result[tag] = testResult.delay
++					b.access.Unlock()
+ 				} else {
+ 					if b.ctx.Err() != nil {
+ 						// the round ended with its group (podkop-engine): the tag may be
+ 						// another outbound's by now
+ 						return nil, nil
+ 					}
+-					b.logger.Debug("outbound ", tag, " available: ", testResult.delay, "ms")
++					delay := testResult.delay
++					if plan.keep > 0 {
++						delay = b.history.StoreURLTestSample(tag, plan.round, plan.keep, delay)
++						b.logger.Debug("outbound ", tag, " available: ", testResult.delay, "ms, the median of the last ", plan.keep, " rounds ", delay, "ms")
++					} else {
++						b.logger.Debug("outbound ", tag, " available: ", delay, "ms")
++					}
+ 					b.history.StoreURLTestHistory(tag, &adapter.URLTestHistory{
+ 						Time:  time.Now(),
+-						Delay: testResult.delay,
++						Delay: delay,
+ 					})
++					testResult.delay = delay
+ 					b.access.Lock()
+ 					b.result[tag] = testResult.delay
+ 					b.access.Unlock()
+diff --git a/protocol/group/urltest_download.go b/protocol/group/urltest_download.go
+index 7101ba871..a8b6dbca5 100644
+--- a/protocol/group/urltest_download.go
++++ b/protocol/group/urltest_download.go
+@@ -163,6 +163,10 @@ func (g *URLTestGroup) setFrozen(tag string, at time.Time) {
+ func (g *URLTestGroup) downloadStopped(tag string, member adapter.Outbound) bool {
+ 	ctx, cancel := context.WithTimeout(g.ctx, downloadTestTimeout)
+ 	defer cancel()
++	// a new connection to the first server of the member, like a URL test (probes)
++	if probes.waitHop(ctx, firstHop(g.outbound, member)) != nil {
++		return false
++	}
+ 	start := time.Now()
+ 	received, elapsed, err := urltest.DownloadTest(ctx, g.downloadLink, member)
+ 	switch {
+diff --git a/protocol/group/urltest_failure.go b/protocol/group/urltest_failure.go
+index cc08e2783..033e89ad8 100644
+--- a/protocol/group/urltest_failure.go
++++ b/protocol/group/urltest_failure.go
+@@ -344,10 +344,17 @@ func (g *URLTestGroup) confirmWith(confirms *map[string]*memberConfirm, tag stri
+ 	state.running = true
+ 	g.confirmAccess.Unlock()
+ 	go func() {
+-		start := time.Now()
+ 		// past probeSlots: one test of a member whose connections fail, paced as above, is
+-		// no burst, and behind the rounds it would keep the group on a dead member
+-		_, err := probeOutbound(g.ctx, g.link, member)
++		// no burst, and behind the rounds it would keep the group on a dead member. Its first
++		// server is waited for: the members of a dead detour fail all at once.
++		if probes.waitHop(g.ctx, firstHop(g.outbound, member)) != nil {
++			g.confirmAccess.Lock()
++			state.running = false
++			g.confirmAccess.Unlock()
++			return
++		}
++		start := time.Now()
++		_, err := probeOutbound(g.ctx, roundPlan(g.links, g.interval, time.Now()).links[0], member)
+ 		now := time.Now()
+ 		g.confirmAccess.Lock()
+ 		state.running = false
+@@ -383,16 +390,11 @@ func (g *URLTestGroup) confirmWith(confirms *map[string]*memberConfirm, tag stri
+ // hellos are what operators' DPI freezes, and a small CPU lags under them.
+ var probeSlots = make(chan struct{}, 4)
+ 
+-// testOutbound runs one URL test of detour (probeOutbound) once one of probeSlots is free:
+-// the wait for the slot does not take the time of the test.
+-func testOutbound(ctx context.Context, link string, detour adapter.Outbound) (uint16, error) {
+-	select {
+-	case probeSlots <- struct{}{}:
+-	case <-ctx.Done():
+-		return 0, ctx.Err()
+-	}
+-	defer func() { <-probeSlots }()
+-	return probeOutbound(ctx, link, detour)
++// testOutbound runs one URL test of detour (probeOutbound) once one of probeSlots is free and
++// the first server of detour may take a new connection (probes): the waits do not take the
++// time of the test. A test of detour with link another group runs is waited for instead.
++func testOutbound(ctx context.Context, manager adapter.OutboundManager, link string, detour adapter.Outbound) (uint16, error) {
++	return probes.test(ctx, manager, link, detour, probeSlots)
+ }
+ 
+ // probeOutbound runs one URL test of detour, bounded by the TCP timeout.
+diff --git a/protocol/group/urltest_probe.go b/protocol/group/urltest_probe.go
+new file mode 100644
+index 000000000..4ff96f450
+--- /dev/null
++++ b/protocol/group/urltest_probe.go
+@@ -0,0 +1,240 @@
++package group
++
++import (
++	"context"
++	"slices"
++	"sync"
++	"time"
++
++	"github.com/sagernet/sing-box/adapter"
++	"github.com/sagernet/sing-box/option"
++)
++
++// hopSpacing is the least time between the starts of two URL tests whose connections go to
++// the same first server (podkop-engine). An operator's DPI that freezes bursts of TLS hellos to
++// one server counts them per server (2026-10-31, from two Russian access networks: a burst to
++// one server froze it while a single hello to another passed). Hellos to one server one every
++// 2 s passed 20 of 20, one every second 12 and 7 of 20. Tests through different first servers
++// run at once.
++const hopSpacing = 2 * time.Second
++
++// probes is the URL tester of the process (podkop-engine). The groups of a configuration share
++// their members (a server in the groups of several rules) and the first servers of the members
++// (twenty servers of a subscription reached through one detour): each group testing on its
++// own would test a server as many times as it has groups, at the same moment, and its rounds
++// would open a TLS connection to the shared detour per member at once. Here a test of one
++// outbound with one URL that another group asked for already is waited for, not run again,
++// and tests through one first server begin hopSpacing apart.
++var probes = newProber(hopSpacing)
++
++type prober struct {
++	spacing time.Duration
++	access  sync.Mutex
++	calls   map[probeKey]*probeCall
++	// when the next test through a first server may begin
++	hops map[any]time.Time
++}
++
++type probeKey struct {
++	detour adapter.Outbound
++	link   string
++}
++
++type probeCall struct {
++	done  chan struct{}
++	delay uint16
++	err   error
++	// the test was cut because the round of the group that ran it ended: the groups that
++	// waited for it test themselves
++	abandoned bool
++}
++
++func newProber(spacing time.Duration) *prober {
++	return &prober{spacing: spacing, calls: make(map[probeKey]*probeCall), hops: make(map[any]time.Time)}
++}
++
++// test runs one URL test of detour with link, or waits for the one that runs. The outbounds
++// are the configuration's own objects: two configurations (a reload, the tests) share none.
++func (p *prober) test(ctx context.Context, manager adapter.OutboundManager, link string, detour adapter.Outbound, slots chan struct{}) (uint16, error) {
++	key := probeKey{detour, link}
++	for {
++		p.access.Lock()
++		call, running := p.calls[key]
++		if !running {
++			call = &probeCall{done: make(chan struct{})}
++			p.calls[key] = call
++			p.access.Unlock()
++			call.delay, call.err = p.run(ctx, firstHop(manager, detour), link, detour, slots)
++			call.abandoned = call.err != nil && roundEnded(ctx)
++			p.access.Lock()
++			delete(p.calls, key)
++			p.access.Unlock()
++			close(call.done)
++			return call.delay, call.err
++		}
++		p.access.Unlock()
++		select {
++		case <-call.done:
++		case <-ctx.Done():
++			return 0, ctx.Err()
++		}
++		if !call.abandoned {
++			return call.delay, call.err
++		}
++	}
++}
++
++// run takes one of slots (nil: none), then waits until a test through hop may begin; while it
++// waits it holds no slot, so that tests through other first servers go on.
++func (p *prober) run(ctx context.Context, hop any, link string, detour adapter.Outbound, slots chan struct{}) (uint16, error) {
++	for {
++		if slots != nil {
++			select {
++			case slots <- struct{}{}:
++			case <-ctx.Done():
++				return 0, ctx.Err()
++			}
++		}
++		wait := p.reserve(hop, time.Now())
++		if wait == 0 {
++			break
++		}
++		if slots != nil {
++			<-slots
++		}
++		if err := sleepContext(ctx, wait); err != nil {
++			return 0, err
++		}
++	}
++	if slots != nil {
++		defer func() { <-slots }()
++	}
++	return probeOutbound(ctx, link, detour)
++}
++
++// waitHop waits until a connection through hop may begin, and reserves it: for a test that
++// takes no slot (the download test, the test of a member whose connections fail).
++func (p *prober) waitHop(ctx context.Context, hop any) error {
++	for {
++		wait := p.reserve(hop, time.Now())
++		if wait == 0 {
++			return nil
++		}
++		if err := sleepContext(ctx, wait); err != nil {
++			return err
++		}
++	}
++}
++
++// reserve gives hop to a test beginning at now and returns 0, or tells how long to wait.
++func (p *prober) reserve(hop any, now time.Time) time.Duration {
++	if p.spacing <= 0 {
++		return 0
++	}
++	p.access.Lock()
++	defer p.access.Unlock()
++	if next, reserved := p.hops[hop]; reserved && now.Before(next) {
++		return next.Sub(now)
++	}
++	if len(p.hops) > 1024 {
++		for key, next := range p.hops {
++			if !now.Before(next) {
++				delete(p.hops, key)
++			}
++		}
++	}
++	p.hops[hop] = now.Add(p.spacing)
++	return 0
++}
++
++func sleepContext(ctx context.Context, wait time.Duration) error {
++	timer := time.NewTimer(wait)
++	defer timer.Stop()
++	select {
++	case <-timer.C:
++		return nil
++	case <-ctx.Done():
++		return ctx.Err()
++	}
++}
++
++// firstHop is the outbound whose server a connection through detour reaches first: detour, or
++// the last of its chain of detours. A group in the chain ends it (which of its members a
++// connection takes varies), and so does a detour the manager does not know (an endpoint).
++func firstHop(manager adapter.OutboundManager, detour adapter.Outbound) any {
++	current := detour
++	for range 8 {
++		if _, isGroup := current.(adapter.OutboundGroup); isGroup || manager == nil {
++			break
++		}
++		dependencies := current.Dependencies()
++		if len(dependencies) != 1 {
++			break
++		}
++		next, loaded := manager.Outbound(dependencies[0])
++		if !loaded {
++			return dependencies[0]
++		}
++		current = next
++	}
++	return current
++}
++
++// probePlan is what a round tests its members with (podkop-engine).
++type probePlan struct {
++	// links[0] is the URL of the round; links[1], when there is one, is tried once after a
++	// test with it fails: a member is unavailable when two URLs of the list do not answer
++	// through it, not one (a server's hoster may block one of them)
++	links []string
++	round int64
++	// keep is how many rounds the delay of a member is the median of
++	// (urltest.HistoryStorage.StoreURLTestSample); 0: the delay stored is the one measured
++	// (a test the Clash API asked for with its own URL)
++	keep int
++}
++
++// roundPlan is the plan of the round that begins at now: the rounds are numbered by the clock
++// (now divided by interval), so that the groups of the process test with the same URL in the
++// same round, and the probes of one member by different groups are one.
++func roundPlan(links []string, interval time.Duration, now time.Time) probePlan {
++	if len(links) == 0 {
++		return probePlan{links: []string{""}, keep: 1}
++	}
++	round := int64(0)
++	if interval > 0 {
++		round = now.UnixNano() / int64(interval)
++	}
++	first := int(round % int64(len(links)))
++	plan := probePlan{links: []string{links[first]}, round: round, keep: len(links)}
++	if len(links) > 1 {
++		plan.links = append(plan.links, links[(first+1)%len(links)])
++	}
++	return plan
++}
++
++// testLinks are the URLs of the tests of a group: urls, or url, without empty and repeated ones;
++// none for the default (urltest.URLTest).
++func testLinks(options option.URLTestOutboundOptions) []string {
++	var links []string
++	for _, link := range options.URLs {
++		if link != "" && !slices.Contains(links, link) {
++			links = append(links, link)
++		}
++	}
++	if len(links) == 0 {
++		return linkList(options.URL)
++	}
++	return links
++}
++
++func linkList(link string) []string {
++	if link == "" {
++		return nil
++	}
++	return []string{link}
++}
++
++// checkTestLink tells whether a URL test can use link.
++func checkTestLink(link string) error {
++	return checkDownloadLink("urls", link)
++}
+diff --git a/protocol/group/urltest_probe_test.go b/protocol/group/urltest_probe_test.go
+new file mode 100644
+index 000000000..dcd0f9394
+--- /dev/null
++++ b/protocol/group/urltest_probe_test.go
+@@ -0,0 +1,272 @@
++package group
++
++import (
++	"context"
++	"errors"
++	"net"
++	"os"
++	"sync"
++	"sync/atomic"
++	"testing"
++	"time"
++
++	"github.com/sagernet/sing-box/adapter"
++	"github.com/sagernet/sing-box/adapter/outbound"
++	"github.com/sagernet/sing-box/common/urltest"
++	C "github.com/sagernet/sing-box/constant"
++	"github.com/sagernet/sing-box/log"
++	"github.com/sagernet/sing-box/option"
++	M "github.com/sagernet/sing/common/metadata"
++	N "github.com/sagernet/sing/common/network"
++
++	"github.com/stretchr/testify/require"
++)
++
++// The tests of the package test their members many times a second: the spacing of tests
++// through one first server is tested with a prober of its own.
++func TestMain(m *testing.M) {
++	probes = newProber(0)
++	os.Exit(m.Run())
++}
++
++// chainMember is a member reached through the outbound detour (its dependency).
++func chainMember(tag string, detour string, dial func(ctx context.Context, network string, destination M.Socksaddr) (net.Conn, error)) *testMember {
++	return &testMember{Adapter: outbound.NewAdapter(C.TypeVLESS, tag, []string{N.NetworkTCP, N.NetworkUDP}, []string{detour}), dial: dial}
++}
++
++// Groups that ask for a test of one member with one URL at the same time get one test.
++func TestProberSharesATest(t *testing.T) {
++	p := newProber(0)
++	release := make(chan struct{})
++	member := newTestMember(C.TypeVLESS, "a", func(ctx context.Context, network string, destination M.Socksaddr) (net.Conn, error) {
++		<-release
++		return nil, errors.New("down")
++	})
++	var done sync.WaitGroup
++	errs := make([]error, 5)
++	for i := range errs {
++		done.Add(1)
++		go func() {
++			defer done.Done()
++			_, errs[i] = p.test(context.Background(), nil, "http://www.example.com/generate_204", member, nil)
++		}()
++	}
++	require.Eventually(t, func() bool { return member.dials.Load() == 1 }, 2*time.Second, time.Millisecond)
++	time.Sleep(50 * time.Millisecond)
++	close(release)
++	done.Wait()
++	require.Equal(t, int32(1), member.dials.Load())
++	for _, err := range errs {
++		require.Error(t, err)
++	}
++	// another URL is another test
++	_, _ = p.test(context.Background(), nil, "http://www.example.org/generate_204", member, nil)
++	require.Equal(t, int32(2), member.dials.Load())
++}
++
++// A test cut by the end of its group's round is not the result of the groups that waited for
++// it: they test themselves.
++func TestProberAbandonedTest(t *testing.T) {
++	p := newProber(0)
++	link, _ := testURL(t, 0)
++	started := make(chan struct{})
++	var first atomic.Bool
++	member := newTestMember(C.TypeVLESS, "a", func(ctx context.Context, network string, destination M.Socksaddr) (net.Conn, error) {
++		if first.CompareAndSwap(false, true) {
++			close(started)
++			<-ctx.Done()
++			return nil, ctx.Err()
++		}
++		return dialWorking(ctx, network, destination)
++	})
++	ctx, cancel := context.WithCancel(context.Background())
++	go func() { _, _ = p.test(ctx, nil, link, member, nil) }()
++	<-started
++	waited := make(chan error, 1)
++	go func() {
++		_, err := p.test(context.Background(), nil, link, member, nil)
++		waited <- err
++	}()
++	time.Sleep(20 * time.Millisecond)
++	cancel()
++	require.NoError(t, <-waited)
++	require.Equal(t, int32(2), member.dials.Load())
++}
++
++// Tests through one first server begin the spacing apart; through others, at once.
++func TestProberSpacesAFirstHop(t *testing.T) {
++	const spacing = 300 * time.Millisecond
++	p := newProber(spacing)
++	var access sync.Mutex
++	starts := make(map[string][]time.Time)
++	dial := func(name string) func(ctx context.Context, network string, destination M.Socksaddr) (net.Conn, error) {
++		return func(ctx context.Context, network string, destination M.Socksaddr) (net.Conn, error) {
++			access.Lock()
++			starts[name] = append(starts[name], time.Now())
++			access.Unlock()
++			return nil, errors.New("down")
++		}
++	}
++	detour := newTestMember(C.TypeVLESS, "x", dial("x"))
++	manager := &testOutboundManager{members: map[string]adapter.Outbound{"x": detour}}
++	var chain []*testMember
++	for _, tag := range []string{"a", "b", "c"} {
++		chain = append(chain, chainMember(tag, "x", dial("via-x")))
++	}
++	alone := newTestMember(C.TypeVLESS, "d", dial("d"))
++	slots := make(chan struct{}, 4)
++	var done sync.WaitGroup
++	for _, member := range append([]*testMember{alone}, chain...) {
++		done.Add(1)
++		go func() {
++			defer done.Done()
++			_, _ = p.test(context.Background(), manager, "http://www.example.com/generate_204", member, slots)
++		}()
++	}
++	done.Wait()
++	viaX := starts["via-x"]
++	require.Len(t, viaX, 3)
++	for i := 1; i < len(viaX); i++ {
++		gap := viaX[i].Sub(viaX[i-1])
++		require.GreaterOrEqual(t, gap, spacing-20*time.Millisecond, "tests through x %d and %d", i-1, i)
++	}
++	require.Len(t, starts["d"], 1)
++	require.Less(t, starts["d"][0].Sub(viaX[0]).Abs(), spacing/2, "a test through another first server waits for none")
++	require.Empty(t, starts["x"], "x itself was not tested")
++}
++
++func TestFirstHop(t *testing.T) {
++	x := newTestMember(C.TypeVLESS, "x", dialRefused)
++	a := chainMember("a", "x", dialRefused)
++	b := chainMember("b", "a", dialRefused)
++	lost := chainMember("lost", "endpoint", dialRefused)
++	nested := &testGroup{testMember: newTestMember(C.TypeSelector, "group", dialRefused), member: x}
++	viaGroup := chainMember("via-group", "group", dialRefused)
++	manager := &testOutboundManager{members: map[string]adapter.Outbound{"x": x, "a": a, "b": b, "group": nested}}
++	require.Equal(t, adapter.Outbound(x), firstHop(manager, x))
++	require.Equal(t, adapter.Outbound(x), firstHop(manager, a))
++	require.Equal(t, adapter.Outbound(x), firstHop(manager, b))
++	require.Equal(t, "endpoint", firstHop(manager, lost))
++	require.Equal(t, adapter.Outbound(nested), firstHop(manager, viaGroup))
++	require.Equal(t, adapter.Outbound(a), firstHop(nil, a))
++}
++
++// The rounds take the URLs in turn by the clock, the next one as the retry; the median is of
++// as many rounds as there are URLs.
++func TestRoundPlan(t *testing.T) {
++	links := []string{"https://a/", "https://b/", "https://c/"}
++	base := time.Unix(1_800_000_000, 0).Truncate(time.Minute)
++	var seen []string
++	for i := range 4 {
++		plan := roundPlan(links, time.Minute, base.Add(time.Duration(i)*time.Minute+time.Second))
++		require.Equal(t, 3, plan.keep)
++		require.Len(t, plan.links, 2)
++		seen = append(seen, plan.links[0])
++		require.Equal(t, links[(indexOf(links, plan.links[0])+1)%3], plan.links[1])
++	}
++	require.Equal(t, seen[0], seen[3])
++	require.ElementsMatch(t, links, seen[:3])
++	// within one round the plan is the same whenever a group asks
++	require.Equal(t, roundPlan(links, time.Minute, base.Add(time.Second)), roundPlan(links, time.Minute, base.Add(59*time.Second)))
++	one := roundPlan([]string{"https://a/"}, time.Minute, base)
++	require.Equal(t, []string{"https://a/"}, one.links)
++	require.Equal(t, 1, one.keep)
++	none := roundPlan(nil, time.Minute, base)
++	require.Equal(t, []string{""}, none.links)
++}
++
++func indexOf(links []string, link string) int {
++	for i, it := range links {
++		if it == link {
++			return i
++		}
++	}
++	return -1
++}
++
++func TestURLTestSampleMedian(t *testing.T) {
++	history := urltest.NewHistoryStorage()
++	require.Equal(t, uint16(50), history.StoreURLTestSample("a", 10, 5, 50))
++	require.Equal(t, uint16(55), history.StoreURLTestSample("a", 11, 5, 60))
++	require.Equal(t, uint16(55), history.StoreURLTestSample("a", 12, 5, 55))
++	// round 13 did not answer: no sample; one stray test moves the median a little only
++	require.Equal(t, uint16(58), history.StoreURLTestSample("a", 14, 5, 2000))
++	// a later test of the same round replaces its sample
++	require.Equal(t, uint16(54), history.StoreURLTestSample("a", 14, 5, 52))
++	// round 10 is out of the last five rounds
++	require.Equal(t, uint16(58), history.StoreURLTestSample("a", 15, 5, 70))
++	require.Len(t, history.LoadURLTestSamples("a"), 4)
++	history.StoreURLTestFailure("a", time.Now())
++	require.Empty(t, history.LoadURLTestSamples("a"))
++	require.Equal(t, uint16(80), history.StoreURLTestSample("a", 16, 5, 80))
++}
++
++// A member that does not answer the URL of the round is tested with the next one: available
++// when that one answers, with its delay as the sample; unavailable when it does not either.
++func TestRoundRetriesTheNextLink(t *testing.T) {
++	good, goodRequests := testURL(t, 0)
++	bad := "http://127.0.0.1:1/generate_204"
++	member := newTestMember(C.TypeVLESS, "a", dialWorking)
++	history := urltest.NewHistoryStorage()
++	plan := probePlan{links: []string{bad, good}, round: 7, keep: 2}
++	result := urlTestOutbounds(context.Background(), nil, history, log.NewNOPFactory().Logger(), []adapter.Outbound{member}, plan, time.Minute, true, true, 1)
++	require.Contains(t, result, "a")
++	require.Equal(t, int32(1), goodRequests.Load())
++	require.NotNil(t, history.LoadURLTestHistory("a"))
++	require.Len(t, history.LoadURLTestSamples("a"), 1)
++	_, failed := history.LoadURLTestFailure("a")
++	require.False(t, failed)
++
++	plan = probePlan{links: []string{bad, bad + "?again"}, round: 8, keep: 2}
++	result = urlTestOutbounds(context.Background(), nil, history, log.NewNOPFactory().Logger(), []adapter.Outbound{member}, plan, time.Minute, true, true, 1)
++	require.NotContains(t, result, "a")
++	require.Nil(t, history.LoadURLTestHistory("a"))
++	_, failed = history.LoadURLTestFailure("a")
++	require.True(t, failed)
++}
++
++// A group with several URLs stores the median of its rounds as the delay of a member.
++func TestURLTestGroupMedianOfRounds(t *testing.T) {
++	fast, _ := testURL(t, 0)
++	slow, _ := testURL(t, 120*time.Millisecond)
++	member := newTestMember(C.TypeVLESS, "a", dialWorking)
++	history := urltest.NewHistoryStorage()
++	for round, link := range []string{slow, fast, fast} {
++		plan := probePlan{links: []string{link}, round: int64(round), keep: 3}
++		urlTestOutbounds(context.Background(), nil, history, log.NewNOPFactory().Logger(), []adapter.Outbound{member}, plan, time.Minute, true, true, 1)
++	}
++	delay := history.LoadURLTestHistory("a").Delay
++	require.Less(t, delay, uint16(100), "the slow URL of one round is not the delay")
++}
++
++// urls of the options: in their order, without empty and repeated ones; url when none.
++func TestURLTestLinksOption(t *testing.T) {
++	require.Equal(t, []string{"https://a/", "https://b/"}, testLinks(option.URLTestOutboundOptions{URL: "https://c/", URLs: []string{"https://a/", "", "https://b/", "https://a/"}}))
++	require.Equal(t, []string{"https://c/"}, testLinks(option.URLTestOutboundOptions{URL: "https://c/"}))
++	require.Nil(t, testLinks(option.URLTestOutboundOptions{}))
++	require.Error(t, checkTestLink("ftp://a/"))
++	require.NoError(t, checkTestLink("https://cp.cloudflare.com/generate_204"))
++}
++
++// A test the Clash API asks for, with its own URL, leaves the median of the rounds alone; in a
++// group of one URL it is stored as before.
++func TestClientTestKeepsTheMedian(t *testing.T) {
++	link, _ := testURL(t, 0)
++	member := newTestMember(C.TypeVLESS, "a", dialWorking)
++	history := urltest.NewHistoryStorage()
++	history.StoreURLTestSample("a", 5, 3, 40)
++	history.StoreURLTestHistory("a", &adapter.URLTestHistory{Time: time.Now(), Delay: 40})
++	slow, _ := testURL(t, 150*time.Millisecond)
++	result := URLTestOutbounds(context.Background(), nil, history, log.NewNOPFactory().Logger(), []adapter.Outbound{member}, slow, time.Minute, true, true)
++	require.GreaterOrEqual(t, result["a"], uint16(150), "the client gets what it measured")
++	require.Equal(t, uint16(40), history.LoadURLTestHistory("a").Delay)
++	URLTestOutbounds(context.Background(), nil, history, log.NewNOPFactory().Logger(), []adapter.Outbound{member}, "http://127.0.0.1:1/", time.Minute, true, true)
++	_, failed := history.LoadURLTestFailure("a")
++	require.False(t, failed)
++
++	single := urltest.NewHistoryStorage()
++	single.StoreURLTestSample("a", 5, 1, 40)
++	URLTestOutbounds(context.Background(), nil, single, log.NewNOPFactory().Logger(), []adapter.Outbound{member}, slow, time.Minute, true, true)
++	require.GreaterOrEqual(t, single.LoadURLTestHistory("a").Delay, uint16(150))
++	_ = link
++}
+diff --git a/protocol/group/urltest_r20_test.go b/protocol/group/urltest_r20_test.go
+index 4750d3f0d..5ec136511 100644
+--- a/protocol/group/urltest_r20_test.go
++++ b/protocol/group/urltest_r20_test.go
+@@ -4,6 +4,7 @@ import (
+ 	"context"
+ 	"errors"
+ 	"net"
++	"strconv"
+ 	"sync"
+ 	"sync/atomic"
+ 	"testing"
+@@ -72,9 +73,10 @@ func TestBlockFallbackAnswers(t *testing.T) {
+ // No more URL tests than probeSlots run at once in the process. Not parallel: the slots are
+ // those of the whole process.
+ func TestProbeLimit(t *testing.T) {
+-	var now, most atomic.Int32
++	var now, most, dials atomic.Int32
+ 	release := make(chan struct{})
+-	slow := newTestMember(C.TypeSOCKS, "slow", func(ctx context.Context, network string, destination M.Socksaddr) (net.Conn, error) {
++	slow := func(ctx context.Context, network string, destination M.Socksaddr) (net.Conn, error) {
++		dials.Add(1)
+ 		running := now.Add(1)
+ 		defer now.Add(-1)
+ 		for {
+@@ -88,13 +90,15 @@ func TestProbeLimit(t *testing.T) {
+ 		case <-ctx.Done():
+ 		}
+ 		return nil, errors.New("down")
+-	})
++	}
+ 	var done sync.WaitGroup
+-	for range 3 * cap(probeSlots) {
++	// members of their own: tests of one member with one URL are one (probes)
++	for i := range 3 * cap(probeSlots) {
++		member := newTestMember(C.TypeSOCKS, "slow"+strconv.Itoa(i), slow)
+ 		done.Add(1)
+ 		go func() {
+ 			defer done.Done()
+-			_, _ = testOutbound(context.Background(), "http://www.example.com/generate_204", slow)
++			_, _ = testOutbound(context.Background(), nil, "http://www.example.com/generate_204", member)
+ 		}()
+ 	}
+ 	require.Eventually(t, func() bool { return now.Load() == int32(cap(probeSlots)) }, 5*time.Second, 10*time.Millisecond)
+@@ -103,7 +107,7 @@ func TestProbeLimit(t *testing.T) {
+ 	close(release)
+ 	done.Wait()
+ 	require.Equal(t, int32(cap(probeSlots)), most.Load())
+-	require.Equal(t, int32(3*cap(probeSlots)), slow.dials.Load())
++	require.Equal(t, int32(3*cap(probeSlots)), dials.Load())
+ }
+ 
+ // Before a round has tested the members a fallback is not taken for want of their results: at
+-- 
+2.53.0
+
