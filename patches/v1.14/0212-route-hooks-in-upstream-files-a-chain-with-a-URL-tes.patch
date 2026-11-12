@@ -1,0 +1,92 @@
+From 830ee61943767ad286759f5015e03b3dba848144 Mon Sep 17 00:00:00 2001
+From: FiyeroT <me@fiyero.xyz>
+Date: Thu, 12 Nov 2026 21:41:20 +0300
+Subject: [PATCH 15/57] route, hooks in upstream files: a chain with a URL test
+ is dialed through the URL test
+
+The lines of upstream files that "route: a chain with a URL test is dialed through the URL test"
+needs; the feature itself is its patch of layer 03, in files of its own.
+
+Pdk-Feature: route-chain
+Pdk-Zone: core
+Pdk-Layer: 02
+---
+ route/conn.go  | 14 +++++---------
+ route/route.go | 14 ++++++++++++++
+ 2 files changed, 19 insertions(+), 9 deletions(-)
+
+diff --git a/route/conn.go b/route/conn.go
+index cff6b1397..e83116e82 100644
+--- a/route/conn.go
++++ b/route/conn.go
+@@ -6,7 +6,6 @@ import (
+ 	"net"
+ 	"net/netip"
+ 	"os"
+-	"slices"
+ 	"strings"
+ 	"sync"
+ 	"sync/atomic"
+@@ -124,7 +123,7 @@ func (m *ConnectionManager) NewConnection(ctx context.Context, this N.Dialer, co
+ 		err = E.Cause(err, "open connection to ", remoteString, dialerString)
+ 		m.deleteURLTestHistory(metadata.OutboundChain)
+ 		N.CloseOnHandshakeFailure(conn, onClose, err)
+-		m.logger.ErrorContext(ctx, err)
++		m.logDialError(ctx, this, err)
+ 		return
+ 	}
+ 	err = N.ReportConnHandshakeSuccess(conn, remoteConn)
+@@ -224,7 +223,7 @@ func (m *ConnectionManager) NewPacketConnection(ctx context.Context, this N.Dial
+ 			err = E.Cause(err, "listen packet connection using ", dialerString)
+ 			m.deleteURLTestHistory(metadata.OutboundChain)
+ 			N.CloseOnHandshakeFailure(conn, onClose, err)
+-			m.logger.ErrorContext(ctx, err)
++			m.logDialError(ctx, this, err)
+ 			return
+ 		}
+ 	}
+@@ -281,13 +280,10 @@ func (m *ConnectionManager) NewPacketConnection(ctx context.Context, this N.Dial
+ 	go m.packetConnectionCopy(ctx, destination, conn, true, &done, onClose)
+ }
+ 
++// deleteURLTestHistory is left to the URL test group: a connection of a chain with one is
++// dialed through it (dialTarget), and it judges the failures of its members itself, a failure of
++// the destination or of the network of the router not taken for one of the member.
+ func (m *ConnectionManager) deleteURLTestHistory(chain []adapter.Outbound) {
+-	if slices.ContainsFunc(chain, func(it adapter.Outbound) bool {
+-		_, isURLTestGroup := it.(adapter.URLTestGroup)
+-		return isURLTestGroup
+-	}) {
+-		m.urlTestHistory.DeleteURLTestHistory(chain[len(chain)-1].Tag())
+-	}
+ }
+ 
+ func (m *ConnectionManager) connectionCopy(ctx context.Context, source net.Conn, destination net.Conn, direction bool, done *atomic.Bool, onClose N.CloseHandlerFunc) {
+diff --git a/route/route.go b/route/route.go
+index bf25baeee..416e6833e 100644
+--- a/route/route.go
++++ b/route/route.go
+@@ -194,6 +194,20 @@ func resolveOutbound(outbound adapter.Outbound, network string) ([]adapter.Outbo
+ 	return chain, nil
+ }
+ 
++// dialTarget is the outbound of a chain a routed connection is dialed through: the first URL
++// test group of the chain, else the last outbound. The URL test of podkop-engine judges the
++// dials of its members itself (a member that fails or does not answer is tested out of turn and
++// left at once, a fallback taken, a member whose test is pending not used): a dial of the member
++// past the group, as sing-box 1.14.4 makes it, would leave all of that out.
++func dialTarget(chain []adapter.Outbound) adapter.Outbound {
++	for _, outbound := range chain {
++		if _, isURLTestGroup := outbound.(adapter.URLTestGroup); isURLTestGroup {
++			return outbound
++		}
++	}
++	return chain[len(chain)-1]
++}
++
+ func registerInterrupt(chain []adapter.Outbound, closer io.Closer, onClose N.CloseHandlerFunc) N.CloseHandlerFunc {
+ 	var removers []func()
+ 	for _, outbound := range chain {
+-- 
+2.53.0
+

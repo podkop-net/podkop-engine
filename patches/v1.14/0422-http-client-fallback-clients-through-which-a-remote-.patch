@@ -1,0 +1,433 @@
+From 4078a4f6ea146c682b8afb42ba3db11aab3ff0ce Mon Sep 17 00:00:00 2001
+From: FiyeroT <me@fiyero.xyz>
+Date: Thu, 12 Nov 2026 21:41:21 +0300
+Subject: [PATCH 57/57] http client: fallback clients, through which a remote
+ rule-set repeats a failed download
+
+An HTTP client may name other shared clients as its fallbacks; a remote rule-set whose download
+through its client fails or stalls repeats it through each fallback client in turn.
+
+Made of these commits of the earlier series (branch archive/r25-1.14-commits):
+  eb3fdb31c http client: fallback clients, through which a remote rule-set repeats a failed download
+
+Pdk-Feature: http-client-fallback
+Pdk-Zone: core
+Pdk-Layer: 04
+---
+ adapter/http.go                             | 14 +++
+ common/httpclient/fallback.go               | 45 ++++++++++
+ common/httpclient/fallback_test.go          | 72 +++++++++++++++
+ docs/configuration/shared/http-client.md    | 11 +++
+ option/http.go                              |  5 ++
+ route/rule/rule_set_remote.go               | 35 ++++++++
+ route/rule/rule_set_remote_fallback.go      | 30 +++++++
+ route/rule/rule_set_remote_fallback_test.go | 99 +++++++++++++++++++++
+ 8 files changed, 311 insertions(+)
+ create mode 100644 common/httpclient/fallback.go
+ create mode 100644 common/httpclient/fallback_test.go
+ create mode 100644 route/rule/rule_set_remote_fallback.go
+ create mode 100644 route/rule/rule_set_remote_fallback_test.go
+
+diff --git a/adapter/http.go b/adapter/http.go
+index 3de4f1ce3..af67ee61f 100644
+--- a/adapter/http.go
++++ b/adapter/http.go
+@@ -21,6 +21,20 @@ type HTTPClientManager interface {
+ 	ResetNetwork()
+ }
+ 
++// HTTPClientFallbacks is an HTTPClientManager that resolves the fallback clients of a client
++// (option.HTTPClientOptions.Fallback): those a caller that saw a request fail through the client
++// may repeat it through, in their order. The options are those the caller resolved its transport
++// from; nil stands for the default client.
++type HTTPClientFallbacks interface {
++	ResolveFallbacks(options *option.HTTPClientOptions) ([]HTTPFallback, error)
++}
++
++// HTTPFallback is a fallback client: its tag and its shared transport.
++type HTTPFallback struct {
++	Tag       string
++	Transport HTTPTransport
++}
++
+ type HTTPStartContext struct {
+ 	access     sync.Mutex
+ 	transports []HTTPTransport
+diff --git a/common/httpclient/fallback.go b/common/httpclient/fallback.go
+new file mode 100644
+index 000000000..f1f7fca91
+--- /dev/null
++++ b/common/httpclient/fallback.go
+@@ -0,0 +1,45 @@
++package httpclient
++
++import (
++	"github.com/sagernet/sing-box/adapter"
++	"github.com/sagernet/sing-box/option"
++	E "github.com/sagernet/sing/common/exceptions"
++)
++
++var _ adapter.HTTPClientFallbacks = (*Manager)(nil)
++
++// ResolveFallbacks resolves the fallback clients of the client of options, or of the default
++// client for nil: the shared transports of the tags its Fallback names, in their order.
++func (m *Manager) ResolveFallbacks(options *option.HTTPClientOptions) ([]adapter.HTTPFallback, error) {
++	var own string
++	var tags []string
++	switch {
++	case options == nil:
++		own = m.defaultTag
++		if own == "" {
++			return nil, nil
++		}
++		tags = m.defines[own].Fallback
++	case options.Tag != "":
++		own = options.Tag
++		define, loaded := m.defines[own]
++		if !loaded {
++			return nil, E.New("http_client not found: ", own)
++		}
++		tags = define.Fallback
++	default:
++		tags = options.Fallback
++	}
++	fallbacks := make([]adapter.HTTPFallback, 0, len(tags))
++	for _, tag := range tags {
++		if own != "" && tag == own {
++			return nil, E.New("http_client[", own, "]: fallback names the client itself")
++		}
++		sharedTransport, err := m.resolveShared(tag)
++		if err != nil {
++			return nil, E.Cause(err, "fallback")
++		}
++		fallbacks = append(fallbacks, adapter.HTTPFallback{Tag: tag, Transport: newSharedRef(sharedTransport.managed, sharedTransport.shared)})
++	}
++	return fallbacks, nil
++}
+diff --git a/common/httpclient/fallback_test.go b/common/httpclient/fallback_test.go
+new file mode 100644
+index 000000000..d66cc8674
+--- /dev/null
++++ b/common/httpclient/fallback_test.go
+@@ -0,0 +1,72 @@
++package httpclient
++
++import (
++	"context"
++	"testing"
++
++	"github.com/sagernet/sing-box/adapter"
++	"github.com/sagernet/sing-box/log"
++	"github.com/sagernet/sing-box/option"
++	"github.com/sagernet/sing/common/json/badoption"
++
++	"github.com/stretchr/testify/require"
++)
++
++// The fallbacks of a client are the shared transports of the tags it names, in their order: of
++// the default client, of a client named by tag, of inline options. A tag that names no client,
++// or the client itself, is an error.
++func TestResolveFallbacks(t *testing.T) {
++	clients := []option.HTTPClient{
++		{Tag: "lists", Fallback: badoption.Listable[string]{"via-b", "via-a"}},
++		{Tag: "via-a"},
++		{Tag: "via-b"},
++		{Tag: "loop", Fallback: badoption.Listable[string]{"loop"}},
++		{Tag: "lost", Fallback: badoption.Listable[string]{"nowhere"}},
++	}
++	manager := NewManager(context.Background(), log.NewNOPFactory().NewLogger("test"), clients, "lists")
++	for _, tag := range []string{"via-a", "via-b"} {
++		manager.sharedTransports[tag] = &sharedManagedTransport{managed: &ManagedTransport{tag: tag}, shared: &sharedState{}}
++	}
++	tags := func(fallbacks []adapter.HTTPFallback) []string {
++		var result []string
++		for _, fallback := range fallbacks {
++			result = append(result, fallback.Tag)
++			require.Equal(t, fallback.Tag, fallback.Transport.(*sharedRef).managed.tag)
++		}
++		return result
++	}
++	fallbacks, err := manager.ResolveFallbacks(nil)
++	require.NoError(t, err)
++	require.Equal(t, []string{"via-b", "via-a"}, tags(fallbacks))
++	fallbacks, err = manager.ResolveFallbacks(&option.HTTPClientOptions{Tag: "lists"})
++	require.NoError(t, err)
++	require.Equal(t, []string{"via-b", "via-a"}, tags(fallbacks))
++	fallbacks, err = manager.ResolveFallbacks(&option.HTTPClientOptions{Fallback: badoption.Listable[string]{"via-a"}})
++	require.NoError(t, err)
++	require.Equal(t, []string{"via-a"}, tags(fallbacks))
++	fallbacks, err = manager.ResolveFallbacks(&option.HTTPClientOptions{Tag: "via-a"})
++	require.NoError(t, err)
++	require.Empty(t, fallbacks)
++	_, err = manager.ResolveFallbacks(&option.HTTPClientOptions{Tag: "loop"})
++	require.ErrorContains(t, err, "names the client itself")
++	_, err = manager.ResolveFallbacks(&option.HTTPClientOptions{Tag: "lost"})
++	require.ErrorContains(t, err, "http_client not found: nowhere")
++	_, err = manager.ResolveFallbacks(&option.HTTPClientOptions{Tag: "unknown"})
++	require.ErrorContains(t, err, "http_client not found: unknown")
++	// no client is defined: the default one has no fallbacks
++	fallbacks, err = NewManager(context.Background(), log.NewNOPFactory().NewLogger("test"), nil, "").ResolveFallbacks(nil)
++	require.NoError(t, err)
++	require.Empty(t, fallbacks)
++}
++
++// the option round-trips through JSON, by tag or inline
++func TestFallbackOptionJSON(t *testing.T) {
++	var client option.HTTPClient
++	require.NoError(t, client.UnmarshalJSON([]byte(`{"tag":"lists","fallback":["via-a","via-b"]}`)))
++	require.Equal(t, badoption.Listable[string]{"via-a", "via-b"}, client.Fallback)
++	content, err := client.MarshalJSON()
++	require.NoError(t, err)
++	var again option.HTTPClient
++	require.NoError(t, again.UnmarshalJSON(content))
++	require.Equal(t, client.Fallback, again.Fallback)
++}
+diff --git a/docs/configuration/shared/http-client.md b/docs/configuration/shared/http-client.md
+index dfa986b88..787aaa3db 100644
+--- a/docs/configuration/shared/http-client.md
++++ b/docs/configuration/shared/http-client.md
+@@ -18,6 +18,7 @@ When object:
+   "version": 0,
+   "disable_version_fallback": false,
+   "headers": {},
++  "fallback": [],
+ 
+   ... // HTTP2 Fields
+ 
+@@ -92,6 +93,16 @@ Custom HTTP headers.
+ 
+ `Host` header is used as request host.
+ 
++#### fallback
++
++Tags of shared HTTP clients defined in top-level `http_clients`, tried in order when a download
++through this client fails.
++
++A remote rule-set whose download through this client fails (an error, an unexpected status,
++no data for the stall timeout, or content that is not a rule-set) repeats it through each
++fallback client in turn, until one brings the list. The fallbacks of a fallback client are not
++followed. Other users of the client do not fall back.
++
+ ### HTTP2 Fields
+ 
+ When `version` is `2` (default).
+diff --git a/option/http.go b/option/http.go
+index c51b26435..5b878421b 100644
+--- a/option/http.go
++++ b/option/http.go
+@@ -39,6 +39,11 @@ type _HTTPClientOptions struct {
+ 	DirectResolver          bool                 `json:"-"`
+ 	OutboundTLSOptionsContainer
+ 	DialerOptions
++
++	// Fallback names the http clients a caller that saw a request fail through this one may
++	// repeat it through, in order (adapter.HTTPClientFallbacks). Their own fallbacks are not
++	// followed.
++	Fallback badoption.Listable[string] `json:"fallback,omitempty"`
+ }
+ 
+ type (
+diff --git a/route/rule/rule_set_remote.go b/route/rule/rule_set_remote.go
+index fec3b987f..c6b500b5c 100644
+--- a/route/rule/rule_set_remote.go
++++ b/route/rule/rule_set_remote.go
+@@ -52,6 +52,9 @@ type RemoteRuleSet struct {
+ 	options        option.RuleSet
+ 	updateInterval time.Duration
+ 	httpClient     *http.Client
++	// the clients a fetch that failed through httpClient is repeated through, in order
++	// (option.HTTPClientOptions.Fallback)
++	fallbacks      []ruleSetFallback
+ 	access         sync.RWMutex
+ 	rules          []adapter.HeadlessRule
+ 	metadata       adapter.RuleSetMetadata
+@@ -136,6 +139,11 @@ func (s *RemoteRuleSet) StartContext(ctx context.Context, startContext *adapter.
+ 	if err != nil {
+ 		return E.Cause(err, "create rule-set http client")
+ 	}
++	for _, fallback := range fallbacks {
++		startContext.Register(fallback.Transport)
++		s.fallbacks = append(s.fallbacks, ruleSetFallback{tag: fallback.Tag, client: &http.Client{Transport: fallback.Transport}})
++	}
++	s.loadCached()
+ 	var loadedFromInitialPath bool
+ 	if s.lastUpdated.IsZero() && s.initialPath != "" {
+ 		var content []byte
+@@ -527,6 +535,33 @@ func describeRuleSetBody(response *http.Response, size int64, sample []byte) str
+ // each of its fallback clients in turn. Each way has the whole stall timeout of its own; the start
+ // deadline bounds them all. The error is that of every way.
+ func (s *RemoteRuleSet) fetch(ctx context.Context, isStart bool) error {
++	if isStart {
++		var stop context.CancelFunc
++		ctx, stop = context.WithTimeout(ctx, ruleSetStartDeadline)
++		defer stop()
++	}
++	err := s.fetchThrough(ctx, s.httpClient, isStart)
++	if err == nil || len(s.fallbacks) == 0 {
++		return err
++	}
++	errs := []error{err}
++	for _, fallback := range s.fallbacks {
++		if s.ctx.Err() != nil || ctx.Err() != nil {
++			break
++		}
++		s.logger.Info("update rule-set ", s.tag, " through http_client[", fallback.tag, "]: ", logText(err))
++		err = s.fetchThrough(ctx, fallback.client, isStart)
++		if err == nil {
++			return nil
++		}
++		err = E.Cause(err, "http_client[", fallback.tag, "]")
++		errs = append(errs, err)
++	}
++	return E.Errors(errs...)
++}
++
++// fetchThrough downloads the list through client.
++func (s *RemoteRuleSet) fetchThrough(ctx context.Context, client *http.Client, isStart bool) error {
+ 	s.logger.Debug("updating rule-set ", s.tag, " from URL: ", s.url)
+ 	// a group that switches members closes the connections it does not know as routed
+ 	// ones: a list half downloaded through it would wait for the next update_interval
+diff --git a/route/rule/rule_set_remote_fallback.go b/route/rule/rule_set_remote_fallback.go
+new file mode 100644
+index 000000000..8f865ce60
+--- /dev/null
++++ b/route/rule/rule_set_remote_fallback.go
+@@ -0,0 +1,30 @@
++package rule
++
++import (
++	"net/http"
++
++	"github.com/sagernet/sing-box/adapter"
++	"github.com/sagernet/sing/service"
++)
++
++// ruleSetFallback is a fallback client of the rule-set: its tag, for the log.
++type ruleSetFallback struct {
++	tag    string
++	client *http.Client
++}
++
++// resolveFallbacks resolves the fallback clients of the http client the rule-set downloads with:
++// none for the deprecated download_detour, nor with a manager that has no fallbacks.
++func (s *RemoteRuleSet) resolveFallbacks() ([]adapter.HTTPFallback, error) {
++	resolver, loaded := service.FromContext[adapter.HTTPClientManager](s.ctx).(adapter.HTTPClientFallbacks)
++	if !loaded {
++		return nil, nil
++	}
++	switch {
++	case s.options.RemoteOptions.HTTPClient != nil && !s.options.RemoteOptions.HTTPClient.IsEmpty():
++		return resolver.ResolveFallbacks(s.options.RemoteOptions.HTTPClient)
++	case s.options.RemoteOptions.DownloadDetour != "": //nolint:staticcheck
++		return nil, nil
++	}
++	return resolver.ResolveFallbacks(nil)
++}
+diff --git a/route/rule/rule_set_remote_fallback_test.go b/route/rule/rule_set_remote_fallback_test.go
+new file mode 100644
+index 000000000..12100a9be
+--- /dev/null
++++ b/route/rule/rule_set_remote_fallback_test.go
+@@ -0,0 +1,99 @@
++package rule
++
++import (
++	"context"
++	"errors"
++	"io"
++	"net"
++	"net/http"
++	"net/http/httptest"
++	"sync/atomic"
++	"testing"
++	"time"
++
++	C "github.com/sagernet/sing-box/constant"
++
++	"github.com/stretchr/testify/require"
++)
++
++// refusingClient is a way that cannot reach the server: its dial fails with err.
++func refusingClient(err error) *http.Client {
++	return &http.Client{Transport: &http.Transport{
++		DialContext: func(ctx context.Context, network, address string) (net.Conn, error) {
++			return nil, err
++		},
++	}}
++}
++
++// A list the client of the rule-set cannot download comes through the first fallback client that
++// can; the clients after it are not asked.
++func TestRemoteRuleSetFetchFallback(t *testing.T) {
++	var asked atomic.Int32
++	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		asked.Add(1)
++		io.WriteString(w, testSourceSet)
++	}))
++	defer server.Close()
++	var lastAsked atomic.Bool
++	last := &http.Client{Transport: &http.Transport{
++		DialContext: func(ctx context.Context, network, address string) (net.Conn, error) {
++			lastAsked.Store(true)
++			return (&net.Dialer{}).DialContext(ctx, network, address)
++		},
++	}}
++	set := newTestRuleSet(server.URL)
++	set.options.Format = C.RuleSetFormatSource
++	set.httpClient = refusingClient(errors.New("direct refused"))
++	set.fallbacks = []ruleSetFallback{
++		{tag: "dead", client: refusingClient(errors.New("dead refused"))},
++		{tag: "via-a", client: &http.Client{Transport: &http.Transport{}}},
++		{tag: "via-b", client: last},
++	}
++	require.NoError(t, set.fetch(context.Background(), false))
++	require.Len(t, set.currentRules(), 1)
++	require.EqualValues(t, 1, asked.Load())
++	require.False(t, lastAsked.Load())
++}
++
++// A way that sends its headers and then goes silent is left after the stall timeout, and the next
++// way has the whole timeout of its own.
++func TestRemoteRuleSetFetchFallbackAfterStall(t *testing.T) {
++	defer swapTimeouts(200*time.Millisecond, time.Minute)()
++	release := make(chan struct{})
++	var stalled atomic.Bool
++	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		if stalled.CompareAndSwap(false, true) {
++			w.WriteHeader(http.StatusOK)
++			w.(http.Flusher).Flush()
++			<-release
++			return
++		}
++		io.WriteString(w, testSourceSet)
++	}))
++	defer server.Close()
++	// before the server closes: Close waits for the handler that holds the stalled answer
++	defer close(release)
++	set := newTestRuleSet(server.URL)
++	set.options.Format = C.RuleSetFormatSource
++	set.httpClient = &http.Client{Transport: &http.Transport{}}
++	set.fallbacks = []ruleSetFallback{{tag: "via-a", client: &http.Client{Transport: &http.Transport{}}}}
++	require.NoError(t, set.fetch(context.Background(), false))
++	require.Len(t, set.currentRules(), 1)
++}
++
++// When no way brings the list, the error tells what each of them met.
++func TestRemoteRuleSetFetchFallbackAllFail(t *testing.T) {
++	set := newTestRuleSet("http://lists.invalid/list.json")
++	set.options.Format = C.RuleSetFormatSource
++	set.httpClient = refusingClient(errors.New("direct refused"))
++	set.fallbacks = []ruleSetFallback{
++		{tag: "via-a", client: refusingClient(errors.New("a refused"))},
++		{tag: "via-b", client: refusingClient(errors.New("b refused"))},
++	}
++	err := set.fetch(context.Background(), false)
++	require.Error(t, err)
++	for _, text := range []string{"direct refused", "http_client[via-a]", "a refused", "http_client[via-b]", "b refused"} {
++		require.Contains(t, err.Error(), text)
++	}
++	require.Empty(t, set.currentRules())
++}
+-- 
+2.53.0
+

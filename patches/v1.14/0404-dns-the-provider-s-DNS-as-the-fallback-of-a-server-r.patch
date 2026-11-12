@@ -1,0 +1,2438 @@
+From 1a5b50d1d6ce4bc517378d244a106f1220c794ae Mon Sep 17 00:00:00 2001
+From: FiyeroT <me@fiyero.xyz>
+Date: Thu, 12 Nov 2026 21:41:20 +0300
+Subject: [PATCH 39/57] dns: the provider's DNS as the fallback of a server
+ reached through the WAN
+
+When a server reached through the WAN fails, the query goes to the DNS of the provider, taken from
+netifd for each uplink, the fastest first; a failure counts once per event and only for names the
+provider resolved; the state is forgotten on a network reset, the list read again at most once in 30
+s.
+
+Made of these commits of the earlier series (branch archive/r25-1.14-commits):
+  92b29fcb5 dns: fall back to the provider's DNS when a server reached through the WAN fails
+  f3bc6de57 dns: take the provider's DNS from netifd for the output device, ask the fastest
+  fe71d80d6 dns: test the decisions of the provider DNS fallback
+  45bcdcef6 dns: count a failure of a server once per event, and only for names the provider resolved
+  a9ead7078 dns: forget the state of the provider fallback of every server on a network reset
+  82a4db1f8 dns: read the provider's servers again after a miss at most once in 30 s
+  949fc49c0 dns: take the first query to a server off the goroutine that reads client queries
+  1814af0f1 dns: use slices.Equal and slices.Contains for the provider's servers
+  60bb116f8 dns: every message of the provider DNS fallback is a warning
+  69ccd4a80 dns: the fallback asks the provider of every uplink through it; a list for each box
+
+Pdk-Feature: dns-provider
+Pdk-Zone: core
+Pdk-Layer: 04
+---
+ dns/client.go                        |   8 +-
+ dns/client_fallback.go               | 515 ++++++++++++++++++
+ dns/client_fallback_exchange_test.go | 767 +++++++++++++++++++++++++++
+ dns/client_fallback_provider.go      | 552 +++++++++++++++++++
+ dns/client_fallback_reload_test.go   |  56 ++
+ dns/client_fallback_test.go          | 319 +++++++++++
+ dns/router.go                        |  20 +-
+ dns/transport_adapter.go             |   6 +
+ protocol/direct/outbound.go          |   7 +
+ 9 files changed, 2244 insertions(+), 6 deletions(-)
+ create mode 100644 dns/client_fallback.go
+ create mode 100644 dns/client_fallback_exchange_test.go
+ create mode 100644 dns/client_fallback_provider.go
+ create mode 100644 dns/client_fallback_reload_test.go
+ create mode 100644 dns/client_fallback_test.go
+
+diff --git a/dns/client.go b/dns/client.go
+index 234b55eae..a56f19270 100644
+--- a/dns/client.go
++++ b/dns/client.go
+@@ -781,7 +781,7 @@ func stripDNSPadding(response *dns.Msg) {
+ }
+ 
+ func (c *Client) exchangeToTransport(ctx context.Context, transport adapter.DNSTransport, message *dns.Msg) (*dns.Msg, error) {
+-	response, err := transport.Exchange(ctx, message)
++	response, err := c.exchangeTransport(ctx, transport, message)
+ 	if err == nil {
+ 		stripDNSPadding(response)
+ 		return response, nil
+@@ -790,11 +790,11 @@ func (c *Client) exchangeToTransport(ctx context.Context, transport adapter.DNST
+ 	if errors.As(err, &rcodeError) {
+ 		return FixedResponseStatus(message, int(rcodeError)), nil
+ 	}
+-	return nil, err
++	return nil, c.failures.failed(ctx, c.logger, transport.Tag(), message, err)
+ }
+ 
+ func (c *Client) exchangeToTransportAsync(ctx context.Context, transport adapter.DNSTransport, message *dns.Msg, callback func(response *dns.Msg, err error)) {
+-	transport.ExchangeAsync(ctx, message, func(response *dns.Msg, err error) {
++	c.exchangeTransportAsync(ctx, transport, message, func(response *dns.Msg, err error) {
+ 		if err == nil {
+ 			stripDNSPadding(response)
+ 			callback(response, nil)
+@@ -805,7 +805,7 @@ func (c *Client) exchangeToTransportAsync(ctx context.Context, transport adapter
+ 			callback(FixedResponseStatus(message, int(rcodeError)), nil)
+ 			return
+ 		}
+-		callback(nil, err)
++		callback(nil, c.failures.failed(ctx, c.logger, transport.Tag(), message, err))
+ 	})
+ }
+ 
+diff --git a/dns/client_fallback.go b/dns/client_fallback.go
+new file mode 100644
+index 000000000..881439ae2
+--- /dev/null
++++ b/dns/client_fallback.go
+@@ -0,0 +1,515 @@
++package dns
++
++import (
++	"context"
++	"errors"
++	"net/netip"
++	"os"
++	"reflect"
++	"strings"
++	"sync"
++	"sync/atomic"
++	"time"
++
++	"github.com/sagernet/sing-box/adapter"
++	C "github.com/sagernet/sing-box/constant"
++	"github.com/sagernet/sing-box/log"
++	"github.com/sagernet/sing-box/option"
++	"github.com/sagernet/sing/common/logger"
++	N "github.com/sagernet/sing/common/network"
++	"github.com/sagernet/sing/service"
++
++	mDNS "github.com/miekg/dns"
++)
++
++// Fallback to the DNS servers of the internet provider (podkop-engine).
++//
++// When a DNS server that sing-box reaches directly through the WAN fails to answer
++// (timeout, refused or reset connection, TLS or HTTP error), the query is sent to the
++// provider's servers: the DNS servers that netifd knows for the output device of sing-box,
++// or for every uplink when sing-box binds no socket, each asked through its uplink (see
++// client_fallback_provider.go). Setting SING_BOX_DNS_FALLBACK turns this on; the
++// init script of podkop-engine does it when podkop is installed.
++//
++// Which servers qualify is decided once, from the configuration: a plain socket (no
++// detour, or a detour to a direct outbound) without dial fields that send it another
++// way (bind_interface, routing_mark, bind address, netns), to a public address or a
++// domain name. A server behind a proxy, an outbound group or a bound interface (a VPN),
++// and a local or private resolver (127.0.0.1, LAN, VPN) never fall back and behave
++// exactly as without this code. Routes of the system are not looked at: a server sent
++// into a VPN by a route, not by sing-box, looks like any other. The fallback query goes
++// through the server's own dialer. A member of a group of servers (transport_group.go) has
++// no fallback of its own: the group decides whom to ask next, and asks the provider when
++// every member failed.
++//
++// After two failures in a row answered by the provider, the server is set aside: queries
++// go straight to the provider, and a copy of one query is sent to the server in the
++// background, every 30 s at first and up to every 5 minutes; the first normal answer
++// brings it back. A failure counts when the provider resolved the name (NOERROR or
++// NXDOMAIN): a name that neither resolves says nothing about the server. Queries that
++// fail together are one failure: the second is a query that started after the first was
++// counted. A SERVFAIL is retried through the provider as well but does not count
++// against the server: it is usually about one domain. When the provider fails to answer
++// twice in a row, the fallback is off for that server for a minute. A network reset
++// starts the counts over and makes the provider usable again; a server that is set aside
++// stays so but is probed with the next query, see reset.
++//
++// Everything the fallback writes to the log is a warning: whether a server has it, the
++// provider's servers and every change of state are there in a log that is not at the
++// info level.
++var fallbackEnabled = os.Getenv("SING_BOX_DNS_FALLBACK") != ""
++
++// stateContext is the context of a query for a line about a change of state that the query
++// caused. The queries sing-box makes itself (common/dialer/resolve.go) lower their lines to
++// the debug level, but a change of state is about the queries that follow, not about that
++// one: the override of the panic level keeps the level of every line.
++func stateContext(ctx context.Context) context.Context {
++	return log.ContextWithOverrideLevel(ctx, log.LevelPanic)
++}
++
++const (
++	fallbackPrimaryTimeout = 3500 * time.Millisecond
++	fallbackTimeout        = 3 * time.Second
++	fallbackDownAfter      = 2
++	fallbackProbeFirst     = 30 * time.Second
++	fallbackProbeMax       = 5 * time.Minute
++	fallbackProviderAfter  = 2           // provider failures in a row that switch the fallback off
++	fallbackUnusableFor    = time.Minute // then the provider is tried again, as dnscrypt-proxy does
++	fallbackMaxTTL         = 60
++)
++
++var (
++	// not public, besides what netip reports: CGNAT (also Tailscale) and "this network"
++	fallbackNonPublic = []netip.Prefix{netip.MustParsePrefix("100.64.0.0/10"), netip.MustParsePrefix("0.0.0.0/8")}
++	fallbackLocalTLDs = []string{".localhost", ".local", ".lan", ".home.arpa", ".internal"}
++)
++
++type fallbackServer struct {
++	options option.RemoteDNSServerOptions
++
++	decideOnce sync.Once
++	decided    atomic.Bool // eligible is set
++	eligible   bool
++	dialer     N.Dialer
++	// ctx is the one of the box (decide); bound are the dialers of the server bound to the
++	// devices of uplinks (dialerFor)
++	ctx   context.Context
++	bound map[string]N.Dialer
++
++	access        sync.Mutex
++	failures      int
++	countedAt     time.Time // the last failure counted or the last network reset
++	providerFails int
++	down          bool
++	probeAt       time.Time
++	probeEvery    time.Duration
++	unusableUntil time.Time
++
++	providers *providerSet // the box's, shared by all its servers (decide)
++
++	// grouped: the server is a member of a group (transport_group.go), which decides whom
++	// to ask when it fails; it has no fallback of its own then
++	grouped atomic.Bool
++}
++
++// newFallbackServer returns the fallback state of a remote server, nil when the fallback
++// is not enabled.
++func newFallbackServer(options option.RemoteDNSServerOptions) *fallbackServer {
++	if !fallbackEnabled {
++		return nil
++	}
++	return &fallbackServer{options: options}
++}
++
++// fallbackFor is the fallback state of a server that has the fallback: a remote server that
++// is no member of a group.
++func fallbackFor(transport adapter.DNSTransport) *fallbackServer {
++	state := fallbackStateOf(transport)
++	if state == nil || state.grouped.Load() {
++		return nil
++	}
++	return state
++}
++
++func fallbackStateOf(transport adapter.DNSTransport) *fallbackServer {
++	remote, isRemote := transport.(interface{ fallbackState() *fallbackServer })
++	if !isRemote {
++		return nil
++	}
++	return remote.fallbackState()
++}
++
++// exchangeWithFallback: ctx carries the deadline of the query, baseCtx the services of
++// the box.
++func exchangeWithFallback(ctx context.Context, baseCtx context.Context, logger logger.ContextLogger, transport adapter.DNSTransport, state *fallbackServer, message *mDNS.Msg) (*mDNS.Msg, error) {
++	tag := transport.Tag()
++	if !state.decide(baseCtx, logger, tag) {
++		return transport.Exchange(ctx, message)
++	}
++	if state.isDown() {
++		if state.probeDue() {
++			go probeServer(context.WithoutCancel(ctx), logger, transport, state, message.Copy())
++		}
++		response, err := state.exchangeProvider(ctx, baseCtx, logger, message)
++		if err == nil {
++			return response, nil
++		}
++		// the provider does not answer either: ask the server itself
++		if ctx.Err() == nil {
++			state.providerFailed(ctx, logger, tag, err)
++		}
++		return transport.Exchange(ctx, message)
++	}
++	usable := state.usable(baseCtx, logger)
++	startAt := time.Now()
++	primaryCtx, cancel := ctx, context.CancelFunc(func() {})
++	if usable {
++		primaryCtx, cancel = context.WithTimeout(ctx, fallbackPrimaryTimeout)
++	}
++	response, err := transport.Exchange(primaryCtx, message)
++	cancel()
++	var rcodeError RcodeError
++	if err == nil || errors.As(err, &rcodeError) {
++		state.success()
++		servfail := (err == nil && response.Rcode == mDNS.RcodeServerFailure) || (err != nil && int(rcodeError) == mDNS.RcodeServerFailure)
++		if usable && servfail {
++			alternative, altErr := state.exchangeProvider(ctx, baseCtx, logger, message)
++			if altErr == nil && (alternative.Rcode == mDNS.RcodeSuccess || alternative.Rcode == mDNS.RcodeNameError) {
++				return alternative, nil
++			}
++		}
++		return response, err
++	}
++	if !usable || ctx.Err() != nil {
++		return nil, err // the provider is not used now, or the caller gave the query up
++	}
++	alternative, altErr := state.exchangeProvider(ctx, baseCtx, logger, message)
++	if altErr != nil {
++		if ctx.Err() == nil {
++			state.providerFailed(ctx, logger, tag, altErr)
++		}
++		return nil, err
++	}
++	if alternative.Rcode == mDNS.RcodeSuccess || alternative.Rcode == mDNS.RcodeNameError {
++		state.failure(ctx, logger, tag, startAt, err)
++	}
++	return alternative, nil
++}
++
++func probeServer(ctx context.Context, logger logger.ContextLogger, transport adapter.DNSTransport, state *fallbackServer, message *mDNS.Msg) {
++	ctx, cancel := context.WithTimeout(ctx, fallbackPrimaryTimeout)
++	defer cancel()
++	response, err := transport.Exchange(ctx, message)
++	if err != nil || response.Rcode == mDNS.RcodeServerFailure {
++		return
++	}
++	state.access.Lock()
++	wasDown := state.down
++	state.down = false
++	state.failures = 0
++	state.access.Unlock()
++	if wasDown && logger != nil {
++		logger.WarnContext(stateContext(ctx), "server ", transport.Tag(), " answers again, provider DNS no longer used")
++	}
++}
++
++// decide tells once whether the fallback applies to the server; ctx carries the services
++// of the box.
++func (s *fallbackServer) decide(ctx context.Context, logger logger.ContextLogger, tag string) bool {
++	s.decideOnce.Do(func() {
++		defer s.decided.Store(true)
++		var reason string
++		if ctx == nil {
++			reason = "no context"
++		} else {
++			reason = fallbackExclusion(ctx, s.options)
++		}
++		if reason == "" {
++			dialer, err := NewRemoteDialer(ctx, s.options)
++			if err != nil {
++				reason = err.Error()
++			} else {
++				s.dialer, s.ctx = dialer, ctx
++				s.eligible = true
++				if s.providers == nil {
++					s.providers = providersFrom(ctx)
++				}
++				s.providers.list(ctx, logger) // at once: the first query may need them
++			}
++		}
++		if logger == nil {
++			return
++		}
++		if s.eligible {
++			logger.Warn("server ", tag, " falls back to provider DNS when it fails")
++		} else {
++			logger.Warn("no provider DNS fallback for server ", tag, ": ", reason)
++		}
++	})
++	return s.eligible
++}
++
++// fallbackExclusion returns why a server does not qualify, "" when it does.
++func fallbackExclusion(ctx context.Context, options option.RemoteDNSServerOptions) string {
++	if field := specialDialField(options.DialerOptions); field != "" {
++		return field
++	}
++	if options.Detour != "" {
++		outbounds := service.FromContext[adapter.OutboundManager](ctx)
++		if outbounds == nil {
++			return "detour " + options.Detour
++		}
++		outbound, loaded := outbounds.Outbound(options.Detour)
++		if !loaded {
++			return "detour " + options.Detour + " not found"
++		}
++		direct, isDirect := outbound.(interface{ DialerOptions() option.DialerOptions })
++		if outbound.Type() != C.TypeDirect || !isDirect {
++			return "detour through " + outbound.Type() + " outbound " + options.Detour
++		}
++		if field := specialDialField(direct.DialerOptions()); field != "" {
++			return field + " of outbound " + options.Detour
++		}
++	}
++	server := options.DNSServerAddressOptions.Build()
++	if server.IsIP() && !publicAddress(server.Addr) {
++		return "local or private address " + server.Addr.String()
++	}
++	if server.IsDomain() && localName(server.Fqdn) {
++		return "local name " + server.Fqdn
++	}
++	return ""
++}
++
++// specialDialField names a dial field that sends a socket another way than a plain one
++// through the system routes. Fields known to leave the route alone are cleared first, so
++// any other one, including a field added by a later sing-box, counts as special.
++func specialDialField(options option.DialerOptions) string {
++	switch {
++	case options.BindInterface != "":
++		return "bind_interface " + options.BindInterface
++	case options.RoutingMark != 0:
++		return "routing_mark"
++	case options.Inet4BindAddress != nil || options.Inet6BindAddress != nil:
++		return "bind address"
++	case options.NetNs != "":
++		return "netns " + options.NetNs
++	}
++	options.Detour = "" // checked by the caller
++	options.BindAddressNoPort = false
++	options.ReuseAddr = false
++	options.ConnectTimeout = 0
++	options.TCPFastOpen = false
++	options.TCPMultiPath = false
++	options.DisableTCPKeepAlive = false
++	options.TCPKeepAlive = 0
++	options.TCPKeepAliveInterval = 0
++	options.TCPKeepAliveSystemDefaults = false
++	options.UDPBindPort = 0
++	options.UDPFragment = nil
++	options.UDPFragmentDefault = false
++	options.DomainResolver = nil
++	options.FallbackDelay = 0
++	options.DomainStrategy = 0 //nolint:staticcheck
++	if !reflect.DeepEqual(options, option.DialerOptions{}) {
++		return "dial fields"
++	}
++	return ""
++}
++
++func publicAddress(address netip.Addr) bool {
++	address = address.Unmap()
++	if !address.IsGlobalUnicast() || address.IsPrivate() {
++		return false // loopback, link-local, multicast, unspecified, RFC 1918, ULA
++	}
++	for _, prefix := range fallbackNonPublic {
++		if prefix.Contains(address) {
++			return false
++		}
++	}
++	return true
++}
++
++func localName(name string) bool {
++	name = strings.ToLower(strings.TrimSuffix(name, "."))
++	if !strings.Contains(name, ".") {
++		return true // "localhost", "router"
++	}
++	for _, suffix := range fallbackLocalTLDs {
++		if strings.HasSuffix(name, suffix) {
++			return true
++		}
++	}
++	return false
++}
++
++// dialerFor is the dialer of a query to a server of the provider: the server's own, or for
++// a server of an uplink one like it bound to the device of that uplink, made once. Only a
++// plain socket qualifies (fallbackExclusion): the detour to a direct outbound is left out.
++func (s *fallbackServer) dialerFor(device string) N.Dialer {
++	if device == "" || s.ctx == nil {
++		return s.dialer
++	}
++	s.access.Lock()
++	defer s.access.Unlock()
++	if dialer, made := s.bound[device]; made {
++		return dialer
++	}
++	options := s.options
++	options.DialerOptions.Detour = ""
++	options.DialerOptions.BindInterface = device
++	dialer, err := NewRemoteDialer(s.ctx, options)
++	if err != nil {
++		dialer = s.dialer
++	}
++	if s.bound == nil {
++		s.bound = make(map[string]N.Dialer)
++	}
++	s.bound[device] = dialer
++	return dialer
++}
++
++func (s *fallbackServer) isDown() bool {
++	s.access.Lock()
++	defer s.access.Unlock()
++	return s.down
++}
++
++// usable reports whether the provider may be used now: it has not stopped answering
++// lately and is known.
++func (s *fallbackServer) usable(ctx context.Context, logger logger.ContextLogger) bool {
++	s.access.Lock()
++	blocked := time.Now().Before(s.unusableUntil)
++	s.access.Unlock()
++	return !blocked && s.providers.known(ctx, logger)
++}
++
++// probeDue reserves the next background check of a server that is set aside.
++func (s *fallbackServer) probeDue() bool {
++	s.access.Lock()
++	defer s.access.Unlock()
++	now := time.Now()
++	if !s.down || now.Before(s.probeAt) {
++		return false
++	}
++	s.probeAt = now.Add(s.probeEvery)
++	s.probeEvery = min(s.probeEvery*2, fallbackProbeMax)
++	return true
++}
++
++func (s *fallbackServer) success() {
++	s.access.Lock()
++	s.failures = 0
++	s.access.Unlock()
++}
++
++// failure counts a failure of the server answered by the provider, for a query sent at
++// startAt. Queries that were on their way when the last failure was counted are part of
++// the same event, such as a closed connection they shared, and are not counted again.
++func (s *fallbackServer) failure(ctx context.Context, logger logger.ContextLogger, tag string, startAt time.Time, cause error) {
++	s.access.Lock()
++	if startAt.Before(s.countedAt) {
++		s.access.Unlock()
++		return
++	}
++	s.countedAt = time.Now()
++	s.failures++
++	if s.down || s.failures < fallbackDownAfter {
++		s.access.Unlock()
++		return
++	}
++	s.down = true
++	s.probeEvery = fallbackProbeFirst
++	s.probeAt = time.Now().Add(s.probeEvery)
++	s.access.Unlock()
++	if logger != nil {
++		// the logger formats only strings, numbers, errors and Stringers
++		logger.WarnContext(stateContext(ctx), "server ", tag, " failed ", fallbackDownAfter, " times in a row (", cause, "), answering from provider DNS ", s.providers.names(), " until it is back")
++	}
++}
++
++// reset forgets what was learned on the network that sing-box has just left: the DNS
++// router calls it when sing-box resets the network. The provider is usable again and the
++// failure counts start over; queries on their way fail with the connections that the
++// reset closes and count nothing. A server that is set aside stays so, since asking a
++// dead server first would cost the next queries its timeout, but it is probed with the
++// next query.
++func (s *fallbackServer) reset() {
++	s.access.Lock()
++	s.failures = 0
++	s.countedAt = time.Now()
++	s.providerFails = 0
++	s.unusableUntil = time.Time{}
++	if s.down {
++		s.probeAt = s.countedAt
++		s.probeEvery = fallbackProbeFirst
++	}
++	s.access.Unlock()
++}
++
++// providerFailed stops using the provider: for a while when it fails to answer twice in a
++// row, until it is listed again when there is none.
++func (s *fallbackServer) providerFailed(ctx context.Context, logger logger.ContextLogger, tag string, cause error) {
++	if errors.Is(cause, errNoProviders) {
++		s.access.Lock()
++		s.down = false
++		s.failures = 0
++		s.access.Unlock()
++		return
++	}
++	s.access.Lock()
++	s.providerFails++
++	if s.providerFails < fallbackProviderAfter {
++		s.access.Unlock()
++		return
++	}
++	s.providerFails = 0
++	s.down = false
++	s.failures = 0
++	s.unusableUntil = time.Now().Add(fallbackUnusableFor)
++	s.access.Unlock()
++	if logger != nil {
++		logger.WarnContext(stateContext(ctx), "provider DNS does not answer for server ", tag, " (", cause, "), no fallback for it for ", fallbackUnusableFor)
++	}
++}
++
++// capTTL keeps provider answers short-lived, so that the server takes over again soon
++// after it is back.
++func capTTL(message *mDNS.Msg, maxTTL uint32) {
++	for _, section := range [][]mDNS.RR{message.Answer, message.Ns, message.Extra} {
++		for _, record := range section {
++			if record.Header().Rrtype == mDNS.TypeOPT {
++				continue
++			}
++			if record.Header().Ttl > maxTTL {
++				record.Header().Ttl = maxTTL
++			}
++		}
++	}
++}
++
++// The client has already applied its timeout to ctx.
++func (c *Client) exchangeTransport(ctx context.Context, transport adapter.DNSTransport, message *mDNS.Msg) (*mDNS.Msg, error) {
++	if state := fallbackFor(transport); state != nil {
++		return exchangeWithFallback(ctx, c.ctx, c.logger, transport, state, message)
++	}
++	return transport.Exchange(ctx, message)
++}
++
++// exchangeTransportAsync is the path of queries hijacked from clients. Servers without
++// the fallback keep the transport's own asynchronous exchange. The caller reads the next
++// queries of the client and must not wait: the first query to a server, which decides
++// and reads the provider's servers (an exec of ubus), does it on the goroutine too.
++func (c *Client) exchangeTransportAsync(ctx context.Context, transport adapter.DNSTransport, message *mDNS.Msg, callback func(response *mDNS.Msg, err error)) {
++	if state := fallbackFor(transport); state != nil && (!state.decided.Load() || state.eligible) {
++		go func() {
++			if state.decide(c.ctx, c.logger, transport.Tag()) {
++				callback(exchangeWithFallback(ctx, c.ctx, c.logger, transport, state, message))
++			} else {
++				transport.ExchangeAsync(ctx, message, callback)
++			}
++		}()
++		return
++	}
++	transport.ExchangeAsync(ctx, message, callback)
++}
+diff --git a/dns/client_fallback_exchange_test.go b/dns/client_fallback_exchange_test.go
+new file mode 100644
+index 000000000..bf596fe9a
+--- /dev/null
++++ b/dns/client_fallback_exchange_test.go
+@@ -0,0 +1,767 @@
++package dns
++
++import (
++	"context"
++	"net"
++	"sync"
++	"sync/atomic"
++	"testing"
++	"time"
++
++	"github.com/sagernet/sing-box/adapter"
++	"github.com/sagernet/sing-box/option"
++	E "github.com/sagernet/sing/common/exceptions"
++	M "github.com/sagernet/sing/common/metadata"
++	N "github.com/sagernet/sing/common/network"
++
++	mDNS "github.com/miekg/dns"
++)
++
++// fallbackTestTransport is a DNS server with the fallback state whose exchanges are
++// answered by a function of the test.
++type fallbackTestTransport struct {
++	TransportAdapter
++	access  sync.Mutex
++	handler func(ctx context.Context, message *mDNS.Msg) (*mDNS.Msg, error)
++	calls   int
++}
++
++func (t *fallbackTestTransport) Start(adapter.StartStage, *adapter.Scope) error { return nil }
++func (t *fallbackTestTransport) Reset()                                         {}
++
++func (t *fallbackTestTransport) Exchange(ctx context.Context, message *mDNS.Msg) (*mDNS.Msg, error) {
++	t.access.Lock()
++	t.calls++
++	handler := t.handler
++	t.access.Unlock()
++	return handler(ctx, message)
++}
++
++func (t *fallbackTestTransport) ExchangeAsync(ctx context.Context, message *mDNS.Msg, callback func(response *mDNS.Msg, err error)) {
++	go func() {
++		callback(t.Exchange(ctx, message))
++	}()
++}
++
++func (t *fallbackTestTransport) serve(handler func(ctx context.Context, message *mDNS.Msg) (*mDNS.Msg, error)) {
++	t.access.Lock()
++	t.handler = handler
++	t.access.Unlock()
++}
++
++func (t *fallbackTestTransport) asked() int {
++	t.access.Lock()
++	defer t.access.Unlock()
++	return t.calls
++}
++
++var errFallbackTestServer = E.New("connection reset")
++
++// The server of the tests answers 5.6.7.8, the provider (testResolver) 1.2.3.4.
++func fallbackTestAnswers(ctx context.Context, message *mDNS.Msg) (*mDNS.Msg, error) {
++	response := new(mDNS.Msg)
++	response.SetReply(message)
++	response.Answer = []mDNS.RR{&mDNS.A{Hdr: mDNS.RR_Header{Name: message.Question[0].Name, Rrtype: mDNS.TypeA, Class: mDNS.ClassINET, Ttl: 300}, A: net.IPv4(5, 6, 7, 8)}}
++	return response, nil
++}
++
++func fallbackTestFails(ctx context.Context, message *mDNS.Msg) (*mDNS.Msg, error) {
++	return nil, errFallbackTestServer
++}
++
++func fallbackTestServfail(ctx context.Context, message *mDNS.Msg) (*mDNS.Msg, error) {
++	response := new(mDNS.Msg)
++	response.SetRcode(message, mDNS.RcodeServerFailure)
++	return response, nil
++}
++
++// newFallbackTest returns a server that qualifies for the fallback, with the decision
++// taken and the provider's servers known, so that ubus is never asked: a read of the
++// list fails and is counted.
++func newFallbackTest(providers ...M.Socksaddr) (*fallbackTestTransport, *fallbackServer, *atomic.Int32) {
++	reads := new(atomic.Int32)
++	state := &fallbackServer{
++		options:  option.RemoteDNSServerOptions{DNSServerAddressOptions: option.DNSServerAddressOptions{Server: "77.88.8.8"}},
++		eligible: true,
++		dialer:   N.SystemDialer,
++		providers: &providerSet{
++			read: func(ctx context.Context) ([]netifdInterface, error) {
++				reads.Add(1)
++				return nil, E.New("no ubus in tests")
++			},
++			servers: providers,
++			readAt:  time.Now(),
++		},
++	}
++	state.decideOnce.Do(func() { state.decided.Store(true) })
++	transport := &fallbackTestTransport{
++		TransportAdapter: TransportAdapter{transportType: "test", transportTag: "dns-server", fallback: state},
++		handler:          fallbackTestAnswers,
++	}
++	return transport, state, reads
++}
++
++func fallbackTestExchange(transport *fallbackTestTransport, state *fallbackServer) (string, error) {
++	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
++	defer cancel()
++	return fallbackTestAnswer(exchangeWithFallback(ctx, context.Background(), nil, transport, state, freshTestQuery()))
++}
++
++// fallbackTestAnswer names who answered: "server" or "provider" with the TTL, else the
++// rcode.
++func fallbackTestAnswer(response *mDNS.Msg, err error) (string, error) {
++	if err != nil {
++		return "", err
++	}
++	if response.Rcode != mDNS.RcodeSuccess || len(response.Answer) != 1 {
++		return mDNS.RcodeToString[response.Rcode], nil
++	}
++	record := response.Answer[0].(*mDNS.A)
++	switch {
++	case record.A.Equal(net.IPv4(5, 6, 7, 8)) && record.Hdr.Ttl == 300:
++		return "server", nil
++	case record.A.Equal(net.IPv4(1, 2, 3, 4)) && record.Hdr.Ttl == fallbackMaxTTL:
++		return "provider", nil
++	}
++	return record.String(), nil
++}
++
++type fallbackTestState struct {
++	failures      int
++	providerFails int
++	down          bool
++	unusable      bool
++	probeIn       time.Duration
++	probeEvery    time.Duration
++}
++
++func (s *fallbackServer) testState() fallbackTestState {
++	s.access.Lock()
++	defer s.access.Unlock()
++	now := time.Now()
++	return fallbackTestState{s.failures, s.providerFails, s.down, now.Before(s.unusableUntil), s.probeAt.Sub(now), s.probeEvery}
++}
++
++func waitFallbackTest(t *testing.T, what string, condition func() bool) {
++	t.Helper()
++	for deadline := time.Now().Add(5 * time.Second); !condition(); time.Sleep(5 * time.Millisecond) {
++		if time.Now().After(deadline) {
++			t.Fatalf("timeout waiting until %s", what)
++		}
++	}
++}
++
++// The decisions of exchangeWithFallback: who answers a query and what it does to the
++// state of the server.
++func TestExchangeWithFallback(t *testing.T) {
++	t.Parallel()
++	expect := func(t *testing.T, transport *fallbackTestTransport, state *fallbackServer, want string, wantErr error) {
++		t.Helper()
++		got, err := fallbackTestExchange(transport, state)
++		if got != want || err != wantErr {
++			t.Fatalf("answered by %q (%v), want %q (%v)", got, err, want, wantErr)
++		}
++	}
++	for _, test := range []struct {
++		name string
++		run  func(t *testing.T)
++	}{
++		{"a server that answers is asked alone", func(t *testing.T) {
++			transport, state, _ := newFallbackTest(testResolver(t, mDNS.RcodeSuccess))
++			expect(t, transport, state, "server", nil)
++			transport.serve(func(ctx context.Context, message *mDNS.Msg) (*mDNS.Msg, error) {
++				return nil, RcodeNameError
++			})
++			expect(t, transport, state, "", RcodeNameError)
++			if got := state.testState(); got.failures != 0 || got.down {
++				t.Errorf("state %+v after answers of the server", got)
++			}
++		}},
++		{"two failures in a row set the server aside", func(t *testing.T) {
++			transport, state, _ := newFallbackTest(testResolver(t, mDNS.RcodeSuccess))
++			transport.serve(fallbackTestFails)
++			expect(t, transport, state, "provider", nil)
++			if got := state.testState(); got.failures != 1 || got.down {
++				t.Fatalf("state %+v after one failure", got)
++			}
++			expect(t, transport, state, "provider", nil)
++			got := state.testState()
++			if !got.down || got.probeEvery != fallbackProbeFirst || got.probeIn < fallbackProbeFirst-5*time.Second {
++				t.Fatalf("state %+v after two failures, want down and a probe in %v", got, fallbackProbeFirst)
++			}
++			// set aside: the provider answers and the server is not asked before the probe
++			expect(t, transport, state, "provider", nil)
++			if asked := transport.asked(); asked != 2 {
++				t.Errorf("server asked %d times, want 2", asked)
++			}
++		}},
++		{"an answer between failures clears the count", func(t *testing.T) {
++			transport, state, _ := newFallbackTest(testResolver(t, mDNS.RcodeSuccess))
++			for _, between := range []func(ctx context.Context, message *mDNS.Msg) (*mDNS.Msg, error){
++				fallbackTestAnswers,
++				func(ctx context.Context, message *mDNS.Msg) (*mDNS.Msg, error) { return nil, RcodeNameError },
++			} {
++				transport.serve(fallbackTestFails)
++				expect(t, transport, state, "provider", nil)
++				transport.serve(between)
++				fallbackTestExchange(transport, state)
++				if got := state.testState(); got.failures != 0 {
++					t.Fatalf("state %+v after an answer of the server", got)
++				}
++			}
++			transport.serve(fallbackTestFails)
++			expect(t, transport, state, "provider", nil)
++			if got := state.testState(); got.failures != 1 || got.down {
++				t.Errorf("state %+v, want one failure", got)
++			}
++		}},
++		{"a query given up by its caller counts nothing", func(t *testing.T) {
++			transport, state, _ := newFallbackTest(testResolver(t, mDNS.RcodeSuccess))
++			for i := 0; i < 3; i++ {
++				ctx, cancel := context.WithCancel(context.Background())
++				transport.serve(func(ctx context.Context, message *mDNS.Msg) (*mDNS.Msg, error) {
++					cancel()
++					<-ctx.Done()
++					return nil, ctx.Err()
++				})
++				response, err := exchangeWithFallback(ctx, context.Background(), nil, transport, state, freshTestQuery())
++				if response != nil || err != context.Canceled {
++					t.Fatalf("got %v, %v, want the error of the caller's context", response, err)
++				}
++			}
++			if got := state.testState(); got.failures != 0 || got.providerFails != 0 || got.down {
++				t.Errorf("state %+v after queries their callers gave up", got)
++			}
++		}},
++		{"a probe that is answered brings the server back", func(t *testing.T) {
++			transport, state, _ := newFallbackTest(testResolver(t, mDNS.RcodeSuccess))
++			transport.serve(fallbackTestFails)
++			expect(t, transport, state, "provider", nil)
++			expect(t, transport, state, "provider", nil)
++			due := func() {
++				state.access.Lock()
++				state.probeAt = time.Now().Add(-time.Second)
++				state.access.Unlock()
++			}
++			// the server still fails: the probe is sent, the next one comes later
++			due()
++			expect(t, transport, state, "provider", nil)
++			waitFallbackTest(t, "the server is probed", func() bool { return transport.asked() == 3 })
++			got := state.testState()
++			if !got.down || got.probeEvery != 2*fallbackProbeFirst || got.probeIn < fallbackProbeFirst-5*time.Second {
++				t.Fatalf("state %+v after a failed probe, want down and the next probe in %v", got, fallbackProbeFirst)
++			}
++			expect(t, transport, state, "provider", nil)
++			if asked := transport.asked(); asked != 3 {
++				t.Fatalf("server asked %d times, want 3: no probe is due", asked)
++			}
++			// a SERVFAIL is not the answer that brings it back
++			transport.serve(fallbackTestServfail)
++			due()
++			expect(t, transport, state, "provider", nil)
++			waitFallbackTest(t, "the server is probed again", func() bool { return transport.asked() == 4 })
++			transport.serve(fallbackTestAnswers)
++			due()
++			expect(t, transport, state, "provider", nil) // the query that carried the probe
++			waitFallbackTest(t, "the server is back", func() bool { return !state.isDown() })
++			expect(t, transport, state, "server", nil)
++			if got := state.testState(); got.failures != 0 {
++				t.Errorf("state %+v after the server came back", got)
++			}
++		}},
++		{"a SERVFAIL of the server is replaced by the provider's answer", func(t *testing.T) {
++			transport, state, _ := newFallbackTest(testResolver(t, mDNS.RcodeSuccess))
++			for i := 0; i < 3; i++ {
++				transport.serve(fallbackTestServfail)
++				expect(t, transport, state, "provider", nil)
++				transport.serve(func(ctx context.Context, message *mDNS.Msg) (*mDNS.Msg, error) {
++					return nil, RcodeServerFailure
++				})
++				expect(t, transport, state, "provider", nil)
++			}
++			if got := state.testState(); got.failures != 0 || got.down {
++				t.Errorf("state %+v: a SERVFAIL counted against the server", got)
++			}
++		}},
++		{"a SERVFAIL of the server stays when the provider has no better answer", func(t *testing.T) {
++			for _, provider := range []int{mDNS.RcodeServerFailure, mDNS.RcodeRefused} {
++				transport, state, _ := newFallbackTest(testResolver(t, provider))
++				transport.serve(fallbackTestServfail)
++				expect(t, transport, state, "SERVFAIL", nil)
++				transport.serve(func(ctx context.Context, message *mDNS.Msg) (*mDNS.Msg, error) {
++					return nil, RcodeServerFailure
++				})
++				expect(t, transport, state, "", RcodeServerFailure)
++				if got := state.testState(); got.failures != 0 || got.down || got.unusable {
++					t.Errorf("provider answers %s: state %+v", mDNS.RcodeToString[provider], got)
++				}
++			}
++		}},
++		{"the provider failing twice in a row switches the fallback off", func(t *testing.T) {
++			transport, state, _ := newFallbackTest(testResolver(t, mDNS.RcodeRefused))
++			transport.serve(fallbackTestFails)
++			expect(t, transport, state, "", errFallbackTestServer)
++			if got := state.testState(); got.providerFails != 1 || got.unusable {
++				t.Fatalf("state %+v after one failure of the provider", got)
++			}
++			expect(t, transport, state, "", errFallbackTestServer)
++			if got := state.testState(); !got.unusable || got.failures != 0 || got.down {
++				t.Fatalf("state %+v after two failures of the provider, want no fallback for a while", got)
++			}
++			if state.usable(context.Background(), nil) {
++				t.Error("fallback still usable")
++			}
++			// without the fallback the server is asked alone
++			expect(t, transport, state, "", errFallbackTestServer)
++			transport.serve(fallbackTestAnswers)
++			expect(t, transport, state, "server", nil)
++		}},
++		{"an answer of the provider clears its failure count", func(t *testing.T) {
++			refused, good := testResolver(t, mDNS.RcodeRefused), testResolver(t, mDNS.RcodeSuccess)
++			transport, state, _ := newFallbackTest(refused)
++			transport.serve(fallbackTestFails)
++			setProviders := func(server M.Socksaddr) {
++				state.providers.access.Lock()
++				state.providers.servers = []M.Socksaddr{server}
++				state.providers.access.Unlock()
++			}
++			for i := 0; i < 2; i++ {
++				setProviders(refused)
++				expect(t, transport, state, "", errFallbackTestServer)
++				setProviders(good)
++				expect(t, transport, state, "provider", nil)
++				if got := state.testState(); got.providerFails != 0 || got.unusable {
++					t.Fatalf("state %+v after an answer of the provider", got)
++				}
++				state.success() // not the subject here
++			}
++		}},
++		{"a server set aside is asked when the provider fails too", func(t *testing.T) {
++			transport, state, _ := newFallbackTest(testResolver(t, mDNS.RcodeRefused))
++			state.access.Lock()
++			state.down, state.probeEvery, state.probeAt = true, fallbackProbeFirst, time.Now().Add(fallbackProbeFirst)
++			state.access.Unlock()
++			expect(t, transport, state, "server", nil)
++			if got := state.testState(); !got.down || got.providerFails != 1 {
++				t.Fatalf("state %+v after one failure of the provider", got)
++			}
++			expect(t, transport, state, "server", nil)
++			if got := state.testState(); got.down || !got.unusable {
++				t.Fatalf("state %+v after two failures of the provider, want the server back and no fallback for a while", got)
++			}
++		}},
++		{"no provider known", func(t *testing.T) {
++			transport, state, reads := newFallbackTest()
++			transport.serve(fallbackTestFails)
++			for i := 0; i < 3; i++ {
++				expect(t, transport, state, "", errFallbackTestServer)
++			}
++			if got := state.testState(); got.failures != 0 || got.providerFails != 0 || got.down || got.unusable {
++				t.Errorf("state %+v without provider servers", got)
++			}
++			if reads.Load() != 0 {
++				t.Errorf("the list was read %d times", reads.Load())
++			}
++		}},
++		{"a server that does not qualify is asked alone", func(t *testing.T) {
++			transport, state, _ := newFallbackTest(testResolver(t, mDNS.RcodeSuccess))
++			state.eligible = false
++			transport.serve(fallbackTestFails)
++			for i := 0; i < 3; i++ {
++				expect(t, transport, state, "", errFallbackTestServer)
++			}
++			transport.serve(fallbackTestServfail)
++			expect(t, transport, state, "SERVFAIL", nil)
++			if got := state.testState(); got.failures != 0 || got.down {
++				t.Errorf("state %+v of a server without the fallback", got)
++			}
++		}},
++	} {
++		t.Run(test.name, func(t *testing.T) {
++			t.Parallel()
++			test.run(t)
++		})
++	}
++}
++
++// A server that stays silent is given up after fallbackPrimaryTimeout, well before the
++// deadline of the query, and the provider answers. The real timeout, once.
++func TestFallbackPrimaryTimeout(t *testing.T) {
++	t.Parallel()
++	transport, state, _ := newFallbackTest(testResolver(t, mDNS.RcodeSuccess))
++	transport.serve(func(ctx context.Context, message *mDNS.Msg) (*mDNS.Msg, error) {
++		<-ctx.Done()
++		return nil, ctx.Err()
++	})
++	startAt := time.Now()
++	got, err := fallbackTestExchange(transport, state) // the query has 10 s
++	elapsed := time.Since(startAt)
++	if got != "provider" || err != nil {
++		t.Fatalf("answered by %q (%v), want the provider", got, err)
++	}
++	if elapsed < fallbackPrimaryTimeout-500*time.Millisecond || elapsed > fallbackPrimaryTimeout+3*time.Second {
++		t.Errorf("answered after %v, want about %v", elapsed, fallbackPrimaryTimeout)
++	}
++	if got := state.testState(); got.failures != 1 || got.down {
++		t.Errorf("state %+v, want one failure", got)
++	}
++}
++
++// Client.exchangeTransport and exchangeTransportAsync, the path of queries hijacked from
++// clients: every query gets one answer, through the fallback when the server has one.
++func TestExchangeTransportFallback(t *testing.T) {
++	t.Parallel()
++	client := &Client{ctx: context.Background()}
++	exchangeAsync := func(t *testing.T, transport adapter.DNSTransport) (string, error) {
++		t.Helper()
++		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
++		defer cancel()
++		type result struct {
++			response *mDNS.Msg
++			err      error
++		}
++		results := make(chan result, 4)
++		client.exchangeTransportAsync(ctx, transport, freshTestQuery(), func(response *mDNS.Msg, err error) {
++			results <- result{response, err}
++		})
++		var first result
++		select {
++		case first = <-results:
++		case <-ctx.Done():
++			t.Fatal("the callback was not called")
++		}
++		select {
++		case <-results:
++			t.Fatal("the callback was called twice")
++		case <-time.After(200 * time.Millisecond):
++		}
++		return fallbackTestAnswer(first.response, first.err)
++	}
++	exchange := func(t *testing.T, transport adapter.DNSTransport) (string, error) {
++		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
++		defer cancel()
++		return fallbackTestAnswer(client.exchangeTransport(ctx, transport, freshTestQuery()))
++	}
++	for _, test := range []struct {
++		name     string
++		exchange func(t *testing.T, transport adapter.DNSTransport) (string, error)
++	}{
++		{"exchangeTransport", exchange},
++		{"exchangeTransportAsync", exchangeAsync},
++	} {
++		t.Run(test.name, func(t *testing.T) {
++			t.Parallel()
++			// with the fallback
++			transport, state, _ := newFallbackTest(testResolver(t, mDNS.RcodeSuccess))
++			if got, err := test.exchange(t, transport); got != "server" || err != nil {
++				t.Errorf("answered by %q (%v), want the server", got, err)
++			}
++			transport.serve(fallbackTestFails)
++			if got, err := test.exchange(t, transport); got != "provider" || err != nil {
++				t.Errorf("answered by %q (%v), want the provider", got, err)
++			}
++			if got := state.testState(); got.failures != 1 {
++				t.Errorf("state %+v, want one failure", got)
++			}
++			// a server that does not qualify
++			transport, state, _ = newFallbackTest(testResolver(t, mDNS.RcodeSuccess))
++			state.eligible = false
++			if got, err := test.exchange(t, transport); got != "server" || err != nil {
++				t.Errorf("answered by %q (%v), want the server", got, err)
++			}
++			transport.serve(fallbackTestFails)
++			if got, err := test.exchange(t, transport); got != "" || err != errFallbackTestServer {
++				t.Errorf("answered by %q (%v), want the error of the server", got, err)
++			}
++			// a server without the fallback state (the fallback is not enabled)
++			transport, _, _ = newFallbackTest()
++			transport.fallback = nil
++			if got, err := test.exchange(t, transport); got != "server" || err != nil {
++				t.Errorf("answered by %q (%v), want the server", got, err)
++			}
++			if asked := transport.asked(); asked != 1 {
++				t.Errorf("server asked %d times, want 1", asked)
++			}
++		})
++	}
++}
++
++// One event that fails many queries at once, as a closed connection they shared does, is
++// one failure of the server; a query that starts after it and fails is the second.
++func TestFallbackCountsBatchOnce(t *testing.T) {
++	t.Parallel()
++	const batch = 20
++	transport, state, _ := newFallbackTest(testResolver(t, mDNS.RcodeSuccess))
++	var waiting sync.WaitGroup
++	waiting.Add(batch)
++	reset := make(chan struct{})
++	transport.serve(func(ctx context.Context, message *mDNS.Msg) (*mDNS.Msg, error) {
++		waiting.Done()
++		<-reset
++		return nil, errFallbackTestServer
++	})
++	answers := make(chan string, batch)
++	for i := 0; i < batch; i++ {
++		go func() {
++			got, _ := fallbackTestExchange(transport, state)
++			answers <- got
++		}()
++	}
++	waiting.Wait()
++	close(reset)
++	for i := 0; i < batch; i++ {
++		if got := <-answers; got != "provider" {
++			t.Errorf("answered by %q, want the provider", got)
++		}
++	}
++	if got := state.testState(); got.failures != 1 || got.down {
++		t.Fatalf("state %+v after %d queries failed at once, want one failure", got, batch)
++	}
++	transport.serve(fallbackTestFails)
++	if got, err := fallbackTestExchange(transport, state); got != "provider" || err != nil {
++		t.Fatalf("answered by %q (%v), want the provider", got, err)
++	}
++	if got := state.testState(); !got.down {
++		t.Errorf("state %+v after a later failure, want the server set aside", got)
++	}
++}
++
++// A failure counts against the server only when the provider resolved the name: a name
++// that the provider cannot resolve either says nothing about the server.
++func TestFallbackCountsResolvedOnly(t *testing.T) {
++	t.Parallel()
++	for _, test := range []struct {
++		provider int
++		answer   string
++		down     bool
++	}{
++		{mDNS.RcodeSuccess, "provider", true},
++		{mDNS.RcodeNameError, "NXDOMAIN", true},
++		{mDNS.RcodeServerFailure, "SERVFAIL", false},
++		{mDNS.RcodeNotImplemented, "NOTIMP", false},
++	} {
++		transport, state, _ := newFallbackTest(testResolver(t, test.provider))
++		transport.serve(fallbackTestFails)
++		for i := 0; i < 3; i++ {
++			if got, err := fallbackTestExchange(transport, state); got != test.answer || err != nil {
++				t.Fatalf("provider answers %s: got %q (%v)", test.answer, got, err)
++			}
++		}
++		if got := state.testState(); got.down != test.down || (!test.down && got.failures != 0) {
++			t.Errorf("provider answers %s: state %+v, want down %v", test.answer, got, test.down)
++		}
++	}
++}
++
++// A network reset forgives what the fallback learned on the old network.
++func TestFallbackNetworkReset(t *testing.T) {
++	t.Parallel()
++	newRouter := func(transport adapter.DNSTransport) *Router {
++		return &Router{transport: &TransportManager{transports: []adapter.DNSTransport{transport}}}
++	}
++	t.Run("the provider is usable again", func(t *testing.T) {
++		t.Parallel()
++		transport, state, _ := newFallbackTest(testResolver(t, mDNS.RcodeSuccess))
++		for i := 0; i < fallbackProviderAfter+1; i++ {
++			state.providerFailed(context.Background(), nil, "dns-server", E.New("timeout"))
++		}
++		if got := state.testState(); !got.unusable || got.providerFails != 1 {
++			t.Fatalf("state %+v before the reset", got)
++		}
++		newRouter(transport).ResetNetwork()
++		if got := state.testState(); got.unusable || got.providerFails != 0 {
++			t.Errorf("state %+v after the reset, want the provider usable", got)
++		}
++		transport.serve(fallbackTestFails)
++		if got, err := fallbackTestExchange(transport, state); got != "provider" || err != nil {
++			t.Errorf("answered by %q (%v), want the provider", got, err)
++		}
++	})
++	t.Run("a server set aside is probed at once", func(t *testing.T) {
++		t.Parallel()
++		transport, state, _ := newFallbackTest(testResolver(t, mDNS.RcodeSuccess))
++		state.access.Lock()
++		state.down, state.probeEvery, state.probeAt = true, fallbackProbeMax, time.Now().Add(fallbackProbeMax)
++		state.access.Unlock()
++		newRouter(transport).ResetNetwork()
++		if got := state.testState(); !got.down || got.probeIn > 0 || got.probeEvery != fallbackProbeFirst {
++			t.Fatalf("state %+v after the reset, want down and a probe due, the next in %v", got, fallbackProbeFirst)
++		}
++		if got, err := fallbackTestExchange(transport, state); got != "provider" || err != nil {
++			t.Errorf("answered by %q (%v), want the provider", got, err)
++		}
++		waitFallbackTest(t, "the server is back", func() bool { return !state.isDown() })
++	})
++	t.Run("failures around the reset do not add up", func(t *testing.T) {
++		t.Parallel()
++		transport, state, _ := newFallbackTest(testResolver(t, mDNS.RcodeSuccess))
++		router := newRouter(transport)
++		transport.serve(fallbackTestFails)
++		if got, err := fallbackTestExchange(transport, state); got != "provider" || err != nil {
++			t.Fatalf("answered by %q (%v), want the provider", got, err)
++		}
++		// a query on its way when the network is reset fails with the connections
++		transport.serve(func(ctx context.Context, message *mDNS.Msg) (*mDNS.Msg, error) {
++			router.ResetNetwork()
++			return nil, errFallbackTestServer
++		})
++		if got, err := fallbackTestExchange(transport, state); got != "provider" || err != nil {
++			t.Fatalf("answered by %q (%v), want the provider", got, err)
++		}
++		if got := state.testState(); got.failures != 0 || got.down {
++			t.Errorf("state %+v, want no failure counted on the new network yet", got)
++		}
++	})
++}
++
++// When none of the provider's servers answers, the list is read again, since it may have
++// changed without a network reset, but not at every such query: not sooner than
++// providerRetryAfter after the last read. A network reset reads it at the next use.
++func TestProviderListRereadAfterMiss(t *testing.T) {
++	t.Parallel()
++	_, state, reads := newFallbackTest(testResolver(t, mDNS.RcodeRefused))
++	for i := 0; i < 3; i++ {
++		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
++		_, err := state.exchangeProvider(ctx, context.Background(), nil, freshTestQuery())
++		cancel()
++		if err == nil || err == errNoProviders {
++			t.Fatalf("query %d: got %v, want the refusal of the provider", i, err)
++		}
++	}
++	if reads.Load() != 0 {
++		t.Fatalf("the list was read %d times right after it was read", reads.Load())
++	}
++	state.providers.access.Lock()
++	state.providers.readAt = time.Now().Add(-providerRetryAfter - time.Second)
++	state.providers.access.Unlock()
++	state.providers.list(context.Background(), nil)
++	state.providers.list(context.Background(), nil)
++	if reads.Load() != 1 {
++		t.Fatalf("the list was read %d times %v after the last read, want 1", reads.Load(), providerRetryAfter)
++	}
++	state.providers.forget()
++	state.providers.list(context.Background(), nil)
++	if reads.Load() != 2 {
++		t.Errorf("the list was read %d times, want 2: a reset reads it at the next use", reads.Load())
++	}
++}
++
++// The first query to a server decides whether the fallback applies and reads the
++// provider's servers. A hijacked query does not wait for that on the goroutine of its
++// caller, which reads the next queries of the client.
++func TestExchangeTransportAsyncFirstQuery(t *testing.T) {
++	t.Parallel()
++	read := make(chan struct{})
++	state := &fallbackServer{
++		options: option.RemoteDNSServerOptions{DNSServerAddressOptions: option.DNSServerAddressOptions{Server: "77.88.8.8"}},
++		providers: &providerSet{read: func(ctx context.Context) ([]netifdInterface, error) {
++			<-read
++			return nil, E.New("no ubus in tests")
++		}},
++	}
++	transport := &fallbackTestTransport{
++		TransportAdapter: TransportAdapter{transportType: "test", transportTag: "dns-server", fallback: state},
++		handler:          fallbackTestAnswers,
++	}
++	client := &Client{ctx: context.Background()}
++	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
++	defer cancel()
++	results := make(chan error, 4)
++	returned := make(chan struct{})
++	go func() {
++		client.exchangeTransportAsync(ctx, transport, freshTestQuery(), func(response *mDNS.Msg, err error) {
++			results <- err
++		})
++		close(returned)
++	}()
++	select {
++	case <-returned:
++	case <-time.After(2 * time.Second):
++		t.Error("exchangeTransportAsync waits for the read of the provider's servers")
++	}
++	close(read)
++	<-returned
++	for i := 0; i < 2; i++ {
++		select {
++		case err := <-results:
++			if err != nil {
++				t.Errorf("query %d: %v", i, err)
++			}
++		case <-ctx.Done():
++			t.Fatalf("query %d: the callback was not called", i)
++		}
++		if !state.eligible {
++			t.Fatal("the server does not qualify: its first query read no provider list")
++		}
++		if i == 0 { // the decision is taken now
++			client.exchangeTransportAsync(ctx, transport, freshTestQuery(), func(response *mDNS.Msg, err error) {
++				results <- err
++			})
++		}
++	}
++	select {
++	case <-results:
++		t.Error("a callback was called twice")
++	case <-time.After(200 * time.Millisecond):
++	}
++}
++
++// The first hijacked query to a server that turns out not to qualify is decided on the
++// goroutine as well and is then answered by the server alone, once; the provider's
++// servers are not read for it.
++func TestExchangeTransportAsyncFirstQueryNoFallback(t *testing.T) {
++	t.Parallel()
++	reads := new(atomic.Int32)
++	state := &fallbackServer{
++		options: option.RemoteDNSServerOptions{DNSServerAddressOptions: option.DNSServerAddressOptions{Server: "192.168.1.1"}},
++		providers: &providerSet{read: func(ctx context.Context) ([]netifdInterface, error) {
++			reads.Add(1)
++			return nil, E.New("no ubus in tests")
++		}},
++	}
++	transport := &fallbackTestTransport{
++		TransportAdapter: TransportAdapter{transportType: "test", transportTag: "dns-server", fallback: state},
++		handler:          fallbackTestAnswers,
++	}
++	client := &Client{ctx: context.Background()}
++	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
++	defer cancel()
++	type result struct {
++		response *mDNS.Msg
++		err      error
++	}
++	results := make(chan result, 4)
++	// the first query takes the decision, the second finds it taken, the third fails
++	for i, want := range []string{"server", "server", ""} {
++		var wantErr error
++		if want == "" {
++			transport.serve(fallbackTestFails)
++			wantErr = errFallbackTestServer
++		}
++		client.exchangeTransportAsync(ctx, transport, freshTestQuery(), func(response *mDNS.Msg, err error) {
++			results <- result{response, err}
++		})
++		select {
++		case answer := <-results:
++			if got, err := fallbackTestAnswer(answer.response, answer.err); got != want || err != wantErr {
++				t.Errorf("query %d: answered by %q (%v), want %q (%v)", i, got, err, want, wantErr)
++			}
++		case <-ctx.Done():
++			t.Fatalf("query %d: the callback was not called", i)
++		}
++		if !state.decided.Load() || state.eligible {
++			t.Fatalf("query %d: decided %v, want a server that does not qualify", i, state.decided.Load())
++		}
++	}
++	select {
++	case <-results:
++		t.Error("a callback was called twice")
++	case <-time.After(200 * time.Millisecond):
++	}
++	if asked := transport.asked(); asked != 3 {
++		t.Errorf("server asked %d times, want 3", asked)
++	}
++	if reads.Load() != 0 {
++		t.Errorf("the provider's servers were read %d times for a server without the fallback", reads.Load())
++	}
++}
+diff --git a/dns/client_fallback_provider.go b/dns/client_fallback_provider.go
+new file mode 100644
+index 000000000..303fb7b12
+--- /dev/null
++++ b/dns/client_fallback_provider.go
+@@ -0,0 +1,552 @@
++package dns
++
++import (
++	"context"
++	"encoding/json"
++	"maps"
++	"net"
++	"net/netip"
++	"os/exec"
++	"slices"
++	"strings"
++	"sync"
++	"time"
++
++	"github.com/sagernet/sing-box/adapter"
++	E "github.com/sagernet/sing/common/exceptions"
++	"github.com/sagernet/sing/common/logger"
++	M "github.com/sagernet/sing/common/metadata"
++	"github.com/sagernet/sing/service"
++
++	mDNS "github.com/miekg/dns"
++)
++
++// The provider's servers for the fallback (podkop-engine), also asked by the DNS server of
++// the type provider and by the safety net of a group (transport_provider.go,
++// transport_group.go).
++//
++// They are the DNS servers of the OpenWrt interfaces, taken from netifd over ubus:
++//
++//   - When sing-box binds its sockets to a device (auto_detect_interface or
++//     default_interface), the servers of the interfaces on that device: all its traffic
++//     leaves there. For DHCP or PPPoE these are the servers of wan and wan6 (or wan_6).
++//   - Else the servers of every uplink: each interface that is up and has a default route,
++//     tunnels left out (wireguard, openvpn and the like), so a backup modem or a second WAN
++//     too. A query to a server of an uplink is bound to the device of that uplink: a
++//     provider answers its own customers, and when mwan3 (or anything else) sends the
++//     traffic of the router another way, the server of each uplink is still reached through
++//     it. An uplink whose provider is down does not answer; another one does.
++//
++// A LAN with DNS set by hand, an interface without a default route and a tunnel are left
++// out. The list belongs to a box (the DNS router makes it): a box that replaces another one
++// in the same process, with other settings, reads it again. It is read at the first
++// fallback, and again when sing-box resets the network after its default interface changed
++// (the DNS router calls forget): another uplink, the WAN down and up, a new PPPoE session.
++// It is also read again after none of its servers answered and 30 s after ubus could not be
++// asked, in both cases not sooner than 30 s after the last read: each read runs ubus.
++//
++// The servers are chosen by their answers, as dnsmasq does: the first fallback query goes
++// to all of them at once, the first to answer gets the next queries alone, and all of them
++// are asked again every 20 s or 50 queries, and as soon as it misses one: an uplink that
++// comes back takes over again when it answers first.
++
++const (
++	providerRetryAfter  = 30 * time.Second // between reads after ubus could not be asked or no server answered
++	providerMax         = 4                // servers of one device
++	providerMaxAll      = 8                // servers asked at once
++	providerRoundEvery  = 20 * time.Second
++	providerRoundAfter  = 50 // queries
++	providerBestTimeout = 1500 * time.Millisecond
++	providerUbusTimeout = 3 * time.Second
++)
++
++var (
++	errNoProviders = E.New("no provider DNS on the output device")
++
++	// provider queries have their own sockets: a burst of queries waiting for a silent
++	// server must not keep them from the provider. The bound is of the process, not of a box.
++	fallbackSocketSlots = make(chan struct{}, 256)
++
++	// the set of a context without a DNS router (providersFrom)
++	defaultProviders = newProviderSet()
++
++	// the protocols of netifd that make tunnels, not uplinks of a provider
++	tunnelProtocols = []string{"wireguard", "amneziawg", "openvpn", "openconnect", "vpnc", "gre", "gretap", "grev6", "grev6tap", "vti", "vtiv6", "xfrm", "ipip"}
++)
++
++func newProviderSet() *providerSet {
++	return &providerSet{read: readUbusInterfaces}
++}
++
++// providersFrom is the provider set of the box of ctx, which its DNS router registers.
++func providersFrom(ctx context.Context) *providerSet {
++	if ctx != nil {
++		if set := service.FromContext[*providerSet](ctx); set != nil {
++			return set
++		}
++	}
++	return defaultProviders
++}
++
++type providerSet struct {
++	read func(ctx context.Context) ([]netifdInterface, error)
++
++	access   sync.Mutex
++	reading  bool          // one read at a time, outside the lock
++	readDone chan struct{} // closed when the read in progress ends (listWait)
++	servers  []M.Socksaddr
++	// devices are the devices of the uplinks the queries to the servers are bound to; a
++	// server without one is asked through the dialer of the server (sing-box binds them)
++	devices map[M.Socksaddr]string
++	device  string // the output device the list is for, "" for every uplink
++	readAt  time.Time
++	readErr bool        // ubus could not be asked
++	stale   bool        // no server answered: the list may have changed
++	best    M.Socksaddr // the server that answered last, invalid when none
++	uses    int         // queries sent to best alone since all were asked
++	roundAt time.Time   // when all were asked
++}
++
++// netifdInterface is what the fallback needs of `ubus call network.interface dump`.
++type netifdInterface struct {
++	Name      string   `json:"interface"`
++	Up        bool     `json:"up"`
++	Proto     string   `json:"proto"`
++	L3Device  string   `json:"l3_device"`
++	DNSServer []string `json:"dns-server"`
++	Route     []struct {
++		Target string `json:"target"`
++		Mask   int    `json:"mask"`
++		Metric int    `json:"metric"`
++	} `json:"route"`
++}
++
++func readUbusInterfaces(ctx context.Context) ([]netifdInterface, error) {
++	ctx, cancel := context.WithTimeout(ctx, providerUbusTimeout)
++	defer cancel()
++	output, err := exec.CommandContext(ctx, "ubus", "call", "network.interface", "dump").Output()
++	if err != nil {
++		return nil, E.Cause(err, "ubus call network.interface dump")
++	}
++	var dump struct {
++		Interface []netifdInterface `json:"interface"`
++	}
++	err = json.Unmarshal(output, &dump)
++	if err != nil {
++		return nil, E.Cause(err, "parse ubus network.interface dump")
++	}
++	return dump.Interface, nil
++}
++
++// known reports whether there are provider servers; it is on the path of every query, so
++// a due read runs in the background.
++func (p *providerSet) known(ctx context.Context, logger logger.ContextLogger) bool {
++	p.access.Lock()
++	count := len(p.servers)
++	start := p.beginRead()
++	p.access.Unlock()
++	if start {
++		go p.refresh(logger, outputDevice(ctx))
++	}
++	return count > 0
++}
++
++func (p *providerSet) rereadDue() bool {
++	return p.readAt.IsZero() || ((p.readErr || p.stale) && time.Since(p.readAt) >= providerRetryAfter)
++}
++
++// beginRead reserves the read when it is due and no other one runs; under the lock.
++func (p *providerSet) beginRead() bool {
++	if !p.rereadDue() || p.reading {
++		return false
++	}
++	p.reading = true
++	p.readDone = make(chan struct{})
++	return true
++}
++
++// list returns the provider's servers, reading them again when it is due. While another
++// query reads them, the servers read before are returned.
++func (p *providerSet) list(ctx context.Context, logger logger.ContextLogger) []M.Socksaddr {
++	p.access.Lock()
++	servers := p.servers
++	start := p.beginRead()
++	p.access.Unlock()
++	if !start {
++		return servers
++	}
++	return p.refresh(logger, outputDevice(ctx))
++}
++
++// listWait is list for the provider DNS server, which has nothing else to ask: when no
++// server is known yet and another query is reading the list (the first queries after the
++// start or a network reset), it waits for that read instead of failing. ctx is the one of
++// the query, baseCtx carries the services of the box.
++func (p *providerSet) listWait(ctx context.Context, baseCtx context.Context, logger logger.ContextLogger) []M.Socksaddr {
++	servers := p.list(baseCtx, logger)
++	if len(servers) > 0 {
++		return servers
++	}
++	p.access.Lock()
++	if !p.reading {
++		servers = p.servers // the read may have ended since
++		p.access.Unlock()
++		return servers
++	}
++	done := p.readDone
++	p.access.Unlock()
++	select {
++	case <-done:
++	case <-ctx.Done():
++		return nil
++	}
++	p.access.Lock()
++	defer p.access.Unlock()
++	return p.servers
++}
++
++// snapshot is the list as it is now, each server with the device a query to it is bound to.
++func (p *providerSet) snapshot() []adapter.DNSProviderServer {
++	p.access.Lock()
++	defer p.access.Unlock()
++	servers := make([]adapter.DNSProviderServer, 0, len(p.servers))
++	for _, server := range p.servers {
++		servers = append(servers, adapter.DNSProviderServer{Address: server.AddrPort(), Device: p.devices[server]})
++	}
++	return servers
++}
++
++func (p *providerSet) refresh(logger logger.ContextLogger, device string) []M.Socksaddr {
++	var (
++		servers []M.Socksaddr
++		devices map[M.Socksaddr]string
++		names   []string
++	)
++	interfaces, err := p.read(context.Background())
++	if err == nil {
++		servers, devices, names = providersOn(interfaces, device)
++	}
++	p.access.Lock()
++	defer p.access.Unlock()
++	p.reading = false
++	if p.readDone != nil {
++		close(p.readDone)
++		p.readDone = nil
++	}
++	changed := p.readAt.IsZero() || device != p.device || !slices.Equal(servers, p.servers) || !maps.Equal(devices, p.devices)
++	p.servers, p.devices, p.device, p.readAt, p.readErr, p.stale = servers, devices, device, time.Now(), err != nil, false
++	if changed {
++		p.best = M.Socksaddr{}
++		if logger != nil {
++			switch {
++			case err != nil:
++				logger.Warn("no provider DNS: ", err)
++			case len(servers) == 0 && device != "":
++				logger.Warn("no provider DNS on ", device)
++			case len(servers) == 0:
++				logger.Warn("no provider DNS: no uplink has DNS servers")
++			case device != "":
++				logger.Warn("provider DNS on ", device, " (", strings.Join(names, ", "), "): ", joinServers(servers))
++			default:
++				logger.Warn("provider DNS, each through its uplink: ", strings.Join(names, "; "))
++			}
++		}
++	}
++	return servers
++}
++
++// deviceOf is the device a query to a server is bound to, "" for none.
++func (p *providerSet) deviceOf(server M.Socksaddr) string {
++	p.access.Lock()
++	defer p.access.Unlock()
++	return p.devices[server]
++}
++
++// forget makes the next use read the servers again.
++func (p *providerSet) forget() {
++	p.access.Lock()
++	p.readAt = time.Time{}
++	p.best = M.Socksaddr{}
++	p.access.Unlock()
++}
++
++// noneAnswered makes a later use read the servers again: they may have changed without a
++// network reset, as when DHCP hands out other ones. Unlike forget it keeps the time of
++// the last read, so that servers that keep refusing do not run ubus at every query.
++func (p *providerSet) noneAnswered() {
++	p.access.Lock()
++	p.stale = true
++	p.best = M.Socksaddr{}
++	p.access.Unlock()
++}
++
++func (p *providerSet) names() string {
++	p.access.Lock()
++	defer p.access.Unlock()
++	return joinServers(p.servers)
++}
++
++// pick returns the server to ask alone: the one that answered last, while its turn lasts.
++func (p *providerSet) pick(servers []M.Socksaddr) (M.Socksaddr, bool) {
++	p.access.Lock()
++	defer p.access.Unlock()
++	if !p.best.IsValid() || p.uses >= providerRoundAfter || time.Since(p.roundAt) >= providerRoundEvery || !slices.Contains(servers, p.best) {
++		return M.Socksaddr{}, false
++	}
++	p.uses++
++	return p.best, true
++}
++
++func (p *providerSet) chose(server M.Socksaddr) {
++	p.access.Lock()
++	p.best, p.uses, p.roundAt = server, 0, time.Now()
++	p.access.Unlock()
++}
++
++func (p *providerSet) missed(server M.Socksaddr) {
++	p.access.Lock()
++	if p.best == server {
++		p.best = M.Socksaddr{}
++	}
++	p.access.Unlock()
++}
++
++// providersOn returns the DNS servers of the interfaces that are up on device; when device
++// is "" (sing-box binds no socket), those of every uplink, each with the device of its
++// uplink to bind the queries to, the uplinks in the order of their default routes. The
++// names tell the interfaces the servers come from.
++func providersOn(interfaces []netifdInterface, device string) (servers []M.Socksaddr, devices map[M.Socksaddr]string, names []string) {
++	own := ownAddresses()
++	seen := make(map[netip.Addr]bool)
++	// the servers of each device: at most providerMax
++	counts := make(map[string]int)
++	add := func(networkInterface netifdInterface, bind bool) []string {
++		var added []string
++		for _, server := range networkInterface.DNSServer {
++			address, err := netip.ParseAddr(server)
++			if err != nil || address.IsLoopback() || address.IsUnspecified() || own[address.Unmap()] {
++				continue
++			}
++			if address.IsLinkLocalUnicast() && address.Zone() == "" {
++				address = address.WithZone(networkInterface.L3Device)
++			}
++			if seen[address] || counts[networkInterface.L3Device] >= providerMax || len(servers) >= providerMaxAll {
++				continue
++			}
++			seen[address] = true
++			counts[networkInterface.L3Device]++
++			socksaddr := M.SocksaddrFrom(address, 53)
++			servers = append(servers, socksaddr)
++			if bind {
++				if devices == nil {
++					devices = make(map[M.Socksaddr]string)
++				}
++				devices[socksaddr] = networkInterface.L3Device
++			}
++			added = append(added, address.String())
++		}
++		return added
++	}
++	if device != "" {
++		for _, networkInterface := range interfaces {
++			if networkInterface.Up && networkInterface.L3Device == device && len(networkInterface.DNSServer) > 0 {
++				names = append(names, networkInterface.Name)
++				add(networkInterface, false)
++			}
++		}
++		return servers, nil, names
++	}
++	for _, networkInterface := range uplinks(interfaces) {
++		if added := add(networkInterface, true); len(added) > 0 {
++			names = append(names, networkInterface.Name+" on "+networkInterface.L3Device+": "+strings.Join(added, ", "))
++		}
++	}
++	return servers, devices, names
++}
++
++// uplinks are the interfaces that are up, have a device and a default route, and are no
++// tunnel, in the order of the metric of their default route (IPv4 first).
++func uplinks(interfaces []netifdInterface) []netifdInterface {
++	type uplink struct {
++		networkInterface netifdInterface
++		metric           int
++	}
++	var found []uplink
++	for _, networkInterface := range interfaces {
++		if !networkInterface.Up || networkInterface.L3Device == "" || slices.Contains(tunnelProtocols, networkInterface.Proto) {
++			continue
++		}
++		best, isUplink := 0, false
++		for _, route := range networkInterface.Route {
++			if route.Mask != 0 || (route.Target != "0.0.0.0" && route.Target != "::") {
++				continue
++			}
++			metric := route.Metric
++			if route.Target == "::" {
++				metric += 1 << 20
++			}
++			if !isUplink || metric < best {
++				best, isUplink = metric, true
++			}
++		}
++		if isUplink {
++			found = append(found, uplink{networkInterface, best})
++		}
++	}
++	slices.SortStableFunc(found, func(left uplink, right uplink) int { return left.metric - right.metric })
++	result := make([]netifdInterface, len(found))
++	for index, item := range found {
++		result[index] = item.networkInterface
++	}
++	return result
++}
++
++// outputDevice is the device sing-box binds its sockets to (auto_detect_interface or
++// default_interface), "" when it does not bind them.
++func outputDevice(ctx context.Context) string {
++	if ctx == nil {
++		return ""
++	}
++	manager := service.FromContext[adapter.NetworkManager](ctx)
++	if manager == nil {
++		return ""
++	}
++	if bind := manager.DefaultOptions().BindInterface; bind != "" {
++		return bind
++	}
++	if manager.AutoDetectInterface() {
++		if networkInterface := manager.DefaultNetworkInterface(); networkInterface != nil {
++			return networkInterface.Name
++		}
++	}
++	return ""
++}
++
++func ownAddresses() map[netip.Addr]bool {
++	own := make(map[netip.Addr]bool)
++	addresses, err := net.InterfaceAddrs()
++	if err != nil {
++		return own
++	}
++	for _, interfaceAddress := range addresses {
++		prefix, err := netip.ParsePrefix(interfaceAddress.String())
++		if err == nil {
++			own[prefix.Addr().Unmap()] = true
++		}
++	}
++	return own
++}
++
++// exchangeProvider asks the provider's servers for the fallback of a server, through the
++// server's own dialer; their answer lives fallbackMaxTTL at most.
++func (s *fallbackServer) exchangeProvider(ctx context.Context, baseCtx context.Context, logger logger.ContextLogger, message *mDNS.Msg) (*mDNS.Msg, error) {
++	servers := s.providersFor(s.providers.list(baseCtx, logger))
++	if len(servers) == 0 {
++		return nil, errNoProviders
++	}
++	ctx, cancel := context.WithTimeout(ctx, fallbackTimeout)
++	defer cancel()
++	response, err := s.askProviders(ctx, servers, message)
++	if err != nil {
++		return nil, err
++	}
++	return s.providerAnswered(response), nil
++}
++
++// askProviders asks the provider's servers from fresh sockets: the one that answered last
++// alone, else (or when it does not answer in providerBestTimeout) all of them at once; a
++// REFUSED is no answer. The answer is returned as the server gave it.
++func (s *fallbackServer) askProviders(ctx context.Context, servers []M.Socksaddr, message *mDNS.Msg) (*mDNS.Msg, error) {
++	if best, loaded := s.providers.pick(servers); loaded {
++		bestCtx, bestCancel := context.WithTimeout(ctx, providerBestTimeout)
++		response, err := exchangeFresh(bestCtx, fallbackSocketSlots, s.dialerFor(s.providers.deviceOf(best)), best, message)
++		bestCancel()
++		if err == nil && response.Rcode != mDNS.RcodeRefused {
++			return response, nil
++		}
++		s.providers.missed(best)
++		if ctx.Err() != nil {
++			if err == nil {
++				err = E.New("refused")
++			}
++			return nil, E.Cause(err, "provider DNS ", best)
++		}
++	}
++	response, err := s.exchangeAll(ctx, servers, message)
++	if err != nil && ctx.Err() == nil {
++		s.providers.noneAnswered()
++	}
++	return response, err
++}
++
++// exchangeAll asks all the servers at once: the first answer wins, the other sockets are
++// closed with the context.
++func (s *fallbackServer) exchangeAll(ctx context.Context, servers []M.Socksaddr, message *mDNS.Msg) (*mDNS.Msg, error) {
++	ctx, cancel := context.WithCancel(ctx)
++	// the losers end with the context (it closes their sockets); wait for them, so that
++	// nothing of this exchange runs on after it returned
++	var exchanges sync.WaitGroup
++	defer func() {
++		cancel()
++		exchanges.Wait()
++	}()
++	type result struct {
++		server   M.Socksaddr
++		response *mDNS.Msg
++		err      error
++	}
++	results := make(chan result, len(servers))
++	for _, server := range servers {
++		exchanges.Add(1)
++		go func(server M.Socksaddr) {
++			defer exchanges.Done()
++			response, err := exchangeFresh(ctx, fallbackSocketSlots, s.dialerFor(s.providers.deviceOf(server)), server, message)
++			results <- result{server, response, err}
++		}(server)
++	}
++	err := E.New("provider DNS refused")
++	for range servers {
++		answer := <-results
++		if answer.err != nil {
++			err = answer.err
++			continue
++		}
++		if answer.response.Rcode == mDNS.RcodeRefused {
++			continue
++		}
++		s.providers.chose(answer.server)
++		return answer.response, nil
++	}
++	return nil, err
++}
++
++func (s *fallbackServer) providerAnswered(response *mDNS.Msg) *mDNS.Msg {
++	s.access.Lock()
++	s.providerFails = 0
++	s.access.Unlock()
++	capTTL(response, fallbackMaxTTL)
++	return response
++}
++
++// providersFor leaves the server itself out.
++func (s *fallbackServer) providersFor(servers []M.Socksaddr) []M.Socksaddr {
++	self := s.options.DNSServerAddressOptions.Build()
++	if !self.IsIP() {
++		return servers
++	}
++	var others []M.Socksaddr
++	for _, server := range servers {
++		if server.Addr.Unmap() != self.Addr.Unmap() {
++			others = append(others, server)
++		}
++	}
++	return others
++}
++
++func joinServers(servers []M.Socksaddr) string {
++	names := make([]string, 0, len(servers))
++	for _, server := range servers {
++		names = append(names, server.Addr.String())
++	}
++	return strings.Join(names, ", ")
++}
+diff --git a/dns/client_fallback_reload_test.go b/dns/client_fallback_reload_test.go
+new file mode 100644
+index 000000000..b4dc05f14
+--- /dev/null
++++ b/dns/client_fallback_reload_test.go
+@@ -0,0 +1,56 @@
++package dns
++
++import (
++	"context"
++	"encoding/json"
++	"testing"
++
++	"github.com/sagernet/sing-box/adapter"
++	"github.com/sagernet/sing/service"
++)
++
++// boundNetwork is a network manager that binds the sockets of sing-box to a device, as
++// default_interface does; nothing else of it is asked here.
++type boundNetwork struct {
++	adapter.NetworkManager
++	device string
++}
++
++func (n boundNetwork) DefaultOptions() adapter.NetworkOptions {
++	return adapter.NetworkOptions{BindInterface: n.device}
++}
++
++func (n boundNetwork) AutoDetectInterface() bool { return false }
++
++// Two boxes one after another in one process (a reload with other settings) have a list of
++// the provider's servers each: the first, which binds no socket, every uplink; the second,
++// which binds its sockets to the modem (wwan0), the servers of the modem alone.
++func TestFallbackProvidersAfterReload(t *testing.T) {
++	var dump struct {
++		Interface []netifdInterface `json:"interface"`
++	}
++	if err := json.Unmarshal([]byte(testUbusDump), &dump); err != nil {
++		t.Fatal(err)
++	}
++	read := func(ctx context.Context) ([]netifdInterface, error) { return dump.Interface, nil }
++	box := func(network adapter.NetworkManager) context.Context {
++		ctx := service.ContextWithDefaultRegistry(context.Background())
++		if network != nil {
++			service.MustRegister[adapter.NetworkManager](ctx, network)
++		}
++		// as the DNS router of the box registers it
++		service.MustRegister[*providerSet](ctx, &providerSet{read: read})
++		return ctx
++	}
++	first := box(nil)
++	if got := joinServers(providersFrom(first).list(first, nil)); got != "10.99.0.53, 10.99.0.54, 100.64.5.1, fe80::1%wan0, 2a00::53" {
++		t.Fatalf("the first box: %q", got)
++	}
++	second := box(boundNetwork{device: "wwan0"})
++	if providersFrom(second) == providersFrom(first) {
++		t.Fatal("the boxes share a list")
++	}
++	if got := joinServers(providersFrom(second).list(second, nil)); got != "100.64.5.1" {
++		t.Fatalf("the second box, bound to wwan0, asks %q", got)
++	}
++}
+diff --git a/dns/client_fallback_test.go b/dns/client_fallback_test.go
+new file mode 100644
+index 000000000..311ca7e16
+--- /dev/null
++++ b/dns/client_fallback_test.go
+@@ -0,0 +1,319 @@
++package dns
++
++import (
++	"bytes"
++	"context"
++	"encoding/json"
++	"net"
++	"slices"
++	"strings"
++	"sync"
++	"testing"
++	"time"
++
++	"github.com/sagernet/sing-box/log"
++	"github.com/sagernet/sing-box/option"
++	E "github.com/sagernet/sing/common/exceptions"
++	"github.com/sagernet/sing/common/json/badoption"
++	M "github.com/sagernet/sing/common/metadata"
++	N "github.com/sagernet/sing/common/network"
++
++	mDNS "github.com/miekg/dns"
++)
++
++func TestFallbackExclusion(t *testing.T) {
++	t.Parallel()
++	harmless := option.DialerOptions{AbstractDialerOptions: option.AbstractDialerOptions{
++		DomainResolver:     &option.DomainResolveOptions{Server: "bootstrap-dns-server"},
++		ConnectTimeout:     badoption.Duration(time.Second),
++		TCPFastOpen:        true,
++		UDPFragmentDefault: true,
++	}}
++	for _, test := range []struct {
++		server   string
++		dial     option.DialerOptions
++		excluded bool
++	}{
++		{server: "77.88.8.8"},
++		{server: "2606:4700:4700::1111"},
++		{server: "dns.google", dial: harmless},
++		{server: "127.0.0.10", excluded: true},
++		{server: "::1", excluded: true},
++		{server: "::ffff:127.0.0.1", excluded: true},
++		{server: "192.168.1.10", excluded: true},
++		{server: "10.8.0.1", excluded: true},
++		{server: "fd00::53", excluded: true},
++		{server: "100.100.100.100", excluded: true},
++		{server: "169.254.169.254", excluded: true},
++		{server: "localhost", excluded: true},
++		{server: "adguard.lan", excluded: true},
++		{server: "1.1.1.1", dial: option.DialerOptions{AbstractDialerOptions: option.AbstractDialerOptions{BindInterface: "wg0"}}, excluded: true},
++		{server: "1.1.1.1", dial: option.DialerOptions{AbstractDialerOptions: option.AbstractDialerOptions{RoutingMark: 0x100}}, excluded: true},
++		{server: "1.1.1.1", dial: option.DialerOptions{AbstractDialerOptions: option.AbstractDialerOptions{NetNs: "vpn"}}, excluded: true},
++		{server: "1.1.1.1", dial: option.DialerOptions{AbstractDialerOptions: option.AbstractDialerOptions{ProtectPath: "/protect"}}, excluded: true}, // a field not known as harmless
++	} {
++		options := option.RemoteDNSServerOptions{
++			RawLocalDNSServerOptions: option.RawLocalDNSServerOptions{DialerOptions: test.dial},
++			DNSServerAddressOptions:  option.DNSServerAddressOptions{Server: test.server},
++		}
++		reason := fallbackExclusion(context.Background(), options)
++		if (reason != "") != test.excluded {
++			t.Errorf("%s %+v: excluded %v (%q), want %v", test.server, test.dial, reason != "", reason, test.excluded)
++		}
++	}
++}
++
++// A dump of `ubus call network.interface dump` with a tunnel, a LAN with DNS set by hand
++// and a backup modem next to the WAN.
++const testUbusDump = `{"interface":[
++{"interface":"awg","up":true,"proto":"amneziawg","l3_device":"awg0","dns-server":["10.9.0.1"],"route":[{"target":"0.0.0.0","mask":0,"metric":5}]},
++{"interface":"lan","up":true,"l3_device":"br-lan","dns-server":["1.1.1.1"],"route":[]},
++{"interface":"loopback","up":true,"l3_device":"lo","dns-server":[],"route":[]},
++{"interface":"modem","up":true,"l3_device":"wwan0","dns-server":["100.64.5.1"],"route":[{"target":"0.0.0.0","mask":0,"metric":20}]},
++{"interface":"wan","up":true,"l3_device":"wan0","dns-server":["10.99.0.53","10.99.0.54","127.0.0.1","10.99.0.53"],"route":[{"target":"0.0.0.0","mask":0,"metric":0}]},
++{"interface":"wan6","up":true,"l3_device":"wan0","dns-server":["fe80::1","2a00::53","2a00::54"],"route":[{"target":"::","mask":0,"metric":512}]},
++{"interface":"wg0","up":false,"dns-server":["10.8.0.1"]}]}`
++
++func TestProvidersOn(t *testing.T) {
++	t.Parallel()
++	var dump struct {
++		Interface []netifdInterface `json:"interface"`
++	}
++	if err := json.Unmarshal([]byte(testUbusDump), &dump); err != nil {
++		t.Fatal(err)
++	}
++	for _, test := range []struct {
++		device, wantNames, wantServers, wantDevices string
++	}{
++		// sing-box binds its sockets to a device: its servers, asked as the server is
++		{"wan0", "wan; wan6", "10.99.0.53, 10.99.0.54, fe80::1%wan0, 2a00::53", ""}, // at most 4
++		{"wwan0", "modem", "100.64.5.1", ""},
++		{"eth9", "", "", ""},
++		// it binds none: every uplink, each server bound to its uplink, the uplinks by the
++		// metric of their default route; the tunnel and the interfaces without a default
++		// route are left out
++		{"", "wan on wan0: 10.99.0.53, 10.99.0.54; modem on wwan0: 100.64.5.1; wan6 on wan0: fe80::1%wan0, 2a00::53",
++			"10.99.0.53, 10.99.0.54, 100.64.5.1, fe80::1%wan0, 2a00::53", "wan0, wan0, wwan0, wan0, wan0"},
++	} {
++		servers, devices, names := providersOn(dump.Interface, test.device)
++		var bound []string
++		for _, server := range servers {
++			if device := devices[server]; device != "" {
++				bound = append(bound, device)
++			}
++		}
++		if strings.Join(names, "; ") != test.wantNames || joinServers(servers) != test.wantServers || strings.Join(bound, ", ") != test.wantDevices {
++			t.Errorf("device %q: got %q %q %q, want %q %q %q", test.device, strings.Join(names, "; "), joinServers(servers), strings.Join(bound, ", "),
++				test.wantNames, test.wantServers, test.wantDevices)
++		}
++	}
++}
++
++// testResolver answers A queries with 1.2.3.4, or with the rcode given; a negative rcode
++// means no answer at all.
++func testResolver(t *testing.T, rcode int) M.Socksaddr {
++	conn, err := net.ListenPacket("udp", "127.0.0.1:0")
++	if err != nil {
++		t.Fatal(err)
++	}
++	t.Cleanup(func() { conn.Close() })
++	go func() {
++		buffer := make([]byte, 1500)
++		for {
++			n, addr, err := conn.ReadFrom(buffer)
++			if err != nil {
++				return
++			}
++			if rcode < 0 {
++				continue
++			}
++			var query mDNS.Msg
++			if query.Unpack(buffer[:n]) != nil {
++				continue
++			}
++			response := new(mDNS.Msg)
++			response.SetRcode(&query, rcode)
++			if rcode == mDNS.RcodeSuccess {
++				response.Answer = []mDNS.RR{&mDNS.A{Hdr: mDNS.RR_Header{Name: query.Question[0].Name, Rrtype: mDNS.TypeA, Class: mDNS.ClassINET, Ttl: 300}, A: net.IPv4(1, 2, 3, 4)}}
++			}
++			packed, _ := response.Pack()
++			conn.WriteTo(packed, addr)
++		}
++	}()
++	return M.SocksaddrFromNet(conn.LocalAddr())
++}
++
++// All servers are asked at once, the first real answer wins and is asked alone next time.
++func TestExchangeAll(t *testing.T) {
++	t.Parallel()
++	silent, refused, good := testResolver(t, -1), testResolver(t, mDNS.RcodeRefused), testResolver(t, mDNS.RcodeSuccess)
++	servers := []M.Socksaddr{silent, refused, good}
++	state := &fallbackServer{dialer: N.SystemDialer, providers: &providerSet{}}
++	message := new(mDNS.Msg)
++	message.SetQuestion("example.com.", mDNS.TypeA)
++	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
++	defer cancel()
++	response, err := state.exchangeAll(ctx, servers, message)
++	// as the server gave it: the fallback caps the TTL (exchangeProvider), the provider DNS
++	// server does not
++	if err != nil || len(response.Answer) != 1 || response.Answer[0].Header().Ttl != 300 {
++		t.Fatalf("got %v, %v", response, err)
++	}
++	if best, loaded := state.providers.pick(servers); !loaded || best != good {
++		t.Fatalf("next query goes to %v (%v), want %v", best, loaded, good)
++	}
++	for i := 1; i < providerRoundAfter; i++ {
++		state.providers.pick(servers)
++	}
++	if _, loaded := state.providers.pick(servers); loaded {
++		t.Error("all servers are not asked again after 50 queries")
++	}
++	_, err = state.exchangeAll(ctx, []M.Socksaddr{silent, refused}, message)
++	if err == nil {
++		t.Error("no error when no server answered")
++	}
++}
++
++func TestCapTTL(t *testing.T) {
++	t.Parallel()
++	message := new(mDNS.Msg)
++	message.Answer = []mDNS.RR{&mDNS.A{Hdr: mDNS.RR_Header{Name: "a.", Rrtype: mDNS.TypeA, Ttl: 3600}}}
++	message.SetEdns0(1232, false)
++	capTTL(message, fallbackMaxTTL)
++	if ttl := message.Answer[0].Header().Ttl; ttl != fallbackMaxTTL {
++		t.Errorf("answer TTL %d, want %d", ttl, fallbackMaxTTL)
++	}
++	if message.IsEdns0() == nil || message.IsEdns0().UDPSize() != 1232 {
++		t.Error("OPT record changed")
++	}
++}
++
++// The logger formats only strings, numbers, errors and Stringers and panics on anything
++// else: every message of the fallback goes through a real one here. It is at the warn
++// level: a message of the fallback written below that level would be missing.
++func TestFallbackLogs(t *testing.T) {
++	t.Parallel()
++	var output bytes.Buffer
++	factory := log.NewDefaultFactory(context.Background(), log.Formatter{BaseTime: time.Now(), DisableColors: true}, &output, "", nil, false)
++	factory.SetLevel(log.LevelWarn)
++	if err := factory.Start(); err != nil {
++		t.Fatal(err)
++	}
++	logger := factory.NewLogger("dns")
++	var dump struct {
++		Interface []netifdInterface `json:"interface"`
++	}
++	if err := json.Unmarshal([]byte(testUbusDump), &dump); err != nil {
++		t.Fatal(err)
++	}
++	readDump := func(ctx context.Context) ([]netifdInterface, error) { return dump.Interface, nil }
++
++	// the decision, with the provider's servers read for it
++	qualifies := &fallbackServer{
++		options:   option.RemoteDNSServerOptions{DNSServerAddressOptions: option.DNSServerAddressOptions{Server: "77.88.8.8"}},
++		providers: &providerSet{read: readDump},
++	}
++	if !qualifies.decide(context.Background(), logger, "dns-server") {
++		t.Error("a server at a public address does not qualify")
++	}
++	(&fallbackServer{}).decide(nil, logger, "dns-server") //nolint:staticcheck
++	(&providerSet{read: readDump}).refresh(logger, "eth9")
++	(&providerSet{read: readDump}).refresh(logger, "wan0")
++	(&providerSet{read: func(ctx context.Context) ([]netifdInterface, error) { return nil, E.New("no ubus in tests") }}).refresh(logger, "")
++
++	// the server fails, the provider fails, the server is back
++	state := &fallbackServer{providers: &providerSet{
++		servers: []M.Socksaddr{M.ParseSocksaddrHostPort("10.99.0.53", 53), M.ParseSocksaddrHostPort("fe80::1%eth1", 53)},
++		readAt:  time.Now(),
++	}}
++	for i := 0; i < fallbackDownAfter; i++ {
++		state.failure(context.Background(), logger, "dns-server", time.Now(), E.New("timeout"))
++	}
++	state.providerFailed(context.Background(), logger, "dns-server", errNoProviders) // silent
++	for i := 0; i < fallbackProviderAfter; i++ {
++		state.providerFailed(context.Background(), logger, "dns-server", E.New("timeout"))
++	}
++	if state.usable(context.Background(), logger) {
++		t.Error("fallback still usable after the provider failed")
++	}
++	transport, setAside, _ := newFallbackTest()
++	setAside.down = true
++	probeServer(context.Background(), logger, transport, setAside, freshTestQuery())
++
++	for _, message := range []string{
++		"provider DNS on wan0 (wan, wan6): 10.99.0.53, 10.99.0.54, fe80::1%wan0, 2a00::53",
++		"provider DNS, each through its uplink: wan on wan0: 10.99.0.53, 10.99.0.54; modem on wwan0: 100.64.5.1; wan6 on wan0: fe80::1%wan0, 2a00::53",
++		"server dns-server falls back to provider DNS when it fails",
++		"no provider DNS fallback for server dns-server: no context",
++		"no provider DNS on eth9",
++		"no provider DNS: no ubus in tests",
++		"failed 2 times in a row (timeout), answering from provider DNS 10.99.0.53, fe80::1%eth1 until it is back",
++		"provider DNS does not answer for server dns-server (timeout), no fallback for it for 1m0s",
++		"server dns-server answers again, provider DNS no longer used",
++	} {
++		if !strings.Contains(output.String(), message) {
++			t.Errorf("missing %q in:\n%s", message, output.String())
++		}
++	}
++}
++
++// recordingDialer dials as the system does and tells which servers it was asked for.
++type recordingDialer struct {
++	N.Dialer
++	access sync.Mutex
++	asked  []string
++}
++
++func (d *recordingDialer) ListenPacket(ctx context.Context, destination M.Socksaddr) (net.PacketConn, error) {
++	d.access.Lock()
++	d.asked = append(d.asked, destination.String())
++	d.access.Unlock()
++	return d.Dialer.ListenPacket(ctx, destination)
++}
++
++func (d *recordingDialer) DialContext(ctx context.Context, network string, destination M.Socksaddr) (net.Conn, error) {
++	d.access.Lock()
++	d.asked = append(d.asked, destination.String())
++	d.access.Unlock()
++	return d.Dialer.DialContext(ctx, network, destination)
++}
++
++func (d *recordingDialer) told() []string {
++	d.access.Lock()
++	defer d.access.Unlock()
++	return slices.Clone(d.asked)
++}
++
++// A server of an uplink is asked through the dialer bound to the device of that uplink, a
++// server without one through the dialer of the server.
++func TestProviderOfAnUplinkThroughIt(t *testing.T) {
++	t.Parallel()
++	ofUplink, ofServer := testResolver(t, mDNS.RcodeSuccess), testResolver(t, -1)
++	own, bound := &recordingDialer{Dialer: N.SystemDialer}, &recordingDialer{Dialer: N.SystemDialer}
++	state := &fallbackServer{
++		dialer: own,
++		ctx:    context.Background(),
++		bound:  map[string]N.Dialer{"wan9": bound},
++		providers: &providerSet{
++			servers: []M.Socksaddr{ofUplink, ofServer},
++			devices: map[M.Socksaddr]string{ofUplink: "wan9"},
++			readAt:  time.Now(),
++		},
++	}
++	message := new(mDNS.Msg)
++	message.SetQuestion("example.com.", mDNS.TypeA)
++	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
++	defer cancel()
++	if _, err := state.exchangeAll(ctx, state.providers.servers, message); err != nil {
++		t.Fatal(err)
++	}
++	if got := bound.told(); len(got) != 1 || got[0] != ofUplink.String() {
++		t.Errorf("the dialer of wan9 was asked for %v, want %v", got, ofUplink)
++	}
++	if got := own.told(); len(got) != 1 || got[0] != ofServer.String() {
++		t.Errorf("the dialer of the server was asked for %v, want %v", got, ofServer)
++	}
++	if state.dialerFor("") != own {
++		t.Error("a server without a device is not asked through the dialer of the server")
++	}
++}
+diff --git a/dns/router.go b/dns/router.go
+index f5e5aa56f..cd85090c0 100644
+--- a/dns/router.go
++++ b/dns/router.go
+@@ -51,6 +51,10 @@ type Router struct {
+ 	rulesAccess           sync.RWMutex
+ 	started               bool
+ 	closing               bool
++	// providers are the provider's servers of the fallback of this box (podkop-engine)
++	providers *providerSet
++	// ipv6IfNoIPv4 is dns.ipv6_if_no_ipv4 (podkop-engine, dns/client_ipv6.go)
++	ipv6IfNoIPv4 bool
+ }
+ 
+ func NewRouter(ctx context.Context, logFactory log.Factory, options option.DNSOptions) (*Router, error) {
+@@ -63,7 +67,13 @@ func NewRouter(ctx context.Context, logFactory log.Factory, options option.DNSOp
+ 		rawRules:              make([]option.DNSRule, 0, len(options.Rules)),
+ 		rules:                 make([]adapter.DNSRule, 0, len(options.Rules)),
+ 		defaultDomainStrategy: C.DomainStrategy(options.Strategy),
++		providers:             newProviderSet(),
+ 	}
++	// the transports of this box find the provider's servers of its fallback here
++	if service.RegistryFromContext(ctx) != nil {
++		service.MustRegister[*providerSet](ctx, router.providers)
++	}
++
+ 	if options.DNSClientOptions.IndependentCache {
+ 		deprecated.Report(ctx, deprecated.OptionIndependentDNSCache)
+ 	}
+@@ -535,7 +545,7 @@ func (r *Router) settleDNSFutures(ctx context.Context, message *mDNS.Msg, state
+ 			continue
+ 		}
+ 		future.settled = true
+-		if future.err != nil && !future.terminal {
++		if future.err != nil && !future.terminal && !IsLoggedFailure(future.err) {
+ 			r.logger.ErrorContext(ctx, E.Cause(future.err, "exchange failed for ", FormatQuestion(message.Question[0].String())))
+ 		}
+ 		if future.tag == "" {
+@@ -1283,7 +1293,7 @@ func (r *Router) Lookup(ctx context.Context, domain string, options adapter.DNSQ
+ 				r.logger.DebugContext(ctx, "lookup rejected for ", domain)
+ 			} else if errors.Is(err, ErrNotCached) {
+ 				r.logger.DebugContext(ctx, "cache-only lookup missed for ", domain)
+-			} else {
++			} else if !IsLoggedFailure(err) {
+ 				r.logger.ErrorContext(ctx, E.Cause(err, "lookup failed for ", domain))
+ 			}
+ 		}
+@@ -1404,6 +1414,12 @@ func (r *Router) LookupReverseMapping(ip netip.Addr) (string, bool) {
+ func (r *Router) ResetNetwork() {
+ 	for _, transport := range r.transport.Transports() {
+ 		transport.Reset()
++		if state := fallbackFor(transport); state != nil {
++			state.reset()
++		}
++	}
++	if r.providers != nil {
++		r.providers.forget() // the output device may have changed
+ 	}
+ }
+ 
+diff --git a/dns/transport_adapter.go b/dns/transport_adapter.go
+index 7d2ebfa7e..252bfc6eb 100644
+--- a/dns/transport_adapter.go
++++ b/dns/transport_adapter.go
+@@ -9,6 +9,7 @@ type TransportAdapter struct {
+ 	transportTag  string
+ 	dependencies  []string
+ 	references    []string
++	fallback      *fallbackServer // remote servers only, see client_fallback.go
+ }
+ 
+ func NewTransportAdapter(transportType string, transportTag string, dependencies []string) TransportAdapter {
+@@ -50,6 +51,7 @@ func NewTransportAdapterWithRemoteOptions(transportType string, transportTag str
+ 		transportTag:  transportTag,
+ 		dependencies:  dependencies,
+ 		references:    references,
++		fallback:      newFallbackServer(remoteOptions),
+ 	}
+ }
+ 
+@@ -68,3 +70,7 @@ func (a *TransportAdapter) Dependencies() []string {
+ func (a *TransportAdapter) References() []string {
+ 	return a.references
+ }
++
++func (a *TransportAdapter) fallbackState() *fallbackServer {
++	return a.fallback
++}
+diff --git a/protocol/direct/outbound.go b/protocol/direct/outbound.go
+index 78fee262e..144b74272 100644
+--- a/protocol/direct/outbound.go
++++ b/protocol/direct/outbound.go
+@@ -45,6 +45,7 @@ type Outbound struct {
+ 	domainStrategy C.DomainStrategy
+ 	fallbackDelay  time.Duration
+ 	isEmpty        bool
++	dialerOptions  option.DialerOptions
+ 	myAddresses    common.TypedValue[[]netip.Prefix]
+ 	icmpPort       *ping.Port
+ }
+@@ -75,6 +76,7 @@ func NewOutbound(ctx context.Context, router adapter.Router, logger log.ContextL
+ 		isEmpty: reflect.DeepEqual(options.DialerOptions, option.DialerOptions{
+ 			AbstractDialerOptions: option.AbstractDialerOptions{UDPFragmentDefault: true},
+ 		}),
++		dialerOptions: options.DialerOptions,
+ 	}
+ 	//nolint:staticcheck
+ 	if options.ProxyProtocol != 0 {
+@@ -269,3 +271,8 @@ func (h *Outbound) ListenSerialNetworkPacket(ctx context.Context, destination M.
+ func (h *Outbound) IsEmpty() bool {
+ 	return h.isEmpty
+ }
++
++// DialerOptions returns the dial fields of the outbound (read by the DNS fallback).
++func (h *Outbound) DialerOptions() option.DialerOptions {
++	return h.dialerOptions
++}
+-- 
+2.53.0
+

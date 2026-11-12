@@ -1,0 +1,57 @@
+From 7a469da8c109b707dd7913ca21ad83157581feec Mon Sep 17 00:00:00 2001
+From: FiyeroT <me@fiyero.xyz>
+Date: Thu, 12 Nov 2026 21:41:20 +0300
+Subject: [PATCH 14/57] cachefile, hooks in upstream files: the content of a
+ remote rule-set in a file of its own
+
+The lines of upstream files that "cachefile: the content of a remote rule-set in a file of its own"
+needs; the feature itself is its patch of layer 03, in files of its own.
+
+Pdk-Feature: cachefile-files
+Pdk-Zone: core
+Pdk-Layer: 02
+---
+ experimental/cachefile/cache.go | 16 ++++++++++++++++
+ 1 file changed, 16 insertions(+)
+
+diff --git a/experimental/cachefile/cache.go b/experimental/cachefile/cache.go
+index 3cbec7347..b4f97d110 100644
+--- a/experimental/cachefile/cache.go
++++ b/experimental/cachefile/cache.go
+@@ -242,6 +242,14 @@ func (c *CacheFile) start() error {
+ 		return err
+ 	}
+ 	c.DB = db
++	c.moveRuleSetsToFiles()
++	// the move may have reset the database (a damaged page found on the way): the one it left
++	db, err = c.compactSparse(c.DB)
++	if err != nil {
++		return err
++	}
++	c.DB = db
++	c.pruneRuleSetFiles(db)
+ 	return nil
+ }
+ 
+@@ -437,6 +445,9 @@ func (c *CacheFile) StoreGroupExpand(group string, isExpand bool) error {
+ }
+ 
+ func (c *CacheFile) LoadRuleSet(tag string) *adapter.SavedBinary {
++	if saved, found := c.loadRuleSetFile(tag); found {
++		return saved
++	}
+ 	var savedSet adapter.SavedBinary
+ 	err := c.view(func(t *bbolt.Tx) error {
+ 		bucket := c.bucket(t, bucketRuleSet)
+@@ -468,3 +479,8 @@ func (c *CacheFile) SaveRuleSet(tag string, set *adapter.SavedBinary) error {
+ 		return bucket.Put([]byte(tag), setBinary)
+ 	})
+ }
++
++// SaveRuleSet keeps the content of a rule set in a file of its own (rule_set_file.go).
++func (c *CacheFile) SaveRuleSet(tag string, set *adapter.SavedBinary) error {
++	return c.saveRuleSetFile(tag, set)
++}
+-- 
+2.53.0
+

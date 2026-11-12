@@ -1,0 +1,1108 @@
+From 5e99cca45844d1818e75a3ffe65038fbe88a1958 Mon Sep 17 00:00:00 2001
+From: FiyeroT <me@fiyero.xyz>
+Date: Thu, 12 Nov 2026 21:41:21 +0300
+Subject: [PATCH 44/57] transports: the dial and the close of v2ray transports
+
+A failed HTTP/2 dial frees the handshake write with its error; QUIC streams and gRPC lite wait for
+data without a buffer; the end of the dial context reaches the upgrade of websocket and httpupgrade;
+Close of a client transport is a reset.
+
+Made of these commits of the earlier series (branch archive/r25-1.14-commits):
+  b5741cbee transport: a failed HTTP/2 dial frees the handshake write, with its error
+  8e451cdf5 readwait: wait for data without a buffer on QUIC streams and gRPC lite
+  934a0d2cb v2ray: state and test that Close of a client transport is a reset
+  7e0d5bf4a v2ray websocket, httpupgrade: the end of the dial context reaches the upgrade
+
+Pdk-Feature: transport
+Pdk-Zone: protocols
+Pdk-Layer: 04
+---
+ adapter/v2ray.go                          |   8 ++
+ common/readwait/peek.go                   | 101 +++++++++++++++
+ common/readwait/peek_test.go              | 146 ++++++++++++++++++++++
+ protocol/hysteria2/outbound.go            |   9 +-
+ protocol/tuic/outbound.go                 |   9 +-
+ transport/v2ray/transport_grpc_test.go    |  25 ++++
+ transport/v2ray/transport_quic_test.go    |  16 +++
+ transport/v2ray/transport_test.go         | 131 +++++++++++++++++++
+ transport/v2raygrpclite/client.go         |   8 +-
+ transport/v2raygrpclite/conn.go           |  32 +++++
+ transport/v2raygrpclite/conn_test.go      |  61 +++++++++
+ transport/v2rayhttp/client.go             |   8 +-
+ transport/v2rayhttp/conn_test.go          |  61 +++++++++
+ transport/v2rayhttpupgrade/client.go      |   5 +
+ transport/v2rayhttpupgrade/client_test.go | 101 +++++++++++++++
+ transport/v2rayquic/stream.go             |  12 ++
+ transport/v2raywebsocket/client.go        |   4 +
+ transport/v2raywebsocket/client_test.go   | 107 ++++++++++++++++
+ 18 files changed, 838 insertions(+), 6 deletions(-)
+ create mode 100644 common/readwait/peek.go
+ create mode 100644 common/readwait/peek_test.go
+ create mode 100644 transport/v2ray/transport_grpc_test.go
+ create mode 100644 transport/v2ray/transport_quic_test.go
+ create mode 100644 transport/v2ray/transport_test.go
+ create mode 100644 transport/v2raygrpclite/conn_test.go
+ create mode 100644 transport/v2rayhttp/conn_test.go
+ create mode 100644 transport/v2rayhttpupgrade/client_test.go
+ create mode 100644 transport/v2raywebsocket/client_test.go
+
+diff --git a/adapter/v2ray.go b/adapter/v2ray.go
+index 2dfa41026..1c4d6111c 100644
+--- a/adapter/v2ray.go
++++ b/adapter/v2ray.go
+@@ -18,6 +18,14 @@ type V2RayServerTransportHandler interface {
+ 	N.TCPConnectionHandlerEx
+ }
+ 
++// V2RayClientTransport is the client side of a V2Ray transport, owned by an
++// outbound.
++//
++// Close is a reset, not an end: it closes the connections the transport keeps
++// and leaves the transport usable. The outbounds call it from InterfaceUpdated
++// on every change of the network, before the first dial as well and any number
++// of times, and once more when they close. DialContext after a Close must open
++// a new connection and must not fail for the Close.
+ type V2RayClientTransport interface {
+ 	DialContext(ctx context.Context) (net.Conn, error)
+ 	Close() error
+diff --git a/common/readwait/peek.go b/common/readwait/peek.go
+new file mode 100644
+index 000000000..2b11e2c6e
+--- /dev/null
++++ b/common/readwait/peek.go
+@@ -0,0 +1,101 @@
++// Package readwait lets connections that can wait for data without consuming it wait
++// without a buffer (podkop-engine).
++//
++// The copy loop of sing takes a pool buffer before every blocking read of a source that has
++// no read waiter, so an idle proxied connection held a 32 KiB buffer (64 KiB after 512 KB)
++// for as long as its server stayed silent. A connection that can wait for data without
++// consuming it (a quic-go stream, a bufio reader) gets a read waiter here: it waits first,
++// then takes the buffer and reads through the connection's own Read, so the framing and the
++// errors stay the connection's.
++package readwait
++
++import (
++	"io"
++	"net"
++
++	"github.com/sagernet/sing/common/buf"
++	N "github.com/sagernet/sing/common/network"
++)
++
++type PeekWaiter struct {
++	reader  io.Reader
++	wait    func() error
++	options N.ReadWaitOptions
++	pending error
++}
++
++// NewPeekWaiter returns a read waiter that calls wait until data can be read, then reads
++// from reader. wait must not consume anything; its error is left to the read, which
++// reports it the way the connection does.
++func NewPeekWaiter(reader io.Reader, wait func() error) *PeekWaiter {
++	return &PeekWaiter{reader: reader, wait: wait}
++}
++
++func (w *PeekWaiter) InitializeReadWaiter(options N.ReadWaitOptions) (needCopy bool) {
++	w.options = options
++	return false
++}
++
++func (w *PeekWaiter) WaitReadBuffer() (*buf.Buffer, error) {
++	if w.pending != nil {
++		err := w.pending
++		w.pending = nil
++		return nil, err
++	}
++	for {
++		waitErr := w.wait()
++		buffer := w.options.NewBuffer()
++		n, err := w.reader.Read(buffer.FreeBytes())
++		if n > 0 {
++			buffer.Truncate(n)
++			w.options.PostReturn(buffer)
++			w.pending = err // delivered with the next call, as io.Reader allows
++			return buffer, nil
++		}
++		buffer.Release()
++		if err != nil {
++			return nil, err
++		}
++		if waitErr != nil {
++			return nil, waitErr
++		}
++		// an empty read (an empty frame): wait again without holding the buffer
++	}
++}
++
++type quicStream interface {
++	Peek(b []byte) (int, error)
++}
++
++// QUICStreamConn is a connection over a quic-go stream: Peek blocks until data arrives
++// (or the stream ends, fails, or reaches its read deadline) and consumes nothing.
++type QUICStreamConn struct {
++	net.Conn
++	stream     quicStream
++	peekBuffer [1]byte
++}
++
++// NewQUICStreamConn gives conn a read waiter when it is a quic-go stream with Peek, as the
++// TCP connections of Hysteria2 and TUIC are; other connections are returned as they are.
++func NewQUICStreamConn(conn net.Conn) net.Conn {
++	stream, isStream := conn.(quicStream)
++	if !isStream {
++		return conn
++	}
++	return &QUICStreamConn{Conn: conn, stream: stream}
++}
++
++func (c *QUICStreamConn) CreateReadWaiter() (N.ReadWaiter, bool) {
++	return NewPeekWaiter(c.Conn, func() error {
++		_, err := c.stream.Peek(c.peekBuffer[:])
++		return err
++	}), true
++}
++
++func (c *QUICStreamConn) Upstream() any {
++	return c.Conn
++}
++
++func (c *QUICStreamConn) WriterReplaceable() bool {
++	return true
++}
+diff --git a/common/readwait/peek_test.go b/common/readwait/peek_test.go
+new file mode 100644
+index 000000000..9a56976d5
+--- /dev/null
++++ b/common/readwait/peek_test.go
+@@ -0,0 +1,146 @@
++package readwait
++
++import (
++	"bufio"
++	"bytes"
++	"errors"
++	"io"
++	"net"
++	"sync/atomic"
++	"testing"
++	"time"
++
++	sbufio "github.com/sagernet/sing/common/bufio"
++	N "github.com/sagernet/sing/common/network"
++
++	"github.com/stretchr/testify/require"
++)
++
++// fakeStream is a stream with a quic-go style Peek over a pipe. A Read that has to wait
++// for data counts as a failure: the read waiter must call Read only once data is there.
++type fakeStream struct {
++	net.Conn
++	reader      *bufio.Reader
++	earlyReads  atomic.Int32
++	peeks       atomic.Int32
++	readLengths []int
++}
++
++func newFakeStream(conn net.Conn) *fakeStream {
++	return &fakeStream{Conn: conn, reader: bufio.NewReader(conn)}
++}
++
++func (s *fakeStream) Peek(b []byte) (int, error) {
++	s.peeks.Add(1)
++	peeked, err := s.reader.Peek(len(b))
++	return copy(b, peeked), err
++}
++
++func (s *fakeStream) Read(b []byte) (int, error) {
++	buffered := s.reader.Buffered()
++	s.readLengths = append(s.readLengths, len(b))
++	n, err := s.reader.Read(b)
++	if buffered == 0 && n > 0 {
++		s.earlyReads.Add(1) // the read had to wait for this data
++	}
++	return n, err
++}
++
++// The copy loop of sing finds the read waiter, waits with Peek and reads only once data has
++// arrived, with the full buffer; the bytes arrive intact and in order.
++func TestQUICStreamConnCopy(t *testing.T) {
++	remote, local := net.Pipe()
++	stream := newFakeStream(local)
++	conn := NewQUICStreamConn(stream)
++	_, isCreator := conn.(N.ReadWaitCreator)
++	require.True(t, isCreator)
++
++	var output bytes.Buffer
++	done := make(chan error, 1)
++	go func() {
++		_, err := sbufio.Copy(&output, conn)
++		done <- err
++	}()
++	var sent bytes.Buffer
++	for i := 0; i < 5; i++ {
++		chunk := bytes.Repeat([]byte{byte('a' + i)}, 100*(i+1))
++		sent.Write(chunk)
++		_, err := remote.Write(chunk)
++		require.NoError(t, err)
++		time.Sleep(20 * time.Millisecond) // the copy loop waits in between
++	}
++	remote.Close()
++	require.NoError(t, <-done)
++	require.Equal(t, sent.Bytes(), output.Bytes())
++	require.Zero(t, stream.earlyReads.Load(), "a read waited for data while holding the buffer")
++	require.Greater(t, stream.peeks.Load(), int32(0))
++	for _, length := range stream.readLengths {
++		require.GreaterOrEqual(t, length, 4096, "the read did not get the copy loop's buffer")
++	}
++}
++
++// A connection without Peek is returned as it is.
++func TestQUICStreamConnWithoutPeek(t *testing.T) {
++	side, peer := net.Pipe()
++	defer side.Close()
++	defer peer.Close()
++	require.Equal(t, side, NewQUICStreamConn(side))
++}
++
++type scriptedReader struct {
++	results []readResult
++}
++
++type readResult struct {
++	data string
++	err  error
++}
++
++func (r *scriptedReader) Read(b []byte) (int, error) {
++	if len(r.results) == 0 {
++		return 0, io.EOF
++	}
++	result := r.results[0]
++	r.results = r.results[1:]
++	return copy(b, result.data), result.err
++}
++
++// Data that comes with an error is delivered first, the error with the next call; empty
++// reads (empty frames) are skipped; a failed wait with an empty read ends the waiting.
++func TestPeekWaiterResults(t *testing.T) {
++	failure := errors.New("reset")
++	reader := &scriptedReader{results: []readResult{{"", nil}, {"data", failure}}}
++	waiter := NewPeekWaiter(reader, func() error { return nil })
++	waiter.InitializeReadWaiter(N.ReadWaitOptions{})
++	buffer, err := waiter.WaitReadBuffer()
++	require.NoError(t, err)
++	require.Equal(t, "data", string(buffer.Bytes()))
++	buffer.Release()
++	_, err = waiter.WaitReadBuffer()
++	require.ErrorIs(t, err, failure)
++
++	waitFailure := errors.New("deadline")
++	reader = &scriptedReader{results: []readResult{{"", nil}}}
++	waiter = NewPeekWaiter(reader, func() error { return waitFailure })
++	waiter.InitializeReadWaiter(N.ReadWaitOptions{})
++	_, err = waiter.WaitReadBuffer()
++	require.ErrorIs(t, err, waitFailure)
++}
++
++// The same stream without the read waiter: sing's copy loop reads with its buffer before the
++// data is there, which is what the read waiter avoids (and what the check above detects).
++func TestCopyWithoutReadWaiterHoldsBuffer(t *testing.T) {
++	remote, local := net.Pipe()
++	stream := newFakeStream(local)
++	done := make(chan error, 1)
++	go func() {
++		_, err := sbufio.Copy(io.Discard, stream)
++		done <- err
++	}()
++	time.Sleep(20 * time.Millisecond)
++	_, err := remote.Write([]byte("data"))
++	require.NoError(t, err)
++	remote.Close()
++	require.NoError(t, <-done)
++	require.Positive(t, stream.earlyReads.Load())
++}
+diff --git a/protocol/hysteria2/outbound.go b/protocol/hysteria2/outbound.go
+index 14e761fba..316e81667 100644
+--- a/protocol/hysteria2/outbound.go
++++ b/protocol/hysteria2/outbound.go
+@@ -12,6 +12,7 @@ import (
+ 	"github.com/sagernet/sing-box/adapter"
+ 	"github.com/sagernet/sing-box/adapter/outbound"
+ 	"github.com/sagernet/sing-box/common/dialer"
++	"github.com/sagernet/sing-box/common/readwait"
+ 	"github.com/sagernet/sing-box/common/tls"
+ 	C "github.com/sagernet/sing-box/constant"
+ 	"github.com/sagernet/sing-box/log"
+@@ -54,7 +55,7 @@ func NewOutbound(ctx context.Context, router adapter.Router, logger log.ContextL
+ 	if err != nil {
+ 		return nil, err
+ 	}
+-	tlsConfig, err := tls.NewClient(ctx, logger, tlsServerAddress, tlsOptions)
++	tlsConfig, err := tls.NewClient(ctx, logger, tlsServerAddress, tls.QUICClientOptions(logger, tlsOptions))
+ 	if err != nil {
+ 		return nil, err
+ 	}
+@@ -190,7 +191,11 @@ func (h *Outbound) DialContext(ctx context.Context, network string, destination
+ 	switch N.NetworkName(network) {
+ 	case N.NetworkTCP:
+ 		h.logger.InfoContext(ctx, "outbound connection to ", destination)
+-		return h.client.DialConn(ctx, destination)
++		conn, err := h.client.DialConn(ctx, destination)
++		if err != nil {
++			return nil, err
++		}
++		return readwait.NewQUICStreamConn(conn), nil
+ 	case N.NetworkUDP:
+ 		conn, err := h.ListenPacket(ctx, destination)
+ 		if err != nil {
+diff --git a/protocol/tuic/outbound.go b/protocol/tuic/outbound.go
+index 988f0065c..0c499c395 100644
+--- a/protocol/tuic/outbound.go
++++ b/protocol/tuic/outbound.go
+@@ -9,6 +9,7 @@ import (
+ 	"github.com/sagernet/sing-box/adapter"
+ 	"github.com/sagernet/sing-box/adapter/outbound"
+ 	"github.com/sagernet/sing-box/common/dialer"
++	"github.com/sagernet/sing-box/common/readwait"
+ 	"github.com/sagernet/sing-box/common/tls"
+ 	C "github.com/sagernet/sing-box/constant"
+ 	"github.com/sagernet/sing-box/log"
+@@ -47,7 +48,7 @@ func NewOutbound(ctx context.Context, router adapter.Router, logger log.ContextL
+ 	if options.TLS == nil || !options.TLS.Enabled {
+ 		return nil, C.ErrTLSRequired
+ 	}
+-	tlsConfig, err := tls.NewClient(ctx, logger, options.Server, common.PtrValueOrDefault(options.TLS))
++	tlsConfig, err := tls.NewClient(ctx, logger, options.Server, tls.QUICClientOptions(logger, common.PtrValueOrDefault(options.TLS)))
+ 	if err != nil {
+ 		return nil, err
+ 	}
+@@ -104,7 +105,11 @@ func (h *Outbound) DialContext(ctx context.Context, network string, destination
+ 	switch N.NetworkName(network) {
+ 	case N.NetworkTCP:
+ 		h.logger.InfoContext(ctx, "outbound connection to ", destination)
+-		return h.client.DialConn(ctx, destination)
++		conn, err := h.client.DialConn(ctx, destination)
++		if err != nil {
++			return nil, err
++		}
++		return readwait.NewQUICStreamConn(conn), nil
+ 	case N.NetworkUDP:
+ 		if h.udpStream {
+ 			h.logger.InfoContext(ctx, "outbound stream packet connection to ", destination)
+diff --git a/transport/v2ray/transport_grpc_test.go b/transport/v2ray/transport_grpc_test.go
+new file mode 100644
+index 000000000..f61c1214b
+--- /dev/null
++++ b/transport/v2ray/transport_grpc_test.go
+@@ -0,0 +1,25 @@
++//go:build with_grpc
++
++package v2ray_test
++
++import (
++	C "github.com/sagernet/sing-box/constant"
++	"github.com/sagernet/sing-box/option"
++)
++
++func init() {
++	for i, c := range clientTransportCases {
++		if c.options.Type == C.V2RayTransportTypeGRPC {
++			// With this tag "grpc" is the client of grpc-go, which connects under
++			// the context of the transport and waits for the server for as long
++			// as that lives: with a dialer that only fails, its dial never
++			// returns.
++			clientTransportCases[i].skip = "the grpc-go client waits for its server"
++		}
++	}
++	forceLite := option.V2RayTransportOptions{Type: C.V2RayTransportTypeGRPC, GRPCOptions: option.V2RayGRPCOptions{ForceLite: true}}
++	clientTransportCases = append(clientTransportCases,
++		clientTransportCase{name: "grpc, lite", options: forceLite},
++		clientTransportCase{name: "grpc, lite, TLS", options: forceLite, alpn: []string{}},
++	)
++}
+diff --git a/transport/v2ray/transport_quic_test.go b/transport/v2ray/transport_quic_test.go
+new file mode 100644
+index 000000000..ac0cb113f
+--- /dev/null
++++ b/transport/v2ray/transport_quic_test.go
+@@ -0,0 +1,16 @@
++//go:build with_quic
++
++package v2ray_test
++
++import (
++	C "github.com/sagernet/sing-box/constant"
++	"github.com/sagernet/sing-box/option"
++	_ "github.com/sagernet/sing-box/transport/v2rayquic"
++)
++
++func init() {
++	clientTransportCases = append(clientTransportCases,
++		clientTransportCase{name: "quic", options: option.V2RayTransportOptions{Type: C.V2RayTransportTypeQUIC}, alpn: []string{}},
++		clientTransportCase{name: "xhttp, HTTP/3", options: option.V2RayTransportOptions{Type: C.V2RayTransportTypeXHTTP}, alpn: []string{"h3"}},
++	)
++}
+diff --git a/transport/v2ray/transport_test.go b/transport/v2ray/transport_test.go
+new file mode 100644
+index 000000000..0315416bc
+--- /dev/null
++++ b/transport/v2ray/transport_test.go
+@@ -0,0 +1,131 @@
++package v2ray_test
++
++import (
++	"context"
++	"errors"
++	"net"
++	"sync/atomic"
++	"testing"
++	"time"
++
++	"github.com/sagernet/sing-box/adapter"
++	"github.com/sagernet/sing-box/common/tls"
++	C "github.com/sagernet/sing-box/constant"
++	"github.com/sagernet/sing-box/log"
++	"github.com/sagernet/sing-box/option"
++	"github.com/sagernet/sing-box/transport/v2ray"
++	"github.com/sagernet/sing/common/json/badoption"
++	M "github.com/sagernet/sing/common/metadata"
++
++	"github.com/stretchr/testify/require"
++)
++
++var errTestDial = errors.New("test dialer: no route to host")
++
++// failingDialer counts the dials it is asked for and fails each of them.
++type failingDialer struct {
++	dials atomic.Int32
++}
++
++func (d *failingDialer) DialContext(ctx context.Context, network string, destination M.Socksaddr) (net.Conn, error) {
++	d.dials.Add(1)
++	return nil, errTestDial
++}
++
++func (d *failingDialer) ListenPacket(ctx context.Context, destination M.Socksaddr) (net.PacketConn, error) {
++	d.dials.Add(1)
++	return nil, errTestDial
++}
++
++type clientTransportCase struct {
++	name    string
++	options option.V2RayTransportOptions
++	// alpn is the ALPN of the TLS the transport runs over; nil is no TLS.
++	alpn []string
++	// skip, when set, says why the case can't be held this way.
++	skip string
++}
++
++var clientTransportCases = []clientTransportCase{
++	{name: "ws", options: option.V2RayTransportOptions{Type: C.V2RayTransportTypeWebsocket}},
++	{name: "httpupgrade", options: option.V2RayTransportOptions{Type: C.V2RayTransportTypeHTTPUpgrade}},
++	{name: "http", options: option.V2RayTransportOptions{Type: C.V2RayTransportTypeHTTP}},
++	{name: "http, TLS", options: option.V2RayTransportOptions{Type: C.V2RayTransportTypeHTTP}, alpn: []string{}},
++	{name: "grpc", options: option.V2RayTransportOptions{Type: C.V2RayTransportTypeGRPC}},
++	{name: "grpc, TLS", options: option.V2RayTransportOptions{Type: C.V2RayTransportTypeGRPC}, alpn: []string{}},
++	{name: "xhttp", options: option.V2RayTransportOptions{Type: C.V2RayTransportTypeXHTTP}},
++	{name: "xhttp, TLS", options: option.V2RayTransportOptions{Type: C.V2RayTransportTypeXHTTP}, alpn: []string{}},
++	{name: "xhttp, TLS, HTTP/1.1", options: option.V2RayTransportOptions{Type: C.V2RayTransportTypeXHTTP}, alpn: []string{"http/1.1"}},
++	{
++		name: "xhttp, TLS, download",
++		options: option.V2RayTransportOptions{Type: C.V2RayTransportTypeXHTTP, XHTTPOptions: option.V2RayXHTTPOptions{
++			Download: &option.V2RayXHTTPDownloadOptions{
++				ServerOptions:               option.ServerOptions{Server: "127.0.0.2", ServerPort: 443},
++				OutboundTLSOptionsContainer: option.OutboundTLSOptionsContainer{TLS: &option.OutboundTLSOptions{Enabled: true, Insecure: true, ServerName: "cdn.example.com"}},
++			},
++		}},
++		alpn: []string{},
++	},
++}
++
++// Close of a client transport is a reset, not an end: the outbounds call it on
++// every change of the network (InterfaceUpdated) and go on dialing through the
++// same transport. Whatever the transport keeps between dials, the dial after a
++// Close must go out to the server again.
++func TestClientTransportCloseIsReset(t *testing.T) {
++	for _, c := range clientTransportCases {
++		t.Run(c.name, func(t *testing.T) {
++			if c.skip != "" {
++				t.Skip(c.skip)
++			}
++			var tlsConfig tls.Config
++			if c.alpn != nil {
++				var err error
++				tlsConfig, err = tls.NewClient(context.Background(), log.StdLogger(), "example.com", option.OutboundTLSOptions{
++					Enabled: true, Insecure: true, ServerName: "example.com", ALPN: badoption.Listable[string](c.alpn),
++				})
++				require.NoError(t, err)
++			}
++			dialer := new(failingDialer)
++			transport, err := v2ray.NewClientTransport(context.Background(), dialer, M.ParseSocksaddr("127.0.0.1:443"), c.options, tlsConfig)
++			require.NoError(t, err)
++			require.NotNil(t, transport)
++			defer transport.Close()
++			require.NoError(t, transport.Close(), "before the first dial")
++			requireDialReachesServer(t, transport, dialer)
++			require.NoError(t, transport.Close())
++			require.NoError(t, transport.Close(), "twice in a row")
++			requireDialReachesServer(t, transport, dialer)
++		})
++	}
++}
++
++// requireDialReachesServer dials through the transport and expects the failure
++// of the dialer back: the transport went to the server, it did not refuse.
++func requireDialReachesServer(t *testing.T, transport adapter.V2RayClientTransport, dialer *failingDialer) {
++	t.Helper()
++	before := dialer.dials.Load()
++	done := make(chan error, 1)
++	go func() {
++		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
++		defer cancel()
++		conn, err := transport.DialContext(ctx)
++		if err == nil {
++			// The HTTP/2 based transports hand out the connection before the
++			// request is on its way: the failure is that of the first read.
++			_, err = conn.Read(make([]byte, 1))
++			conn.Close()
++		}
++		done <- err
++	}()
++	select {
++	case err := <-done:
++		require.Error(t, err)
++		require.NotErrorIs(t, err, net.ErrClosed)
++		require.NotContains(t, err.Error(), net.ErrClosed.Error())
++		require.ErrorContains(t, err, errTestDial.Error())
++		require.Greater(t, dialer.dials.Load(), before, "the dialer was not asked")
++	case <-time.After(15 * time.Second):
++		t.Fatal("the dial did not return")
++	}
++}
+diff --git a/transport/v2raygrpclite/client.go b/transport/v2raygrpclite/client.go
+index 3ac0404cc..67a961583 100644
+--- a/transport/v2raygrpclite/client.go
++++ b/transport/v2raygrpclite/client.go
+@@ -122,10 +122,16 @@ func (c *Client) DialContext(ctx context.Context) (net.Conn, error) {
+ 			if handshakeTimedOut.Load() {
+ 				err = os.ErrDeadlineExceeded
+ 			}
++			// RoundTrip failed, so the request never established and nothing will ever read
++			// the request-body pipe: closing its read end with the error releases a Write
++			// blocked on it (the synchronous first write of the handshake) with that error
++			pipeInReader.CloseWithError(err)
+ 			conn.setup(nil, err)
+ 		} else if response.StatusCode != 200 {
+ 			response.Body.Close()
+-			conn.setup(nil, E.New("v2ray-grpc: unexpected status: ", response.Status))
++			err = E.New("v2ray-grpc: unexpected status: ", response.Status)
++			pipeInReader.CloseWithError(err)
++			conn.setup(nil, err)
+ 		} else {
+ 			conn.setup(response.Body, nil)
+ 		}
+diff --git a/transport/v2raygrpclite/conn.go b/transport/v2raygrpclite/conn.go
+index 7080d63c2..22750e042 100644
+--- a/transport/v2raygrpclite/conn.go
++++ b/transport/v2raygrpclite/conn.go
+@@ -10,10 +10,12 @@ import (
+ 	"os"
+ 	"time"
+ 
++	"github.com/sagernet/sing-box/common/readwait"
+ 	"github.com/sagernet/sing/common"
+ 	"github.com/sagernet/sing/common/baderror"
+ 	"github.com/sagernet/sing/common/buf"
+ 	M "github.com/sagernet/sing/common/metadata"
++	N "github.com/sagernet/sing/common/network"
+ 	"github.com/sagernet/sing/common/varbin"
+ )
+ 
+@@ -56,6 +58,13 @@ func (c *GunConn) setup(reader io.Reader, err error) {
+ 		c.reader = std_bufio.NewReader(reader)
+ 	}
+ 	c.err = err
++	if err != nil {
++		// the client has closed the request-body pipe with the error; cancel the request
++		// too, so that the transport lets its goroutine go
++		if c.cancel != nil {
++			c.cancel()
++		}
++	}
+ 	close(c.create)
+ }
+ 
+@@ -101,6 +110,29 @@ func (c *GunConn) read(b []byte) (n int, err error) {
+ 	return
+ }
+ 
++// CreateReadWaiter lets the copy loop wait for the next bytes in the frame reader's own
++// buffer before it takes a buffer (podkop-engine, see common/readwait).
++func (c *GunConn) CreateReadWaiter() (N.ReadWaiter, bool) {
++	return readwait.NewPeekWaiter(c, c.waitData), true
++}
++
++// waitData waits at the start of a message only: Peek fills the reader's 4 KiB buffer,
++// and a read then gets no more than that, while inside a message a read with the copy
++// loop's buffer goes past the empty reader buffer to the body directly.
++func (c *GunConn) waitData() error {
++	if c.create != nil {
++		<-c.create
++		if c.err != nil {
++			return c.err
++		}
++	}
++	if c.readRemaining > 0 {
++		return nil
++	}
++	_, err := c.reader.Peek(1)
++	return err
++}
++
+ func (c *GunConn) Write(b []byte) (n int, err error) {
+ 	varLen := varbin.UvarintLen(uint64(len(b)))
+ 	buffer := buf.NewSize(6 + varLen + len(b))
+diff --git a/transport/v2raygrpclite/conn_test.go b/transport/v2raygrpclite/conn_test.go
+new file mode 100644
+index 000000000..d74a1b348
+--- /dev/null
++++ b/transport/v2raygrpclite/conn_test.go
+@@ -0,0 +1,61 @@
++package v2raygrpclite
++
++import (
++	"context"
++	"io"
++	"syscall"
++	"testing"
++	"time"
++
++	"github.com/stretchr/testify/require"
++)
++
++// When RoundTrip fails (the server cannot be dialled), the request never establishes and
++// nothing reads the request-body pipe. A Write that started before the failure must not
++// block for ever: the client closes the read end of the pipe with the error, so the write
++// returns that error. Without the fix this test hangs and the goroutine and socket of every
++// such attempt leak.
++func TestLateGunConnWriteUnblocksOnSetupError(t *testing.T) {
++	t.Parallel()
++	pipeReader, pipeWriter := io.Pipe()
++	defer pipeReader.Close()
++	_, cancel := context.WithCancel(context.Background())
++	conn := newLateGunConn(pipeWriter, cancel)
++
++	writeErr := make(chan error, 1)
++	go func() {
++		_, err := conn.Write([]byte("handshake"))
++		writeErr <- err
++	}()
++
++	// the write is now blocked on the pipe that nobody reads
++	select {
++	case <-writeErr:
++		t.Fatal("write returned before the request failed")
++	case <-time.After(100 * time.Millisecond):
++	}
++
++	pipeReader.CloseWithError(syscall.ECONNREFUSED)
++	conn.setup(nil, syscall.ECONNREFUSED)
++
++	// the blocked write returns the dial error itself instead of hanging (the field case: the
++	// server refuses or is blackholed)
++	select {
++	case err := <-writeErr:
++		require.ErrorIs(t, err, syscall.ECONNREFUSED)
++	case <-time.After(5 * time.Second):
++		t.Fatal("write still blocked after setup failed: the goroutine and socket would leak")
++	}
++
++	// a write after the failure also returns at once, it does not block
++	done := make(chan struct{})
++	go func() {
++		conn.Write([]byte("after"))
++		close(done)
++	}()
++	select {
++	case <-done:
++	case <-time.After(5 * time.Second):
++		t.Fatal("a write after the failure blocked")
++	}
++}
+diff --git a/transport/v2rayhttp/client.go b/transport/v2rayhttp/client.go
+index b831086d3..c7f975d5b 100644
+--- a/transport/v2rayhttp/client.go
++++ b/transport/v2rayhttp/client.go
+@@ -170,10 +170,16 @@ func (c *Client) dialHTTP2(ctx context.Context) (net.Conn, error) {
+ 			if handshakeTimedOut.Load() {
+ 				err = os.ErrDeadlineExceeded
+ 			}
++			// RoundTrip failed, so the request never established and nothing will ever read
++			// the request-body pipe: closing its read end with the error releases a Write
++			// blocked on it (the synchronous first write of the handshake) with that error
++			pipeInReader.CloseWithError(err)
+ 			conn.Setup(nil, err)
+ 		} else if response.StatusCode != 200 {
+ 			response.Body.Close()
+-			conn.Setup(nil, E.New("v2ray-http: unexpected status: ", response.Status))
++			err = E.New("v2ray-http: unexpected status: ", response.Status)
++			pipeInReader.CloseWithError(err)
++			conn.Setup(nil, err)
+ 		} else {
+ 			conn.Setup(response.Body, nil)
+ 		}
+diff --git a/transport/v2rayhttp/conn_test.go b/transport/v2rayhttp/conn_test.go
+new file mode 100644
+index 000000000..518740c6c
+--- /dev/null
++++ b/transport/v2rayhttp/conn_test.go
+@@ -0,0 +1,61 @@
++package v2rayhttp
++
++import (
++	"context"
++	"io"
++	"syscall"
++	"testing"
++	"time"
++
++	"github.com/stretchr/testify/require"
++)
++
++// When RoundTrip fails (the server cannot be dialled), the request never establishes and
++// nothing reads the request-body pipe. A Write that started before the failure must not
++// block for ever: the client closes the read end of the pipe with the error, so the write
++// returns that error. Without the fix this test hangs and the goroutine and socket of every
++// such attempt leak, as they did in the gRPC-lite transport.
++func TestLateHTTPConnWriteUnblocksOnSetupError(t *testing.T) {
++	t.Parallel()
++	pipeReader, pipeWriter := io.Pipe()
++	defer pipeReader.Close()
++	_, cancel := context.WithCancel(context.Background())
++	conn := NewLateHTTPConn(pipeWriter, cancel)
++
++	writeErr := make(chan error, 1)
++	go func() {
++		_, err := conn.Write([]byte("handshake"))
++		writeErr <- err
++	}()
++
++	// the write is now blocked on the pipe that nobody reads
++	select {
++	case <-writeErr:
++		t.Fatal("write returned before the request failed")
++	case <-time.After(100 * time.Millisecond):
++	}
++
++	pipeReader.CloseWithError(syscall.ECONNREFUSED)
++	conn.Setup(nil, syscall.ECONNREFUSED)
++
++	// the blocked write returns the dial error itself instead of hanging (the field case: the
++	// server refuses or is blackholed)
++	select {
++	case err := <-writeErr:
++		require.ErrorIs(t, err, syscall.ECONNREFUSED)
++	case <-time.After(5 * time.Second):
++		t.Fatal("write still blocked after setup failed: the goroutine and socket would leak")
++	}
++
++	// a write after the failure also returns at once, it does not block
++	done := make(chan struct{})
++	go func() {
++		conn.Write([]byte("after"))
++		close(done)
++	}()
++	select {
++	case <-done:
++	case <-time.After(5 * time.Second):
++		t.Fatal("a write after the failure blocked")
++	}
++}
+diff --git a/transport/v2rayhttpupgrade/client.go b/transport/v2rayhttpupgrade/client.go
+index 207c4ebe6..9d243bdfb 100644
+--- a/transport/v2rayhttpupgrade/client.go
++++ b/transport/v2rayhttpupgrade/client.go
+@@ -82,6 +82,11 @@ func (c *Client) DialContext(ctx context.Context) (net.Conn, error) {
+ 	if err != nil {
+ 		return nil, err
+ 	}
++	// the upgrade reads with no deadline: the end of ctx has to reach it (podkop-engine). The
++	// watcher ends with the dial, so an upgraded connection does not die with ctx
++	handshakeConn := conn
++	stop := context.AfterFunc(ctx, func() { handshakeConn.Close() })
++	defer stop()
+ 	request := &http.Request{
+ 		Method: http.MethodGet,
+ 		URL:    &c.requestURL,
+diff --git a/transport/v2rayhttpupgrade/client_test.go b/transport/v2rayhttpupgrade/client_test.go
+new file mode 100644
+index 000000000..622808db4
+--- /dev/null
++++ b/transport/v2rayhttpupgrade/client_test.go
+@@ -0,0 +1,101 @@
++package v2rayhttpupgrade
++
++import (
++	"bufio"
++	"context"
++	"io"
++	"net"
++	"net/http"
++	"testing"
++	"time"
++
++	"github.com/sagernet/sing-box/option"
++	M "github.com/sagernet/sing/common/metadata"
++	N "github.com/sagernet/sing/common/network"
++
++	"github.com/stretchr/testify/require"
++)
++
++func testClient(t *testing.T, serve func(conn net.Conn)) *Client {
++	t.Helper()
++	listener, err := net.Listen("tcp", "127.0.0.1:0")
++	require.NoError(t, err)
++	t.Cleanup(func() { listener.Close() })
++	go func() {
++		for {
++			conn, err := listener.Accept()
++			if err != nil {
++				return
++			}
++			go func() {
++				defer conn.Close()
++				serve(conn)
++			}()
++		}
++	}()
++	client, err := NewClient(context.Background(), N.SystemDialer, M.SocksaddrFromNet(listener.Addr()), option.V2RayHTTPUpgradeOptions{Path: "/"}, nil)
++	require.NoError(t, err)
++	return client
++}
++
++// A server that takes the request and never answers: the dial ends with its context, or a caller
++// that holds a lock across it (the probe of the block detector) blocks whoever waits for that lock.
++func TestDialEndsWithItsContext(t *testing.T) {
++	client := testClient(t, func(conn net.Conn) { io.Copy(io.Discard, conn) })
++	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
++	defer cancel()
++	result := make(chan error, 1)
++	go func() {
++		conn, err := client.DialContext(ctx)
++		if err == nil {
++			conn.Close()
++		}
++		result <- err
++	}()
++	select {
++	case err := <-result:
++		require.Error(t, err)
++	case <-time.After(3 * time.Second):
++		t.Fatal("the upgrade outlived the context of its dial")
++	}
++}
++
++// A healthy upgraded connection does not die with the context of its dial, what came with the
++// answer included.
++func TestUpgradedConnectionOutlivesItsDialContext(t *testing.T) {
++	send := make(chan struct{})
++	client := testClient(t, func(conn net.Conn) {
++		request, err := http.ReadRequest(bufio.NewReader(conn))
++		if err != nil {
++			t.Error(err)
++			return
++		}
++		request.Body.Close()
++		_, err = io.WriteString(conn, "HTTP/1.1 101 Switching Protocols\r\nConnection: upgrade\r\nUpgrade: websocket\r\n\r\nearly")
++		if err != nil {
++			t.Error(err)
++			return
++		}
++		<-send
++		_, err = io.WriteString(conn, "late")
++		if err != nil {
++			t.Error(err)
++			return
++		}
++		io.Copy(io.Discard, conn)
++	})
++	ctx, cancel := context.WithCancel(context.Background())
++	conn, err := client.DialContext(ctx)
++	require.NoError(t, err)
++	defer conn.Close()
++	cancel()
++	time.Sleep(50 * time.Millisecond)
++	close(send)
++	require.NoError(t, conn.SetReadDeadline(time.Now().Add(3*time.Second)))
++	data := make([]byte, len("earlylate"))
++	_, err = io.ReadFull(conn, data)
++	require.NoError(t, err)
++	require.Equal(t, "earlylate", string(data))
++	_, err = conn.Write([]byte("more"))
++	require.NoError(t, err)
++}
+diff --git a/transport/v2rayquic/stream.go b/transport/v2rayquic/stream.go
+index 7be6e2a92..5015bbf71 100644
+--- a/transport/v2rayquic/stream.go
++++ b/transport/v2rayquic/stream.go
+@@ -6,7 +6,9 @@ import (
+ 	"time"
+ 
+ 	"github.com/sagernet/quic-go"
++	"github.com/sagernet/sing-box/common/readwait"
+ 	qtls "github.com/sagernet/sing-quic"
++	N "github.com/sagernet/sing/common/network"
+ )
+ 
+ type StreamWrapper struct {
+@@ -21,6 +23,16 @@ func (s *StreamWrapper) Read(p []byte) (n int, err error) {
+ 	return n, qtls.WrapError(err)
+ }
+ 
++// CreateReadWaiter lets the copy loop wait for data with Peek before it takes a buffer
++// (podkop-engine, see common/readwait).
++func (s *StreamWrapper) CreateReadWaiter() (N.ReadWaiter, bool) {
++	peekBuffer := make([]byte, 1)
++	return readwait.NewPeekWaiter(s, func() error {
++		_, err := s.Stream.Peek(peekBuffer)
++		return err
++	}), true
++}
++
+ func (s *StreamWrapper) Write(p []byte) (n int, err error) {
+ 	n, err = s.Stream.Write(p)
+ 	return n, qtls.WrapError(err)
+diff --git a/transport/v2raywebsocket/client.go b/transport/v2raywebsocket/client.go
+index 54d748f1b..b18a0c67e 100644
+--- a/transport/v2raywebsocket/client.go
++++ b/transport/v2raywebsocket/client.go
+@@ -81,6 +81,10 @@ func (c *Client) DialContext(ctx context.Context) (net.Conn, error) {
+ 	if c.maxEarlyData > 0 {
+ 		return &EarlyWebsocketConn{Client: c, rawConn: conn, create: make(chan struct{})}, nil
+ 	}
++	// the upgrade knows only its own deadline: the end of ctx has to reach it (podkop-engine). The
++	// watcher ends with the dial, so an upgraded connection does not die with ctx
++	stop := context.AfterFunc(ctx, func() { conn.Close() })
++	defer stop()
+ 	websocketConn, err := c.upgrade(conn, &c.requestURL, c.headers)
+ 	if err != nil {
+ 		return nil, err
+diff --git a/transport/v2raywebsocket/client_test.go b/transport/v2raywebsocket/client_test.go
+new file mode 100644
+index 000000000..844d88062
+--- /dev/null
++++ b/transport/v2raywebsocket/client_test.go
+@@ -0,0 +1,107 @@
++package v2raywebsocket
++
++import (
++	"context"
++	"io"
++	"net"
++	"testing"
++	"time"
++
++	"github.com/sagernet/sing-box/adapter"
++	"github.com/sagernet/sing-box/option"
++	M "github.com/sagernet/sing/common/metadata"
++	N "github.com/sagernet/sing/common/network"
++	"github.com/sagernet/ws"
++
++	"github.com/stretchr/testify/require"
++)
++
++func testClient(t *testing.T, serve func(conn net.Conn)) adapter.V2RayClientTransport {
++	t.Helper()
++	listener, err := net.Listen("tcp", "127.0.0.1:0")
++	require.NoError(t, err)
++	t.Cleanup(func() { listener.Close() })
++	go func() {
++		for {
++			conn, err := listener.Accept()
++			if err != nil {
++				return
++			}
++			go func() {
++				defer conn.Close()
++				serve(conn)
++			}()
++		}
++	}()
++	client, err := NewClient(context.Background(), N.SystemDialer, M.SocksaddrFromNet(listener.Addr()), option.V2RayWebsocketOptions{Path: "/"}, nil)
++	require.NoError(t, err)
++	return client
++}
++
++// A server that takes the request and never answers: the dial ends with its context, not at the
++// fixed deadline of the upgrade, or a caller that holds a lock across it (the probe of the block
++// detector) blocks whoever waits for that lock.
++func TestDialEndsWithItsContext(t *testing.T) {
++	client := testClient(t, func(conn net.Conn) { io.Copy(io.Discard, conn) })
++	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
++	defer cancel()
++	result := make(chan error, 1)
++	go func() {
++		conn, err := client.DialContext(ctx)
++		if err == nil {
++			conn.Close()
++		}
++		result <- err
++	}()
++	select {
++	case err := <-result:
++		require.Error(t, err)
++	case <-time.After(3 * time.Second):
++		t.Fatal("the upgrade outlived the context of its dial")
++	}
++}
++
++// A healthy upgraded connection does not die with the context of its dial.
++func TestUpgradedConnectionOutlivesItsDialContext(t *testing.T) {
++	send := make(chan struct{})
++	client := testClient(t, func(conn net.Conn) {
++		_, err := ws.Upgrade(conn)
++		if err != nil {
++			t.Error(err)
++			return
++		}
++		<-send
++		err = ws.WriteFrame(conn, ws.NewBinaryFrame([]byte("late")))
++		if err != nil {
++			t.Error(err)
++			return
++		}
++		io.Copy(io.Discard, conn)
++	})
++	ctx, cancel := context.WithCancel(context.Background())
++	conn, err := client.DialContext(ctx)
++	require.NoError(t, err)
++	defer conn.Close()
++	cancel()
++	time.Sleep(50 * time.Millisecond)
++	close(send)
++	// this connection has no read deadline
++	read := make(chan string, 1)
++	go func() {
++		data := make([]byte, len("late"))
++		_, err := io.ReadFull(conn, data)
++		if err != nil {
++			read <- err.Error()
++			return
++		}
++		read <- string(data)
++	}()
++	select {
++	case data := <-read:
++		require.Equal(t, "late", data)
++	case <-time.After(3 * time.Second):
++		t.Fatal("nothing came through the upgraded connection")
++	}
++	_, err = conn.Write([]byte("more"))
++	require.NoError(t, err)
++}
+-- 
+2.53.0
+

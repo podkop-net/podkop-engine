@@ -1,0 +1,43 @@
+From 61403d8a92c6ad72f981c92647094b48b4bc85e9 Mon Sep 17 00:00:00 2001
+From: FiyeroT <me@fiyero.xyz>
+Date: Thu, 12 Nov 2026 21:41:21 +0300
+Subject: [PATCH 55/57] box: StartWithoutClose leaves a box whose start failed
+ to its caller
+
+StartWithoutClose leaves a box whose start failed to its caller.
+
+Made of these commits of the earlier series (branch archive/r25-1.14-commits):
+  6d546710b box: StartWithoutClose leaves a box whose start failed to its caller
+
+Pdk-Feature: box-start
+Pdk-Zone: other
+Pdk-Layer: 04
+---
+ box.go | 11 +++++++++++
+ 1 file changed, 11 insertions(+)
+
+diff --git a/box.go b/box.go
+index d9d90b90f..60e450dbd 100644
+--- a/box.go
++++ b/box.go
+@@ -504,6 +504,17 @@ func (s *Box) PreStart() error {
+ }
+ 
+ func (s *Box) Start() error {
++	err := s.StartWithoutClose()
++	if err != nil {
++		s.Close()
++	}
++	return err
++}
++
++// StartWithoutClose is Start that leaves a box whose start failed as it is: the caller
++// closes it, and may bound how long that takes (podkop-engine). Start closes it at once,
++// and a component whose Close does not return holds Start with it.
++func (s *Box) StartWithoutClose() error {
+ 	err := s.start()
+ 	if err != nil {
+ 		return err
+-- 
+2.53.0
+

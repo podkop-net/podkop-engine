@@ -1,0 +1,128 @@
+From 4dd81c868fe0b7b45de7a99a60308bca6cc69b52 Mon Sep 17 00:00:00 2001
+From: FiyeroT <me@fiyero.xyz>
+Date: Thu, 12 Nov 2026 21:41:19 +0300
+Subject: [PATCH 12/57] dns, hooks in upstream files: ipv6_if_no_ipv4
+
+The lines of upstream files that "dns: ipv6_if_no_ipv4" needs; the feature itself is its patch of
+layer 03, in files of its own.
+
+Pdk-Feature: dns-ipv6
+Pdk-Zone: core
+Pdk-Layer: 02
+---
+ dns/client.go | 25 ++++++++++++++++++++++++-
+ dns/router.go |  9 ++++++++-
+ option/dns.go |  4 ++++
+ 3 files changed, 36 insertions(+), 2 deletions(-)
+
+diff --git a/dns/client.go b/dns/client.go
+index 61769494f..234b55eae 100644
+--- a/dns/client.go
++++ b/dns/client.go
+@@ -66,6 +66,7 @@ type ClientOptions struct {
+ 	RDRC              func() adapter.RDRCStore
+ 	DNSCache          func() adapter.DNSCacheStore
+ 	Logger            logger.ContextLogger
++	IPv6IfNoIPv4      bool
+ }
+ 
+ func NewClient(options ClientOptions) *Client {
+@@ -81,6 +82,7 @@ func NewClient(options ClientOptions) *Client {
+ 		initRDRCFunc:      options.RDRC,
+ 		initDNSCacheFunc:  options.DNSCache,
+ 		logger:            options.Logger,
++		ipv6IfNoIPv4:      options.IPv6IfNoIPv4,
+ 	}
+ 	if client.timeout == 0 {
+ 		client.timeout = C.DNSTimeout
+@@ -404,6 +406,13 @@ func (c *Client) finishExchange(transport adapter.DNSTransport, operation *excha
+ }
+ 
+ func (c *Client) Exchange(ctx context.Context, transport adapter.DNSTransport, message *dns.Msg, options adapter.DNSQueryOptions, responseChecker func(response *dns.Msg) bool) (*dns.Msg, error) {
++	if c.mayAskIPv6(transport, message, options) && c.noIPv4(ctx, transport, message, options, responseChecker) {
++		options.Strategy = C.DomainStrategyPreferIPv4
++	}
++	return c.exchange(ctx, transport, message, options, responseChecker)
++}
++
++func (c *Client) exchange(ctx context.Context, transport adapter.DNSTransport, message *dns.Msg, options adapter.DNSQueryOptions, responseChecker func(response *dns.Msg) bool) (*dns.Msg, error) {
+ 	if options.Timeout == 0 {
+ 		options.Timeout = c.timeout
+ 	}
+@@ -422,6 +431,16 @@ func (c *Client) Exchange(ctx context.Context, transport adapter.DNSTransport, m
+ }
+ 
+ func (c *Client) ExchangeAsync(ctx context.Context, transport adapter.DNSTransport, message *dns.Msg, options adapter.DNSQueryOptions, responseChecker func(response *dns.Msg) bool, callback func(response *dns.Msg, err error)) {
++	if c.mayAskIPv6(transport, message, options) {
++		// the A question may have to go out: not on the caller's goroutine
++		go func() {
++			if c.noIPv4(ctx, transport, message, options, responseChecker) {
++				options.Strategy = C.DomainStrategyPreferIPv4
++			}
++			callback(c.exchange(ctx, transport, message, options, responseChecker))
++		}()
++		return
++	}
+ 	if options.Timeout == 0 {
+ 		options.Timeout = c.timeout
+ 	}
+@@ -469,7 +488,11 @@ func (c *Client) Lookup(ctx context.Context, transport adapter.DNSTransport, dom
+ 	}
+ 	switch strategy {
+ 	case C.DomainStrategyIPv4Only:
+-		return c.lookupToExchange(ctx, transport, dnsName, dns.TypeA, lookupOptions, responseChecker)
++		addresses, err := c.lookupToExchange(ctx, transport, dnsName, dns.TypeA, lookupOptions, responseChecker)
++		if err == nil && len(addresses) == 0 && c.ipv6IfNoIPv4 && transport.Type() != C.DNSTypeFakeIP {
++			return c.lookupToExchange(ctx, transport, dnsName, dns.TypeAAAA, lookupOptions, responseChecker)
++		}
++		return addresses, err
+ 	case C.DomainStrategyIPv6Only:
+ 		return c.lookupToExchange(ctx, transport, dnsName, dns.TypeAAAA, lookupOptions, responseChecker)
+ 	}
+diff --git a/dns/router.go b/dns/router.go
+index dec640141..aa673b7ef 100644
+--- a/dns/router.go
++++ b/dns/router.go
+@@ -81,8 +81,10 @@ func NewRouter(ctx context.Context, logFactory log.Factory, options option.DNSOp
+ 			optimisticTimeout = 3 * 24 * time.Hour
+ 		}
+ 	}
++	router.ipv6IfNoIPv4 = options.DNSClientOptions.IPv6IfNoIPv4
+ 	router.client = NewClient(ClientOptions{
+ 		Context:           ctx,
++		IPv6IfNoIPv4:      options.DNSClientOptions.IPv6IfNoIPv4,
+ 		Timeout:           time.Duration(options.DNSClientOptions.Timeout),
+ 		DisableCache:      options.DNSClientOptions.DisableCache,
+ 		DisableExpire:     options.DNSClientOptions.DisableExpire,
+@@ -992,7 +994,12 @@ func (r *Router) lookupWithRules(ctx context.Context, rules []adapter.DNSRule, d
+ 		lookupOptions.Strategy = strategy
+ 	}
+ 	if strategy == C.DomainStrategyIPv4Only {
+-		return r.lookupWithRulesType(ctx, rules, domain, mDNS.TypeA, lookupOptions)
++		addresses, err := r.lookupWithRulesType(ctx, rules, domain, mDNS.TypeA, lookupOptions)
++		if err == nil && len(addresses) == 0 && r.ipv6IfNoIPv4 {
++			// podkop-engine: a name without an IPv4 address (dns/client_ipv6.go)
++			return r.lookupWithRulesType(ctx, rules, domain, mDNS.TypeAAAA, lookupOptions)
++		}
++		return addresses, err
+ 	}
+ 	if strategy == C.DomainStrategyIPv6Only {
+ 		return r.lookupWithRulesType(ctx, rules, domain, mDNS.TypeAAAA, lookupOptions)
+diff --git a/option/dns.go b/option/dns.go
+index 299c734c7..aee455763 100644
+--- a/option/dns.go
++++ b/option/dns.go
+@@ -68,6 +68,10 @@ type DNSClientOptions struct {
+ 	CacheCapacity    uint32                `json:"cache_capacity,omitempty"`
+ 	Optimistic       *OptimisticDNSOptions `json:"optimistic,omitempty"`
+ 	ClientSubnet     *badoption.Prefixable `json:"client_subnet,omitempty"`
++	// podkop-engine: with the strategy ipv4_only, the AAAA question of a name that has no
++	// IPv4 address is asked, and a lookup of such a name takes its IPv6 addresses
++	// (dns/client_ipv6.go)
++	IPv6IfNoIPv4 bool `json:"ipv6_if_no_ipv4,omitempty"`
+ }
+ 
+ type _OptimisticDNSOptions struct {
+-- 
+2.53.0
+

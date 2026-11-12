@@ -1,0 +1,1328 @@
+From 100073d6a69539daafb593552d7f81b29c072aac Mon Sep 17 00:00:00 2001
+From: FiyeroT <me@fiyero.xyz>
+Date: Thu, 12 Nov 2026 21:41:20 +0300
+Subject: [PATCH 36/57] tls: uTLS and REALITY clients as Xray and the browsers
+ do
+
+REALITY keeps the X25519MLKEM768 key share and announces Xray's client version; the uTLS hellos of
+the browsers are built from their specification (Firefox 148, Safari 26.3, chrome, edge, ios and the
+rest); the handshake state is released after the handshake; the TLS dialer reads a pending alert
+after data as crypto/tls does; REALITY refuses what it cannot use.
+
+Made of these commits of the earlier series (branch archive/r25-1.14-commits):
+  b8464e0cf reality: keep X25519MLKEM768 key share, announce client version 26.3.27
+  b6985ee63 utls: firefox -> Firefox 148, safari -> Safari 26.3 (as Xray-core)
+  7392caf99 utls: keep the randomized fingerprint consistent
+  478cbe204 tls: release the uTLS handshake state after the handshake
+  7e4affe4e badtls: read a pending alert after data, as crypto/tls does
+  555fd2231 tls: give the connections of the TLS dialer the badtls read waiter
+  4e6496d2e tls: name the uTLS fingerprints REALITY cannot use
+  67f48d60e tls: do not rebuild the Client Hello after the handshake
+  de1ead908 tls: make the uTLS hello of chrome, edge, ios, qq, 360 and android from its specification
+  d0485065e reality: refuse a short_id longer than it can be
+  28769b0d9 tls: REALITY: drop the loop that did not change the ALPN
+
+Pdk-Feature: utls-reality
+Pdk-Zone: protocols
+Pdk-Layer: 04
+---
+ common/badtls/read_wait.go             |   2 +-
+ common/tls/client.go                   |  25 +-
+ common/tls/client_read_wait_test.go    |  83 ++++++
+ common/tls/reality_client.go           |  84 ++++--
+ common/tls/reality_fingerprint_test.go | 398 +++++++++++++++++++++++++
+ common/tls/reality_server.go           |   5 +
+ common/tls/utls_client.go              |  57 +++-
+ common/tls/utls_spec.go                | 280 +++++++++++++++++
+ common/tls/utls_spec_test.go           | 100 +++++++
+ docs/configuration/shared/tls.md       |   5 +
+ docs/configuration/shared/tls.zh.md    |   4 +
+ 11 files changed, 1006 insertions(+), 37 deletions(-)
+ create mode 100644 common/tls/client_read_wait_test.go
+ create mode 100644 common/tls/reality_fingerprint_test.go
+ create mode 100644 common/tls/utls_spec.go
+ create mode 100644 common/tls/utls_spec_test.go
+
+diff --git a/common/badtls/read_wait.go b/common/badtls/read_wait.go
+index 982f0f17f..0922323de 100644
+--- a/common/badtls/read_wait.go
++++ b/common/badtls/read_wait.go
+@@ -62,7 +62,7 @@ func (c *ReadWaitConn) WaitReadBuffer() (buffer *buf.Buffer, err error) {
+ 	}
+ 	buffer.Truncate(n)
+ 
+-	if n != 0 && c.rawConn.Input.Len() == 0 && c.rawConn.Input.Len() > 0 &&
++	if n != 0 && c.rawConn.Input.Len() == 0 && c.rawConn.RawInput.Len() > 0 &&
+ 		// recordType(c.RawInput.Bytes()[0]) == recordTypeAlert {
+ 		c.rawConn.RawInput.Bytes()[0] == 21 {
+ 		_ = c.rawConn.ReadRecord()
+diff --git a/common/tls/client.go b/common/tls/client.go
+index 7b303687c..ae6b23198 100644
+--- a/common/tls/client.go
++++ b/common/tls/client.go
+@@ -7,10 +7,12 @@ import (
+ 	"net"
+ 	"os"
+ 	"strings"
++	"sync"
+ 
+ 	"github.com/sagernet/sing-box/common/badtls"
+ 	"github.com/sagernet/sing-box/common/tlsspoof"
+ 	C "github.com/sagernet/sing-box/constant"
++	"github.com/sagernet/sing-box/log"
+ 	"github.com/sagernet/sing-box/option"
+ 	E "github.com/sagernet/sing/common/exceptions"
+ 	"github.com/sagernet/sing/common/logger"
+@@ -122,6 +124,28 @@ func ClientHandshake(ctx context.Context, conn net.Conn, config Config) (Conn, e
+ 	return tlsConn, nil
+ }
+ 
++// withReadWait gives a client connection the read waiter of badtls, as ClientHandshake
++// does (podkop-engine): the dialer of the proxy protocols returned the bare connection,
++// so the copy loop took a buffer before every blocking read and an idle proxied
++// connection held it for as long as the server stayed silent. With the read waiter the
++// buffer is taken only once a whole record has arrived. A connection badtls cannot handle
++// is kept as it is, unlike in ClientHandshake: a change in the layout of crypto/tls or
++// utls must cost the read waiter, not every TLS dial.
++func withReadWait(tlsConn Conn) Conn {
++	readWaitConn, err := badtls.NewReadWaitConn(tlsConn)
++	if err == nil {
++		return readWaitConn
++	}
++	if err != os.ErrInvalid {
++		readWaitFailure.Do(func() {
++			log.StdLogger().Warn("TLS read waiter unavailable: ", err)
++		})
++	}
++	return tlsConn
++}
++
++var readWaitFailure sync.Once
++
+ type Dialer interface {
+ 	N.Dialer
+ 	DialTLSContext(ctx context.Context, destination M.Socksaddr) (Conn, error)
+@@ -168,7 +192,6 @@ func (d *defaultDialer) dialContext(ctx context.Context, destination M.Socksaddr
+ 		}
+ 		return nil, err
+ 	}
+-	return tlsConn, nil
+ }
+ 
+ func (d *defaultDialer) Upstream() any {
+diff --git a/common/tls/client_read_wait_test.go b/common/tls/client_read_wait_test.go
+new file mode 100644
+index 000000000..8f6fdb43d
+--- /dev/null
++++ b/common/tls/client_read_wait_test.go
+@@ -0,0 +1,83 @@
++//go:build go1.25 && badlinkname
++
++package tls
++
++import (
++	"context"
++	"crypto/ecdsa"
++	"crypto/elliptic"
++	"crypto/rand"
++	"crypto/tls"
++	"crypto/x509"
++	"crypto/x509/pkix"
++	"math/big"
++	"net"
++	"testing"
++	"time"
++
++	N "github.com/sagernet/sing/common/network"
++
++	"github.com/stretchr/testify/require"
++)
++
++func testCertificate(t *testing.T) tls.Certificate {
++	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
++	require.NoError(t, err)
++	template := &x509.Certificate{
++		SerialNumber: big.NewInt(1),
++		Subject:      pkix.Name{CommonName: "test"},
++		NotBefore:    time.Now().Add(-time.Hour),
++		NotAfter:     time.Now().Add(time.Hour),
++	}
++	der, err := x509.CreateCertificate(rand.Reader, template, template, &key.PublicKey, key)
++	require.NoError(t, err)
++	return tls.Certificate{Certificate: [][]byte{der}, PrivateKey: key}
++}
++
++// A connection from the dialer reads through the read waiter of badtls: the copy loop takes
++// a buffer only once a record has arrived, not before it waits.
++func TestWithReadWait(t *testing.T) {
++	serverSide, clientSide := net.Pipe()
++	defer serverSide.Close()
++	defer clientSide.Close()
++	certificate := testCertificate(t)
++	go func() {
++		server := tls.Server(serverSide, &tls.Config{Certificates: []tls.Certificate{certificate}})
++		server.Write([]byte("hello"))
++	}()
++	client := tls.Client(clientSide, &tls.Config{InsecureSkipVerify: true})
++	require.NoError(t, client.HandshakeContext(context.Background()))
++
++	readWaiter, isReadWaiter := withReadWait(client).(N.ReadWaiter)
++	require.True(t, isReadWaiter, "the dialer's connection has no read waiter")
++	require.False(t, readWaiter.InitializeReadWaiter(N.ReadWaitOptions{}), "the read waiter asks for a copy")
++	buffer, err := readWaiter.WaitReadBuffer()
++	require.NoError(t, err)
++	require.Equal(t, "hello", string(buffer.Bytes()))
++	buffer.Release()
++}
++
++type plainConn struct {
++	net.Conn
++}
++
++func (c plainConn) NetConn() net.Conn {
++	return c.Conn
++}
++
++func (c plainConn) HandshakeContext(context.Context) error {
++	return nil
++}
++
++func (c plainConn) ConnectionState() tls.ConnectionState {
++	return tls.ConnectionState{}
++}
++
++// A connection badtls does not know stays as it is, and the dial goes on.
++func TestWithReadWaitUnknownConn(t *testing.T) {
++	side, peer := net.Pipe()
++	defer side.Close()
++	defer peer.Close()
++	conn := plainConn{side}
++	require.Equal(t, Conn(conn), withReadWait(conn))
++}
+diff --git a/common/tls/reality_client.go b/common/tls/reality_client.go
+index be4806fe6..20597bda7 100644
+--- a/common/tls/reality_client.go
++++ b/common/tls/reality_client.go
+@@ -30,7 +30,6 @@ import (
+ 	"github.com/sagernet/sing-box/adapter"
+ 	C "github.com/sagernet/sing-box/constant"
+ 	"github.com/sagernet/sing-box/option"
+-	"github.com/sagernet/sing/common"
+ 	"github.com/sagernet/sing/common/debug"
+ 	E "github.com/sagernet/sing/common/exceptions"
+ 	"github.com/sagernet/sing/common/logger"
+@@ -60,8 +59,10 @@ func newRealityClient(ctx context.Context, logger logger.ContextLogger, serverAd
+ 	if options.UTLS == nil || !options.UTLS.Enabled {
+ 		return nil, E.New("uTLS is required by reality client")
+ 	}
+-	if options.Spoof != "" || options.SpoofMethod != "" {
+-		return nil, E.New("spoof is unsupported in reality")
++
++	classicFingerprint, err := checkRealityFingerprint(options.UTLS.Fingerprint)
++	if err != nil {
++		return nil, err
+ 	}
+ 
+ 	uClient, err := newUTLSClient(ctx, logger, serverAddress, options, allowEmptyServerName)
+@@ -77,6 +78,10 @@ func newRealityClient(ctx context.Context, logger logger.ContextLogger, serverAd
+ 		return nil, E.New("invalid public_key")
+ 	}
+ 	var shortID [8]byte
++	// hex.Decode writes past a destination shorter than its input (podkop-engine)
++	if len(options.Reality.ShortID) > 2*len(shortID) {
++		return nil, E.New("invalid short_id")
++	}
+ 	decodedLen, err := hex.Decode(shortID[:], []byte(options.Reality.ShortID))
+ 	if err != nil {
+ 		return nil, E.Cause(err, "decode short_id")
+@@ -85,7 +90,18 @@ func newRealityClient(ctx context.Context, logger logger.ContextLogger, serverAd
+ 		return nil, E.New("invalid short_id")
+ 	}
+ 
+-	var config Config = &RealityClientConfig{ctx, uClient.(*UTLSClientConfig), publicKey, shortID}
++	realityConfig := &RealityClientConfig{ctx: ctx, uClient: uClient.(*UTLSClientConfig), publicKey: publicKey, shortID: shortID, outcome: new(detectOutcomeWriter)}
++	realityConfig.fingerprint = options.UTLS.Fingerprint
++	if realityConfig.fingerprint == "" {
++		realityConfig.fingerprint = "chrome"
++	}
++	if classicFingerprint {
++		realityConfig.classicFingerprint = options.UTLS.Fingerprint
++		if logger != nil {
++			logger.Warn("uTLS fingerprint ", options.UTLS.Fingerprint, " carries no X25519MLKEM768 key share: ", realityHybridKeyShareNote, realityHybridKeyShareAdvice)
++		}
++	}
++	var config Config = realityConfig
+ 	if options.KernelRx || options.KernelTx {
+ 		if !C.IsLinux {
+ 			return nil, E.New("kTLS is only supported on Linux")
+@@ -146,32 +162,32 @@ func (e *RealityClientConfig) ClientHandshake(ctx context.Context, conn net.Conn
+ 	if err != nil {
+ 		return nil, err
+ 	}
+-	for _, extension := range uConn.Extensions {
+-		if ce, ok := extension.(*utls.SupportedCurvesExtension); ok {
+-			ce.Curves = common.Filter(ce.Curves, func(curveID utls.CurveID) bool {
+-				return curveID != utls.X25519MLKEM768
+-			})
+-		}
+-		if ks, ok := extension.(*utls.KeyShareExtension); ok {
+-			ks.KeyShares = common.Filter(ks.KeyShares, func(share utls.KeyShare) bool {
+-				return share.Group != utls.X25519MLKEM768
+-			})
+-		}
++	uConn, err := newUClient(conn, uConfig, e.uClient.id)
++	if err != nil {
++		return nil, err
+ 	}
++	verifier.UConn = uConn
++	// X25519MLKEM768 is kept as the fingerprint carries it: REALITY servers
++	// since Xray-core v26.9.8 (XTLS/REALITY@8cdf7bf) reject a Client Hello
++	// without an X25519MLKEM768 key share placed before the optional X25519 one.
+ 	err = uConn.BuildHandshakeState()
+ 	if err != nil {
+ 		return nil, err
+ 	}
+-
+-	if len(uConfig.NextProtos) > 0 {
+-		for _, extension := range uConn.Extensions {
+-			if alpnExtension, isALPN := extension.(*utls.ALPNExtension); isALPN {
+-				alpnExtension.AlpnProtocols = uConfig.NextProtos
+-				break
+-			}
++	if e.uClient.noMLKEM {
++		// a candidate of the fingerprint fallback: the ClientHello as stock sing-box sends it
++		dropMLKEM(uConn)
++		err = uConn.BuildHandshakeState()
++		if err != nil {
++			return nil, err
+ 		}
+ 	}
+ 
++	// The ALPN of the ClientHello is the fingerprint's: BuildHandshakeState has already put
++	// its list in uConfig.NextProtos, and changing the extension here would not reach the
++	// wire before the session ID is sealed below anyway. Only "randomized" reads the
++	// configured ALPN, when it builds its spec.
++
+ 	hello := uConn.HandshakeState.Hello
+ 	hello.SessionId = make([]byte, 32)
+ 	copy(hello.Raw[39:], hello.SessionId)
+@@ -184,9 +200,11 @@ func (e *RealityClientConfig) ClientHandshake(ctx context.Context, conn net.Conn
+ 	}
+ 	binary.BigEndian.PutUint64(hello.SessionId, uint64(nowTime.Unix()))
+ 
+-	hello.SessionId[0] = 1
+-	hello.SessionId[1] = 8
+-	hello.SessionId[2] = 1
++	// Client version checked against the server's minClientVer
++	// (Xray-core v26.7.x defaults to 26.3.27 and refuses older clients).
++	hello.SessionId[0] = 26
++	hello.SessionId[1] = 3
++	hello.SessionId[2] = 27
+ 	binary.BigEndian.PutUint32(hello.SessionId[4:], uint32(time.Now().Unix()))
+ 	copy(hello.SessionId[8:], e.shortID[:])
+ 	if debug.Enabled {
+@@ -200,7 +218,12 @@ func (e *RealityClientConfig) ClientHandshake(ctx context.Context, conn net.Conn
+ 	if keyShareKeys == nil {
+ 		return nil, E.New("nil KeyShareKeys")
+ 	}
++	// Same share the server picks: plain X25519 if present,
++	// otherwise the X25519 part of X25519MLKEM768.
+ 	ecdheKey := keyShareKeys.Ecdhe
++	if ecdheKey == nil {
++		ecdheKey = keyShareKeys.MlkemEcdhe
++	}
+ 	if ecdheKey == nil {
+ 		return nil, E.New("nil ecdheKey")
+ 	}
+@@ -227,6 +250,11 @@ func (e *RealityClientConfig) ClientHandshake(ctx context.Context, conn net.Conn
+ 
+ 	err = uConn.HandshakeContext(ctx)
+ 	if err != nil {
++		if verifier.rejected && e.classicFingerprint != "" {
++			// the server passed the connection on to its target, and the certificate of
++			// the target is not valid here: the cause is the same as below
++			return nil, e.verificationFailed(err)
++		}
+ 		return nil, err
+ 	}
+ 
+@@ -236,9 +264,10 @@ func (e *RealityClientConfig) ClientHandshake(ctx context.Context, conn net.Conn
+ 
+ 	if !verifier.verified {
+ 		go realityClientFallback(e.ctx, uConn, e.uClient.ServerName(), e.uClient.id)
+-		return nil, E.New("reality verification failed")
++		return nil, e.verificationFailed(nil)
+ 	}
+ 
++	releaseHandshakeState(uConn)
+ 	return &realityClientConnWrapper{uConn}, nil
+ }
+ 
+@@ -288,6 +317,8 @@ type realityVerifier struct {
+ 	serverName string
+ 	authKey    []byte
+ 	verified   bool
++	// the certificate is not the server's and did not pass the system verification
++	rejected bool
+ }
+ 
+ func (c *realityVerifier) VerifyPeerCertificate(rawCerts [][]byte, verifiedChains [][]*x509.Certificate) error {
+@@ -309,6 +340,7 @@ func (c *realityVerifier) VerifyPeerCertificate(rawCerts [][]byte, verifiedChain
+ 		opts.Intermediates.AddCert(cert)
+ 	}
+ 	if _, err := certs[0].Verify(opts); err != nil {
++		c.rejected = true
+ 		return err
+ 	}
+ 	return nil
+diff --git a/common/tls/reality_fingerprint_test.go b/common/tls/reality_fingerprint_test.go
+new file mode 100644
+index 000000000..81878772d
+--- /dev/null
++++ b/common/tls/reality_fingerprint_test.go
+@@ -0,0 +1,398 @@
++//go:build with_utls
++
++package tls
++
++import (
++	"context"
++	"crypto/ecdh"
++	"crypto/ecdsa"
++	"crypto/elliptic"
++	"crypto/rand"
++	"crypto/tls"
++	"crypto/x509"
++	"crypto/x509/pkix"
++	"encoding/base64"
++	"encoding/pem"
++	"io"
++	"math/big"
++	"net"
++	"os"
++	"path/filepath"
++	"runtime"
++	"strings"
++	"sync"
++	"testing"
++	"time"
++
++	"github.com/sagernet/sing-box/log"
++	"github.com/sagernet/sing-box/option"
++
++	"github.com/stretchr/testify/require"
++)
++
++type warnLog struct {
++	access sync.Mutex
++	lines  []string
++}
++
++func (l *warnLog) WriteMessage(level log.Level, message string) {
++	if level != log.LevelWarn {
++		return
++	}
++	l.access.Lock()
++	defer l.access.Unlock()
++	l.lines = append(l.lines, message)
++}
++
++func (l *warnLog) take() []string {
++	l.access.Lock()
++	defer l.access.Unlock()
++	lines := l.lines
++	l.lines = nil
++	return lines
++}
++
++func newWarnLogger(t *testing.T) (log.ContextLogger, *warnLog) {
++	writer := &warnLog{}
++	factory := log.NewDefaultFactory(context.Background(), log.Formatter{BaseTime: time.Now()}, io.Discard, "", writer, false)
++	factory.SetLevel(log.LevelDebug)
++	require.NoError(t, factory.Start())
++	t.Cleanup(func() { factory.Close() })
++	return factory.NewLogger("tls"), writer
++}
++
++func realityOptionsForTest(fingerprint string, reality bool) option.OutboundTLSOptions {
++	options := option.OutboundTLSOptions{
++		Enabled:    true,
++		ServerName: "example.org",
++		UTLS:       &option.OutboundUTLSOptions{Enabled: true, Fingerprint: fingerprint},
++	}
++	if reality {
++		serverKey, _ := ecdh.X25519().GenerateKey(rand.Reader)
++		options.Reality = &option.OutboundRealityOptions{
++			Enabled:   true,
++			PublicKey: base64.RawURLEncoding.EncodeToString(serverKey.PublicKey().Bytes()),
++			ShortID:   "0123456789abcdef",
++		}
++	}
++	return options
++}
++
++// The fingerprints of TLS 1.2 have no key share for REALITY to derive its key from: the
++// configuration is refused and the error names the fingerprint. Without REALITY they stay
++// usable.
++func TestRealityFingerprintWithoutKeyShareRefused(t *testing.T) {
++	for _, fingerprint := range []string{"android", "360"} {
++		t.Run(fingerprint, func(t *testing.T) {
++			logger, _ := newWarnLogger(t)
++			_, err := NewClient(context.Background(), logger, "example.org", realityOptionsForTest(fingerprint, true))
++			require.Error(t, err)
++			require.Contains(t, err.Error(), "uTLS fingerprint "+fingerprint+" ")
++			require.Contains(t, err.Error(), "reality")
++
++			_, err = NewClient(context.Background(), logger, "example.org", realityOptionsForTest(fingerprint, false))
++			require.NoError(t, err)
++		})
++	}
++}
++
++// The fingerprints with an X25519 key share only work with older REALITY servers: one
++// warning at creation names the fingerprint and the requirement. The fingerprints with the
++// hybrid key share, and any fingerprint without REALITY, warn about nothing.
++func TestRealityFingerprintWithoutHybridKeyShareWarns(t *testing.T) {
++	for _, testCase := range []struct {
++		fingerprint string
++		reality     bool
++		warns       bool
++	}{
++		{"edge", true, true},
++		{"ios", true, true},
++		{"qq", true, true},
++		{"", true, false},
++		{"chrome", true, false},
++		{"firefox", true, false},
++		{"safari", true, false},
++		{"random", true, false},
++		{"randomized", true, false},
++		{"edge", false, false},
++		{"ios", false, false},
++		{"qq", false, false},
++	} {
++		name := testCase.fingerprint
++		if name == "" {
++			name = "default"
++		}
++		if !testCase.reality {
++			name += " without reality"
++		}
++		t.Run(name, func(t *testing.T) {
++			logger, writer := newWarnLogger(t)
++			config, err := NewClient(context.Background(), logger, "example.org", realityOptionsForTest(testCase.fingerprint, testCase.reality))
++			require.NoError(t, err)
++			// a copy, which every connection of some transports takes, does not warn again
++			config.Clone()
++			lines := writer.take()
++			if !testCase.warns {
++				require.Empty(t, lines)
++				return
++			}
++			require.Len(t, lines, 1)
++			require.Contains(t, lines[0], "uTLS fingerprint "+testCase.fingerprint+" ")
++			require.Contains(t, lines[0], "X25519MLKEM768")
++			require.Contains(t, lines[0], "Xray-core v26.9.8")
++		})
++	}
++}
++
++// trustedServerCertificate is a certificate for example.org that the system verifier of
++// this process accepts: REALITY verifies the certificate of a server that did not
++// authenticate against the system roots, which a test can add to only through
++// SSL_CERT_FILE and only before their first use: a test of this package that verifies
++// against the system roots calls this first. From then on the roots of the test process
++// are this test root and the certificates of the system directories.
++var trustedServerCertificate = sync.OnceValues(func() (tls.Certificate, bool) {
++	rootKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
++	if err != nil {
++		return tls.Certificate{}, false
++	}
++	rootTemplate := &x509.Certificate{
++		SerialNumber:          big.NewInt(1),
++		Subject:               pkix.Name{CommonName: "test root"},
++		NotBefore:             time.Now().Add(-time.Hour),
++		NotAfter:              time.Now().Add(time.Hour),
++		KeyUsage:              x509.KeyUsageCertSign,
++		BasicConstraintsValid: true,
++		IsCA:                  true,
++	}
++	rootDER, err := x509.CreateCertificate(rand.Reader, rootTemplate, rootTemplate, &rootKey.PublicKey, rootKey)
++	if err != nil {
++		return tls.Certificate{}, false
++	}
++	leafKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
++	if err != nil {
++		return tls.Certificate{}, false
++	}
++	leafTemplate := &x509.Certificate{
++		SerialNumber: big.NewInt(2),
++		Subject:      pkix.Name{CommonName: "example.org"},
++		DNSNames:     []string{"example.org"},
++		NotBefore:    time.Now().Add(-time.Hour),
++		NotAfter:     time.Now().Add(time.Hour),
++		KeyUsage:     x509.KeyUsageDigitalSignature,
++		ExtKeyUsage:  []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
++	}
++	leafDER, err := x509.CreateCertificate(rand.Reader, leafTemplate, rootTemplate, &leafKey.PublicKey, rootKey)
++	if err != nil {
++		return tls.Certificate{}, false
++	}
++	leaf, err := x509.ParseCertificate(leafDER)
++	if err != nil {
++		return tls.Certificate{}, false
++	}
++
++	directory, err := os.MkdirTemp("", "reality-roots")
++	if err != nil {
++		return tls.Certificate{}, false
++	}
++	defer os.RemoveAll(directory)
++	rootsPath := filepath.Join(directory, "roots.pem")
++	err = os.WriteFile(rootsPath, pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: rootDER}), 0o600)
++	if err != nil {
++		return tls.Certificate{}, false
++	}
++	savedFile, hadFile := os.LookupEnv("SSL_CERT_FILE")
++	os.Setenv("SSL_CERT_FILE", rootsPath)
++	defer func() {
++		if hadFile {
++			os.Setenv("SSL_CERT_FILE", savedFile)
++		} else {
++			os.Unsetenv("SSL_CERT_FILE")
++		}
++	}()
++	// loads the system roots, unless something has loaded them before
++	_, err = leaf.Verify(x509.VerifyOptions{DNSName: "example.org"})
++	if err != nil {
++		return tls.Certificate{}, false
++	}
++	return tls.Certificate{Certificate: [][]byte{leafDER}, PrivateKey: leafKey, Leaf: leaf}, true
++})
++
++// plainTLSServer answers one connection as the target of a REALITY server does for a
++// client it did not recognise: a TLS handshake with its own certificate.
++func plainTLSServer(t *testing.T, conn net.Conn, certificate tls.Certificate) {
++	done := make(chan struct{})
++	go func() {
++		defer close(done)
++		defer conn.Close()
++		serverConn := tls.Server(conn, &tls.Config{
++			Certificates:           []tls.Certificate{certificate},
++			SessionTicketsDisabled: true,
++		})
++		if serverConn.Handshake() != nil {
++			return
++		}
++		io.Copy(io.Discard, serverConn)
++	}()
++	t.Cleanup(func() {
++		conn.Close()
++		<-done
++	})
++}
++
++// A server that takes the Client Hello for a stranger's hands the connection to its target,
++// and the client sees a valid certificate that is not the server's. With a fingerprint that
++// lacks the hybrid key share the error says that the fingerprint may be the cause.
++func TestRealityVerificationFailureNamesFingerprint(t *testing.T) {
++	certificate, trusted := trustedServerCertificate()
++	if !trusted {
++		if runtime.GOOS == "linux" {
++			// a skip would go unnoticed, and nothing else tests the text of this error
++			t.Fatal("the system roots of this process cannot be set: were they loaded by an earlier test?")
++		}
++		t.Skip("the system roots of this process cannot be set")
++	}
++	for _, testCase := range []struct {
++		fingerprint string
++		named       bool
++	}{
++		{"ios", true},
++		{"edge", true},
++		{"qq", true},
++		{"chrome", false},
++	} {
++		t.Run(testCase.fingerprint, func(t *testing.T) {
++			logger, _ := newWarnLogger(t)
++			config, err := NewClient(context.Background(), logger, "example.org", realityOptionsForTest(testCase.fingerprint, true))
++			require.NoError(t, err)
++			client, server := net.Pipe()
++			defer client.Close()
++			plainTLSServer(t, server, certificate)
++
++			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
++			defer cancel()
++			// a copy, as the transports that set their own ALPN make
++			_, err = ClientHandshake(ctx, client, config.Clone())
++			require.Error(t, err)
++			require.True(t, strings.HasPrefix(err.Error(), "reality verification failed"), err.Error())
++			if !testCase.named {
++				require.Equal(t, "reality verification failed", err.Error())
++				return
++			}
++			require.Contains(t, err.Error(), "uTLS fingerprint "+testCase.fingerprint+":")
++			require.Contains(t, err.Error(), "X25519MLKEM768")
++			require.Contains(t, err.Error(), "Xray-core v26.9.8")
++		})
++	}
++}
++
++// The certificate of the target may also be one this host does not accept (no CA bundle, a
++// clock that is not set yet): the handshake then fails on the certificate, and the error
++// names the fingerprint as well. Other fingerprints keep the bare error.
++func TestRealityRejectedCertificateNamesFingerprint(t *testing.T) {
++	// this test verifies against the system roots too and must not load them first
++	trustedServerCertificate()
++	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
++	require.NoError(t, err)
++	template := &x509.Certificate{
++		SerialNumber: big.NewInt(1),
++		Subject:      pkix.Name{CommonName: "example.org"},
++		DNSNames:     []string{"example.org"},
++		NotBefore:    time.Now().Add(-time.Hour),
++		NotAfter:     time.Now().Add(time.Hour),
++	}
++	der, err := x509.CreateCertificate(rand.Reader, template, template, &key.PublicKey, key)
++	require.NoError(t, err)
++	certificate := tls.Certificate{Certificate: [][]byte{der}, PrivateKey: key}
++
++	for _, testCase := range []struct {
++		fingerprint string
++		named       bool
++	}{
++		{"ios", true},
++		{"edge", true},
++		{"qq", true},
++		{"chrome", false},
++	} {
++		t.Run(testCase.fingerprint, func(t *testing.T) {
++			logger, _ := newWarnLogger(t)
++			config, err := NewClient(context.Background(), logger, "example.org", realityOptionsForTest(testCase.fingerprint, true))
++			require.NoError(t, err)
++			// a socket, not a pipe: the alert of the client and the rest of the server's
++			// flight cross on the way, and a pipe buffers neither
++			listener, err := net.Listen("tcp", "127.0.0.1:0")
++			require.NoError(t, err)
++			defer listener.Close()
++			client, err := net.Dial("tcp", listener.Addr().String())
++			require.NoError(t, err)
++			defer client.Close()
++			server, err := listener.Accept()
++			require.NoError(t, err)
++			plainTLSServer(t, server, certificate)
++
++			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
++			defer cancel()
++			_, err = ClientHandshake(ctx, client, config.Clone())
++			require.Error(t, err)
++			require.Contains(t, err.Error(), "x509: ")
++			if !testCase.named {
++				require.NotContains(t, err.Error(), "uTLS fingerprint")
++				require.NotContains(t, err.Error(), "reality verification failed")
++				return
++			}
++			require.True(t, strings.HasPrefix(err.Error(), "reality verification failed"), err.Error())
++			require.Contains(t, err.Error(), "uTLS fingerprint "+testCase.fingerprint+":")
++			require.Contains(t, err.Error(), "Xray-core v26.9.8")
++		})
++	}
++}
++
++// The handshake state is released once the handshake is done. A second HandshakeContext
++// on a connection with ALPN has no Client Hello to rebuild and reports the finished
++// handshake instead.
++func TestUTLSALPNHandshakeAgainAfterRelease(t *testing.T) {
++	rootKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
++	require.NoError(t, err)
++	template := &x509.Certificate{
++		SerialNumber: big.NewInt(1),
++		Subject:      pkix.Name{CommonName: "example.org"},
++		DNSNames:     []string{"example.org"},
++		NotBefore:    time.Now().Add(-time.Hour),
++		NotAfter:     time.Now().Add(time.Hour),
++	}
++	der, err := x509.CreateCertificate(rand.Reader, template, template, &rootKey.PublicKey, rootKey)
++	require.NoError(t, err)
++
++	options := realityOptionsForTest("chrome", false)
++	options.Insecure = true
++	options.ALPN = []string{"h2", "http/1.1"}
++	config, err := NewClient(context.Background(), nil, "example.org", options)
++	require.NoError(t, err)
++	client, server := net.Pipe()
++	defer client.Close()
++	plainTLSServer(t, server, tls.Certificate{Certificate: [][]byte{der}, PrivateKey: rootKey})
++
++	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
++	defer cancel()
++	conn, err := config.Client(client)
++	require.NoError(t, err)
++	require.IsType(t, &utlsALPNWrapper{}, conn)
++	require.NoError(t, conn.HandshakeContext(ctx))
++	require.Nil(t, conn.(*utlsALPNWrapper).HandshakeState.Hello)
++	require.NotPanics(t, func() {
++		require.NoError(t, conn.HandshakeContext(ctx))
++	})
++	require.True(t, conn.ConnectionState().HandshakeComplete)
++}
++
++// A short_id longer than eight bytes is an error of the configuration, not a crash:
++// hex.Decode writes past a destination shorter than its input.
++func TestRealityShortIDTooLong(t *testing.T) {
++	logger, _ := newWarnLogger(t)
++	options := realityOptionsForTest("chrome", true)
++	options.Reality.ShortID = "0123456789abcdef01"
++	_, err := NewClient(context.Background(), logger, "192.0.2.1", options)
++	require.ErrorContains(t, err, "invalid short_id")
++	options.Reality.ShortID = "0123456789abcdef"
++	_, err = NewClient(context.Background(), logger, "192.0.2.1", options)
++	require.NoError(t, err)
++}
+diff --git a/common/tls/reality_server.go b/common/tls/reality_server.go
+index 8ad59e144..6c04cfc57 100644
+--- a/common/tls/reality_server.go
++++ b/common/tls/reality_server.go
+@@ -109,6 +109,11 @@ func NewRealityServer(ctx context.Context, logger log.ContextLogger, options opt
+ 	} else {
+ 		for i, shortIDString := range options.Reality.ShortID {
+ 			var shortID [8]byte
++			// hex.Decode writes past a destination shorter than what it is given
++			// (podkop-engine)
++			if len(shortIDString) > 2*len(shortID) {
++				return nil, E.New("invalid short_id[", i, "]: ", shortIDString)
++			}
+ 			decodedLen, err := hex.Decode(shortID[:], []byte(shortIDString))
+ 			if err != nil {
+ 				return nil, E.Cause(err, "decode short_id[", i, "]: ", shortIDString)
+diff --git a/common/tls/utls_client.go b/common/tls/utls_client.go
+index 16d0352d0..18e135747 100644
+--- a/common/tls/utls_client.go
++++ b/common/tls/utls_client.go
+@@ -90,7 +90,11 @@ func (c *UTLSClientConfig) Client(conn net.Conn) (Conn, error) {
+ 	if err != nil {
+ 		return nil, err
+ 	}
+-	return &utlsALPNWrapper{utlsConnWrapper{utls.UClient(conn, c.config.Clone(), c.id)}, c.config.NextProtos}, nil
++	uConn, err := newUClient(conn, c.config.Clone(), c.id)
++	if err != nil {
++		return nil, err
++	}
++	return &utlsALPNWrapper{utlsConnWrapper{uConn}, c.config.NextProtos, c.noMLKEM}, nil
+ }
+ 
+ func (c *UTLSClientConfig) SetSessionIDGenerator(generator func(clientHello []byte, sessionID []byte) error) {
+@@ -165,6 +169,11 @@ type utlsALPNWrapper struct {
+ }
+ 
+ func (c *utlsALPNWrapper) HandshakeContext(ctx context.Context) error {
++	if c.UConn.HandshakeState.Hello == nil {
++		// the handshake is done and its state released (releaseHandshakeState): there is
++		// no Client Hello to rebuild, the connection only reports that it is complete
++		return c.UConn.HandshakeContext(ctx)
++	}
+ 	if len(c.nextProtocols) > 0 {
+ 		err := c.BuildHandshakeState()
+ 		if err != nil {
+@@ -181,7 +190,34 @@ func (c *utlsALPNWrapper) HandshakeContext(ctx context.Context) error {
+ 			}
+ 		}
+ 	}
+-	return c.UConn.HandshakeContext(ctx)
++	if c.noMLKEM {
++		err := c.BuildHandshakeState()
++		if err != nil {
++			return err
++		}
++		dropMLKEM(c.UConn)
++		err = c.BuildHandshakeState()
++		if err != nil {
++			return err
++		}
++	}
++	err := c.UConn.HandshakeContext(ctx)
++	if err != nil {
++		return err
++	}
++	releaseHandshakeState(c.UConn)
++	return nil
++}
++
++// releaseHandshakeState drops what only the handshake reads: the ClientHello, the private
++// keys of the key shares (an ML-KEM-768 decapsulation key takes ~8 KiB) and the extension
++// objects. The connection keeps them for its whole life otherwise; after the handshake
++// uTLS works through the embedded Conn, which does not use them.
++func releaseHandshakeState(uConn *utls.UConn) {
++	uConn.HandshakeState.Hello = nil
++	uConn.HandshakeState.ServerHello = nil
++	uConn.HandshakeState.State13 = utls.TLS13OnlyState{}
++	uConn.Extensions = nil
+ }
+ 
+ func NewUTLSClient(ctx context.Context, logger logger.ContextLogger, serverAddress string, options option.OutboundTLSOptions) (Config, error) {
+@@ -353,17 +389,20 @@ var (
+ func init() {
+ 	modernFingerprints := []utls.ClientHelloID{
+ 		utls.HelloChrome_Auto,
+-		utls.HelloFirefox_Auto,
+-		utls.HelloEdge_Auto,
+-		utls.HelloSafari_Auto,
+-		utls.HelloIOS_Auto,
++		helloFirefox148,
++		helloSafari26_3,
+ 	}
+ 	randomFingerprint = modernFingerprints[rand.Intn(len(modernFingerprints))]
+ 
+ 	weights := utls.DefaultWeights
+ 	weights.TLSVersMax_Set_VersionTLS13 = 1
+ 	weights.FirstKeyShare_Set_CurveP256 = 0
+-	randomizedFingerprint = utls.HelloRandomized
++	// X25519MLKEM768 always offered: REALITY servers since Xray-core v26.9.8 refuse a
++	// Client Hello without it (its key share: randomizedSpec).
++	weights.CurveIDs_Append_X25519 = 1
++	// ALPN always sent, as Xray-core does: without it gRPC and HTTP/2 transports cannot
++	// agree on h2, for as long as the process keeps the seed.
++	randomizedFingerprint = utls.HelloRandomizedALPN
+ 	randomizedFingerprint.Seed, _ = utls.NewPRNGSeed()
+ 	randomizedFingerprint.Weights = &weights
+ }
+@@ -375,11 +414,11 @@ func uTLSClientHelloID(name string) (utls.ClientHelloID, error) {
+ 	case "chrome", "":
+ 		return utls.HelloChrome_Auto, nil
+ 	case "firefox":
+-		return utls.HelloFirefox_Auto, nil
++		return helloFirefox148, nil
+ 	case "edge":
+ 		return utls.HelloEdge_Auto, nil
+ 	case "safari":
+-		return utls.HelloSafari_Auto, nil
++		return helloSafari26_3, nil
+ 	case "360":
+ 		return utls.Hello360_Auto, nil
+ 	case "qq":
+diff --git a/common/tls/utls_spec.go b/common/tls/utls_spec.go
+new file mode 100644
+index 000000000..7e2d575bb
+--- /dev/null
++++ b/common/tls/utls_spec.go
+@@ -0,0 +1,280 @@
++//go:build with_utls
++
++package tls
++
++import (
++	"net"
++	"slices"
++
++	utls "github.com/metacubex/utls"
++	"github.com/metacubex/utls/dicttls"
++)
++
++// Fingerprints Xray-core uses for "firefox" and "safari", missing from metacubex/utls
++// (its Firefox 120 / Safari 16.0 carry no X25519MLKEM768 key share, which REALITY
++// servers since Xray-core v26.9.8 require). Specs are ported from
++// refraction-networking/utls@aa6edf4 (HelloFirefox_148, HelloSafari_26_3).
++var (
++	helloFirefox148 = utls.ClientHelloID{Client: "Firefox", Version: "148"}
++	helloSafari26_3 = utls.ClientHelloID{Client: "Safari", Version: "26.3"}
++)
++
++func newUClient(conn net.Conn, config *utls.Config, id utls.ClientHelloID) (*utls.UConn, error) {
++	var spec *utls.ClientHelloSpec
++	switch {
++	case id == helloFirefox148:
++		spec = firefox148Spec()
++	case id == helloSafari26_3:
++		spec = safari26_3Spec()
++	case id.Client == utls.HelloRandomizedALPN.Client:
++		var err error
++		spec, err = randomizedSpec(id, config.NextProtos)
++		if err != nil {
++			return nil, err
++		}
++	default:
++		// By its specification, not by its ID. uTLS keeps the specification of a hello made
++		// by ID for the life of the connection, and with it the extension objects that
++		// releaseHandshakeState drops, the key shares among them; a custom specification
++		// it does not keep. The hello is the same: uTLS makes it from this very
++		// specification (TestNewUClientHelloUnchanged).
++		parrot, err := utls.UTLSIdToSpec(id)
++		if err != nil {
++			return utls.UClient(conn, config, id), nil
++		}
++		// as uTLS has it for a hello made by ID (the configuration is the caller's copy)
++		config.PreferSkipResumptionOnNilExtension = true
++		spec = &parrot
++	}
++	uConn := utls.UClient(conn, config, utls.HelloCustom)
++	err := uConn.ApplyPreset(spec)
++	if err != nil {
++		return nil, err
++	}
++	if id == helloFirefox148 {
++		reuseHybridX25519KeyShare(uConn)
++	}
++	return uConn, nil
++}
++
++// randomizedSpec is the "randomized" Client Hello of this process, as uTLS builds it from
++// the seed, with the X25519MLKEM768 key share sent exactly when the group is offered (as
++// proposed in refraction-networking/utls#415). uTLS draws the two independently: a group
++// offered without its key share makes servers preferring it (Cloudflare, Google) send a
++// HelloRetryRequest that uTLS cannot answer for X25519MLKEM768 ("CurvePreferences includes
++// unsupported curve"), a key share without the group is refused as an illegal parameter
++// (GitHub, Apple, Microsoft); REALITY passes either reply on from its target.
++func randomizedSpec(id utls.ClientHelloID, nextProtos []string) (*utls.ClientHelloSpec, error) {
++	spec, err := utls.UTLSIdToSpec(id)
++	if err != nil {
++		return nil, err
++	}
++	var offered bool
++	for _, extension := range spec.Extensions {
++		if curves, isCurves := extension.(*utls.SupportedCurvesExtension); isCurves {
++			offered = slices.Contains(curves.Curves, utls.X25519MLKEM768)
++		}
++	}
++	for _, extension := range spec.Extensions {
++		switch ext := extension.(type) {
++		case *utls.KeyShareExtension:
++			ext.KeyShares = slices.DeleteFunc(ext.KeyShares, func(share utls.KeyShare) bool {
++				return share.Group == utls.X25519MLKEM768
++			})
++			if offered {
++				ext.KeyShares = append([]utls.KeyShare{{Group: utls.X25519MLKEM768}}, ext.KeyShares...)
++			}
++		case *utls.ALPNExtension:
++			// UTLSIdToSpec does not know the configured protocols and offers h2 and http/1.1
++			// (kept when none are configured, as for the fixed fingerprints)
++			if len(nextProtos) > 0 {
++				ext.AlpnProtocols = slices.Clone(nextProtos)
++			}
++		}
++	}
++	return &spec, nil
++}
++
++// reuseHybridX25519KeyShare makes the X25519 key share reuse the X25519 part of
++// X25519MLKEM768, as Firefox does (refraction-networking/utls ReuseHybridAndClassicalKeyShares).
++func reuseHybridX25519KeyShare(uConn *utls.UConn) {
++	keys := uConn.HandshakeState.State13.KeyShareKeys
++	if keys == nil || keys.MlkemEcdhe == nil {
++		return
++	}
++	for _, extension := range uConn.Extensions {
++		keyShares, isKeyShares := extension.(*utls.KeyShareExtension)
++		if !isKeyShares {
++			continue
++		}
++		for i := range keyShares.KeyShares {
++			if keyShares.KeyShares[i].Group == utls.X25519 {
++				keyShares.KeyShares[i].Data = keys.MlkemEcdhe.PublicKey().Bytes()
++				keys.Ecdhe = keys.MlkemEcdhe
++				return
++			}
++		}
++	}
++}
++
++func firefox148Spec() *utls.ClientHelloSpec {
++	return &utls.ClientHelloSpec{
++		TLSVersMin: utls.VersionTLS12,
++		TLSVersMax: utls.VersionTLS13,
++		CipherSuites: []uint16{
++			utls.TLS_AES_128_GCM_SHA256,
++			utls.TLS_CHACHA20_POLY1305_SHA256,
++			utls.TLS_AES_256_GCM_SHA384,
++			utls.TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256,
++			utls.TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256,
++			utls.TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305,
++			utls.TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305,
++			utls.TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384,
++			utls.TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384,
++			utls.TLS_ECDHE_ECDSA_WITH_AES_256_CBC_SHA,
++			utls.TLS_ECDHE_ECDSA_WITH_AES_128_CBC_SHA,
++			utls.TLS_ECDHE_RSA_WITH_AES_128_CBC_SHA,
++			utls.TLS_ECDHE_RSA_WITH_AES_256_CBC_SHA,
++			utls.TLS_RSA_WITH_AES_128_GCM_SHA256,
++			utls.TLS_RSA_WITH_AES_256_GCM_SHA384,
++			utls.TLS_RSA_WITH_AES_128_CBC_SHA,
++			utls.TLS_RSA_WITH_AES_256_CBC_SHA,
++		},
++		CompressionMethods: []uint8{0x0},
++		Extensions: []utls.TLSExtension{
++			&utls.SNIExtension{},
++			&utls.ExtendedMasterSecretExtension{},
++			&utls.RenegotiationInfoExtension{Renegotiation: utls.RenegotiateOnceAsClient},
++			&utls.SupportedCurvesExtension{Curves: []utls.CurveID{
++				utls.X25519MLKEM768,
++				utls.X25519,
++				utls.CurveP256,
++				utls.CurveP384,
++				utls.CurveP521,
++				0x0100, // ffdhe2048
++				0x0101, // ffdhe3072
++			}},
++			&utls.SupportedPointsExtension{SupportedPoints: []uint8{0x0}},
++			&utls.ALPNExtension{AlpnProtocols: []string{"h2", "http/1.1"}},
++			&utls.StatusRequestExtension{},
++			&utls.FakeDelegatedCredentialsExtension{SupportedSignatureAlgorithms: []utls.SignatureScheme{
++				utls.ECDSAWithP256AndSHA256,
++				utls.ECDSAWithP384AndSHA384,
++				utls.ECDSAWithP521AndSHA512,
++				utls.ECDSAWithSHA1,
++			}},
++			&utls.SCTExtension{},
++			&utls.KeyShareExtension{KeyShares: []utls.KeyShare{
++				{Group: utls.X25519MLKEM768},
++				{Group: utls.X25519}, // reuses the hybrid's X25519 key, see reuseHybridX25519KeyShare
++				{Group: utls.CurveP256},
++			}},
++			&utls.SupportedVersionsExtension{Versions: []uint16{
++				utls.VersionTLS13,
++				utls.VersionTLS12,
++			}},
++			&utls.SignatureAlgorithmsExtension{SupportedSignatureAlgorithms: []utls.SignatureScheme{
++				utls.ECDSAWithP256AndSHA256,
++				utls.ECDSAWithP384AndSHA384,
++				utls.ECDSAWithP521AndSHA512,
++				utls.PSSWithSHA256,
++				utls.PSSWithSHA384,
++				utls.PSSWithSHA512,
++				utls.PKCS1WithSHA256,
++				utls.PKCS1WithSHA384,
++				utls.PKCS1WithSHA512,
++				utls.ECDSAWithSHA1,
++				utls.PKCS1WithSHA1,
++			}},
++			&utls.FakeRecordSizeLimitExtension{Limit: 0x4001},
++			&utls.UtlsCompressCertExtension{Algorithms: []utls.CertCompressionAlgo{
++				utls.CertCompressionZlib,
++				utls.CertCompressionBrotli,
++				utls.CertCompressionZstd,
++			}},
++			&utls.GREASEEncryptedClientHelloExtension{
++				CandidateCipherSuites: []utls.HPKESymmetricCipherSuite{
++					{KdfId: dicttls.HKDF_SHA256, AeadId: dicttls.AEAD_AES_128_GCM},
++					{KdfId: dicttls.HKDF_SHA256, AeadId: dicttls.AEAD_CHACHA20_POLY1305},
++				},
++				CandidatePayloadLens: []uint16{223}, // +16: 239
++			},
++		},
++	}
++}
++
++func safari26_3Spec() *utls.ClientHelloSpec {
++	return &utls.ClientHelloSpec{
++		TLSVersMin: utls.VersionTLS12,
++		TLSVersMax: utls.VersionTLS13,
++		CipherSuites: []uint16{
++			utls.GREASE_PLACEHOLDER,
++			utls.TLS_AES_256_GCM_SHA384,
++			utls.TLS_CHACHA20_POLY1305_SHA256,
++			utls.TLS_AES_128_GCM_SHA256,
++			utls.TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384,
++			utls.TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256,
++			utls.TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305,
++			utls.TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384,
++			utls.TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256,
++			utls.TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305,
++			utls.TLS_ECDHE_ECDSA_WITH_AES_256_CBC_SHA,
++			utls.TLS_ECDHE_ECDSA_WITH_AES_128_CBC_SHA,
++			utls.TLS_ECDHE_RSA_WITH_AES_256_CBC_SHA,
++			utls.TLS_ECDHE_RSA_WITH_AES_128_CBC_SHA,
++			utls.TLS_RSA_WITH_AES_256_GCM_SHA384,
++			utls.TLS_RSA_WITH_AES_128_GCM_SHA256,
++			utls.TLS_RSA_WITH_AES_256_CBC_SHA,
++			utls.TLS_RSA_WITH_AES_128_CBC_SHA,
++			utls.FAKE_TLS_ECDHE_ECDSA_WITH_3DES_EDE_CBC_SHA,
++			utls.TLS_ECDHE_RSA_WITH_3DES_EDE_CBC_SHA,
++			utls.TLS_RSA_WITH_3DES_EDE_CBC_SHA,
++		},
++		CompressionMethods: []uint8{0x0},
++		Extensions: []utls.TLSExtension{
++			&utls.UtlsGREASEExtension{},
++			&utls.SNIExtension{},
++			&utls.ExtendedMasterSecretExtension{},
++			&utls.RenegotiationInfoExtension{Renegotiation: utls.RenegotiateOnceAsClient},
++			&utls.SupportedCurvesExtension{Curves: []utls.CurveID{
++				utls.GREASE_PLACEHOLDER,
++				utls.X25519MLKEM768,
++				utls.X25519,
++				utls.CurveP256,
++				utls.CurveP384,
++				utls.CurveP521,
++			}},
++			&utls.SupportedPointsExtension{SupportedPoints: []uint8{0x0}},
++			&utls.ALPNExtension{AlpnProtocols: []string{"h2", "http/1.1"}},
++			&utls.StatusRequestExtension{},
++			&utls.SignatureAlgorithmsExtension{SupportedSignatureAlgorithms: []utls.SignatureScheme{
++				utls.ECDSAWithP256AndSHA256,
++				utls.PSSWithSHA256,
++				utls.PKCS1WithSHA256,
++				utls.ECDSAWithP384AndSHA384,
++				utls.PSSWithSHA384,
++				utls.PSSWithSHA384,
++				utls.PKCS1WithSHA384,
++				utls.PSSWithSHA512,
++				utls.PKCS1WithSHA512,
++				utls.PKCS1WithSHA1,
++			}},
++			&utls.SCTExtension{},
++			&utls.KeyShareExtension{KeyShares: []utls.KeyShare{
++				{Group: utls.GREASE_PLACEHOLDER, Data: []byte{0}},
++				{Group: utls.X25519MLKEM768},
++				{Group: utls.X25519},
++			}},
++			&utls.PSKKeyExchangeModesExtension{Modes: []uint8{utls.PskModeDHE}},
++			&utls.SupportedVersionsExtension{Versions: []uint16{
++				utls.GREASE_PLACEHOLDER,
++				utls.VersionTLS13,
++				utls.VersionTLS12,
++			}},
++			&utls.UtlsCompressCertExtension{Algorithms: []utls.CertCompressionAlgo{
++				utls.CertCompressionZlib,
++			}},
++			&utls.UtlsGREASEExtension{},
++		},
++	}
++}
+diff --git a/common/tls/utls_spec_test.go b/common/tls/utls_spec_test.go
+new file mode 100644
+index 000000000..04a7cc5fb
+--- /dev/null
++++ b/common/tls/utls_spec_test.go
+@@ -0,0 +1,100 @@
++//go:build with_utls
++
++package tls
++
++import (
++	"bytes"
++	"net"
++	"runtime"
++	"testing"
++	"testing/cryptotest"
++
++	utls "github.com/metacubex/utls"
++	"github.com/stretchr/testify/require"
++)
++
++var specFingerprints = []string{"chrome", "edge", "ios", "qq", "360", "android"}
++
++// A hello built from the specification of a fingerprint is, byte for byte, the hello uTLS
++// builds from the fingerprint's ID: the same random stream gives the same bytes, the
++// shuffled extension order of Chrome included.
++func TestNewUClientHelloUnchanged(t *testing.T) {
++	// a key share made from a caller's random source reads, at random, one byte more of it
++	// (the Go version of the module keeps that behavior): two hellos by ID then differ
++	t.Setenv("GODEBUG", "cryptocustomrand=0")
++	for _, name := range specFingerprints {
++		id, err := uTLSClientHelloID(name)
++		require.NoError(t, err, name)
++		build := func(create func(conn net.Conn, config *utls.Config) *utls.UConn) []byte {
++			cryptotest.SetGlobalRandom(t, 20261008)
++			uConn := create(nil, &utls.Config{ServerName: "example.com", NextProtos: []string{"h2", "http/1.1"}})
++			require.NoError(t, uConn.BuildHandshakeState(), name)
++			return uConn.HandshakeState.Hello.Raw
++		}
++		makeByID := func(conn net.Conn, config *utls.Config) *utls.UConn {
++			return utls.UClient(conn, config, id)
++		}
++		makeBySpec := func(conn net.Conn, config *utls.Config) *utls.UConn {
++			uConn, err := newUClient(conn, config, id)
++			require.NoError(t, err, name)
++			return uConn
++		}
++		byID := build(makeByID)
++		require.NotEmpty(t, byID, name)
++		for range 8 {
++			again := build(makeByID)
++			require.True(t, bytes.Equal(byID, again), "%s: the test is not deterministic, two hellos by ID differ: %d and %d bytes, first difference at byte %d", name, len(byID), len(again), firstDifference(byID, again))
++			bySpec := build(makeBySpec)
++			require.True(t, bytes.Equal(byID, bySpec), "%s: the hello differs: %d bytes by ID, %d by specification, first difference at byte %d", name, len(byID), len(bySpec), firstDifference(byID, bySpec))
++		}
++	}
++}
++
++func firstDifference(a []byte, b []byte) int {
++	first := 0
++	for first < len(a) && first < len(b) && a[first] == b[first] {
++		first++
++	}
++	return first
++}
++
++// Once the handshake state is released, a connection made from the specification no longer
++// holds the extension objects, which one made by ID does: for chrome that is the
++// X25519MLKEM768 key share alone, 1216 bytes.
++func TestNewUClientSpecReleased(t *testing.T) {
++	const connections = 2000
++	held := func(name string, create func(config *utls.Config) *utls.UConn) int {
++		conns := make([]*utls.UConn, connections)
++		runtime.GC()
++		var before, after runtime.MemStats
++		runtime.ReadMemStats(&before)
++		for i := range conns {
++			uConn := create(&utls.Config{ServerName: "example.com", NextProtos: []string{"h2", "http/1.1"}})
++			require.NoError(t, uConn.BuildHandshakeState(), name)
++			releaseHandshakeState(uConn)
++			conns[i] = uConn
++		}
++		runtime.GC()
++		runtime.GC()
++		runtime.ReadMemStats(&after)
++		runtime.KeepAlive(conns)
++		return (int(after.HeapAlloc) - int(before.HeapAlloc)) / connections
++	}
++	for _, name := range specFingerprints {
++		id, err := uTLSClientHelloID(name)
++		require.NoError(t, err, name)
++		byID := held(name, func(config *utls.Config) *utls.UConn {
++			return utls.UClient(nil, config, id)
++		})
++		bySpec := held(name, func(config *utls.Config) *utls.UConn {
++			uConn, err := newUClient(nil, config, id)
++			require.NoError(t, err, name)
++			return uConn
++		})
++		t.Logf("%s: %d bytes held per connection by ID, %d by specification, %d less", name, byID, bySpec, byID-bySpec)
++		require.Less(t, bySpec, byID, name)
++		if name == "chrome" {
++			require.GreaterOrEqual(t, byID-bySpec, 1216, name)
++		}
++	}
++}
+diff --git a/docs/configuration/shared/tls.md b/docs/configuration/shared/tls.md
+index 984c6cfe7..3bdf2106b 100644
+--- a/docs/configuration/shared/tls.md
++++ b/docs/configuration/shared/tls.md
+@@ -268,6 +268,11 @@ no mutually supported protocol.
+ 
+ See [Application-Layer Protocol Negotiation](https://en.wikipedia.org/wiki/Application-Layer_Protocol_Negotiation).
+ 
++!!! note ""
++
++    With REALITY the ClientHello carries the ALPN list of the uTLS fingerprint: `alpn` is
++    used only with the fingerprint `randomized`.
++
+ #### min_version
+ 
+ The minimum TLS version that is acceptable.
+diff --git a/docs/configuration/shared/tls.zh.md b/docs/configuration/shared/tls.zh.md
+index 0db72f43a..40ac43894 100644
+--- a/docs/configuration/shared/tls.zh.md
++++ b/docs/configuration/shared/tls.zh.md
+@@ -267,6 +267,10 @@ TLS 版本值：
+ 
+ 参阅 [Application-Layer Protocol Negotiation](https://en.wikipedia.org/wiki/Application-Layer_Protocol_Negotiation)。
+ 
++!!! note ""
++
++    使用 REALITY 时，ClientHello 携带 uTLS 指纹自带的 ALPN 列表：仅 `randomized` 指纹使用 `alpn`。
++
+ #### min_version
+ 
+ 可接受的最低 TLS 版本。
+-- 
+2.53.0
+

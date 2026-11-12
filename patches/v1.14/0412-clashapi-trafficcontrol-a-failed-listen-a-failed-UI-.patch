@@ -1,0 +1,655 @@
+From f6f581f2f6cbaaf12fa3c3ece65e57dcdb7e2bef Mon Sep 17 00:00:00 2001
+From: FiyeroT <me@fiyero.xyz>
+Date: Thu, 12 Nov 2026 21:41:21 +0300
+Subject: [PATCH 47/57] clashapi, trafficcontrol: a failed listen, a failed UI,
+ records of connections
+
+A failed listen of the external controller does not fail the start, an external UI that fails to
+unpack leaves the one served, the record of a connection is not written while it is listed, and a
+tracker's metadata drops the sniffer state and the DNS answers.
+
+Made of these commits of the earlier series (branch archive/r25-1.14-commits):
+  abac3a212 clashapi: a failed listen of the external controller does not fail the start
+  9c9bc81ed trafficcontrol: drop the sniffer state and the DNS answers from a tracker's metadata
+  23dc434d6 clashapi: do not write to the record of a connection while it is listed
+  f70882d02 clashapi: an external UI that fails to unpack leaves the one served
+  41f832ef9 patches: adapt to sing-box 1.14.4
+
+Pdk-Feature: clashapi
+Pdk-Zone: other
+Pdk-Layer: 04
+---
+ common/trafficcontrol/manager.go              |   5 +-
+ common/trafficcontrol/manager_race_test.go    |  45 ++++++++
+ common/trafficcontrol/tracker.go              |  16 ++-
+ .../trafficcontrol/tracker_metadata_test.go   |  36 +++++++
+ experimental/clashapi/server.go               |  95 ++++++++++++----
+ experimental/clashapi/server_listen_test.go   |  69 ++++++++++++
+ experimental/clashapi/server_resources.go     |  96 ++++++++++++-----
+ .../clashapi/server_resources_test.go         | 102 ++++++++++++++++++
+ 8 files changed, 417 insertions(+), 47 deletions(-)
+ create mode 100644 common/trafficcontrol/manager_race_test.go
+ create mode 100644 common/trafficcontrol/tracker_metadata_test.go
+ create mode 100644 experimental/clashapi/server_listen_test.go
+ create mode 100644 experimental/clashapi/server_resources_test.go
+
+diff --git a/common/trafficcontrol/manager.go b/common/trafficcontrol/manager.go
+index 5e938cf6f..34eb216b2 100644
+--- a/common/trafficcontrol/manager.go
++++ b/common/trafficcontrol/manager.go
+@@ -95,8 +95,11 @@ func (m *Manager) leave(tracker Tracker) {
+ 		m.closedConnectionsAccess.Unlock()
+ 		return
+ 	}
+-	metadata.ClosedAt = closedAt
++	// The time goes into the copy that is kept, not into the record of the connection
++	// itself: that one is being read by whoever lists the connections at this moment (the
++	// Clash API copies every record), and the write raced with that read (podkop-engine).
+ 	metadataCopy := *metadata
++	metadataCopy.ClosedAt = closedAt
+ 	if m.closedConnections.Len() >= closedConnectionsLimit {
+ 		evicted := m.closedConnections.PopFront()
+ 		m.closedUploadTotal += evicted.Upload.Load()
+diff --git a/common/trafficcontrol/manager_race_test.go b/common/trafficcontrol/manager_race_test.go
+new file mode 100644
+index 000000000..b3b48765c
+--- /dev/null
++++ b/common/trafficcontrol/manager_race_test.go
+@@ -0,0 +1,45 @@
++package trafficcontrol
++
++import (
++	"sync/atomic"
++	"testing"
++
++	"github.com/gofrs/uuid/v5"
++	"github.com/stretchr/testify/require"
++)
++
++type recordTracker struct {
++	metadata TrackerMetadata
++}
++
++func (t *recordTracker) Metadata() *TrackerMetadata { return &t.metadata }
++func (t *recordTracker) Close() error               { return nil }
++
++// A connection that closes while the connections are being listed: the record of the
++// connection is read by the one who lists (the Clash API copies each), so the closing
++// writes its time into the copy it keeps and not into that record. With the race detector
++// this test is the race itself.
++func TestLeaveDoesNotWriteTheRecordBeingRead(t *testing.T) {
++	manager := NewManager()
++	var read int64
++	for range 100 {
++		tracker := &recordTracker{metadata: TrackerMetadata{ID: uuid.Must(uuid.NewV4()), Upload: new(atomic.Int64), Download: new(atomic.Int64)}}
++		manager.join(tracker)
++		listed := make(chan struct{})
++		go func() {
++			defer close(listed)
++			for _, metadata := range manager.Connections() {
++				record := *metadata
++				atomic.AddInt64(&read, record.ClosedAt.Unix())
++			}
++		}()
++		manager.leave(tracker)
++		<-listed
++		require.True(t, tracker.metadata.ClosedAt.IsZero(), "the record of the connection was written to")
++	}
++	closed := manager.ClosedConnections()
++	require.Len(t, closed, 100)
++	for _, metadata := range closed {
++		require.False(t, metadata.ClosedAt.IsZero(), "the record that is kept has no closing time")
++	}
++}
+diff --git a/common/trafficcontrol/tracker.go b/common/trafficcontrol/tracker.go
+index 1a38908b4..25d8cd823 100644
+--- a/common/trafficcontrol/tracker.go
++++ b/common/trafficcontrol/tracker.go
+@@ -38,7 +38,7 @@ func (m *Manager) RoutedConnection(ctx context.Context, conn net.Conn, metadata
+ 	upload := new(atomic.Int64)
+ 	download := new(atomic.Int64)
+ 	tracker := &connTracker{
+-		ExtendedConn: bufio.NewInt64CounterConn(conn, []*atomic.Int64{upload}, []*atomic.Int64{download}),
++		ExtendedConn: bufio.NewCounterConn(conn, []N.CountFunc{countUpload}, []N.CountFunc{countDownload}),
+ 		metadata:     m.newTrackerMetadata(metadata, matchedRule, matchOutbound, upload, download),
+ 		manager:      m,
+ 	}
+@@ -70,6 +70,7 @@ func (m *Manager) newTrackerMetadata(metadata adapter.InboundContext, matchedRul
+ 	chain := common.Map(metadata.OutboundChain, adapter.Outbound.Tag)
+ 	slices.Reverse(chain)
+ 	outbound := metadata.OutboundChain[len(metadata.OutboundChain)-1]
++	trimTrackedMetadata(&metadata)
+ 	return TrackerMetadata{
+ 		ID:           id,
+ 		Metadata:     metadata,
+@@ -83,6 +84,19 @@ func (m *Manager) newTrackerMetadata(metadata adapter.InboundContext, matchedRul
+ 	}
+ }
+ 
++// trimTrackedMetadata drops from the tracker's copy what only routing needed: the sniffer's
++// working state (for QUIC, the fragments of the client hello collected so far) and the DNS
++// answers. A tracker lives as long as its connection, and then in the list of closed
++// connections.
++func trimTrackedMetadata(metadata *adapter.InboundContext) {
++	metadata.SniffContext = nil
++	metadata.SniffError = nil
++	metadata.DNSResponse = nil
++	metadata.NamedDNSResponses = nil
++}
++
++var _ adapter.RemoteEOFMarker = (*connTracker)(nil)
++
+ type connTracker struct {
+ 	N.ExtendedConn
+ 	metadata TrackerMetadata
+diff --git a/common/trafficcontrol/tracker_metadata_test.go b/common/trafficcontrol/tracker_metadata_test.go
+new file mode 100644
+index 000000000..7deeb8c27
+--- /dev/null
++++ b/common/trafficcontrol/tracker_metadata_test.go
+@@ -0,0 +1,36 @@
++package trafficcontrol
++
++import (
++	"errors"
++	"testing"
++
++	"github.com/sagernet/sing-box/adapter"
++
++	mDNS "github.com/miekg/dns"
++	"github.com/stretchr/testify/require"
++)
++
++// The tracker's copy of the metadata drops the sniffer's state and the DNS answers; the
++// caller's metadata keeps them, and what the connection list shows stays.
++func TestTrimTrackedMetadata(t *testing.T) {
++	original := adapter.InboundContext{
++		Protocol:          "quic",
++		Domain:            "example.com",
++		SniffContext:      make([]byte, 4096),
++		SniffError:        errors.New("need more packets"),
++		DNSResponse:       new(mDNS.Msg),
++		NamedDNSResponses: map[string]*mDNS.Msg{"a": new(mDNS.Msg)},
++	}
++	tracked := original
++	trimTrackedMetadata(&tracked)
++	require.Nil(t, tracked.SniffContext)
++	require.NoError(t, tracked.SniffError)
++	require.Nil(t, tracked.DNSResponse)
++	require.Nil(t, tracked.NamedDNSResponses)
++	require.Equal(t, "quic", tracked.Protocol)
++	require.Equal(t, "example.com", tracked.Domain)
++	require.NotNil(t, original.SniffContext)
++	require.Error(t, original.SniffError)
++	require.NotNil(t, original.DNSResponse)
++	require.Len(t, original.NamedDNSResponses, 1)
++}
+diff --git a/experimental/clashapi/server.go b/experimental/clashapi/server.go
+index a8c99af36..5a4be4b30 100644
+--- a/experimental/clashapi/server.go
++++ b/experimental/clashapi/server.go
+@@ -9,6 +9,7 @@ import (
+ 	"os"
+ 	"runtime"
+ 	"strings"
++	"sync"
+ 	"syscall"
+ 	"time"
+ 
+@@ -21,6 +22,7 @@ import (
+ 	"github.com/sagernet/sing-box/experimental/clashmode"
+ 	"github.com/sagernet/sing-box/log"
+ 	"github.com/sagernet/sing-box/option"
++	"github.com/sagernet/sing/common"
+ 	E "github.com/sagernet/sing/common/exceptions"
+ 	"github.com/sagernet/sing/common/json"
+ 	M "github.com/sagernet/sing/common/metadata"
+@@ -49,6 +51,8 @@ type Server struct {
+ 	endpoint       adapter.EndpointManager
+ 	logger         log.Logger
+ 	httpServer     *http.Server
++	closed         chan struct{}
++	closeOnce      sync.Once
+ 	trafficManager *trafficcontrol.Manager
+ 	urlTestHistory *urltest.HistoryStorage
+ 	clashMode      *clashmode.Manager
+@@ -86,6 +90,7 @@ func NewServer(ctx context.Context, logFactory log.ObservableFactory, options op
+ 			Addr:    options.ExternalController,
+ 			Handler: chiRouter,
+ 		},
++		closed:                   make(chan struct{}),
+ 		trafficManager:           trafficManager,
+ 		urlTestHistory:           urlTestHistory,
+ 		clashMode:                clashMode,
+@@ -154,33 +159,81 @@ func (s *Server) Start(stage adapter.StartStage, scope *adapter.Scope) error {
+ 	}
+ 	if s.externalController {
+ 		s.checkAndDownloadExternalUI()
+-		var (
+-			listener net.Listener
+-			err      error
+-		)
+-		for range 3 {
+-			listener, err = net.Listen(M.NetworkFromNetAddr(N.NetworkTCP, M.ParseSocksaddr(s.httpServer.Addr).Addr), s.httpServer.Addr)
+-			if runtime.GOOS == "android" && errors.Is(err, syscall.EADDRINUSE) {
+-				time.Sleep(100 * time.Millisecond)
+-				continue
+-			}
+-			break
+-		}
++		scope.Add(s.close)
++		listener, err := s.listen()
+ 		if err != nil {
+-			return E.Cause(err, "external controller listen error")
++			// The API carries no traffic: an address taken by another program, or not
++			// yet on an interface at boot, must not stop the proxy (on a router, a failed
++			// start is retried a few times and then the service is given up).
++			s.logger.Error("external controller listen error, retrying in the background: ", err)
++			go s.listenLater(listenRetryDelay)
++			return nil
+ 		}
+-		scope.Add(s.httpServer.Close)
+-		s.logger.Info("restful api listening at ", listener.Addr())
+-		go func() {
+-			err = s.httpServer.Serve(listener)
+-			if err != nil && !errors.Is(err, http.ErrServerClosed) {
+-				s.logger.Error("external controller serve error: ", err)
+-			}
+-		}()
++		s.serve(listener)
+ 	}
+ 	return nil
+ }
+ 
++// listenRetryDelay is the first pause before the listen of the external controller is
++// retried; the pause doubles up to listenRetryMaxDelay.
++var (
++	listenRetryDelay    = 5 * time.Second
++	listenRetryMaxDelay = time.Minute
++)
++
++func (s *Server) listen() (listener net.Listener, err error) {
++	for range 3 {
++		listener, err = net.Listen(M.NetworkFromNetAddr(N.NetworkTCP, M.ParseSocksaddr(s.httpServer.Addr).Addr), s.httpServer.Addr)
++		if runtime.GOOS == "android" && errors.Is(err, syscall.EADDRINUSE) {
++			time.Sleep(100 * time.Millisecond)
++			continue
++		}
++		break
++	}
++	return
++}
++
++func (s *Server) listenLater(delay time.Duration) {
++	for {
++		select {
++		case <-s.closed:
++			return
++		case <-time.After(delay):
++		}
++		listener, err := s.listen()
++		if err == nil {
++			select {
++			case <-s.closed:
++				// closed while it listened: the server would not take the listener
++				listener.Close()
++			default:
++				s.serve(listener)
++			}
++			return
++		}
++		s.logger.Debug("external controller listen error: ", err)
++		delay = min(delay*2, listenRetryMaxDelay)
++	}
++}
++
++func (s *Server) serve(listener net.Listener) {
++	s.logger.Info("restful api listening at ", listener.Addr())
++	go func() {
++		err := s.httpServer.Serve(listener)
++		if err != nil && !errors.Is(err, http.ErrServerClosed) {
++			s.logger.Error("external controller serve error: ", err)
++		}
++	}()
++}
++
++// close stops a listen retried in the background and the server.
++func (s *Server) close() error {
++	s.closeOnce.Do(func() { close(s.closed) })
++	return common.Close(
++		common.PtrOrNil(s.httpServer),
++	)
++}
++
+ func authentication(serverSecret string) func(next http.Handler) http.Handler {
+ 	return func(next http.Handler) http.Handler {
+ 		fn := func(w http.ResponseWriter, r *http.Request) {
+diff --git a/experimental/clashapi/server_listen_test.go b/experimental/clashapi/server_listen_test.go
+new file mode 100644
+index 000000000..a11a44f8b
+--- /dev/null
++++ b/experimental/clashapi/server_listen_test.go
+@@ -0,0 +1,69 @@
++package clashapi
++
++import (
++	"context"
++	"net"
++	"net/http"
++	"testing"
++	"time"
++
++	"github.com/sagernet/sing-box/adapter"
++	"github.com/sagernet/sing-box/log"
++
++	"github.com/stretchr/testify/require"
++)
++
++func newListenTestServer(t *testing.T, address string) *Server {
++	saved := listenRetryDelay
++	listenRetryDelay = 20 * time.Millisecond
++	t.Cleanup(func() { listenRetryDelay = saved })
++	return &Server{
++		logger: log.NewNOPFactory().NewLogger("clash-api"),
++		httpServer: &http.Server{Addr: address, Handler: http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
++			w.WriteHeader(http.StatusNoContent)
++		})},
++		closed:             make(chan struct{}),
++		externalController: true,
++	}
++}
++
++func answers(address string) bool {
++	client := &http.Client{Timeout: 200 * time.Millisecond}
++	response, err := client.Get("http://" + address + "/")
++	if err != nil {
++		return false
++	}
++	response.Body.Close()
++	return response.StatusCode == http.StatusNoContent
++}
++
++// An address taken by another program does not fail the start: the API comes up once the
++// address is free.
++func TestExternalControllerListenRetried(t *testing.T) {
++	blocker, err := net.Listen("tcp", "127.0.0.1:0")
++	require.NoError(t, err)
++	address := blocker.Addr().String()
++	server := newListenTestServer(t, address)
++	scope := adapter.NewScope(context.Background(), log.NewNOPFactory().NewLogger("scope"))
++	require.NoError(t, server.Start(adapter.StartStateStarted, scope))
++	defer scope.Close()
++
++	blocker.Close()
++	require.Eventually(t, func() bool { return answers(address) }, 5*time.Second, 20*time.Millisecond)
++}
++
++// A server whose scope is closed while it waits to retry does not listen afterwards.
++func TestExternalControllerRetryEndsOnClose(t *testing.T) {
++	blocker, err := net.Listen("tcp", "127.0.0.1:0")
++	require.NoError(t, err)
++	address := blocker.Addr().String()
++	server := newListenTestServer(t, address)
++	scope := adapter.NewScope(context.Background(), log.NewNOPFactory().NewLogger("scope"))
++	require.NoError(t, server.Start(adapter.StartStateStarted, scope))
++	require.NoError(t, scope.Close())
++
++	blocker.Close()
++	time.Sleep(200 * time.Millisecond)
++	_, err = net.DialTimeout("tcp", address, 200*time.Millisecond)
++	require.Error(t, err)
++}
+diff --git a/experimental/clashapi/server_resources.go b/experimental/clashapi/server_resources.go
+index a5997ebea..5586632e5 100644
+--- a/experimental/clashapi/server_resources.go
++++ b/experimental/clashapi/server_resources.go
+@@ -76,11 +76,7 @@ func (s *Server) downloadExternalUI() error {
+ 	if response.StatusCode != http.StatusOK {
+ 		return E.New("download external ui failed: ", response.Status)
+ 	}
+-	err = s.downloadZIP(response.Body, s.externalUI)
+-	if err != nil {
+-		removeAllInDirectory(s.ctx, s.externalUI)
+-	}
+-	return err
++	return s.downloadZIP(response.Body, s.externalUI)
+ }
+ 
+ func (s *Server) downloadZIP(body io.Reader, output string) error {
+@@ -94,13 +90,42 @@ func (s *Server) downloadZIP(body io.Reader, output string) error {
+ 	if err != nil {
+ 		return err
+ 	}
+-	reader, err := zip.OpenReader(tempFile.Name())
++	return extractExternalUI(s.ctx, tempFile.Name(), output)
++}
++
++// externalUIStaging is the directory inside the external UI directory that an archive is
++// unpacked into before its files replace those served.
++const externalUIStaging = ".external-ui-update"
++
++// extractExternalUI unpacks the archive into a directory of its own inside output, and puts
++// what it unpacked in place of the other files of output only when all of it is there: an
++// archive that fails to unpack (no space left, a broken or an empty archive) leaves the
++// files that were served. The directory is inside output to be on its file system, a mount
++// point or a symbolic link included: the files are moved into place, not copied.
++func extractExternalUI(ctx context.Context, archive string, output string) error {
++	reader, err := zip.OpenReader(archive)
+ 	if err != nil {
+ 		return err
+ 	}
+ 	defer reader.Close()
+-	trimDir := zipIsInSingleDirectory(reader.File)
+-	for _, file := range reader.File {
++	staging := filepath.Join(output, externalUIStaging)
++	// left by an update that did not end
++	err = filemanager.RemoveAll(ctx, staging)
++	if err != nil {
++		return err
++	}
++	err = unpackZIP(ctx, reader.File, staging)
++	if err != nil {
++		filemanager.RemoveAll(ctx, staging)
++		return err
++	}
++	return replaceWithStaging(ctx, output, staging)
++}
++
++func unpackZIP(ctx context.Context, files []*zip.File, output string) error {
++	trimDir := zipIsInSingleDirectory(files)
++	var unpacked int
++	for _, file := range files {
+ 		if file.FileInfo().IsDir() {
+ 			continue
+ 		}
+@@ -108,23 +133,56 @@ func (s *Server) downloadZIP(body io.Reader, output string) error {
+ 		if trimDir {
+ 			pathElements = pathElements[1:]
+ 		}
+-		saveDirectory := output
+-		if len(pathElements) > 1 {
+-			saveDirectory = filepath.Join(saveDirectory, filepath.Join(pathElements[:len(pathElements)-1]...))
++		name := filepath.Join(pathElements...)
++		if !filepath.IsLocal(name) || pathElements[0] == externalUIStaging {
++			return E.New("invalid path in archive: ", file.Name)
+ 		}
+-		err = filemanager.MkdirAll(s.ctx, saveDirectory, 0o755)
++		savePath := filepath.Join(output, name)
++		err := filemanager.MkdirAll(ctx, filepath.Dir(savePath), 0o755)
+ 		if err != nil {
+ 			return err
+ 		}
+-		savePath := filepath.Join(saveDirectory, pathElements[len(pathElements)-1])
+-		err = downloadZIPEntry(s.ctx, file, savePath)
++		err = downloadZIPEntry(ctx, file, savePath)
+ 		if err != nil {
+ 			return err
+ 		}
++		unpacked++
++	}
++	if unpacked == 0 {
++		return E.New("no files in archive")
+ 	}
+ 	return nil
+ }
+ 
++// replaceWithStaging puts the files of staging, a directory inside directory, in place of
++// the other files of directory.
++func replaceWithStaging(ctx context.Context, directory string, staging string) error {
++	entries, err := filemanager.ReadDir(ctx, directory)
++	if err != nil {
++		return err
++	}
++	for _, entry := range entries {
++		if entry.Name() == externalUIStaging {
++			continue
++		}
++		err = filemanager.RemoveAll(ctx, filepath.Join(directory, entry.Name()))
++		if err != nil {
++			return err
++		}
++	}
++	entries, err = filemanager.ReadDir(ctx, staging)
++	if err != nil {
++		return err
++	}
++	for _, entry := range entries {
++		err = filemanager.Rename(ctx, filepath.Join(staging, entry.Name()), filepath.Join(directory, entry.Name()))
++		if err != nil {
++			return err
++		}
++	}
++	return filemanager.Remove(ctx, staging)
++}
++
+ func downloadZIPEntry(ctx context.Context, zipFile *zip.File, savePath string) error {
+ 	saveFile, err := filemanager.Create(ctx, savePath)
+ 	if err != nil {
+@@ -139,16 +197,6 @@ func downloadZIPEntry(ctx context.Context, zipFile *zip.File, savePath string) e
+ 	return common.Error(io.Copy(saveFile, reader))
+ }
+ 
+-func removeAllInDirectory(ctx context.Context, directory string) {
+-	dirEntries, err := filemanager.ReadDir(ctx, directory)
+-	if err != nil {
+-		return
+-	}
+-	for _, dirEntry := range dirEntries {
+-		filemanager.RemoveAll(ctx, filepath.Join(directory, dirEntry.Name()))
+-	}
+-}
+-
+ func zipIsInSingleDirectory(files []*zip.File) bool {
+ 	var singleDirectory string
+ 	for _, file := range files {
+diff --git a/experimental/clashapi/server_resources_test.go b/experimental/clashapi/server_resources_test.go
+new file mode 100644
+index 000000000..893589ca9
+--- /dev/null
++++ b/experimental/clashapi/server_resources_test.go
+@@ -0,0 +1,102 @@
++package clashapi
++
++import (
++	"archive/zip"
++	"context"
++	"os"
++	"path/filepath"
++	"sort"
++	"strings"
++	"testing"
++
++	"github.com/stretchr/testify/require"
++)
++
++func writeArchive(t *testing.T, files ...string) string {
++	t.Helper()
++	path := filepath.Join(t.TempDir(), "ui.zip")
++	file, err := os.Create(path)
++	require.NoError(t, err)
++	writer := zip.NewWriter(file)
++	for _, name := range files {
++		entry, err := writer.Create(name)
++		require.NoError(t, err)
++		if !strings.HasSuffix(name, "/") {
++			_, err = entry.Write([]byte("new " + name))
++			require.NoError(t, err)
++		}
++	}
++	require.NoError(t, writer.Close())
++	require.NoError(t, file.Close())
++	return path
++}
++
++func listFiles(t *testing.T, directory string) []string {
++	t.Helper()
++	var files []string
++	err := filepath.WalkDir(directory, func(path string, entry os.DirEntry, err error) error {
++		if err != nil {
++			return err
++		}
++		if !entry.IsDir() {
++			relative, _ := filepath.Rel(directory, path)
++			files = append(files, filepath.ToSlash(relative))
++		}
++		return nil
++	})
++	require.NoError(t, err)
++	sort.Strings(files)
++	return files
++}
++
++func servedDirectory(t *testing.T) string {
++	t.Helper()
++	directory := filepath.Join(t.TempDir(), "ui")
++	require.NoError(t, os.MkdirAll(filepath.Join(directory, "assets"), 0o755))
++	require.NoError(t, os.WriteFile(filepath.Join(directory, "index.html"), []byte("old"), 0o644))
++	require.NoError(t, os.WriteFile(filepath.Join(directory, "assets", "old.js"), []byte("old"), 0o644))
++	return directory
++}
++
++var oldFiles = []string{"assets/old.js", "index.html"}
++
++func TestExtractExternalUIReplaces(t *testing.T) {
++	directory := servedDirectory(t)
++	// left by an update that did not end
++	require.NoError(t, os.MkdirAll(filepath.Join(directory, externalUIStaging, "x"), 0o755))
++	archive := writeArchive(t, "Yacd-meta-gh-pages/", "Yacd-meta-gh-pages/index.html", "Yacd-meta-gh-pages/assets/new.js")
++	require.NoError(t, extractExternalUI(context.Background(), archive, directory))
++	require.Equal(t, []string{"assets/new.js", "index.html"}, listFiles(t, directory))
++	content, err := os.ReadFile(filepath.Join(directory, "index.html"))
++	require.NoError(t, err)
++	require.Equal(t, "new Yacd-meta-gh-pages/index.html", string(content))
++}
++
++func TestExtractExternalUIIntoEmptyDirectory(t *testing.T) {
++	directory := filepath.Join(t.TempDir(), "ui")
++	require.NoError(t, os.MkdirAll(directory, 0o755))
++	archive := writeArchive(t, "index.html", "assets/a.js")
++	require.NoError(t, extractExternalUI(context.Background(), archive, directory))
++	require.Equal(t, []string{"assets/a.js", "index.html"}, listFiles(t, directory))
++}
++
++// An archive that does not unpack leaves the files served as they were, and nothing of it.
++func TestExtractExternalUIKeepsServedOnFailure(t *testing.T) {
++	broken := filepath.Join(t.TempDir(), "broken.zip")
++	require.NoError(t, os.WriteFile(broken, []byte("not a zip"), 0o644))
++	for name, archive := range map[string]string{
++		"a file where a directory goes": writeArchive(t, "index.html", "assets", "assets/a.js"),
++		"a path out of the directory":   writeArchive(t, "index.html", "../escaped.js"),
++		"the name of the staging":       writeArchive(t, "index.html", externalUIStaging+"/a.js"),
++		"no files":                      writeArchive(t, "dist/"),
++		"one file in a single folder":   writeArchive(t, "index.html"),
++		"not an archive":                broken,
++	} {
++		t.Run(name, func(t *testing.T) {
++			directory := servedDirectory(t)
++			require.Error(t, extractExternalUI(context.Background(), archive, directory))
++			require.Equal(t, oldFiles, listFiles(t, directory))
++			require.NoFileExists(t, filepath.Join(filepath.Dir(directory), "escaped.js"))
++		})
++	}
++}
+-- 
+2.53.0
+

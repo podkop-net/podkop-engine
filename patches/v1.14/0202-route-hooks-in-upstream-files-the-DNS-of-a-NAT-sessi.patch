@@ -1,0 +1,65 @@
+From 11fd2a2a14bbfb0537e3e29a8d23ab4bc8862cc0 Mon Sep 17 00:00:00 2001
+From: FiyeroT <me@fiyero.xyz>
+Date: Thu, 12 Nov 2026 21:41:19 +0300
+Subject: [PATCH 05/57] route, hooks in upstream files: the DNS of a NAT
+ session answered off the reading loop
+
+The lines of upstream files that "route: the DNS of a NAT session answered off the reading loop"
+needs; the feature itself is its patch of layer 03, in files of its own.
+
+Pdk-Feature: dns-nat
+Pdk-Zone: core
+Pdk-Layer: 02
+---
+ route/dns.go | 10 +++++++---
+ 1 file changed, 7 insertions(+), 3 deletions(-)
+
+diff --git a/route/dns.go b/route/dns.go
+index d697e787e..94985248f 100644
+--- a/route/dns.go
++++ b/route/dns.go
+@@ -13,6 +13,7 @@ import (
+ 	E "github.com/sagernet/sing/common/exceptions"
+ 	M "github.com/sagernet/sing/common/metadata"
+ 	N "github.com/sagernet/sing/common/network"
++	"github.com/sagernet/sing/common/udpnat2"
+ 
+ 	mDNS "github.com/miekg/dns"
+ )
+@@ -28,7 +29,7 @@ func (r *Router) hijackDNSStream(ctx context.Context, conn net.Conn, metadata ad
+ 		conn.SetReadDeadline(time.Now().Add(C.DNSTimeout))
+ 		err = dnsOutbound.HandleStreamDNSRequest(ctx, r.dns, conn, metadata)
+ 		if err != nil {
+-			if !E.IsClosedOrCanceled(err) {
++			if !E.IsClosedOrCanceled(err) && !dns.IsLoggedFailure(err) {
+ 				return err
+ 			} else {
+ 				return nil
+@@ -43,11 +44,14 @@ func (r *Router) hijackDNSPacket(ctx context.Context, conn N.PacketConn, packetB
+ 	if err != nil {
+ 		N.ReleaseMultiPacketBuffer(packetBuffers)
+ 		err = E.Cause(err, "report handshake success")
++	} else if natConn, isNatConn := conn.(udpnat.Conn); isNatConn {
++		r.hijackDNSNatConn(ctx, natConn, packetBuffers, metadata, onClose) // see dns_nat.go
++		return nil
+ 	} else {
+ 		err = dnsOutbound.NewDNSPacketConnection(ctx, r.dns, conn, packetBuffers, metadata)
+ 	}
+ 	N.CloseOnHandshakeFailure(conn, onClose, err)
+-	if err != nil && !E.IsClosedOrCanceled(err) {
++	if err != nil && !E.IsClosedOrCanceled(err) && !dns.IsLoggedFailure(err) {
+ 		return E.Cause(err, "process DNS packet")
+ 	}
+ 	return nil
+@@ -67,7 +71,7 @@ func (r *Router) HijackDNSPacket(ctx context.Context, payload []byte, writer N.P
+ 		if exchangeErr == nil {
+ 			exchangeErr = r.writeDNSPacketResponse(&message, response, writer, destination)
+ 		}
+-		if exchangeErr != nil && !R.IsRejected(exchangeErr) && !E.IsClosedOrCanceled(exchangeErr) {
++		if exchangeErr != nil && !R.IsRejected(exchangeErr) && !E.IsClosedOrCanceled(exchangeErr) && !dns.IsLoggedFailure(exchangeErr) {
+ 			r.logger.ErrorContext(ctx, E.Cause(exchangeErr, "process DNS packet"))
+ 		}
+ 	})
+-- 
+2.53.0
+

@@ -1,0 +1,68 @@
+From 63b4a8dec304907e8b72a112a3d9bbc736083ba1 Mon Sep 17 00:00:00 2001
+From: FiyeroT <me@fiyero.xyz>
+Date: Thu, 12 Nov 2026 21:41:20 +0300
+Subject: [PATCH 29/57] hysteria, hysteria2, tuic: a uTLS fingerprint is
+ dropped with a warning
+
+A uTLS fingerprint on a QUIC protocol is dropped with a warning.
+
+Made of these commits of the earlier series (branch archive/r25-1.14-commits):
+  dbe74957e hysteria, hysteria2, tuic: a uTLS fingerprint is dropped with a warning
+
+Pdk-Feature: hysteria-utls
+Pdk-Zone: protocols
+Pdk-Layer: 03
+---
+ common/tls/quic_options_test.go | 40 +++++++++++++++++++++++++++++++++
+ 1 file changed, 40 insertions(+)
+ create mode 100644 common/tls/quic_options_test.go
+
+diff --git a/common/tls/quic_options_test.go b/common/tls/quic_options_test.go
+new file mode 100644
+index 000000000..515e767cf
+--- /dev/null
++++ b/common/tls/quic_options_test.go
+@@ -0,0 +1,40 @@
++//go:build with_utls
++
++package tls
++
++import (
++	"context"
++	"testing"
++
++	"github.com/sagernet/sing-box/log"
++	"github.com/sagernet/sing-box/option"
++
++	"github.com/stretchr/testify/require"
++)
++
++// An outbound over QUIC with a uTLS fingerprint gets the TLS client QUIC can use (the
++// fingerprint dropped): with it its every connection failed.
++func TestQUICClientOptionsDropUTLS(t *testing.T) {
++	logger := log.NewNOPFactory().Logger()
++	options := option.OutboundTLSOptions{
++		Enabled:    true,
++		ServerName: "example.org",
++		UTLS:       &option.OutboundUTLSOptions{Enabled: true, Fingerprint: "chrome"},
++	}
++	config, err := NewClient(context.Background(), logger, "example.org", options)
++	require.NoError(t, err)
++	_, err = config.STDConfig()
++	require.Error(t, err, "uTLS has no form QUIC can use")
++
++	quicOptions := QUICClientOptions(logger, options)
++	require.Nil(t, quicOptions.UTLS)
++	require.NotNil(t, options.UTLS, "the options of the caller were changed")
++	config, err = NewClient(context.Background(), logger, "example.org", quicOptions)
++	require.NoError(t, err)
++	stdConfig, err := config.STDConfig()
++	require.NoError(t, err)
++	require.Equal(t, "example.org", stdConfig.ServerName)
++
++	plain := option.OutboundTLSOptions{Enabled: true, ServerName: "example.org"}
++	require.Equal(t, plain, QUICClientOptions(logger, plain))
++}
+-- 
+2.53.0
+

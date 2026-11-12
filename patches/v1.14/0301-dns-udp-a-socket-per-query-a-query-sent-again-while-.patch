@@ -1,0 +1,408 @@
+From a3a268c6bd531fd6b35e94d4aeb4a74868565811 Mon Sep 17 00:00:00 2001
+From: FiyeroT <me@fiyero.xyz>
+Date: Thu, 12 Nov 2026 21:41:20 +0300
+Subject: [PATCH 19/57] dns/udp: a socket per query, a query sent again while
+ no answer came
+
+A server reached without a proxy gets a socket of its own for each query, and a plain UDP query is
+sent again while no answer has come.
+
+Made of these commits of the earlier series (branch archive/r25-1.14-commits):
+  f37046c27 dns/udp: one socket per query for servers reached without a proxy
+  39ce754d8 dns: retransmit plain UDP queries while no answer has come
+
+Pdk-Feature: dns-udp
+Pdk-Zone: core
+Pdk-Layer: 03
+---
+ dns/exchange_fresh.go      | 137 +++++++++++++++++++++++++++++
+ dns/exchange_fresh_test.go | 176 +++++++++++++++++++++++++++++++++++++
+ dns/transport/udp_fresh.go |  49 +++++++++++
+ 3 files changed, 362 insertions(+)
+ create mode 100644 dns/exchange_fresh.go
+ create mode 100644 dns/exchange_fresh_test.go
+ create mode 100644 dns/transport/udp_fresh.go
+
+diff --git a/dns/exchange_fresh.go b/dns/exchange_fresh.go
+new file mode 100644
+index 000000000..7d8e80017
+--- /dev/null
++++ b/dns/exchange_fresh.go
+@@ -0,0 +1,137 @@
++package dns
++
++import (
++	"context"
++	"strings"
++	"time"
++
++	"github.com/sagernet/sing-box/adapter"
++	C "github.com/sagernet/sing-box/constant"
++	"github.com/sagernet/sing-box/option"
++	"github.com/sagernet/sing/common/buf"
++	E "github.com/sagernet/sing/common/exceptions"
++	M "github.com/sagernet/sing/common/metadata"
++	N "github.com/sagernet/sing/common/network"
++	"github.com/sagernet/sing/service"
++
++	mDNS "github.com/miekg/dns"
++)
++
++// ExchangeFresh sends one query over plain DNS from its own UDP socket, as dnsmasq,
++// unbound, AdGuard dnsproxy and the Go resolver do: a random source port and query ID
++// per query (RFC 5452), and no per-socket rate limit of a public resolver applied to the
++// whole router (Yandex DNS answers only about 20 queries per burst and 20 per second per
++// source port and drops the rest). The reply must match the ID and the question; the
++// socket is closed on every return path, including cancellation. While no answer has come
++// the same datagram is sent again (see freshRetransmitAt).
++
++// freshSocketSlots caps the sockets open at once, like dnsmasq --dns-forward-max.
++var freshSocketSlots = make(chan struct{}, 256)
++
++// freshRetransmitAt are the times after the first send at which the same datagram is sent
++// again while no answer has come, so that a lost query or reply costs about a second, not
++// the whole deadline. Duplicate queries of clients do not help here: the DNS client makes
++// them wait on the exchange in flight. One second, then doubling, as the Windows and
++// Apple resolvers, Chromium and dnsmasq --fast-dns-retry do and RFC 8085 recommends; three
++// sends in all, the limit of RFC 9520. The caller's deadline cuts the schedule short: the
++// provider fallback gives its servers 1.5-3 s, so they get two sends. The socket and ID
++// stay the same: a reply to any send is accepted (RFC 1035 7.3), so a slow but working
++// server is not punished, one port and ID stay in flight (RFC 5452), and a source port
++// carries three packets at most.
++var freshRetransmitAt = []time.Duration{time.Second, 3 * time.Second}
++
++func ExchangeFresh(ctx context.Context, dialer N.Dialer, serverAddr M.Socksaddr, message *mDNS.Msg) (*mDNS.Msg, error) {
++	return exchangeFresh(ctx, freshSocketSlots, dialer, serverAddr, message)
++}
++
++// exchangeFresh takes a socket from the given pool of slots.
++func exchangeFresh(ctx context.Context, slots chan struct{}, dialer N.Dialer, serverAddr M.Socksaddr, message *mDNS.Msg) (*mDNS.Msg, error) {
++	select {
++	case slots <- struct{}{}:
++		defer func() { <-slots }()
++	case <-ctx.Done():
++		return nil, ctx.Err()
++	}
++	conn, err := dialer.DialContext(ctx, N.NetworkUDP, serverAddr)
++	if err != nil {
++		return nil, E.Cause(err, "dial UDP connection")
++	}
++	defer conn.Close()
++	// closing the socket when the context ends also unblocks a pending read
++	stop := context.AfterFunc(ctx, func() { conn.Close() })
++	defer stop()
++
++	exMessage := *message
++	exMessage.Compress = true
++	exMessage.Id = mDNS.Id()
++	request := buf.NewSize(1 + message.Len())
++	defer request.Release()
++	rawMessage, err := exMessage.PackBuffer(request.FreeBytes())
++	if err != nil {
++		return nil, err
++	}
++	_, err = conn.Write(rawMessage)
++	if err != nil {
++		return nil, E.Cause(err, "write request")
++	}
++	// the timers get their own copy: the request buffer goes back to the pool on return
++	retransmit := append([]byte(nil), rawMessage...)
++	for _, at := range freshRetransmitAt {
++		timer := time.AfterFunc(at, func() { conn.Write(retransmit) })
++		defer timer.Stop()
++	}
++
++	udpSize := 2048
++	if edns0Opt := message.IsEdns0(); edns0Opt != nil && int(edns0Opt.UDPSize()) > udpSize {
++		udpSize = int(edns0Opt.UDPSize())
++	}
++	response := buf.NewSize(udpSize)
++	defer response.Release()
++	for {
++		response.Reset()
++		_, err = response.ReadOnceFrom(conn)
++		if err != nil {
++			if ctx.Err() != nil {
++				return nil, ctx.Err()
++			}
++			return nil, E.Cause(err, "read response")
++		}
++		var reply mDNS.Msg
++		if reply.Unpack(response.Bytes()) != nil || reply.Id != exMessage.Id || !sameQuestion(message, &reply) {
++			continue // stray or forged packet: keep waiting for the real answer
++		}
++		reply.Id = message.Id
++		return &reply, nil
++	}
++}
++
++func sameQuestion(query *mDNS.Msg, reply *mDNS.Msg) bool {
++	if len(reply.Question) == 0 {
++		return true // some servers omit the question in error replies
++	}
++	if len(query.Question) != len(reply.Question) {
++		return false
++	}
++	for i, q := range query.Question {
++		r := reply.Question[i]
++		if q.Qtype != r.Qtype || q.Qclass != r.Qclass || !strings.EqualFold(q.Name, r.Name) {
++			return false
++		}
++	}
++	return true
++}
++
++// DirectRoute reports whether the queries of a remote server leave through a socket of
++// this process: no detour, or a detour to a direct outbound. Only valid once the
++// outbounds are created.
++func DirectRoute(ctx context.Context, options option.RemoteDNSServerOptions) bool {
++	if options.Detour == "" {
++		return true
++	}
++	outbounds := service.FromContext[adapter.OutboundManager](ctx)
++	if outbounds == nil {
++		return false
++	}
++	outbound, loaded := outbounds.Outbound(options.Detour)
++	return loaded && outbound.Type() == C.TypeDirect
++}
+diff --git a/dns/exchange_fresh_test.go b/dns/exchange_fresh_test.go
+new file mode 100644
+index 000000000..e01d06675
+--- /dev/null
++++ b/dns/exchange_fresh_test.go
+@@ -0,0 +1,176 @@
++package dns
++
++import (
++	"context"
++	"net"
++	"sync"
++	"testing"
++	"time"
++
++	M "github.com/sagernet/sing/common/metadata"
++	N "github.com/sagernet/sing/common/network"
++
++	mDNS "github.com/miekg/dns"
++)
++
++type freshArrival struct {
++	at   time.Time
++	port int
++	id   uint16
++}
++
++// lossyResolver ignores the first drop queries (all of them when drop < 0) and answers the
++// next one. With firstAfter set it answers only the first query, that much later, as a
++// slow server whose reply to the first send arrives after the retransmission.
++type lossyResolver struct {
++	addr     M.Socksaddr
++	access   sync.Mutex
++	arrivals []freshArrival
++}
++
++func newLossyResolver(t *testing.T, drop int, firstAfter time.Duration) *lossyResolver {
++	conn, err := net.ListenPacket("udp", "127.0.0.1:0")
++	if err != nil {
++		t.Fatal(err)
++	}
++	t.Cleanup(func() { conn.Close() })
++	resolver := &lossyResolver{addr: M.SocksaddrFromNet(conn.LocalAddr())}
++	go func() {
++		buffer := make([]byte, 1500)
++		for {
++			n, addr, err := conn.ReadFrom(buffer)
++			if err != nil {
++				return
++			}
++			var query mDNS.Msg
++			if query.Unpack(buffer[:n]) != nil {
++				continue
++			}
++			resolver.access.Lock()
++			resolver.arrivals = append(resolver.arrivals, freshArrival{time.Now(), addr.(*net.UDPAddr).Port, query.Id})
++			count := len(resolver.arrivals)
++			resolver.access.Unlock()
++			response := new(mDNS.Msg)
++			response.SetReply(&query)
++			response.Answer = []mDNS.RR{&mDNS.A{Hdr: mDNS.RR_Header{Name: query.Question[0].Name, Rrtype: mDNS.TypeA, Class: mDNS.ClassINET, Ttl: 300}, A: net.IPv4(1, 2, 3, 4)}}
++			packed, _ := response.Pack()
++			switch {
++			case firstAfter > 0:
++				if count == 1 {
++					time.AfterFunc(firstAfter, func() { conn.WriteTo(packed, addr) })
++				}
++			case drop >= 0 && count > drop:
++				conn.WriteTo(packed, addr)
++			}
++		}
++	}()
++	return resolver
++}
++
++func (r *lossyResolver) sent() []freshArrival {
++	r.access.Lock()
++	defer r.access.Unlock()
++	return append([]freshArrival(nil), r.arrivals...)
++}
++
++func swapRetransmit(at ...time.Duration) func() {
++	old := freshRetransmitAt
++	freshRetransmitAt = at
++	return func() { freshRetransmitAt = old }
++}
++
++func freshTestQuery() *mDNS.Msg {
++	message := new(mDNS.Msg)
++	message.SetQuestion("example.com.", mDNS.TypeA)
++	return message
++}
++
++// A lost query or reply costs one retransmission interval, not the whole deadline; the
++// retransmissions are the same datagram from the same socket, at most three sends.
++func TestExchangeFreshRetransmits(t *testing.T) {
++	defer swapRetransmit(100*time.Millisecond, 300*time.Millisecond)()
++	for _, testCase := range []struct {
++		name      string
++		drop      int
++		deadline  time.Duration
++		wantSends int
++		answered  bool
++		earliest  time.Duration
++	}{
++		{"no loss", 0, 2 * time.Second, 1, true, 0},
++		{"first lost", 1, 2 * time.Second, 2, true, 100 * time.Millisecond},
++		{"two lost", 2, 2 * time.Second, 3, true, 300 * time.Millisecond},
++		{"server silent: three sends, then the deadline", -1, 600 * time.Millisecond, 3, false, 0},
++		{"short deadline cuts the schedule (provider fallback)", -1, 200 * time.Millisecond, 2, false, 0},
++	} {
++		t.Run(testCase.name, func(t *testing.T) {
++			resolver := newLossyResolver(t, testCase.drop, 0)
++			ctx, cancel := context.WithTimeout(context.Background(), testCase.deadline)
++			defer cancel()
++			start := time.Now()
++			response, err := exchangeFresh(ctx, fallbackSocketSlots, N.SystemDialer, resolver.addr, freshTestQuery())
++			elapsed := time.Since(start)
++			if testCase.answered && (err != nil || len(response.Answer) != 1) {
++				t.Fatalf("no answer: %v", err)
++			}
++			if !testCase.answered && err == nil {
++				t.Fatal("answer from a silent server")
++			}
++			if elapsed < testCase.earliest {
++				t.Errorf("answered after %v, before the retransmission at %v", elapsed, testCase.earliest)
++			}
++			time.Sleep(400 * time.Millisecond) // no send may follow the return
++			sends := resolver.sent()
++			if len(sends) != testCase.wantSends {
++				t.Fatalf("%d sends, want %d", len(sends), testCase.wantSends)
++			}
++			for _, send := range sends[1:] {
++				if send.port != sends[0].port || send.id != sends[0].id {
++					t.Errorf("retransmission from port %d ID %d, first send from port %d ID %d", send.port, send.id, sends[0].port, sends[0].id)
++				}
++			}
++		})
++	}
++}
++
++// A reply to the first send that arrives after the retransmission is still accepted: a
++// slow but working server is not punished by the retransmission.
++func TestExchangeFreshLateReply(t *testing.T) {
++	defer swapRetransmit(100*time.Millisecond, 300*time.Millisecond)()
++	resolver := newLossyResolver(t, 0, 180*time.Millisecond)
++	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
++	defer cancel()
++	start := time.Now()
++	response, err := exchangeFresh(ctx, fallbackSocketSlots, N.SystemDialer, resolver.addr, freshTestQuery())
++	elapsed := time.Since(start)
++	if err != nil || len(response.Answer) != 1 {
++		t.Fatalf("late reply to the first send rejected: %v", err)
++	}
++	if elapsed > 290*time.Millisecond {
++		t.Errorf("answered after %v: the reply to the first send (at ~180 ms) was not taken", elapsed)
++	}
++	if sends := len(resolver.sent()); sends != 2 {
++		t.Errorf("%d sends, want 2 (first and one retransmission before the late reply)", sends)
++	}
++}
++
++// When the provider servers race, the first answer wins and the others stop at once,
++// retransmissions included. It runs with the real schedule: the losers read it on their
++// own goroutines, which exchangeAll does not wait for, so it must not be swapped here.
++func TestExchangeAllStopsRetransmitting(t *testing.T) {
++	t.Parallel()
++	// the winner answers a little later, when the query to the loser has gone out: on a busy
++	// machine an answer at once could come before the loser was scheduled to send at all
++	silent, good := newLossyResolver(t, -1, 0), newLossyResolver(t, 0, 100*time.Millisecond)
++	state := &fallbackServer{dialer: N.SystemDialer, providers: &providerSet{}}
++	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
++	defer cancel()
++	response, err := state.exchangeAll(ctx, []M.Socksaddr{silent.addr, good.addr}, freshTestQuery())
++	if err != nil || len(response.Answer) != 1 {
++		t.Fatalf("no answer: %v", err)
++	}
++	time.Sleep(freshRetransmitAt[0] + 300*time.Millisecond) // past the first retransmission
++	if sends := len(silent.sent()); sends != 1 {
++		t.Errorf("the silent server got %d sends after the race was won, want 1", sends)
++	}
++}
+diff --git a/dns/transport/udp_fresh.go b/dns/transport/udp_fresh.go
+new file mode 100644
+index 000000000..d8d96d0c5
+--- /dev/null
++++ b/dns/transport/udp_fresh.go
+@@ -0,0 +1,49 @@
++package transport
++
++import (
++	"context"
++	"sync"
++
++	"github.com/sagernet/sing-box/dns"
++	"github.com/sagernet/sing-box/option"
++
++	mDNS "github.com/miekg/dns"
++)
++
++// Plain DNS over UDP sends every query from its own socket (see dns.ExchangeFresh) when
++// the query leaves through a socket of this process: no detour, or a detour to a direct
++// outbound, whatever interface or mark it binds to. Through a proxy the shared session
++// stays: a new UDP session of VLESS, VMess, Trojan or SOCKS is a new TCP (and TLS)
++// connection to the proxy server.
++type freshSocket struct {
++	ctx     context.Context
++	options option.RemoteDNSServerOptions
++	once    sync.Once
++	enabled bool
++}
++
++// freshEnabled is decided at the first query: outbounds are created after DNS servers.
++func (t *UDPTransport) freshEnabled() bool {
++	if t.fresh == nil {
++		return false
++	}
++	t.fresh.once.Do(func() { t.fresh.enabled = dns.DirectRoute(t.fresh.ctx, t.fresh.options) })
++	return t.fresh.enabled
++}
++
++func (t *UDPTransport) exchangeQuery(ctx context.Context, message *mDNS.Msg) (*mDNS.Msg, error) {
++	if !t.freshEnabled() {
++		return t.multiplexer.Exchange(ctx, message)
++	}
++	return dns.ExchangeFresh(ctx, t.dialer, t.serverAddr, message)
++}
++
++func (t *UDPTransport) exchangeQueryAsync(ctx context.Context, message *mDNS.Msg, callback func(response *mDNS.Msg, err error)) {
++	if !t.freshEnabled() {
++		t.multiplexer.ExchangeAsync(ctx, message, callback)
++		return
++	}
++	go func() {
++		callback(dns.ExchangeFresh(ctx, t.dialer, t.serverAddr, message))
++	}()
++}
+-- 
+2.53.0
+

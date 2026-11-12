@@ -1,0 +1,43 @@
+From 8491495f37805b2d49b2af31466f7694ada35bcd Mon Sep 17 00:00:00 2001
+From: FiyeroT <me@fiyero.xyz>
+Date: Thu, 12 Nov 2026 21:41:19 +0300
+Subject: [PATCH 08/57] box, hooks in upstream files: the Go memory limit
+ follows the memory the system can still give
+
+The lines of upstream files that "box: the Go memory limit follows the memory the system can still
+give" needs; the feature itself is its patch of layer 03, in files of its own.
+
+Pdk-Feature: box-memory
+Pdk-Zone: other
+Pdk-Layer: 02
+---
+ box.go | 6 +++++-
+ 1 file changed, 5 insertions(+), 1 deletion(-)
+
+diff --git a/box.go b/box.go
+index 3654fb65d..b409d3ab8 100644
+--- a/box.go
++++ b/box.go
+@@ -501,7 +501,6 @@ func (s *Box) PreStart() error {
+ func (s *Box) Start() error {
+ 	err := s.start()
+ 	if err != nil {
+-		s.Close()
+ 		return err
+ 	}
+ 	s.logger.Info("sing-box started (", F.Seconds(time.Since(s.createdAt).Seconds()), "s)")
+@@ -543,6 +542,11 @@ func (s *Box) preStart() error {
+ 	}
+ 	s.scope.Add(s.logFactory.Close)
+ 	applyDebugOptions(s.debugOptions)
++	stopMemoryLimit := startMemoryLimit(s.logger, s.debugOptions)
++	s.scope.Add(func() error {
++		stopMemoryLimit()
++		return nil
++	})
+ 	debugHTTPServer, err := startDebugHTTPServer(s.debugOptions)
+ 	if err != nil {
+ 		return err
+-- 
+2.53.0
+

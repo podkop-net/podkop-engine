@@ -1,0 +1,1171 @@
+From 7dfeba21366e4b410b25ad76d5daa95aea74a346 Mon Sep 17 00:00:00 2001
+From: FiyeroT <me@fiyero.xyz>
+Date: Thu, 12 Nov 2026 21:41:20 +0300
+Subject: [PATCH 35/57] probesock: the TCP of a probe connection, for the loss
+ of a member
+
+The probe sockets of the loss mode: the retransmissions and reordering of a probe connection told
+from the kernel, the buffer let go after the probe.
+
+Made of these commits of the earlier series (branch archive/r25-1.14-commits):
+  a2d7a6967 urltest: modes loss and balance, loss counted from the packets of a probe
+  e7034df02 urltest: a probe the URL failed holds no member back; one member a device
+  2b4cfe8eb probesock: reordering told by the least RTT; the buffer back after a probe
+  33b84707e probesock: the window of a probe held after the connect, then let go
+  738022b35 probesock: the buffer of a probe connection let go at the most the tuning reaches, not twice it
+  2128f4ce7 urltest modes: the fixes of the review
+
+Pdk-Feature: probesock
+Pdk-Zone: groups
+Pdk-Layer: 03
+---
+ common/probesock/capture_linux.go      | 369 +++++++++++++++++++++++++
+ common/probesock/capture_linux_test.go | 145 ++++++++++
+ common/probesock/capture_other.go      |  35 +++
+ common/probesock/count.go              | 154 +++++++++++
+ common/probesock/count_test.go         | 140 ++++++++++
+ common/probesock/probesock.go          | 189 +++++++++++++
+ common/probesock/window_linux_test.go  |  57 ++++
+ 7 files changed, 1089 insertions(+)
+ create mode 100644 common/probesock/capture_linux.go
+ create mode 100644 common/probesock/capture_linux_test.go
+ create mode 100644 common/probesock/capture_other.go
+ create mode 100644 common/probesock/count.go
+ create mode 100644 common/probesock/count_test.go
+ create mode 100644 common/probesock/probesock.go
+ create mode 100644 common/probesock/window_linux_test.go
+
+diff --git a/common/probesock/capture_linux.go b/common/probesock/capture_linux.go
+new file mode 100644
+index 000000000..0f44a1772
+--- /dev/null
++++ b/common/probesock/capture_linux.go
+@@ -0,0 +1,369 @@
++//go:build linux
++
++package probesock
++
++import (
++	"encoding/binary"
++	"net"
++	"net/netip"
++	"os"
++	"strconv"
++	"strings"
++	"sync"
++	"sync/atomic"
++	"time"
++	"unsafe"
++
++	"github.com/sagernet/sing/common/control"
++	E "github.com/sagernet/sing/common/exceptions"
++
++	"golang.org/x/net/bpf"
++	"golang.org/x/sys/unix"
++)
++
++// clampWindow holds the window a connection offers to window bytes: its receive buffer and the
++// clamp of its window. Set once the connection is established and before data moves, it leaves
++// the window scale the connect chose by the system maximum: a buffer set before the connect has
++// the kernel choose the scale by it (tcp_connect_init clamps the window to a buffer the user
++// set), and the window could never grow past 64 KB again. The buffer is set too, not the clamp
++// alone: the kernel's tuning of a buffer the user did not set moves the clamp along with it.
++// The connection keeps the buffer it is given (restoreWindow).
++func clampWindow(conn *net.TCPConn, window int) error {
++	return holdWindow(conn, window, window)
++}
++
++// holdWindow sets the receive buffer of a connection to buffer bytes (the kernel doubles what it
++// is given, as the bookkeeping counts) and the clamp of its window to window bytes.
++func holdWindow(conn *net.TCPConn, buffer int, window int) error {
++	raw, err := conn.SyscallConn()
++	if err != nil {
++		return err
++	}
++	return control.Raw(raw, func(fd uintptr) error {
++		if err := setBuffer(int(fd), buffer); err != nil {
++			return err
++		}
++		return unix.SetsockoptInt(int(fd), unix.IPPROTO_TCP, unix.TCP_WINDOW_CLAMP, window)
++	})
++}
++
++// setBuffer sets the receive buffer of a socket to size bytes, doubled by the kernel:
++// SO_RCVBUFFORCE passes over net.core.rmem_max, small on routers, for a process with
++// CAP_NET_ADMIN.
++func setBuffer(fd int, size int) error {
++	if unix.SetsockoptInt(fd, unix.SOL_SOCKET, unix.SO_RCVBUFFORCE, size) == nil {
++		return nil
++	}
++	return unix.SetsockoptInt(fd, unix.SOL_SOCKET, unix.SO_RCVBUF, size)
++}
++
++var (
++	bufferMaxOnce sync.Once
++	bufferMax     int
++)
++
++// systemBufferMax is the largest receive buffer the system grows a TCP connection to (the
++// last of net.ipv4.tcp_rmem), 4 MB when it cannot be read: the clamp of a window no tuning
++// reaches.
++func systemBufferMax() int {
++	bufferMaxOnce.Do(func() {
++		bufferMax = 4 << 20
++		content, err := os.ReadFile("/proc/sys/net/ipv4/tcp_rmem")
++		if err != nil {
++			return
++		}
++		fields := strings.Fields(string(content))
++		if len(fields) == 3 {
++			if value, err := strconv.Atoi(fields[2]); err == nil && value > 0 {
++				bufferMax = value
++			}
++		}
++	})
++	return bufferMax
++}
++
++// restoreWindow lets the window of a probe connection grow as far as the system lets a TCP
++// connection's once the probe is done: a multiplexed transport (gRPC, HTTP/2, xhttp, mux) keeps
++// the connection a probe dialed in its pool and carries other connections over it. The buffer
++// stays set (no tuning), at the most the tuning would reach: memory is taken only by data that
++// waits to be read.
++func restoreWindow(conn *net.TCPConn) {
++	// half given, as the kernel doubles it: the buffer the tuning would grow it to at most
++	_ = holdWindow(conn, systemBufferMax()/2, systemBufferMax())
++}
++
++type connInfo struct {
++	mss    int
++	minRTT time.Duration
++}
++
++func tcpInfo(conn *net.TCPConn) (connInfo, error) {
++	var info connInfo
++	raw, err := conn.SyscallConn()
++	if err != nil {
++		return info, err
++	}
++	var tcp *unix.TCPInfo
++	err = control.Raw(raw, func(fd uintptr) error {
++		var err error
++		tcp, err = unix.GetsockoptTCPInfo(int(fd), unix.IPPROTO_TCP, unix.TCP_INFO)
++		return err
++	})
++	if err != nil {
++		return info, err
++	}
++	info.mss = int(tcp.Rcv_mss)
++	info.minRTT = time.Duration(tcp.Min_rtt) * time.Microsecond
++	return info, nil
++}
++
++// snapLength is how much of a packet the capture keeps: the IP header (IPv6 without
++// extension headers) and the TCP header with its options.
++const snapLength = 128
++
++// capture takes the packets of one TCP connection from a packet socket of every interface,
++// headers only, and counts the incoming sequence.
++type capture struct {
++	fd      int
++	local   netip.AddrPort
++	remote  netip.AddrPort
++	stopped atomic.Bool
++	done    chan struct{}
++
++	access  sync.Mutex
++	counter counter
++	inIndex int // the interface the incoming packets are taken from: the first one seen
++}
++
++func startCapture(conn *net.TCPConn) (*capture, error) {
++	local, err := netip.ParseAddrPort(conn.LocalAddr().String())
++	if err != nil {
++		return nil, err
++	}
++	remote, err := netip.ParseAddrPort(conn.RemoteAddr().String())
++	if err != nil {
++		return nil, err
++	}
++	local = netip.AddrPortFrom(local.Addr().Unmap(), local.Port())
++	remote = netip.AddrPortFrom(remote.Addr().Unmap(), remote.Port())
++	// protocol 0: nothing comes before the filter is on and the socket is bound
++	fd, err := unix.Socket(unix.AF_PACKET, unix.SOCK_DGRAM|unix.SOCK_CLOEXEC, 0)
++	if err != nil {
++		return nil, E.Cause(err, "open a packet socket")
++	}
++	c := &capture{fd: fd, local: local, remote: remote, done: make(chan struct{})}
++	err = c.setup()
++	if err != nil {
++		unix.Close(fd)
++		return nil, err
++	}
++	go c.run()
++	return c, nil
++}
++
++func htons(value uint16) uint16 {
++	return value<<8 | value>>8
++}
++
++func (c *capture) setup() error {
++	filter, err := incomingFilter(c.local, c.remote)
++	if err != nil {
++		return err
++	}
++	err = unix.SetsockoptSockFprog(c.fd, unix.SOL_SOCKET, unix.SO_ATTACH_FILTER, &unix.SockFprog{Len: uint16(len(filter)), Filter: &filter[0]})
++	if err != nil {
++		return E.Cause(err, "attach the filter")
++	}
++	// what the router sends is not wanted: the kernel does not clone it for this socket
++	// (Linux 4.20 and later; on older ones it is passed over as it is read)
++	_ = unix.SetsockoptInt(c.fd, unix.SOL_PACKET, unix.PACKET_IGNORE_OUTGOING, 1)
++	// a probe is a few hundred packets a second: a megabyte of buffer holds seconds of them
++	_ = setBuffer(c.fd, 1<<20)
++	err = unix.SetsockoptInt(c.fd, unix.SOL_SOCKET, unix.SO_TIMESTAMPNS, 1)
++	if err != nil {
++		return E.Cause(err, "timestamps")
++	}
++	err = unix.SetsockoptTimeval(c.fd, unix.SOL_SOCKET, unix.SO_RCVTIMEO, &unix.Timeval{Usec: 100_000})
++	if err != nil {
++		return err
++	}
++	err = unix.Bind(c.fd, &unix.SockaddrLinklayer{Protocol: htons(unix.ETH_P_ALL)})
++	if err != nil {
++		return E.Cause(err, "bind the packet socket")
++	}
++	return nil
++}
++
++// incomingFilter passes the TCP packets the remote end sends to the local port of the
++// connection, IPv4 not fragmented or IPv6 without extension headers, cut to snapLength.
++// The remote address is matched, the local one is not: a source NAT on the way out (mwan3,
++// a VPN that masquerades) rewrites it before the capture sees the packets come back. A
++// packet of another connection to the same server port that shares the local port (the
++// kernel lets connections to different destinations share one) stays out.
++func incomingFilter(local netip.AddrPort, remote netip.AddrPort) ([]unix.SockFilter, error) {
++	ports := uint32(remote.Port())<<16 | uint32(local.Port())
++	var program []bpf.Instruction
++	var drops []int // the jumps to the drop at the end, their skips set once it is placed
++	require := func(value uint32) {
++		drops = append(drops, len(program))
++		program = append(program, bpf.JumpIf{Cond: bpf.JumpEqual, Val: value})
++	}
++	program = append(program, bpf.LoadAbsolute{Off: 0, Size: 1}, bpf.ALUOpConstant{Op: bpf.ALUOpAnd, Val: 0xf0})
++	address := remote.Addr()
++	if address.Is4() {
++		require(0x40)
++		program = append(program, bpf.LoadAbsolute{Off: 9, Size: 1})
++		require(unix.IPPROTO_TCP)
++		// a fragment carries no TCP header where one is looked for
++		program = append(program, bpf.LoadAbsolute{Off: 6, Size: 2}, bpf.ALUOpConstant{Op: bpf.ALUOpAnd, Val: 0x1fff})
++		require(0)
++		bytes := address.As4()
++		program = append(program, bpf.LoadAbsolute{Off: 12, Size: 4})
++		require(binary.BigEndian.Uint32(bytes[:]))
++		program = append(program, bpf.LoadMemShift{Off: 0}, bpf.LoadIndirect{Off: 0, Size: 4})
++		require(ports)
++	} else {
++		require(0x60)
++		program = append(program, bpf.LoadAbsolute{Off: 6, Size: 1})
++		require(unix.IPPROTO_TCP)
++		bytes := address.As16()
++		for word := 0; word < 4; word++ {
++			program = append(program, bpf.LoadAbsolute{Off: uint32(8 + 4*word), Size: 4})
++			require(binary.BigEndian.Uint32(bytes[4*word:]))
++		}
++		program = append(program, bpf.LoadAbsolute{Off: 40, Size: 4})
++		require(ports)
++	}
++	program = append(program, bpf.RetConstant{Val: snapLength})
++	drop := len(program)
++	program = append(program, bpf.RetConstant{Val: 0})
++	for _, index := range drops {
++		jump := program[index].(bpf.JumpIf)
++		skip := drop - index - 1
++		if skip > 255 {
++			return nil, E.New("the filter is too long")
++		}
++		jump.SkipFalse = uint8(skip)
++		program[index] = jump
++	}
++	raw, err := bpf.Assemble(program)
++	if err != nil {
++		return nil, E.Cause(err, "assemble the filter")
++	}
++	filter := make([]unix.SockFilter, len(raw))
++	for i, instruction := range raw {
++		filter[i] = unix.SockFilter{Code: instruction.Op, Jt: instruction.Jt, Jf: instruction.Jf, K: instruction.K}
++	}
++	return filter, nil
++}
++
++func (c *capture) run() {
++	defer close(c.done)
++	buffer := make([]byte, snapLength)
++	oob := make([]byte, unix.CmsgSpace(int(unsafe.Sizeof(unix.Timespec{}))))
++	for {
++		flags := 0
++		if c.stopped.Load() {
++			// what came before the stop is read without waiting, then the capture ends
++			flags = unix.MSG_DONTWAIT
++		}
++		n, oobn, _, from, err := unix.Recvmsg(c.fd, buffer, oob, flags)
++		if err != nil {
++			if err == unix.EAGAIN || err == unix.EINTR {
++				if c.stopped.Load() && flags != 0 {
++					return
++				}
++				continue
++			}
++			return
++		}
++		link, isLink := from.(*unix.SockaddrLinklayer)
++		if !isLink || link.Pkttype == unix.PACKET_OUTGOING {
++			continue
++		}
++		at, hasTime := packetTime(oob[:oobn])
++		if !hasTime {
++			at = time.Now()
++		}
++		c.take(buffer[:n], link.Ifindex, at)
++	}
++}
++
++// packetTime reads the kernel's receive time of a packet: a struct timespec of the platform
++// (32-bit fields on the 32-bit routers).
++func packetTime(oob []byte) (time.Time, bool) {
++	messages, err := unix.ParseSocketControlMessage(oob)
++	if err != nil {
++		return time.Time{}, false
++	}
++	for _, message := range messages {
++		if message.Header.Level == unix.SOL_SOCKET && message.Header.Type == unix.SCM_TIMESTAMPNS && len(message.Data) >= int(unsafe.Sizeof(unix.Timespec{})) {
++			spec := *(*unix.Timespec)(unsafe.Pointer(&message.Data[0]))
++			return time.Unix(int64(spec.Sec), int64(spec.Nsec)), true
++		}
++	}
++	return time.Time{}, false
++}
++
++// take counts an incoming packet of the connection: the addresses are checked here, and
++// only the first interface that brought one is believed (a packet may be seen on a device
++// and on the device under it).
++func (c *capture) take(packet []byte, index int, at time.Time) {
++	if len(packet) < 20 {
++		return
++	}
++	var (
++		source  netip.Addr
++		tcp     []byte
++		payload int
++	)
++	switch packet[0] >> 4 {
++	case 4:
++		headerLength := int(packet[0]&0x0f) * 4
++		if len(packet) < headerLength+20 {
++			return
++		}
++		source = netip.AddrFrom4([4]byte(packet[12:16]))
++		tcp = packet[headerLength:]
++		payload = int(binary.BigEndian.Uint16(packet[2:4])) - headerLength - int(tcp[12]>>4)*4
++	case 6:
++		if len(packet) < 60 {
++			return
++		}
++		source = netip.AddrFrom16([16]byte(packet[8:24]))
++		tcp = packet[40:]
++		payload = int(binary.BigEndian.Uint16(packet[4:6])) - int(tcp[12]>>4)*4
++	default:
++		return
++	}
++	// the local address is not matched: a source NAT on the way rewrites it (incomingFilter)
++	if source != c.remote.Addr() ||
++		binary.BigEndian.Uint16(tcp[0:2]) != c.remote.Port() || binary.BigEndian.Uint16(tcp[2:4]) != c.local.Port() {
++		return
++	}
++	c.access.Lock()
++	defer c.access.Unlock()
++	if c.inIndex == 0 {
++		c.inIndex = index
++	} else if index != c.inIndex {
++		return
++	}
++	c.counter.add(at, binary.BigEndian.Uint32(tcp[4:8]), payload)
++}
++
++// stop ends the capture once the packets already taken are read, and returns what it
++// counted and how many packets the socket dropped.
++func (c *capture) stop() (*counter, int) {
++	if c.stopped.Swap(true) {
++		return &counter{}, 0
++	}
++	<-c.done
++	dropped := 0
++	if stats, err := unix.GetsockoptTpacketStats(c.fd, unix.SOL_PACKET, unix.PACKET_STATISTICS); err == nil {
++		dropped = int(stats.Drops)
++	}
++	unix.Close(c.fd)
++	c.access.Lock()
++	defer c.access.Unlock()
++	return &c.counter, dropped
++}
+diff --git a/common/probesock/capture_linux_test.go b/common/probesock/capture_linux_test.go
+new file mode 100644
+index 000000000..f4bb53135
+--- /dev/null
++++ b/common/probesock/capture_linux_test.go
+@@ -0,0 +1,145 @@
++//go:build linux
++
++package probesock
++
++import (
++	"context"
++	"io"
++	"net"
++	"strings"
++	"testing"
++
++	"github.com/sagernet/sing/common/control"
++
++	"github.com/stretchr/testify/require"
++	"golang.org/x/sys/unix"
++)
++
++func serve(t *testing.T, size int) string {
++	listener, err := net.Listen("tcp", "127.0.0.1:0")
++	require.NoError(t, err)
++	t.Cleanup(func() { listener.Close() })
++	go func() {
++		for {
++			conn, err := listener.Accept()
++			if err != nil {
++				return
++			}
++			go func() {
++				defer conn.Close()
++				// the client speaks first, as through a proxy: nothing comes before the
++				// capture is on
++				request := make([]byte, 1)
++				if _, err := io.ReadFull(conn, request); err != nil {
++					return
++				}
++				conn.Write(make([]byte, size))
++			}()
++		}
++	}()
++	return listener.Addr().String()
++}
++
++func skipWithoutCapture(t *testing.T, err error) {
++	if err != nil && strings.Contains(err.Error(), "operation not permitted") {
++		t.Skip("no CAP_NET_RAW: ", err)
++	}
++}
++
++// The probe connection of a context: a small receive buffer, and every byte of it counted
++// once over the loopback (seen there both as sent and as received), nothing lost.
++func TestCaptureLoopback(t *testing.T) {
++	const size = 1 << 20
++	address := serve(t, size)
++	ctx, socket := With(context.Background(), Window)
++	conn, err := socket.Dial(ctx, net.Dialer{}, "tcp", address)
++	require.NoError(t, err)
++	defer conn.Close()
++	raw, err := conn.(*net.TCPConn).SyscallConn()
++	require.NoError(t, err)
++	clamp := func() int {
++		var value int
++		require.NoError(t, control.Raw(raw, func(fd uintptr) error {
++			var err error
++			value, err = unix.GetsockoptInt(int(fd), unix.IPPROTO_TCP, unix.TCP_WINDOW_CLAMP)
++			return err
++		}))
++		return value
++	}
++	// the window of the probe is clamped once the connection is established
++	require.Equal(t, Window, clamp())
++	_, err = conn.Write([]byte{1})
++	require.NoError(t, err)
++	received, err := io.Copy(io.Discard, conn)
++	require.NoError(t, err)
++	require.Equal(t, int64(size), received)
++	result, err := socket.Finish()
++	skipWithoutCapture(t, err)
++	require.NoError(t, err)
++	require.Zero(t, result.Dropped)
++	require.Equal(t, int64(size), result.Bytes)
++	// the probe done, the connection may carry other traffic: its window may grow again, its
++	// buffer no larger than the kernel's tuning would make it
++	require.Equal(t, systemBufferMax(), clamp())
++	require.NoError(t, control.Raw(raw, func(fd uintptr) error {
++		buffer, err := unix.GetsockoptInt(int(fd), unix.SOL_SOCKET, unix.SO_RCVBUF)
++		if err == nil && buffer > systemBufferMax() {
++			t.Errorf("the buffer is %d, the tuning stops at %d", buffer, systemBufferMax())
++		}
++		return err
++	}))
++	require.Zero(t, result.Lost)
++	require.Zero(t, result.DupBytes)
++	require.Positive(t, result.Segments)
++	require.Positive(t, result.RTT)
++}
++
++// Only the first dial under the context is the probe connection.
++func TestSecondDialOrdinary(t *testing.T) {
++	address := serve(t, 64<<10)
++	ctx, socket := With(context.Background(), Window)
++	first, err := socket.Dial(ctx, net.Dialer{}, "tcp", address)
++	require.NoError(t, err)
++	defer first.Close()
++	second, err := socket.Dial(ctx, net.Dialer{}, "tcp", address)
++	require.NoError(t, err)
++	defer second.Close()
++	_, err = first.Write([]byte{1})
++	require.NoError(t, err)
++	_, err = second.Write([]byte{1})
++	require.NoError(t, err)
++	_, err = io.Copy(io.Discard, second)
++	require.NoError(t, err)
++	_, err = io.Copy(io.Discard, first)
++	require.NoError(t, err)
++	result, err := socket.Finish()
++	skipWithoutCapture(t, err)
++	require.NoError(t, err)
++	require.Equal(t, int64(64<<10), result.Bytes)
++	require.Nil(t, From(Without(ctx)))
++}
++
++// Without a dial there is nothing to count.
++func TestFinishWithoutDial(t *testing.T) {
++	_, socket := With(context.Background(), Window)
++	_, err := socket.Finish()
++	require.Error(t, err)
++	socket.Close()
++}
++
++// A dial under the context of a probe that is over is an ordinary connection: no capture is
++// started that nobody would stop.
++func TestSealedAfterClose(t *testing.T) {
++	address := serve(t, 64<<10)
++	ctx, socket := With(context.Background(), Window)
++	socket.Close()
++	conn, err := socket.Dial(ctx, net.Dialer{}, "tcp", address)
++	require.NoError(t, err)
++	defer conn.Close()
++	socket.access.Lock()
++	require.Nil(t, socket.capture)
++	require.Nil(t, socket.conn)
++	socket.access.Unlock()
++	_, err = socket.Finish()
++	require.ErrorIs(t, err, ErrNoOwnConnection)
++}
+diff --git a/common/probesock/capture_other.go b/common/probesock/capture_other.go
+new file mode 100644
+index 000000000..c0fae7418
+--- /dev/null
++++ b/common/probesock/capture_other.go
+@@ -0,0 +1,35 @@
++//go:build !linux
++
++package probesock
++
++import (
++	"net"
++	"time"
++
++	E "github.com/sagernet/sing/common/exceptions"
++)
++
++func clampWindow(conn *net.TCPConn, window int) error {
++	return E.New("not supported on this platform")
++}
++
++type connInfo struct {
++	mss    int
++	minRTT time.Duration
++}
++
++func tcpInfo(conn *net.TCPConn) (connInfo, error) {
++	return connInfo{}, E.New("not supported on this platform")
++}
++
++type capture struct{}
++
++func startCapture(conn *net.TCPConn) (*capture, error) {
++	return nil, E.New("the capture is not supported on this platform")
++}
++
++func (c *capture) stop() (*counter, int) {
++	return &counter{}, 0
++}
++
++func restoreWindow(conn *net.TCPConn) {}
+diff --git a/common/probesock/count.go b/common/probesock/count.go
+new file mode 100644
+index 000000000..f29264e0b
+--- /dev/null
++++ b/common/probesock/count.go
+@@ -0,0 +1,154 @@
++// Package probesock counts what a probe connection lost on its way to this host
++// (podkop-engine).
++//
++// A loss probe downloads through a server over a TCP connection of its own, opened with a
++// small receive buffer: the window the host offers stays at a few segments, so the server
++// never sends a burst that a shallow queue on the way (the subscriber's line, mostly) would
++// drop. Loss the probe made itself would show on every server alike. While the probe runs,
++// the headers of the packets of its connection are captured, and the incoming sequence is
++// followed: a hole a later packet fills is reordering when it is filled sooner than a
++// quarter of the RTT, and a loss when filled later, by the retransmission of the lost
++// segment. The kernel's own counters cannot tell the two apart: its count of out-of-order
++// packets grows with the window, not with the loss, and calls a server that reorders lossy.
++package probesock
++
++import (
++	"time"
++)
++
++// Counts are what the capture saw of the incoming data of the probe connection.
++type Counts struct {
++	Packets      int   // incoming packets with data
++	Bytes        int64 // the sequence space they covered, once
++	Holes        int   // gaps in the sequence that opened
++	LostBytes    int64 // bytes of holes filled late: retransmitted
++	LostFills    int   // packets that filled a hole late
++	ReorderBytes int64 // bytes of holes filled soon: reordered
++	DupBytes     int64 // bytes that came twice
++	Unfilled     int64 // bytes of holes still open at the end
++}
++
++// minReorderWindow is the least time a hole may take to fill and still be reordering: a
++// quarter of the RTT, but not less than this, so that the scheduling of the capture on a
++// nearby server does not turn reordering into loss.
++const minReorderWindow = 3 * time.Millisecond
++
++// reorderWindow is that time for a connection whose connect took rtt.
++func reorderWindow(rtt time.Duration) time.Duration {
++	return max(rtt/4, minReorderWindow)
++}
++
++type hole struct {
++	start, end int64
++	at         time.Time
++}
++
++// fill is a piece of a hole a packet filled: how long the hole had been open, and its bytes.
++// The pieces are told apart (reordering or loss) only at the end, by the least RTT of the
++// connection: the time of its connect, which a busy host or server stretches, would call
++// retransmissions reordering.
++type fill struct {
++	packet int
++	age    time.Duration
++	bytes  int64
++}
++
++// counter follows the incoming sequence of one connection, packet by packet.
++type counter struct {
++	started bool
++	base    uint32
++	highest int64
++	holes   []hole
++	fills   []fill
++	Counts
++}
++
++// maxAhead bounds how far past the highest byte a packet may start: a sequence number
++// further away is not of this stream (an older packet, wrapped around).
++const maxAhead = 1 << 30
++
++// add takes an incoming packet with payload bytes of data starting at seq, captured at at.
++func (c *counter) add(at time.Time, seq uint32, payload int) {
++	if payload <= 0 {
++		return
++	}
++	if !c.started {
++		c.base, c.started = seq, true
++	}
++	start := int64(seq - c.base)
++	if start > c.highest+maxAhead {
++		return
++	}
++	end := start + int64(payload)
++	c.Packets++
++	if start > c.highest {
++		c.holes = append(c.holes, hole{c.highest, start, at})
++		c.Holes++
++		c.highest = end
++		return
++	}
++	limit := min(end, c.highest)
++	covered := int64(0)
++	// a new list: a packet inside a hole splits it in two, and a list filtered in place would
++	// write the second piece over the next hole before it is read
++	kept := make([]hole, 0, len(c.holes)+1)
++	for _, h := range c.holes {
++		from, to := max(start, h.start), min(limit, h.end)
++		if from >= to {
++			kept = append(kept, h)
++			continue
++		}
++		covered += to - from
++		c.fills = append(c.fills, fill{packet: c.Packets, age: at.Sub(h.at), bytes: to - from})
++		if h.start < from {
++			kept = append(kept, hole{h.start, from, h.at})
++		}
++		if to < h.end {
++			kept = append(kept, hole{to, h.end, h.at})
++		}
++	}
++	c.holes = kept
++	c.DupBytes += (limit - start) - covered
++	if end > c.highest {
++		c.highest = end
++	}
++}
++
++// finish returns the counts of the connection so far, the holes filled within window
++// counted as reordering, the others as loss.
++func (c *counter) finish(window time.Duration) Counts {
++	counts := c.Counts
++	counts.Bytes = c.highest
++	for _, h := range c.holes {
++		counts.Unfilled += h.end - h.start
++	}
++	lastLate := -1
++	for _, piece := range c.fills {
++		if piece.age < window {
++			counts.ReorderBytes += piece.bytes
++			continue
++		}
++		counts.LostBytes += piece.bytes
++		if piece.packet != lastLate {
++			counts.LostFills++
++			lastLate = piece.packet
++		}
++	}
++	return counts
++}
++
++// segments turns the counts into segments of size mss: how many the data took, and how many
++// of them were lost (a lost segment is at least one late fill).
++func (c Counts) segments(mss int) (segments int, lost int) {
++	if mss <= 0 {
++		mss = defaultMSS
++	}
++	segments = int((c.Bytes + int64(mss) - 1) / int64(mss))
++	lost = int((c.LostBytes + int64(mss)/2) / int64(mss))
++	lost = max(lost, c.LostFills)
++	return
++}
++
++// defaultMSS is the segment size when the connection does not tell its own: Ethernet, IPv4,
++// TCP timestamps.
++const defaultMSS = 1448
+diff --git a/common/probesock/count_test.go b/common/probesock/count_test.go
+new file mode 100644
+index 000000000..321d6b793
+--- /dev/null
++++ b/common/probesock/count_test.go
+@@ -0,0 +1,140 @@
++package probesock
++
++import (
++	"testing"
++	"time"
++
++	"github.com/stretchr/testify/require"
++)
++
++func at(milliseconds int) time.Time {
++	return time.Unix(1000, 0).Add(time.Duration(milliseconds) * time.Millisecond)
++}
++
++func newCounter() *counter {
++	return &counter{}
++}
++
++const testWindow = 10 * time.Millisecond
++
++func TestCounterInOrder(t *testing.T) {
++	c := newCounter()
++	for i := 0; i < 10; i++ {
++		c.add(at(i), uint32(5000+i*1000), 1000)
++	}
++	counts := c.finish(testWindow)
++	require.Equal(t, int64(10000), counts.Bytes)
++	require.Zero(t, counts.Holes)
++	require.Zero(t, counts.LostBytes)
++	require.Equal(t, 10, counts.Packets)
++}
++
++// A hole filled later than the window is a loss: the retransmission of the segment.
++func TestCounterLoss(t *testing.T) {
++	c := newCounter()
++	c.add(at(0), 0, 1000)
++	c.add(at(1), 1000, 1000)
++	c.add(at(2), 3000, 1000)
++	c.add(at(3), 4000, 1000)
++	c.add(at(100), 2000, 1000)
++	counts := c.finish(testWindow)
++	require.Equal(t, 1, counts.Holes)
++	require.Equal(t, int64(1000), counts.LostBytes)
++	require.Equal(t, 1, counts.LostFills)
++	require.Zero(t, counts.ReorderBytes)
++	require.Zero(t, counts.Unfilled)
++	require.Equal(t, int64(5000), counts.Bytes)
++}
++
++// A hole filled within the window is reordering, not a loss.
++func TestCounterReorder(t *testing.T) {
++	c := newCounter()
++	c.add(at(0), 0, 1000)
++	c.add(at(1), 2000, 1000)
++	c.add(at(2), 1000, 1000)
++	counts := c.finish(testWindow)
++	require.Equal(t, int64(1000), counts.ReorderBytes)
++	require.Zero(t, counts.LostBytes)
++	require.Zero(t, counts.LostFills)
++}
++
++func TestCounterDuplicateAndUnfilled(t *testing.T) {
++	c := newCounter()
++	c.add(at(0), 0, 1000)
++	c.add(at(1), 0, 1000)
++	c.add(at(2), 2000, 1000)
++	counts := c.finish(testWindow)
++	require.Equal(t, int64(1000), counts.DupBytes)
++	require.Equal(t, int64(1000), counts.Unfilled)
++}
++
++// A hole of two segments filled late by two retransmissions is two lost segments.
++func TestCounterPartialFills(t *testing.T) {
++	c := newCounter()
++	c.add(at(0), 0, 1000)
++	c.add(at(1), 3000, 1000)
++	c.add(at(50), 1000, 1000)
++	c.add(at(60), 2000, 1000)
++	counts := c.finish(testWindow)
++	require.Equal(t, int64(2000), counts.LostBytes)
++	require.Equal(t, 2, counts.LostFills)
++	segments, lost := counts.segments(1000)
++	require.Equal(t, 4, segments)
++	require.Equal(t, 2, lost)
++}
++
++// The sequence number wraps around; a number far behind the stream is not taken.
++func TestCounterWrap(t *testing.T) {
++	c := newCounter()
++	c.add(at(0), 0xffffff00, 0x100)
++	c.add(at(1), 0, 1000)
++	c.add(at(2), 0x7fff0000, 1000)
++	counts := c.finish(testWindow)
++	require.Equal(t, int64(0x100+1000), counts.Bytes)
++	require.Zero(t, counts.Holes)
++}
++
++func TestSegments(t *testing.T) {
++	segments, lost := Counts{Bytes: 14480, LostBytes: 1448}.segments(1448)
++	require.Equal(t, 10, segments)
++	require.Equal(t, 1, lost)
++	segments, lost = Counts{Bytes: 14480, LostBytes: 100, LostFills: 2}.segments(0)
++	require.Equal(t, 10, segments)
++	require.Equal(t, 2, lost)
++}
++
++func TestReorderWindow(t *testing.T) {
++	require.Equal(t, minReorderWindow, reorderWindow(time.Millisecond))
++	require.Equal(t, 25*time.Millisecond, reorderWindow(100*time.Millisecond))
++}
++
++// The pieces are told apart by the window given at the end: a longer RTT makes a fill
++// reordering that a shorter one calls a loss.
++func TestCounterWindowAtTheEnd(t *testing.T) {
++	c := newCounter()
++	c.add(at(0), 0, 1000)
++	c.add(at(1), 2000, 1000)
++	c.add(at(30), 1000, 1000)
++	require.Equal(t, int64(1000), c.finish(20*time.Millisecond).LostBytes)
++	require.Equal(t, int64(1000), c.finish(40*time.Millisecond).ReorderBytes)
++	require.Zero(t, c.finish(40*time.Millisecond).LostBytes)
++}
++
++// A packet in the middle of a hole splits it; the holes after it stay as they were.
++func TestCounterSplitKeepsLaterHoles(t *testing.T) {
++	c := newCounter()
++	c.add(at(0), 0, 1000)
++	c.add(at(1), 4000, 1000)
++	c.add(at(2), 6000, 1000)
++	// holes [1000,4000) and [5000,6000); a retransmission lands in the middle of the first
++	c.add(at(50), 2000, 1000)
++	c.add(at(60), 1000, 1000)
++	c.add(at(70), 3000, 1000)
++	c.add(at(80), 5000, 1000)
++	counts := c.finish(testWindow)
++	require.Equal(t, int64(4000), counts.LostBytes)
++	require.Equal(t, 4, counts.LostFills)
++	require.Zero(t, counts.DupBytes)
++	require.Zero(t, counts.Unfilled)
++	require.Equal(t, int64(7000), counts.Bytes)
++}
+diff --git a/common/probesock/probesock.go b/common/probesock/probesock.go
+new file mode 100644
+index 000000000..e3be2ac78
+--- /dev/null
++++ b/common/probesock/probesock.go
+@@ -0,0 +1,189 @@
++package probesock
++
++import (
++	"context"
++	"net"
++	"sync"
++	"time"
++
++	E "github.com/sagernet/sing/common/exceptions"
++)
++
++// Window is the most a probe connection offers its server, about a dozen segments. On the
++// stand a 1 MB download with a window of 16-24 KB lost nothing on a 25-packet queue and on a
++// 10 Mbit/s line, where a download with the ordinary window lost 6-13 %, and still showed a
++// random loss of 1 % as 0.8-1.25 %.
++const Window = 20 << 10
++
++type contextKey struct{}
++
++// Socket is the probe connection of a context: the first TCP connection a dialer opens
++// under it (see Dial). One probe, one socket: a context is made for each probe.
++type Socket struct {
++	window int
++
++	access   sync.Mutex
++	taken    bool
++	conn     *net.TCPConn
++	connect  time.Duration
++	capture  *capture
++	err      error
++	restored bool
++	// sealed: the probe is over (Finish or Close). A transport may still dial under its context
++	// afterwards (in the background, with the cancellation taken off): that is an ordinary
++	// connection, with no capture nobody would stop
++	sealed bool
++}
++
++// ErrNoOwnConnection tells that the probe went over no TCP connection of its own: a
++// multiplexed transport took a connection it had, or the transport is not TCP. Probing the
++// member again would not count either.
++var ErrNoOwnConnection = E.New("no connection of its own")
++
++// restore lets the window of the probe connection grow again once the probe has run: a
++// multiplexed transport (gRPC, HTTP/2, xhttp, mux) keeps the connection a probe dialed in its
++// pool and carries other connections over it, which a window of 20 KB would hold to a crawl
++// (on the stand, a gRPC server 25 ms away: 7 Mbit/s). Called under access.
++func (s *Socket) restore() {
++	if s.conn == nil || s.restored {
++		return
++	}
++	s.restored = true
++	restoreWindow(s.conn)
++}
++
++// With returns a context under which the first TCP dial is a probe connection with a
++// receive buffer of window bytes.
++func With(ctx context.Context, window int) (context.Context, *Socket) {
++	socket := &Socket{window: window}
++	return context.WithValue(ctx, contextKey{}, socket), socket
++}
++
++// From returns the probe socket of the context, nil when it has none.
++func From(ctx context.Context) *Socket {
++	socket, _ := ctx.Value(contextKey{}).(*Socket)
++	return socket
++}
++
++// Without returns a context whose dials are no probe connection: for the dials a probe
++// causes on the side, as the queries that resolve the server's name.
++func Without(ctx context.Context) context.Context {
++	if From(ctx) == nil {
++		return ctx
++	}
++	return context.WithValue(ctx, contextKey{}, (*Socket)(nil))
++}
++
++// take reports whether this dial is the probe connection: the first one under the context.
++func (s *Socket) take() bool {
++	if s == nil {
++		return false
++	}
++	s.access.Lock()
++	defer s.access.Unlock()
++	if s.taken || s.sealed {
++		return false
++	}
++	s.taken = true
++	return true
++}
++
++// Dial dials address with dialer. The first dial under the context that connects is the
++// probe connection: once it is established its window is clamped to the window of the probe
++// (the kernel's first window is ten segments, below it) and its packets are captured, before
++// any data moves (the client speaks first through a proxy). Every later dial is an ordinary
++// one.
++func (s *Socket) Dial(ctx context.Context, dialer net.Dialer, network string, address string) (net.Conn, error) {
++	if !s.take() {
++		return dialer.DialContext(ctx, network, address)
++	}
++	start := time.Now()
++	conn, err := dialer.DialContext(ctx, network, address)
++	if err != nil {
++		// the next address of the server, dialed after this one, is the probe connection
++		s.access.Lock()
++		s.taken = false
++		s.access.Unlock()
++		return nil, err
++	}
++	connect := time.Since(start)
++	s.access.Lock()
++	defer s.access.Unlock()
++	if s.sealed {
++		// the probe ended while this dialed: an ordinary connection
++		return conn, nil
++	}
++	s.connect = connect
++	tcpConn, isTCP := conn.(*net.TCPConn)
++	if !isTCP {
++		s.err = E.Cause(ErrNoOwnConnection, "not a TCP connection")
++		return conn, nil
++	}
++	s.conn = tcpConn
++	if s.err = clampWindow(tcpConn, s.window); s.err != nil {
++		// a probe whose window is not held could make its own loss: not counted
++		return conn, nil
++	}
++	s.capture, s.err = startCapture(tcpConn)
++	return conn, nil
++}
++
++// Result is what a probe connection showed.
++type Result struct {
++	Counts
++	Segments int           // segments of data that came
++	Lost     int           // of them lost on the way
++	RTT      time.Duration // the least RTT of the connection, or its connect time
++	MSS      int
++	Dropped  int // packets the capture could not keep: the counts are short
++}
++
++// Finish ends the capture and returns the counts, before the connection is closed (its
++// TCP information is read). An error tells that the probe had no connection of its own to
++// count: the dial went over a connection opened before (a multiplexed transport), over UDP,
++// or the capture could not run.
++func (s *Socket) Finish() (Result, error) {
++	s.access.Lock()
++	defer s.access.Unlock()
++	s.sealed = true
++	var result Result
++	if !s.taken || s.conn == nil {
++		if s.err != nil {
++			return result, s.err
++		}
++		return result, ErrNoOwnConnection
++	}
++	if s.capture == nil {
++		s.restore()
++		return result, E.Cause(s.err, "capture")
++	}
++	result.RTT = s.connect
++	if info, err := tcpInfo(s.conn); err == nil {
++		result.MSS = info.mss
++		if info.minRTT > 0 {
++			result.RTT = info.minRTT
++		}
++	}
++	counter, dropped := s.capture.stop()
++	s.capture = nil
++	s.restore()
++	result.Counts = counter.finish(reorderWindow(result.RTT))
++	result.Dropped = dropped
++	result.Segments, result.Lost = result.Counts.segments(result.MSS)
++	return result, nil
++}
++
++// Close ends a capture that Finish did not end: the probe failed on the way.
++func (s *Socket) Close() {
++	if s == nil {
++		return
++	}
++	s.access.Lock()
++	defer s.access.Unlock()
++	s.sealed = true
++	if s.capture != nil {
++		s.capture.stop()
++		s.capture = nil
++	}
++	s.restore()
++}
+diff --git a/common/probesock/window_linux_test.go b/common/probesock/window_linux_test.go
+new file mode 100644
+index 000000000..f92ab4e5a
+--- /dev/null
++++ b/common/probesock/window_linux_test.go
+@@ -0,0 +1,57 @@
++//go:build linux
++
++package probesock
++
++import (
++	"context"
++	"io"
++	"net"
++	"os"
++	"testing"
++	"time"
++
++	"github.com/stretchr/testify/require"
++)
++
++// The window of a probe connection that a multiplexed transport keeps for other traffic grows
++// again once the probe is done; left as the probe had it, it holds the traffic to some 16 KB a
++// round trip. Needs a delay on the loopback (PROBESOCK_NETEM=1 after
++// "tc qdisc add dev lo root netem delay 12ms"); skipped otherwise.
++func TestWindowGrowsAfterProbe(t *testing.T) {
++	if os.Getenv("PROBESOCK_NETEM") == "" {
++		t.Skip("needs a delay on lo: tc qdisc add dev lo root netem delay 12ms, PROBESOCK_NETEM=1")
++	}
++	const after = 16 << 20
++	address := serve(t, LossProbeSizeForTest+after)
++	rate := func(restore bool) float64 {
++		ctx, socket := With(context.Background(), Window)
++		conn, err := socket.Dial(ctx, net.Dialer{}, "tcp", address)
++		require.NoError(t, err)
++		defer conn.Close()
++		_, err = conn.Write([]byte{1})
++		require.NoError(t, err)
++		_, err = io.CopyN(io.Discard, conn, LossProbeSizeForTest)
++		require.NoError(t, err)
++		if restore {
++			_, err = socket.Finish()
++			require.NoError(t, err)
++		} else {
++			// the probe as it was before: the capture ends, the window stays
++			socket.access.Lock()
++			socket.capture.stop()
++			socket.capture = nil
++			socket.restored = true
++			socket.access.Unlock()
++		}
++		start := time.Now()
++		received, err := io.CopyN(io.Discard, conn, after)
++		require.NoError(t, err)
++		return float64(received) * 8 / time.Since(start).Seconds() / 1e6
++	}
++	kept, restored := rate(false), rate(true)
++	t.Logf("after the probe: %.1f Mbit/s with the window of the probe, %.1f Mbit/s with it restored", kept, restored)
++	require.Greater(t, restored, 4*kept)
++}
++
++// LossProbeSizeForTest is what the probe reads before the traffic goes on.
++const LossProbeSizeForTest = 256 << 10
+-- 
+2.53.0
+

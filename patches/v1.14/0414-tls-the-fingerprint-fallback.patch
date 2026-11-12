@@ -1,0 +1,3043 @@
+From 79ca7b94345291519a0ebe5e5b9288f97a57f430 Mon Sep 17 00:00:00 2001
+From: FiyeroT <me@fiyero.xyz>
+Date: Thu, 12 Nov 2026 21:41:21 +0300
+Subject: [PATCH 49/57] tls: the fingerprint fallback
+
+When a ClientHello of the configured uTLS fingerprint gets no acknowledgment, a dial goes on with
+another one: the hello without X25519MLKEM768 first, then firefox; the choice is kept in the cache
+file, a dial waits for a probe of it 5 s at most and not at all while it rests.
+
+Made of these commits of the earlier series (branch archive/r25-1.14-commits):
+  bc09ce077 tls: go on with another uTLS fingerprint when the ClientHello gets no acknowledgment
+  312286f06 tls: fingerprint fallback, what two reviews and the stands showed
+  fde268110 tls: the fingerprint fallback tries the ClientHello without X25519MLKEM768 first, then firefox
+  bc823daa3 tls: dials do not wait for a probe of the fingerprint fallback while it rests
+  3f08323e4 tls: a dial waits for the probe of the fingerprint fallback 5 s at most
+  ef67c2584 tls, dns: fixes from the review of the fallback and of ipv6_if_no_ipv4
+
+Pdk-Feature: tls-fp-fallback
+Pdk-Zone: protocols
+Pdk-Layer: 04
+---
+ box.go                                |    4 +
+ common/tls/client.go                  |   76 +-
+ common/tls/detour_test.go             |  165 ++++
+ common/tls/ech.go                     |    6 +
+ common/tls/hello_watch.go             |  116 +++
+ common/tls/hello_watch_linux.go       |  100 +++
+ common/tls/hello_watch_linux_test.go  |  336 ++++++++
+ common/tls/hello_watch_stub.go        |    9 +
+ common/tls/ktls.go                    |    6 +
+ common/tls/reality_client.go          |   75 ++
+ common/tls/utls_client.go             |   13 +
+ common/tls/utls_fallback.go           |  806 +++++++++++++++++++
+ common/tls/utls_fallback_test.go      | 1019 +++++++++++++++++++++++++
+ common/tls/utls_mlkem.go              |   27 +
+ experimental/cachefile/utls_choice.go |   43 ++
+ option/experimental.go                |   15 +
+ 16 files changed, 2811 insertions(+), 5 deletions(-)
+ create mode 100644 common/tls/detour_test.go
+ create mode 100644 common/tls/hello_watch.go
+ create mode 100644 common/tls/hello_watch_linux.go
+ create mode 100644 common/tls/hello_watch_linux_test.go
+ create mode 100644 common/tls/hello_watch_stub.go
+ create mode 100644 common/tls/utls_fallback.go
+ create mode 100644 common/tls/utls_fallback_test.go
+ create mode 100644 common/tls/utls_mlkem.go
+ create mode 100644 experimental/cachefile/utls_choice.go
+
+diff --git a/box.go b/box.go
+index 3ebc8eb7b..d9d90b90f 100644
+--- a/box.go
++++ b/box.go
+@@ -144,6 +144,10 @@ func New(options Options) (*Box, error) {
+ 
+ 	ctx = pause.WithDefaultManager(ctx)
+ 	experimentalOptions := common.PtrValueOrDefault(options.Experimental)
++	// Read by the TLS clients of the outbounds (common/tls). Registered also when the
++	// configuration has none: where the instances of a process share the registry, a
++	// configuration loaded again without the option would keep that of the one before.
++	service.MustRegister[*option.UTLSFallbackOptions](ctx, experimentalOptions.UTLSFallback)
+ 	debugOptions := common.PtrValueOrDefault(experimentalOptions.Debug)
+ 	err := checkDebugOptions(debugOptions)
+ 	if err != nil {
+diff --git a/common/tls/client.go b/common/tls/client.go
+index ae6b23198..c9116634d 100644
+--- a/common/tls/client.go
++++ b/common/tls/client.go
+@@ -40,6 +40,16 @@ func parseTLSSpoofOptions(serverName string, options option.OutboundTLSOptions)
+ 	return spoof, method, nil
+ }
+ 
++// spoofingConfig is a client configuration that may send a forged ClientHello first
++// (podkop-engine). A configuration that wraps another answers for it.
++type spoofingConfig interface {
++	spoofs() bool
++}
++
++func (c *STDClientConfig) spoofs() bool {
++	return c.spoof != ""
++}
++
+ func applyTLSSpoof(conn net.Conn, spoof string, method tlsspoof.Method) (net.Conn, error) {
+ 	if spoof == "" {
+ 		return conn, nil
+@@ -176,13 +186,66 @@ func (d *defaultDialer) DialTLSContext(ctx context.Context, destination M.Socksa
+ }
+ 
+ func (d *defaultDialer) dialContext(ctx context.Context, destination M.Socksaddr, echRetry bool) (Conn, error) {
+-	conn, err := d.dialer.DialContext(ctx, N.NetworkTCP, destination)
+-	if err != nil {
+-		return nil, err
++	// Inside the connection of another outbound the socket is not the server's: there is
++	// no ClientHello of this client to watch on it, and a forged one would be sent to the
++	// server of the tunnel, into its connection (podkop-engine).
++	tunnel := throughTunnel(d.dialer)
++	var fallback fingerprintDial
++	if fallbackConfig, hasFallback := d.config.(fingerprintFallbackConfig); hasFallback && !tunnel {
++		fallback = fallbackConfig.fingerprintDial()
+ 	}
+-	tlsConn, err := aTLS.ClientHandshake(ctx, conn, d.config)
+-	if err != nil {
++	if tunnel {
++		if spoofing, canSpoof := d.config.(spoofingConfig); canSpoof && spoofing.spoofs() {
++			return nil, E.New("tls.spoof does not work through a detour to a proxy outbound")
++		}
++	}
++	if fallback != nil {
++		err := fallback.ready(ctx, destination)
++		if err != nil {
++			return nil, err
++		}
++		defer fallback.done()
++	}
++	for {
++		conn, err := d.dialer.DialContext(ctx, N.NetworkTCP, destination)
++		if err != nil {
++			return nil, err
++		}
++		config := d.config
++		var watch *helloWatch
++		if fallback != nil {
++			var watched bool
++			config, watched = fallback.attempt(conn)
++			if watched {
++				watch = watchClientHello(conn)
++			}
++		}
++		tlsConn, err := aTLS.ClientHandshake(ctx, conn, config)
++		unanswered := watch.stop()
++		if fallback == nil && !tunnel {
++			// the fallback is off, so nothing else records the outcome for the block detector.
++			// Only for a direct dial: a handshake through a detour times out on the tunnel, not
++			// on the server's path, so recording it would feed the detector a false failure.
++			if recorder, ok := d.config.(detectRecorder); ok {
++				recorder.recordDetectOutcome(ctx, destination, err)
++			}
++		}
++		// a handshake that completed in the instant the watch gave the connection up has
++		// a closed socket under it
++		if err == nil && !unanswered {
++			if fallback != nil {
++				fallback.answered()
++			}
++			return withReadWait(tlsConn), nil
++		}
+ 		conn.Close()
++		if unanswered {
++			again, fallbackErr := fallback.unanswered(destination)
++			if again {
++				continue
++			}
++			return nil, fallbackErr
++		}
+ 		var echErr *tls.ECHRejectionError
+ 		if echRetry && errors.As(err, &echErr) && len(echErr.RetryConfigList) > 0 {
+ 			if echConfig, isECH := d.config.(ECHCapableConfig); isECH {
+@@ -190,6 +253,9 @@ func (d *defaultDialer) dialContext(ctx context.Context, destination M.Socksaddr
+ 				return d.dialContext(ctx, destination, false)
+ 			}
+ 		}
++		if fallback != nil && fallback.failed(ctx, destination, err) {
++			continue
++		}
+ 		return nil, err
+ 	}
+ }
+diff --git a/common/tls/detour_test.go b/common/tls/detour_test.go
+new file mode 100644
+index 000000000..67e833fab
+--- /dev/null
++++ b/common/tls/detour_test.go
+@@ -0,0 +1,165 @@
++//go:build with_utls
++
++package tls
++
++import (
++	"context"
++	"net"
++	"sync/atomic"
++	"testing"
++
++	"github.com/sagernet/sing-box/adapter"
++	"github.com/sagernet/sing-box/common/dialer"
++	"github.com/sagernet/sing-box/common/tlsspoof"
++	E "github.com/sagernet/sing/common/exceptions"
++	M "github.com/sagernet/sing/common/metadata"
++	N "github.com/sagernet/sing/common/network"
++
++	"github.com/stretchr/testify/require"
++)
++
++type upstreamDialer struct {
++	N.Dialer
++}
++
++func (d upstreamDialer) Upstream() any {
++	return d.Dialer
++}
++
++// detourOutbounds is the outbound manager of a detour: two outbounds to lead to.
++type detourOutbounds struct {
++	adapter.OutboundManager
++	outbounds map[string]adapter.Outbound
++}
++
++func (m detourOutbounds) Outbound(tag string) (adapter.Outbound, bool) {
++	outbound, loaded := m.outbounds[tag]
++	return outbound, loaded
++}
++
++var errDetourDialed = E.New("the detour was dialed")
++
++// detourTarget is an outbound a detour leads to; it counts the dials and fails them.
++type detourTarget struct {
++	adapter.Outbound
++	dialed *atomic.Int32
++}
++
++func (o detourTarget) DialContext(ctx context.Context, network string, destination M.Socksaddr) (net.Conn, error) {
++	o.dialed.Add(1)
++	return nil, errDetourDialed
++}
++
++// directTarget is what a detour takes for a direct outbound.
++type directTarget struct {
++	detourTarget
++}
++
++func (o directTarget) IsEmpty() bool {
++	return false
++}
++
++func newDetours() (outbounds detourOutbounds, proxyDialed *atomic.Int32, directDialed *atomic.Int32) {
++	proxyDialed, directDialed = new(atomic.Int32), new(atomic.Int32)
++	outbounds = detourOutbounds{outbounds: map[string]adapter.Outbound{
++		"proxy":  detourTarget{dialed: proxyDialed},
++		"direct": directTarget{detourTarget{dialed: directDialed}},
++	}}
++	return
++}
++
++// A dialer that goes through a proxy outbound is told apart from one that dials the
++// server itself, also under the wrapper that resolves the server's name. A detour to a
++// direct outbound dials the server itself; one that leads nowhere is left to the dial.
++func TestThroughTunnel(t *testing.T) {
++	outbounds, _, _ := newDetours()
++	proxy := dialer.NewDetour(outbounds, "proxy", false)
++	require.True(t, throughTunnel(proxy))
++	require.True(t, throughTunnel(upstreamDialer{proxy}))
++	direct := dialer.NewDetour(outbounds, "direct", false)
++	require.False(t, throughTunnel(direct))
++	require.False(t, throughTunnel(upstreamDialer{direct}))
++	missing := dialer.NewDetour(outbounds, "missing", false)
++	require.False(t, throughTunnel(missing))
++	_, err := missing.DialContext(context.Background(), N.NetworkTCP, M.ParseSocksaddrHostPort("192.0.2.1", 443))
++	require.ErrorContains(t, err, "outbound detour not found: missing")
++	require.False(t, throughTunnel(N.SystemDialer))
++	require.False(t, throughTunnel(upstreamDialer{N.SystemDialer}))
++}
++
++// Inside the connection of a proxy outbound the socket is the tunnel's: tls.spoof would
++// forge its ClientHello into that connection, and is refused before anything is dialed,
++// also for a configuration wrapped for kernel TLS or for ECH taken from DNS. Through a
++// detour to a direct outbound the socket is the server's, and the dial goes on.
++func TestSpoofThroughDetour(t *testing.T) {
++	if !tlsspoof.PlatformSupported {
++		t.Skip("tls spoof is not supported here")
++	}
++	setFallback(t, true)
++	logger, _ := newWarnLogger(t)
++	options := realityOptionsForTest("chrome", false)
++	options.Spoof = "packagist.org"
++	config, err := NewClient(context.Background(), logger, "192.0.2.1", options)
++	require.NoError(t, err)
++	destination := M.ParseSocksaddrHostPort("192.0.2.1", 443)
++	wrapped := map[string]Config{
++		"as it is":   config,
++		"kernel TLS": &KTLSClientConfig{Config: config},
++		"ECH":        &ECHClientConfig{ECHCapableConfig: config.(ECHCapableConfig)},
++	}
++	for name, config := range wrapped {
++		outbounds, proxyDialed, directDialed := newDetours()
++		_, err = NewDialer(dialer.NewDetour(outbounds, "proxy", false), config).DialTLSContext(context.Background(), destination)
++		require.ErrorContains(t, err, "tls.spoof does not work through a detour to a proxy outbound", name)
++		require.Zero(t, proxyDialed.Load(), name)
++		_, err = NewDialer(dialer.NewDetour(outbounds, "direct", false), config).DialTLSContext(context.Background(), destination)
++		require.ErrorIs(t, err, errDetourDialed, name)
++		require.EqualValues(t, 1, directDialed.Load(), name)
++	}
++
++	// a detour that leads nowhere says so itself, whatever the configuration asks for
++	outbounds, proxyDialed, _ := newDetours()
++	_, err = NewDialer(dialer.NewDetour(outbounds, "missing", false), config).DialTLSContext(context.Background(), destination)
++	require.ErrorContains(t, err, "outbound detour not found: missing")
++	require.Zero(t, proxyDialed.Load())
++
++	// without tls.spoof nothing is refused
++	plain, err := NewClient(context.Background(), logger, "192.0.2.1", realityOptionsForTest("chrome", false))
++	require.NoError(t, err)
++	_, err = NewDialer(dialer.NewDetour(outbounds, "proxy", false), plain).DialTLSContext(context.Background(), destination)
++	require.ErrorIs(t, err, errDetourDialed)
++	require.EqualValues(t, 1, proxyDialed.Load())
++}
++
++// askedConfig is a client configuration that counts how many dials asked it for the
++// fingerprint fallback.
++type askedConfig struct {
++	Config
++	asked *atomic.Int32
++}
++
++func (c askedConfig) fingerprintDial() fingerprintDial {
++	c.asked.Add(1)
++	return nil
++}
++
++// The fingerprint fallback is not used inside the connection of a proxy outbound: the
++// first flight on that socket is not the ClientHello of this client. Through a detour to
++// a direct outbound, and without a detour, it is.
++func TestFallbackThroughDetour(t *testing.T) {
++	outbounds, _, _ := newDetours()
++	destination := M.ParseSocksaddrHostPort("192.0.2.1", 443)
++	config := askedConfig{asked: new(atomic.Int32)}
++	_, err := NewDialer(dialer.NewDetour(outbounds, "proxy", false), config).DialTLSContext(context.Background(), destination)
++	require.ErrorIs(t, err, errDetourDialed)
++	require.Zero(t, config.asked.Load())
++	_, err = NewDialer(upstreamDialer{dialer.NewDetour(outbounds, "proxy", false)}, config).DialTLSContext(context.Background(), destination)
++	require.ErrorIs(t, err, errDetourDialed)
++	require.Zero(t, config.asked.Load())
++	_, err = NewDialer(dialer.NewDetour(outbounds, "direct", false), config).DialTLSContext(context.Background(), destination)
++	require.ErrorIs(t, err, errDetourDialed)
++	require.EqualValues(t, 1, config.asked.Load())
++	_, err = NewDialer(detourTarget{dialed: new(atomic.Int32)}, config).DialTLSContext(context.Background(), destination)
++	require.ErrorIs(t, err, errDetourDialed)
++	require.EqualValues(t, 2, config.asked.Load())
++}
+diff --git a/common/tls/ech.go b/common/tls/ech.go
+index 46ab50a23..8322dfb74 100644
+--- a/common/tls/ech.go
++++ b/common/tls/ech.go
+@@ -188,6 +188,12 @@ func (s *ECHClientConfig) Clone() Config {
+ 	}
+ }
+ 
++// spoofs answers for the configuration it wraps (podkop-engine).
++func (s *ECHClientConfig) spoofs() bool {
++	spoofing, canSpoof := s.ECHCapableConfig.(spoofingConfig)
++	return canSpoof && spoofing.spoofs()
++}
++
+ func UnmarshalECHKeys(raw []byte) ([]tls.EncryptedClientHelloKey, error) {
+ 	var keys []tls.EncryptedClientHelloKey
+ 	rawString := cryptobyte.String(raw)
+diff --git a/common/tls/hello_watch.go b/common/tls/hello_watch.go
+new file mode 100644
+index 000000000..c9753980a
+--- /dev/null
++++ b/common/tls/hello_watch.go
+@@ -0,0 +1,116 @@
++package tls
++
++import (
++	"context"
++	"net"
++	"sync/atomic"
++
++	"github.com/sagernet/sing-box/common/dialer"
++	"github.com/sagernet/sing/common"
++
++	M "github.com/sagernet/sing/common/metadata"
++	N "github.com/sagernet/sing/common/network"
++)
++
++// The uTLS fingerprint fallback (podkop-engine).
++//
++// Since 2026 the Russian DPI freezes the connections of some browser ClientHellos to a
++// server when many are made to it at once: chrome (Chrome 133, with the X25519MLKEM768 key
++// share), safari and randomized among them; the same ClientHello without the key share,
++// and firefox, pass (measured in October 2026). A frozen ClientHello is never
++// acknowledged; the handshake waits out its whole timeout, and so does every connection
++// after it for a while. With the fallback on, a client tries its ClientHellos in this order
++// and keeps the first that a server takes and the path lets through:
++//
++//  1. the configured fingerprint without its X25519MLKEM768 key share, as stock sing-box
++//     sends it under REALITY;
++//  2. firefox, with the key share: REALITY servers since Xray-core v26.9.8 refuse a
++//     ClientHello without it (they answer it as a stranger's);
++//  3. the configured fingerprint as it is.
++//
++// The dialer watches the connection while the handshake runs; when the ClientHello stays
++// unacknowledged it gives the connection up at once and dials again: with the same
++// ClientHello once more, then with the next one. A server that answers the ClientHello as a
++// stranger's moves the client on at once. While nothing is known of a server, one dial
++// tries the ClientHellos and the others wait for it: a burst of connections would
++// otherwise freeze the path or pile up refusals on the server. The choice is kept for the
++// local address it was made from (another address is another network) and in the cache
++// file, for a day; then one dial tries the first ClientHello again. When none gets through,
++// what drops the ClientHello does not choose by it: the fallback then rests, and
++// connections are made with the ClientHello that worked last, the configured fingerprint
++// when none has. It rests as well when the ClientHello that was not answered is answered on
++// the next connection, a loss on the way; when that keeps happening it is left after all,
++// since what drops only a part of the ClientHellos of one kind looks the same.
++//
++// The fallback is turned on by the option experimental.utls_fallback of the configuration,
++// or else by the environment variable SING_BOX_UTLS_FALLBACK; the list of fingerprints the
++// option may carry is no longer used. It concerns the TLS clients with a uTLS fingerprint,
++// REALITY included, dialed over a TCP socket of the kernel on Linux: not through a detour
++// to a proxy outbound, and not a client with ECH taken from DNS or with kernel TLS, whose
++// configuration is wrapped in another.
++
++// fingerprintFallbackConfig is a client configuration that can go on with another
++// fingerprint.
++type fingerprintFallbackConfig interface {
++	// fingerprintDial returns the fallback of one dial, nil when the configuration has
++	// none.
++	fingerprintDial() fingerprintDial
++}
++
++// fingerprintDial follows the attempts of one dial.
++type fingerprintDial interface {
++	// ready waits, before the connection is made, while another dial tries the
++	// ClientHellos of a server nothing is known of.
++	ready(ctx context.Context, destination M.Socksaddr) error
++	// done ends the dial: what it held for the others is released.
++	done()
++	// attempt returns the configuration for the handshake over conn, and whether the
++	// ClientHello is to be watched.
++	attempt(conn net.Conn) (config Config, watched bool)
++	// answered tells that the handshake of the last attempt succeeded.
++	answered()
++	// unanswered tells that the ClientHello of the last attempt got no acknowledgment.
++	// It reports whether to dial again, and the error of the dial when not.
++	unanswered(destination M.Socksaddr) (again bool, err error)
++	// failed tells that the handshake of the last attempt failed with err though its
++	// ClientHello was not left unanswered. It reports whether to dial again.
++	failed(ctx context.Context, destination M.Socksaddr, err error) (again bool)
++}
++
++// throughTunnel tells whether a dialer makes its connections inside those of another
++// outbound. Such a connection is not a socket to the server: its first flight is the
++// tunnel's, and some protocols send theirs only with the first payload, the ClientHello.
++// A detour to a direct outbound (another uplink, by its interface or mark) is a socket
++// to the server as any other. It is asked at the dial, not before: a dialer finds the
++// outbound of its detour at the first use, and keeps what it found.
++func throughTunnel(outboundDialer N.Dialer) bool {
++	detour, isDetour := common.Cast[*dialer.DetourDialer](outboundDialer)
++	if !isDetour {
++		return false
++	}
++	target, err := detour.Dialer()
++	if err != nil {
++		// nothing is dialed through it: the dial returns this error
++		return false
++	}
++	_, isDirect := target.(dialer.DirectDialer)
++	return !isDirect
++}
++
++// helloWatch watches a connection for a ClientHello that the server does not acknowledge.
++type helloWatch struct {
++	stopped    chan struct{}
++	finished   chan struct{}
++	unanswered atomic.Bool
++}
++
++// stop ends the watch and reports whether it has closed the connection, the ClientHello
++// having got no acknowledgment.
++func (w *helloWatch) stop() bool {
++	if w == nil {
++		return false
++	}
++	close(w.stopped)
++	<-w.finished
++	return w.unanswered.Load()
++}
+diff --git a/common/tls/hello_watch_linux.go b/common/tls/hello_watch_linux.go
+new file mode 100644
+index 000000000..f233fc9a1
+--- /dev/null
++++ b/common/tls/hello_watch_linux.go
+@@ -0,0 +1,100 @@
++package tls
++
++import (
++	"net"
++	"syscall"
++	"time"
++
++	"github.com/sagernet/sing/common"
++
++	"golang.org/x/sys/unix"
++)
++
++var (
++	helloWatchInterval = 50 * time.Millisecond
++	// retransmissions by timeout in a row, as the kernel counts them, after which the
++	// ClientHello is taken for dropped: on a path of 50 ms that is about a second
++	helloWatchRetransmits uint8 = 2
++	// what is written stays unacknowledged this long: the same, however the kernel
++	// paces its retransmissions
++	helloWatchLimit = 5 * time.Second
++)
++
++// watchClientHello closes conn when what the client writes to it stays unacknowledged
++// through helloWatchRetransmits retransmissions (or for helloWatchLimit) while nothing
++// has come from the server. The watch ends by itself once the server has sent anything:
++// from then on a stalled connection is not the ClientHello's doing. Until then the
++// client writes nothing but its ClientHello, in pieces when it is fragmented: an
++// acknowledgment of what is written so far does not end the watch. A connection that is
++// not a TCP socket of the kernel is not watched.
++func watchClientHello(conn net.Conn) *helloWatch {
++	tcpConn := kernelTCPConn(conn)
++	if tcpConn == nil {
++		return nil
++	}
++	rawConn, err := tcpConn.SyscallConn()
++	if err != nil {
++		return nil
++	}
++	watch := &helloWatch{
++		stopped:  make(chan struct{}),
++		finished: make(chan struct{}),
++	}
++	go watch.run(tcpConn, rawConn)
++	return watch
++}
++
++// kernelTCPConn finds the TCP socket a connection of the dialer is: the dialer wraps what
++// it returns (the tracking of connections, counters). A connection with addresses of its
++// own is carried by something else and is not a socket to the server; the dialer of a
++// detour is left out before this (throughTunnel).
++func kernelTCPConn(conn net.Conn) *net.TCPConn {
++	tcpConn, isTCP := common.Cast[*net.TCPConn](conn)
++	if !isTCP || tcpConn == nil {
++		return nil
++	}
++	if conn.RemoteAddr() == nil || tcpConn.RemoteAddr() == nil || conn.LocalAddr() == nil || tcpConn.LocalAddr() == nil ||
++		conn.RemoteAddr().String() != tcpConn.RemoteAddr().String() || conn.LocalAddr().String() != tcpConn.LocalAddr().String() {
++		return nil
++	}
++	return tcpConn
++}
++
++func (w *helloWatch) run(tcpConn *net.TCPConn, rawConn syscall.RawConn) {
++	defer close(w.finished)
++	ticker := time.NewTicker(helloWatchInterval)
++	defer ticker.Stop()
++	var unackedSince time.Time
++	for {
++		select {
++		case <-w.stopped:
++			return
++		case <-ticker.C:
++		}
++		var (
++			info    *unix.TCPInfo
++			infoErr error
++		)
++		err := rawConn.Control(func(fd uintptr) {
++			info, infoErr = unix.GetsockoptTCPInfo(int(fd), unix.IPPROTO_TCP, unix.TCP_INFO)
++		})
++		if err != nil || infoErr != nil {
++			return
++		}
++		switch {
++		case info.Bytes_received > 0:
++			return
++		case info.Unacked == 0:
++			unackedSince = time.Time{}
++		default:
++			if unackedSince.IsZero() {
++				unackedSince = time.Now()
++			}
++			if info.Retransmits >= helloWatchRetransmits || time.Since(unackedSince) >= helloWatchLimit {
++				w.unanswered.Store(true)
++				tcpConn.Close()
++				return
++			}
++		}
++	}
++}
+diff --git a/common/tls/hello_watch_linux_test.go b/common/tls/hello_watch_linux_test.go
+new file mode 100644
+index 000000000..48cc08eec
+--- /dev/null
++++ b/common/tls/hello_watch_linux_test.go
+@@ -0,0 +1,336 @@
++//go:build with_utls
++
++package tls
++
++import (
++	"context"
++	"crypto/tls"
++	"encoding/binary"
++	"fmt"
++	"io"
++	"net"
++	"os"
++	"os/exec"
++	"strings"
++	"sync"
++	"testing"
++	"time"
++
++	"github.com/sagernet/sing-box/option"
++	M "github.com/sagernet/sing/common/metadata"
++	N "github.com/sagernet/sing/common/network"
++
++	utls "github.com/metacubex/utls"
++	"github.com/stretchr/testify/require"
++)
++
++// dropArriving adds an nftables rule that drops the packets arriving for port which match.
++// They are dropped on the way in, not on the way out: a packet refused on the way out was
++// never sent, as the kernel sees it, and waits in the send queue instead of going
++// unacknowledged, which is not what a middlebox on the path does. The tests that need the
++// rule run as root with nft at hand, in a network namespace of their own (a container).
++func dropArriving(t *testing.T, port int, match string) {
++	t.Helper()
++	if os.Geteuid() != 0 {
++		t.Skip("needs root and nft")
++	}
++	table := fmt.Sprintf("hellowatch%d", port)
++	script := fmt.Sprintf("add table inet %s\nadd chain inet %s input { type filter hook input priority 0; }\nadd rule inet %s input tcp dport %d %s counter drop\n", table, table, table, port, match)
++	command := exec.Command("nft", "-f", "-")
++	command.Stdin = strings.NewReader(script)
++	output, err := command.CombinedOutput()
++	if err != nil {
++		t.Skip("nft: ", err, ": ", string(output))
++	}
++	t.Cleanup(func() {
++		exec.Command("nft", "delete", "table", "inet", table).Run()
++	})
++}
++
++func listenLocal(t *testing.T, handle func(conn net.Conn)) *net.TCPAddr {
++	t.Helper()
++	listener, err := net.Listen("tcp4", "127.0.0.1:0")
++	require.NoError(t, err)
++	var (
++		access   sync.Mutex
++		accepted []net.Conn
++		running  sync.WaitGroup
++	)
++	// the handlers end with the test: one left behind runs into the tests after it
++	t.Cleanup(func() {
++		listener.Close()
++		access.Lock()
++		for _, conn := range accepted {
++			conn.Close()
++		}
++		access.Unlock()
++		running.Wait()
++	})
++	running.Add(1)
++	go func() {
++		defer running.Done()
++		for {
++			conn, err := listener.Accept()
++			if err != nil {
++				return
++			}
++			access.Lock()
++			accepted = append(accepted, conn)
++			access.Unlock()
++			running.Add(1)
++			go func() {
++				defer running.Done()
++				handle(conn)
++			}()
++		}
++	}()
++	return listener.Addr().(*net.TCPAddr)
++}
++
++// A connection whose first write is never acknowledged is closed by the watch after two
++// retransmissions; one whose writes arrive is left alone, and so is one nothing has been
++// written to yet. The watch ends by itself when the server sends something, not when it
++// acknowledges what was written: more of the ClientHello may follow.
++func TestIntegrationHelloWatch(t *testing.T) {
++	// the server answers one connection, when told to
++	answer, done := make(chan struct{}), make(chan struct{})
++	t.Cleanup(func() { close(done) })
++	address := listenLocal(t, func(conn net.Conn) {
++		go func() {
++			select {
++			case <-answer:
++				conn.Write([]byte("answer"))
++			case <-done:
++			}
++		}()
++		io.Copy(io.Discard, conn)
++		conn.Close()
++	})
++
++	delivered, err := net.Dial("tcp4", address.String())
++	require.NoError(t, err)
++	defer delivered.Close()
++	watch := watchClientHello(delivered)
++	require.NotNil(t, watch)
++	time.Sleep(4 * helloWatchInterval)
++	select {
++	case <-watch.finished:
++		t.Fatal("the watch ended before anything was written")
++	default:
++	}
++	for range 2 {
++		_, err = delivered.Write(make([]byte, 600))
++		require.NoError(t, err)
++		time.Sleep(4 * helloWatchInterval)
++		select {
++		case <-watch.finished:
++			t.Fatal("the watch ended when a piece was acknowledged")
++		default:
++		}
++	}
++	answer <- struct{}{}
++	select {
++	case <-watch.finished:
++	case <-time.After(time.Second):
++		t.Fatal("the watch goes on after the server has answered")
++	}
++	require.False(t, watch.stop())
++	_, err = delivered.Write(make([]byte, 600))
++	require.NoError(t, err, "the connection stays open")
++
++	dropArriving(t, address.Port, "meta length > 100")
++	dropped, err := net.Dial("tcp4", address.String())
++	require.NoError(t, err)
++	defer dropped.Close()
++	watch = watchClientHello(dropped)
++	require.NotNil(t, watch)
++	start := time.Now()
++	_, err = dropped.Write(make([]byte, 600))
++	require.NoError(t, err)
++	select {
++	case <-watch.finished:
++	case <-time.After(helloWatchLimit):
++		t.Fatal("the watch did not notice the unacknowledged write")
++	}
++	require.True(t, watch.stop())
++	t.Logf("an unacknowledged write noticed after %d ms", time.Since(start).Milliseconds())
++	_, err = dropped.Write([]byte("more"))
++	require.Error(t, err, "the connection is closed")
++}
++
++type wrappedConn struct {
++	net.Conn
++}
++
++func (c *wrappedConn) Upstream() any {
++	return c.Conn
++}
++
++type wrappingDialer struct{}
++
++func (wrappingDialer) DialContext(ctx context.Context, network string, destination M.Socksaddr) (net.Conn, error) {
++	conn, err := N.SystemDialer.DialContext(ctx, network, destination)
++	if err != nil {
++		return nil, err
++	}
++	return &wrappedConn{&wrappedConn{conn}}, nil
++}
++
++func (wrappingDialer) ListenPacket(ctx context.Context, destination M.Socksaddr) (net.PacketConn, error) {
++	return nil, os.ErrInvalid
++}
++
++// otherAddrConn is a connection carried by another one: its addresses are not the socket's.
++type otherAddrConn struct {
++	net.Conn
++}
++
++func (c *otherAddrConn) Upstream() any {
++	return c.Conn
++}
++
++func (c *otherAddrConn) RemoteAddr() net.Addr {
++	return &net.TCPAddr{IP: net.IPv4(192, 0, 2, 1), Port: 443}
++}
++
++// The watch finds the socket under the wrappers of the dialer, and leaves alone a
++// connection that is not the socket to the server.
++func TestHelloWatchFindsTheSocket(t *testing.T) {
++	address := listenLocal(t, func(conn net.Conn) {
++		io.Copy(io.Discard, conn)
++		conn.Close()
++	})
++	conn, err := net.Dial("tcp4", address.String())
++	require.NoError(t, err)
++	defer conn.Close()
++	require.NotNil(t, kernelTCPConn(conn))
++	require.NotNil(t, kernelTCPConn(&wrappedConn{&wrappedConn{conn}}))
++	require.Nil(t, kernelTCPConn(&otherAddrConn{conn}))
++	client, server := net.Pipe()
++	defer client.Close()
++	defer server.Close()
++	require.Nil(t, kernelTCPConn(client))
++	require.Nil(t, watchClientHello(client))
++	watch := watchClientHello(&wrappedConn{conn})
++	require.NotNil(t, watch)
++	require.False(t, watch.stop())
++}
++
++func cipherSuitesLength(t *testing.T, fingerprint string) uint16 {
++	t.Helper()
++	id, err := uTLSClientHelloID(fingerprint)
++	require.NoError(t, err)
++	uConn, err := newUClient(nil, &utls.Config{ServerName: "example.org"}, id)
++	require.NoError(t, err)
++	require.NoError(t, uConn.BuildHandshakeState())
++	// the handshake header, the version, the random, the session ID with its length
++	return binary.BigEndian.Uint16(uConn.HandshakeState.Hello.Raw[4+2+32+1+32:])
++}
++
++// A path that drops the large ClientHellos, those with the X25519MLKEM768 key share, as the
++// Russian DPI does with chrome under a burst of connections: the first candidate of the
++// fallback (chrome without the key share) gets through at once. Without the fallback the
++// same dial waits for its handshake timeout.
++func TestIntegrationFingerprintFallbackLargeHello(t *testing.T) {
++	setFallback(t, true)
++	quietLog(t)
++	certificate := testCertificate(t)
++	address := listenLocal(t, echoTLS(certificate))
++	dropArriving(t, address.Port, "meta length > 1100")
++	logger, warnings := newWarnLogger(t)
++	options := integrationOptions("chrome")
++	config, err := NewClient(context.Background(), logger, "127.0.0.1", options)
++	require.NoError(t, err)
++	destination := M.SocksaddrFromNet(address)
++	start := time.Now()
++	conn, err := NewDialer(wrappingDialer{}, config).DialTLSContext(context.Background(), destination)
++	require.NoError(t, err)
++	t.Logf("the dial took %d ms", time.Since(start).Milliseconds())
++	echoPing(t, conn)
++	conn.Close()
++	require.Empty(t, warnings.take(), "no ClientHello went unanswered")
++	require.Equal(t, chromeWithout, attemptName(t, newDialOf(config), "127.0.0.1"))
++
++	setFallback(t, false)
++	config, err = NewClient(context.Background(), logger, "127.0.0.1", options)
++	require.NoError(t, err)
++	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
++	defer cancel()
++	_, err = NewDialer(N.SystemDialer, config).DialTLSContext(ctx, destination)
++	require.Error(t, err)
++	require.ErrorIs(t, ctx.Err(), context.DeadlineExceeded, "the control: the ClientHello of chrome is dropped, the handshake hangs")
++}
++
++// A path that drops the ClientHello of chrome whatever its key shares: the dial gets through
++// with firefox after two lost ClientHellos of the first candidate, and the dials after it
++// begin with firefox.
++func TestIntegrationFingerprintFallback(t *testing.T) {
++	setFallback(t, true)
++	quietLog(t)
++	chromeSuites := cipherSuitesLength(t, "chrome")
++	if chromeSuites == cipherSuitesLength(t, "firefox") {
++		t.Skip("the ClientHello of chrome and firefox cannot be told apart by the length of the cipher suites")
++	}
++	certificate := testCertificate(t)
++	address := listenLocal(t, echoTLS(certificate))
++	// the length of the cipher suites follows the record header (5 bytes) and what
++	// cipherSuitesLength skips, in the payload of the segment
++	dropArriving(t, address.Port, fmt.Sprintf("@ih,%d,16 == %d", (5+4+2+32+1+32)*8, chromeSuites))
++	logger, warnings := newWarnLogger(t)
++	config, err := NewClient(context.Background(), logger, "127.0.0.1", integrationOptions("chrome"))
++	require.NoError(t, err)
++	// the dialer of an outbound wraps its connections, as the tracking of connections does
++	dialer := NewDialer(wrappingDialer{}, config)
++	destination := M.SocksaddrFromNet(address)
++
++	start := time.Now()
++	conn, err := dialer.DialTLSContext(context.Background(), destination)
++	require.NoError(t, err)
++	t.Logf("the first dial took %d ms", time.Since(start).Milliseconds())
++	echoPing(t, conn)
++	conn.Close()
++	lines := warnings.take()
++	require.Len(t, lines, 3)
++	require.Contains(t, lines[0], "unanswered with "+chromeWithout+", trying it once more")
++	require.Contains(t, lines[1], "unanswered with "+chromeWithout+", retrying with firefox")
++	require.Contains(t, lines[2], "firefox is answered where "+chromeWithout+" was not")
++
++	start = time.Now()
++	conn, err = dialer.DialTLSContext(context.Background(), destination)
++	require.NoError(t, err)
++	t.Logf("the second dial took %d ms", time.Since(start).Milliseconds())
++	echoPing(t, conn)
++	conn.Close()
++	// a dial that began with the ClientHello that is dropped would have said so
++	require.Empty(t, warnings.take())
++	require.Equal(t, "firefox", attemptName(t, newDialOf(config), "127.0.0.1"))
++}
++
++func integrationOptions(fingerprint string) option.OutboundTLSOptions {
++	return option.OutboundTLSOptions{
++		Enabled:    true,
++		ServerName: "example.org",
++		Insecure:   true,
++		UTLS:       &option.OutboundUTLSOptions{Enabled: true, Fingerprint: fingerprint},
++	}
++}
++
++func echoTLS(certificate tls.Certificate) func(conn net.Conn) {
++	return func(conn net.Conn) {
++		defer conn.Close()
++		server := tls.Server(conn, &tls.Config{Certificates: []tls.Certificate{certificate}})
++		if server.Handshake() != nil {
++			return
++		}
++		io.Copy(server, server)
++	}
++}
++
++func echoPing(t *testing.T, conn net.Conn) {
++	_, err := conn.Write([]byte("ping"))
++	require.NoError(t, err)
++	answer := make([]byte, 4)
++	_, err = io.ReadFull(conn, answer)
++	require.NoError(t, err)
++	require.Equal(t, "ping", string(answer))
++}
+diff --git a/common/tls/hello_watch_stub.go b/common/tls/hello_watch_stub.go
+new file mode 100644
+index 000000000..8dcf52b6b
+--- /dev/null
++++ b/common/tls/hello_watch_stub.go
+@@ -0,0 +1,9 @@
++//go:build !linux
++
++package tls
++
++import "net"
++
++func watchClientHello(conn net.Conn) *helloWatch {
++	return nil
++}
+diff --git a/common/tls/ktls.go b/common/tls/ktls.go
+index dd564f534..8f8a24a96 100644
+--- a/common/tls/ktls.go
++++ b/common/tls/ktls.go
+@@ -38,6 +38,12 @@ func (w *KTLSClientConfig) Clone() Config {
+ 	}
+ }
+ 
++// spoofs answers for the configuration it wraps (podkop-engine).
++func (w *KTLSClientConfig) spoofs() bool {
++	spoofing, canSpoof := w.Config.(spoofingConfig)
++	return canSpoof && spoofing.spoofs()
++}
++
+ type KTlSServerConfig struct {
+ 	ServerConfig
+ 	logger             logger.ContextLogger
+diff --git a/common/tls/reality_client.go b/common/tls/reality_client.go
+index 20597bda7..8ad21f88f 100644
+--- a/common/tls/reality_client.go
++++ b/common/tls/reality_client.go
+@@ -49,6 +49,77 @@ type RealityClientConfig struct {
+ 	uClient   *UTLSClientConfig
+ 	publicKey []byte
+ 	shortID   [8]byte
++	// the name of a uTLS fingerprint without an X25519MLKEM768 key share, otherwise empty
++	classicFingerprint string
++	// that fingerprint is one the fingerprint fallback has gone on to, not the configured one
++	classicFallback bool
++	// the configured fingerprint name, for the block detector's key when the fallback is off
++	// (podkop-engine); it defaults to "chrome", as the fallback does
++	fingerprint string
++	// what the block detector reads of the server when the fallback is off, shared with the
++	// clones (podkop-engine)
++	outcome *detectOutcomeWriter
++}
++
++// REALITY servers since Xray-core v26.9.8 (XTLS/REALITY@8cdf7bf) take a Client Hello
++// without an X25519MLKEM768 key share for a stranger and pass it on to the target, whose
++// certificate then fails the verification. Older servers accept such a Client Hello, so
++// the fingerprints that carry only X25519 are not refused, but the cause is named.
++const (
++	realityHybridKeyShareNote = "REALITY servers since Xray-core v26.9.8 reject a Client Hello without an X25519MLKEM768 key share"
++	// what to configure in place of such a fingerprint
++	realityHybridKeyShareAdvice = ", use chrome, firefox, safari, random or randomized"
++	// the text every failed verification begins with
++	realityVerificationFailed = "reality verification failed"
++)
++
++// realityStrangerError is the failure of a handshake with a fingerprint without the
++// X25519MLKEM768 key share that the server answered as it answers a stranger, with the
++// certificate of its target: what a server since Xray-core v26.9.8 does with every such
++// Client Hello, whatever it did before it was updated.
++type realityStrangerError struct {
++	error
++}
++
++func (e *realityStrangerError) Unwrap() error {
++	return e.error
++}
++
++// checkRealityFingerprint refuses the uTLS fingerprints REALITY cannot work with and
++// reports whether the named one lacks the X25519MLKEM768 key share.
++func checkRealityFingerprint(name string) (classic bool, err error) {
++	switch name {
++	case "android", "360":
++		// Client Hellos of TLS 1.2: no key share to derive the authentication key from
++		return false, E.New("uTLS fingerprint ", name, " is unsupported in reality: a TLS 1.2 Client Hello without a key share, use chrome, firefox, safari, random or randomized")
++	case "edge", "ios", "qq":
++		return true, nil
++	default:
++		return false, nil
++	}
++}
++
++// verificationFailed is the error of a failed verification, cause being what the
++// handshake itself failed with, if it did. It names the fingerprint that may be the
++// cause, and what to configure in its place when it is the configured one.
++func (e *RealityClientConfig) verificationFailed(cause error) error {
++	text := realityVerificationFailed
++	if e.classicFingerprint != "" {
++		text += ", possibly because of the uTLS fingerprint " + e.classicFingerprint + ": " + realityHybridKeyShareNote
++		if !e.classicFallback {
++			text += realityHybridKeyShareAdvice
++		}
++	}
++	var err error
++	if cause != nil {
++		err = E.Cause(cause, text)
++	} else {
++		err = E.New(text)
++	}
++	if e.classicFingerprint != "" {
++		return &realityStrangerError{err}
++	}
++	return err
+ }
+ 
+ func NewRealityClient(ctx context.Context, logger logger.ContextLogger, serverAddress string, options option.OutboundTLSOptions) (Config, error) {
+@@ -386,3 +457,7 @@ func (c *realityClientConnWrapper) ReaderReplaceable() bool {
+ func (c *realityClientConnWrapper) WriterReplaceable() bool {
+ 	return false
+ }
++
++func (e *RealityClientConfig) spoofs() bool {
++	return e.uClient.spoof != ""
++}
+diff --git a/common/tls/utls_client.go b/common/tls/utls_client.go
+index 18e135747..fd0e7e227 100644
+--- a/common/tls/utls_client.go
++++ b/common/tls/utls_client.go
+@@ -39,6 +39,10 @@ type UTLSClientConfig struct {
+ 	recordFragment        bool
+ 	spoof                 string
+ 	spoofMethod           tlsspoof.Method
++	// the fingerprint fallback, shared with the clones; nil when off
++	fallback *utlsFallback
++	// the ClientHello without the X25519MLKEM768 key share: a candidate of the fallback
++	noMLKEM bool
+ }
+ 
+ func (c *UTLSClientConfig) ServerName() string {
+@@ -115,6 +119,8 @@ func (c *UTLSClientConfig) Clone() Config {
+ 		recordFragment:        c.recordFragment,
+ 		spoof:                 c.spoof,
+ 		spoofMethod:           c.spoofMethod,
++		fallback:              c.fallback,
++		noMLKEM:               c.noMLKEM,
+ 	}
+ 	cloned.SetServerName(cloned.serverName)
+ 	return cloned
+@@ -166,6 +172,8 @@ func (c *utlsConnWrapper) WriterReplaceable() bool {
+ type utlsALPNWrapper struct {
+ 	utlsConnWrapper
+ 	nextProtocols []string
++	// the ClientHello goes without the X25519MLKEM768 key share
++	noMLKEM bool
+ }
+ 
+ func (c *utlsALPNWrapper) HandshakeContext(ctx context.Context) error {
+@@ -356,6 +364,7 @@ func newUTLSClient(ctx context.Context, logger logger.ContextLogger, serverAddre
+ 		recordFragment:        options.RecordFragment,
+ 		spoof:                 spoof,
+ 		spoofMethod:           spoofMethod,
++		fallback:              newUTLSFallback(ctx, logger, options.UTLS.Fingerprint, id, options.Reality != nil && options.Reality.Enabled, spoof != ""),
+ 	}
+ 	config.SetServerName(serverName)
+ 	if options.ECH != nil && options.ECH.Enabled {
+@@ -435,3 +444,7 @@ func uTLSClientHelloID(name string) (utls.ClientHelloID, error) {
+ 		return utls.ClientHelloID{}, E.New("unknown uTLS fingerprint: ", name)
+ 	}
+ }
++
++func (c *UTLSClientConfig) spoofs() bool {
++	return c.spoof != ""
++}
+diff --git a/common/tls/utls_fallback.go b/common/tls/utls_fallback.go
+new file mode 100644
+index 000000000..f2c0c159a
+--- /dev/null
++++ b/common/tls/utls_fallback.go
+@@ -0,0 +1,806 @@
++//go:build with_utls
++
++package tls
++
++import (
++	"context"
++	"errors"
++	"net"
++	"net/netip"
++	"os"
++	"sync"
++	"time"
++
++	"github.com/sagernet/sing-box/adapter"
++	"github.com/sagernet/sing-box/log"
++	"github.com/sagernet/sing-box/option"
++	E "github.com/sagernet/sing/common/exceptions"
++	F "github.com/sagernet/sing/common/format"
++	"github.com/sagernet/sing/common/logger"
++	M "github.com/sagernet/sing/common/metadata"
++	"github.com/sagernet/sing/service"
++
++	utls "github.com/metacubex/utls"
++)
++
++const (
++	// handshakes of one dial; the next dial goes on with the list
++	utlsFallbackAttempts = 4
++	// local addresses whose choice is remembered
++	utlsFallbackPaths = 8
++	// The fingerprint with the X25519MLKEM768 key share that the fallback goes on to when the
++	// ClientHello without the key share is refused (by a REALITY server since Xray-core
++	// v26.9.8) or not let through. Measured in October 2026: it passes the Russian DPI that
++	// freezes the connections of chrome (Chrome 133 with the key share), and of safari and
++	// randomized as well, when many are made to one server at once.
++	utlsFallbackWithKeyShare = "firefox"
++	// lines remembered so as not to be repeated
++	utlsFallbackLines = 64
++	// times in a row a candidate may be answered again after it was not, before the next
++	// time counts against it
++	utlsFallbackAgain = 3
++	// such a time is one of a row when the ClientHello that went unanswered was among
++	// this many first ones sent since the rest before it ended
++	utlsFallbackFirst = 10
++)
++
++var (
++	// a configuration without the option experimental.utls_fallback turns the fallback on
++	// with any value of SING_BOX_UTLS_FALLBACK
++	utlsFallbackEnvironment = os.Getenv("SING_BOX_UTLS_FALLBACK")
++	// a line that comes again within this time is counted, not written
++	utlsFallbackLogInterval = 10 * time.Second
++	// The fallback of a path rests when what leaves a ClientHello unanswered turns out
++	// not to choose by the ClientHello: every candidate went unanswered (a block of the
++	// address or of the name, a server that is down), or the one that went unanswered is
++	// answered on another connection (a loss on the way). Another ClientHello does not help
++	// there, and every further try is one more connection. While the fallback rests,
++	// connections are made with the candidate that worked last, the configured fingerprint
++	// when none has. The rest after the whole list is twice as long when the next one begins
++	// as soon after it, up to the maximum.
++	utlsFallbackRest    = 30 * time.Second
++	utlsFallbackRestMax = 10 * time.Minute
++	// without a ClientHello left unanswered for this long, what was before is forgotten
++	utlsFallbackQuiet = 5 * time.Minute
++	// A choice is kept this long, also across restarts in the cache file; then one dial
++	// tries the first candidate again: the server may have been updated, the path changed.
++	utlsFallbackRecheck = 24 * time.Hour
++	// A dial waits this long at most for the probe of another. A probe takes a second or
++	// two, four unanswered ClientHellos about four on a path of 50 ms; one that takes longer
++	// is kept by something else (a server that is down, a TCP handshake that does not end),
++	// and the dials behind it would go one at a time, each waiting out its timeout.
++	utlsFallbackProbeWait = 5 * time.Second
++)
++
++// utlsFallbackCandidate is a ClientHello the fallback may send: a fingerprint, with or
++// without its X25519MLKEM768 key share.
++type utlsFallbackCandidate struct {
++	name    string
++	id      utls.ClientHelloID
++	noMLKEM bool
++}
++
++func (c utlsFallbackCandidate) String() string {
++	if c.noMLKEM {
++		return c.name + " without X25519MLKEM768"
++	}
++	return c.name
++}
++
++// utlsClassicFingerprint tells a fingerprint whose ClientHello carries no X25519MLKEM768
++// key share.
++func utlsClassicFingerprint(name string) bool {
++	switch name {
++	case "edge", "ios", "qq", "360", "android":
++		return true
++	}
++	return false
++}
++
++// utlsFallbackPath is what the fallback has learned from one local address.
++//
++// A path begins with the first candidate, or with the one chosen for the server before (the
++// cache file) when that was less than utlsFallbackRecheck ago. A server that refuses the
++// ClientHello of a candidate (answers it as a stranger's) makes the path go on at once. A
++// candidate is left for the next when its ClientHello goes unanswered; the first one, and
++// one that has completed a handshake on this path, only when that happens on two
++// connections in a row, the second made after the first was given up: one unanswered
++// ClientHello may be a second of loss, while a new connection is made over a path that has
++// just carried its SYN. When such a candidate is answered after all, the fallback rests
++// (see above); after utlsFallbackAgain such rests in a row the next unanswered ClientHello
++// counts at once: what drops a part of the ClientHellos of one kind looks like a loss each
++// time. The rests are in a row when the ClientHello that began each was among the first
++// utlsFallbackFirst sent since the rest before it: a filter that drops one kind in twenty or
++// more does that as a rule, a loss of one ClientHello in a hundred seldom.
++type utlsFallbackPath struct {
++	local netip.Addr
++	// the candidate in use
++	position int
++	// candidates left in a row, and of them those that the server answered and refused
++	failed  int
++	refused int
++	// the candidates that have completed a handshake on this path, a bit each, and the
++	// one that did last (-1: none); a candidate refused since is in neither
++	worked uint64
++	last   int
++	// when the candidate in use was chosen or confirmed last, and the candidate this path
++	// kept as the choice for the server then (-1: none)
++	chosen time.Time
++	choice int
++	// a dial is trying the first candidate again, the choice being old
++	rechecking bool
++	// when the ClientHello of the candidate in use went unanswered for the first time
++	suspected time.Time
++	// rests in a row that the candidate in use began by being answered again, and the
++	// ClientHellos sent with it and watched since the last of them ended
++	again int
++	sent  int
++	// until when the fallback rests, and the candidate the path goes on with after the rest
++	// (-1: the one it rests on)
++	restUntil time.Time
++	resume    int
++	// the last rest after a whole list: how long it was, and when it ended
++	rest           time.Duration
++	exhaustedUntil time.Time
++	// the candidate this path last told the block detector of (-1: none)
++	reported int
++}
++
++// twice tells whether the candidate in use is left only after two unanswered connections:
++// the first one and one that has worked here.
++func (p *utlsFallbackPath) twice() bool {
++	return p.position == 0 || p.worked&(1<<p.position) != 0
++}
++
++type utlsFallbackLine struct {
++	written time.Time
++	// times it came again since it was written
++	more int
++}
++
++// utlsFallback is shared by a client configuration and its clones.
++type utlsFallback struct {
++	logger logger.ContextLogger
++	// the ClientHellos in the order they are tried
++	candidates []utlsFallbackCandidate
++	// the configured fingerprint as it is: what is used when nothing has worked
++	configured int
++	// with tls.spoof the forged ClientHello may be what the path does not let through: the
++	// lines say so
++	spoof bool
++	// the cache file is found at the first dial: the box registers it after it has made the
++	// outbounds, whose clients make the fallback
++	ctx   context.Context
++	cache adapter.CacheFile
++	// what the choice of the server is kept under in the cache file: the configured
++	// fingerprint, the server name and the server
++	key    string
++	access sync.Mutex
++	paths  []*utlsFallbackPath
++	lines  map[string]*utlsFallbackLine
++	// the choice read from the cache file (-1: none) and when it was made
++	saved   int
++	savedAt time.Time
++	// a candidate has completed a handshake or was read from the cache file: no dial waits
++	known bool
++	// while nothing is known, the dial that tries the candidates; the others wait for it
++	// so that a burst of connections does not try all of them at once: a server refusing a
++	// ClientHello counts every refusal, and a path freezes on a burst
++	probing chan struct{}
++	// until when a path rests: its dials are made as without the fallback, and none waits
++	// for a probe, which would make them one at a time, each waiting out its timeout
++	restUntil time.Time
++	// the writes of the choice to the cache file, made in the order the choices were: a
++	// write waits for the file (a batch of bbolt) and is not made under access
++	storing sync.Mutex
++	stored  time.Time
++	// what the block detector reads of the server (podkop-engine)
++	outcome detectOutcomeWriter
++	// The first candidate was refused as a stranger's, and neither has it completed a handshake
++	// since nor has the list ended. A wrong key does this as well: only a later candidate that
++	// completes tells the server is one since Xray-core v26.9.8.
++	sawRefused bool
++}
++
++// utlsFallbackEnabled tells whether the fallback is on: the option
++// experimental.utls_fallback of the configuration when it is there, else the environment.
++// The list of fingerprints the option may carry is no longer used: the candidates are
++// fixed (newUTLSFallback).
++func utlsFallbackEnabled(ctx context.Context) bool {
++	configured := service.FromContext[*option.UTLSFallbackOptions](ctx)
++	if configured == nil {
++		return utlsFallbackEnvironment != ""
++	}
++	return configured.Enabled
++}
++
++// newUTLSFallback makes the fallback of a client with the fingerprint configured (of the ID
++// configuredID), nil when it is off. Its candidates, each once:
++//
++//  1. the configured fingerprint without its X25519MLKEM768 key share, as stock sing-box sends
++//     it under REALITY (a fingerprint without the key share as it is): a small ClientHello
++//     that the DPI freezing chrome under bursts of connections lets through, and that every
++//     server takes but a REALITY server since Xray-core v26.9.8;
++//  2. firefox with the key share, which such a server takes and that DPI lets through;
++//  3. the configured fingerprint as it is.
++func newUTLSFallback(ctx context.Context, logger logger.ContextLogger, configured string, configuredID utls.ClientHelloID, reality bool, spoof bool) *utlsFallback {
++	if !utlsFallbackEnabled(ctx) {
++		return nil
++	}
++	if logger == nil {
++		logger = log.StdLogger()
++	}
++	if configured == "" {
++		configured = "chrome"
++	}
++	asConfigured := utlsFallbackCandidate{name: configured, id: configuredID}
++	candidates := []utlsFallbackCandidate{asConfigured}
++	if !utlsClassicFingerprint(configured) {
++		candidates[0].noMLKEM = true
++	}
++	// the same ClientHello is not tried twice: random may have taken firefox
++	id, err := uTLSClientHelloID(utlsFallbackWithKeyShare)
++	if err == nil && id != configuredID {
++		candidates = append(candidates, utlsFallbackCandidate{name: utlsFallbackWithKeyShare, id: id})
++	}
++	configuredIndex := -1
++	for index, candidate := range candidates {
++		if candidate == asConfigured {
++			configuredIndex = index
++		}
++	}
++	if configuredIndex < 0 {
++		candidates = append(candidates, asConfigured)
++		configuredIndex = len(candidates) - 1
++	}
++	if len(candidates) < 2 {
++		return nil
++	}
++	return &utlsFallback{
++		logger:     logger,
++		candidates: candidates,
++		configured: configuredIndex,
++		spoof:      spoof,
++		ctx:        ctx,
++		lines:      make(map[string]*utlsFallbackLine),
++		saved:      -1,
++	}
++}
++
++// warn writes a line of the fallback, once in utlsFallbackLogInterval: a path that answers
++// no ClientHello gives the same lines on every connection. The next time the line is
++// written it says how many times it came meanwhile. The caller holds the lock.
++func (f *utlsFallback) warn(message ...any) {
++	text := F.ToString(message...)
++	now := time.Now()
++	line := f.lines[text]
++	if line != nil && now.Sub(line.written) < utlsFallbackLogInterval {
++		line.more++
++		return
++	}
++	if line == nil {
++		if len(f.lines) >= utlsFallbackLines {
++			clear(f.lines)
++		}
++		line = new(utlsFallbackLine)
++		f.lines[text] = line
++	}
++	if line.more > 0 {
++		f.logger.Warn(text, " (", line.more, " more in the last ", now.Sub(line.written).Round(time.Second), ")")
++	} else {
++		f.logger.Warn(text)
++	}
++	line.written = now
++	line.more = 0
++}
++
++// load reads the choice for the server from the cache file, once: the first dial gives the
++// key. The caller holds the lock.
++func (f *utlsFallback) load(serverName string, destination M.Socksaddr) {
++	if f.key != "" {
++		return
++	}
++	f.key = F.ToString(f.candidates[f.configured].name, " ", serverName, " ", destination)
++	f.cache = service.FromContext[adapter.CacheFile](f.ctx)
++	if f.cache == nil {
++		return
++	}
++	f.outcome.open(f.cache, f.key)
++	choice, at, loaded := f.cache.LoadUTLSChoice(f.key)
++	if !loaded || time.Since(at) >= utlsFallbackRecheck {
++		return
++	}
++	for index, candidate := range f.candidates {
++		if candidate.String() == choice {
++			f.saved, f.savedAt = index, at
++			f.known = true
++			return
++		}
++	}
++}
++
++// store keeps the candidate in use of a path as the choice for the server; the cache file
++// is written in the background. The caller holds the lock.
++func (f *utlsFallback) store(path *utlsFallbackPath, now time.Time) {
++	path.chosen, path.choice = now, path.position
++	f.saved, f.savedAt = path.position, now
++	if f.cache == nil || f.key == "" {
++		return
++	}
++	cache, key, choice := f.cache, f.key, f.candidates[path.position].String()
++	go func() {
++		f.storing.Lock()
++		defer f.storing.Unlock()
++		if now.Before(f.stored) {
++			// a later choice is written already
++			return
++		}
++		f.stored = now
++		_ = cache.StoreUTLSChoice(key, choice, now)
++	}()
++}
++
++// path returns what is known of the local address of conn. The caller holds the lock.
++func (f *utlsFallback) path(conn net.Conn) *utlsFallbackPath {
++	local := M.AddrPortFromNet(conn.LocalAddr()).Addr().Unmap().WithZone("")
++	for index, path := range f.paths {
++		if path.local == local {
++			// the most recently used first
++			copy(f.paths[1:index+1], f.paths[:index])
++			f.paths[0] = path
++			return path
++		}
++	}
++	path := &utlsFallbackPath{local: local, last: -1, resume: -1, choice: -1, reported: -1}
++	if f.saved >= 0 {
++		// what was chosen for the server before, on this or another address
++		path.position, path.last, path.chosen, path.choice = f.saved, f.saved, f.savedAt, f.saved
++		path.worked = 1 << f.saved
++	}
++	if len(f.paths) < utlsFallbackPaths {
++		f.paths = append(f.paths, nil)
++	}
++	copy(f.paths[1:], f.paths)
++	f.paths[0] = path
++	return path
++}
++
++func (f *utlsFallback) names() string {
++	names := ""
++	for index, candidate := range f.candidates {
++		if index > 0 {
++			names += ", "
++		}
++		names += candidate.String()
++	}
++	return names
++}
++
++// advance takes the next candidate of a path. The caller holds the lock.
++func (f *utlsFallback) advance(path *utlsFallbackPath) {
++	path.position = (path.position + 1) % len(f.candidates)
++	path.failed++
++	path.suspected = time.Time{}
++	path.again, path.sent = 0, 0
++}
++
++// rests puts the fallback of a path to rest for the given time, on the candidate that
++// completed a handshake last, the configured fingerprint as it is when none has: its
++// connections are made as without the fallback. After the rest the path goes on with that
++// candidate, or tries the list again from the first when none has completed a handshake. The
++// caller holds the lock.
++func (f *utlsFallback) rests(path *utlsFallbackPath, now time.Time, rest time.Duration) {
++	path.restUntil = now.Add(rest)
++	if path.restUntil.After(f.restUntil) {
++		f.restUntil = path.restUntil
++	}
++	path.position = path.last
++	path.resume = -1
++	if path.position < 0 {
++		path.position = f.configured
++		path.resume = 0
++	}
++	path.failed, path.refused = 0, 0
++	path.suspected = time.Time{}
++	path.sent = 0
++}
++
++// exhausted is the verdict of a list that was gone through without one handshake: the
++// fallback rests, twice as long as the last time when that was not long ago. refusal is
++// the failure of the candidate that closed the list, nil when its ClientHello went
++// unanswered. It returns what the dial says of it. The caller holds the lock.
++func (f *utlsFallback) exhausted(path *utlsFallbackPath, now time.Time, destination M.Socksaddr, closing string, refusal error) string {
++	// counted from the last rest of this kind: a rest for a candidate answered again may
++	// have come since
++	if path.rest > 0 && now.Sub(path.exhaustedUntil) < path.rest {
++		path.rest = min(2*path.rest, utlsFallbackRestMax)
++	} else {
++		path.rest = utlsFallbackRest
++	}
++	path.exhaustedUntil = now.Add(path.rest)
++	// the rest below zeroes the count
++	outcome := adapter.DetectNoAnswer
++	if path.refused > 0 {
++		outcome = adapter.DetectFailed
++	}
++	said := F.ToString("ClientHello unanswered with all of ", f.names())
++	line := F.ToString("ClientHello to ", destination, " unanswered with all of ", f.names())
++	if path.refused > 0 {
++		// some were answered, and the handshake failed after that
++		counted := F.ToString(" (", path.failed-path.refused, " unanswered, ", path.refused, " refused")
++		if refusal != nil {
++			counted = F.ToString(counted, "; ", closing, ": ", refusal)
++		}
++		said = F.ToString("none of ", f.names(), " got through", counted, ")")
++		line = F.ToString("none of ", f.names(), " got through to ", destination, counted, ")")
++	}
++	f.rests(path, now, path.rest)
++	kept := f.candidates[path.position].String()
++	if path.position == f.configured && path.last < 0 {
++		kept += " is used as configured"
++	} else {
++		kept += " is used: it worked here last"
++	}
++	f.warn("tls: ", line, f.cause(), "; the fallback rests for ", path.rest, ", ", kept)
++	// no candidate that followed the refusal of the first one completed: it told nothing
++	f.sawRefused = false
++	f.outcome.failed(now, outcome)
++	return said + f.cause()
++}
++
++// cause is what a line about ClientHellos nobody answered adds when tls.spoof is on.
++func (f *utlsFallback) cause() string {
++	if f.spoof {
++		return "; tls.spoof is enabled and may be the cause"
++	}
++	return ""
++}
++
++// utlsFallbackDial follows one dial: fingerprintDial.
++type utlsFallbackDial struct {
++	fallback *utlsFallback
++	// the server name, a part of the key of the choice
++	serverName string
++	// configuration returns the configuration of the dial with a candidate
++	configuration func(candidate utlsFallbackCandidate) Config
++	path          *utlsFallbackPath
++	// the candidate of the last attempt, and when its connection was made
++	position  int
++	connected time.Time
++	attempts  int
++	// the last attempt is watched: not while the fallback rests
++	watched bool
++	// which of the watched ClientHellos sent since the last rest it is
++	ordinal int
++	// this dial tries the candidates while nothing is known (the others wait for it), or
++	// tries the first candidate again, the choice being old
++	probe   bool
++	recheck bool
++}
++
++func (d *utlsFallbackDial) ready(ctx context.Context, destination M.Socksaddr) error {
++	f := d.fallback
++	timer := time.NewTimer(utlsFallbackProbeWait)
++	defer timer.Stop()
++	for {
++		f.access.Lock()
++		f.load(d.serverName, destination)
++		if f.known || time.Now().Before(f.restUntil) {
++			f.access.Unlock()
++			return nil
++		}
++		if f.probing == nil {
++			f.probing = make(chan struct{})
++			d.probe = true
++			f.access.Unlock()
++			return nil
++		}
++		probing := f.probing
++		f.access.Unlock()
++		select {
++		case <-probing:
++		case <-timer.C:
++			// the probe takes long: the dial goes on its own
++			return nil
++		case <-ctx.Done():
++			return ctx.Err()
++		}
++	}
++}
++
++func (d *utlsFallbackDial) done() {
++	f := d.fallback
++	f.access.Lock()
++	defer f.access.Unlock()
++	if d.probe {
++		d.probe = false
++		if f.probing != nil {
++			close(f.probing)
++			f.probing = nil
++		}
++	}
++	if d.recheck {
++		d.recheck = false
++		d.path.rechecking = false
++	}
++}
++
++func (d *utlsFallbackDial) attempt(conn net.Conn) (Config, bool) {
++	f := d.fallback
++	f.access.Lock()
++	defer f.access.Unlock()
++	if d.path == nil {
++		d.path = f.path(conn)
++	}
++	path := d.path
++	d.attempts++
++	d.connected = time.Now()
++	d.watched = !d.connected.Before(path.restUntil)
++	if d.watched && path.resume >= 0 {
++		// the first dial after a rest
++		path.position, path.resume = path.resume, -1
++	}
++	d.position = path.position
++	if d.watched {
++		path.sent++
++		d.ordinal = path.sent
++		if d.attempts == 1 && path.position != 0 && !path.rechecking && !path.chosen.IsZero() && d.connected.Sub(path.chosen) >= utlsFallbackRecheck {
++			// the choice is old: this dial tries the first candidate again, the others go
++			// on with the choice
++			path.rechecking = true
++			d.recheck = true
++			d.position = 0
++		}
++	}
++	return d.configuration(f.candidates[d.position]), d.watched
++}
++
++// rechecked ends the try of the first candidate again: answered or not, the choice is good
++// for another utlsFallbackRecheck. The caller holds the lock.
++func (d *utlsFallbackDial) rechecked(path *utlsFallbackPath, now time.Time, answered bool) {
++	f := d.fallback
++	d.recheck = false
++	path.rechecking = false
++	if answered {
++		path.position = 0
++		path.worked |= 1
++		path.last = 0
++		path.failed, path.refused = 0, 0
++		path.suspected = time.Time{}
++		f.warn("tls: ", f.candidates[0], " is answered again; it is used from now on")
++	}
++	f.known = true
++	f.store(path, now)
++}
++
++// recordAnswered tells the block detector of a completed handshake. Any such handshake clears
++// the failures. The caller holds the lock.
++func (d *utlsFallbackDial) recordAnswered(path *utlsFallbackPath, now time.Time) {
++	f := d.fallback
++	if d.position == 0 {
++		f.sawRefused = false
++	}
++	// The fingerprint is told when this path goes on to another candidate, so two paths with
++	// candidates of their own do not write by turns. A dial that began with a candidate the path
++	// has left says only that the server answers.
++	current := d.recheck || d.position == path.position
++	report := current && path.reported != d.position
++	if current {
++		path.reported = d.position
++	}
++	name := f.candidates[d.position].String()
++	f.outcome.answered(now, func(flags byte, fingerprint string) (byte, string) {
++		switch {
++		case d.position == 0:
++			flags = 0
++		case f.sawRefused:
++			flags = adapter.DetectRefused
++		default:
++			flags &= adapter.DetectRefused
++		}
++		if report || (current && fingerprint == "") {
++			fingerprint = name
++		}
++		return flags, fingerprint
++	})
++}
++
++func (d *utlsFallbackDial) answered() {
++	f := d.fallback
++	f.access.Lock()
++	defer f.access.Unlock()
++	path := d.path
++	now := time.Now()
++	d.recordAnswered(path, now)
++	if d.recheck {
++		d.rechecked(path, now, true)
++		return
++	}
++	// of a dial that began with a candidate the path has left
++	if d.position != path.position {
++		return
++	}
++	first := path.worked&(1<<d.position) == 0
++	path.worked |= 1 << d.position
++	path.last = d.position
++	f.known = true
++	if !d.watched || now.Before(path.restUntil) {
++		// what a dial made during a rest got through with (the configured fingerprint as it
++		// is when nothing has worked) is no choice of the fallback: it is not kept
++		return
++	}
++	// kept when the choice of this path changes or gets old: two paths with choices of
++	// their own do not write by turns
++	if path.choice != d.position || now.Sub(path.chosen) >= utlsFallbackRecheck {
++		f.store(path, now)
++	}
++	name := f.candidates[d.position].String()
++	if !path.suspected.IsZero() {
++		// On this or on another connection: what left the other ClientHello unanswered did
++		// not do so for the ClientHello alone.
++		path.again++
++		f.rests(path, now, utlsFallbackRest)
++		f.warn("tls: ", name, " is answered after its ClientHello was not: a loss on the way, or something that does not choose by the ClientHello; the fallback rests for ", utlsFallbackRest)
++		return
++	}
++	path.failed, path.refused = 0, 0
++	if first && d.position != 0 {
++		f.warn("tls: ", name, " is answered where ", f.candidates[0], " was not; it is used from now on")
++	} else if first {
++		f.logger.Info("tls: ", name, " is answered; it is used")
++	}
++}
++
++func (d *utlsFallbackDial) unanswered(destination M.Socksaddr) (bool, error) {
++	f := d.fallback
++	f.access.Lock()
++	defer f.access.Unlock()
++	path := d.path
++	last := f.candidates[d.position].String()
++	now := time.Now()
++	if d.recheck {
++		// the first candidate is still not let through: the dial goes on with the choice
++		d.rechecked(path, now, false)
++		return true, nil
++	}
++	if !d.watched || now.Before(path.restUntil) {
++		// another dial has put the fallback to rest meanwhile
++		return false, E.New("ClientHello unanswered with ", last)
++	}
++	// another dial may have moved on already
++	if path.position == d.position {
++		if path.suspected.IsZero() && (d.ordinal > utlsFallbackFirst || now.Sub(path.restUntil) > utlsFallbackQuiet) {
++			// not soon after the last rest: a row of them begins anew
++			path.again = 0
++		}
++		if path.twice() && path.again < utlsFallbackAgain && (path.suspected.IsZero() || !d.connected.After(path.suspected)) {
++			// the first time, or of a connection made before that
++			if path.suspected.IsZero() {
++				path.suspected = now
++			}
++			if d.attempts >= utlsFallbackAttempts {
++				f.warn("tls: ClientHello to ", destination, " unanswered with ", last, ", the next connection tries it once more")
++				return false, E.New("ClientHello unanswered with ", last)
++			}
++			f.warn("tls: ClientHello to ", destination, " unanswered with ", last, ", trying it once more")
++			return true, nil
++		}
++		f.advance(path)
++	}
++	if path.failed >= len(f.candidates) {
++		return false, E.New(f.exhausted(path, now, destination, last, nil))
++	}
++	next := f.candidates[path.position].String()
++	if d.attempts >= utlsFallbackAttempts {
++		f.warn("tls: ClientHello to ", destination, " unanswered with ", last, ", the next connection tries ", next)
++		return false, E.New("ClientHello unanswered with ", last)
++	}
++	f.warn("tls: ClientHello to ", destination, " unanswered with ", last, ", retrying with ", next)
++	return true, nil
++}
++
++func (d *utlsFallbackDial) failed(ctx context.Context, destination M.Socksaddr, err error) bool {
++	f := d.fallback
++	f.access.Lock()
++	defer f.access.Unlock()
++	path := d.path
++	now := time.Now()
++	var stranger *realityStrangerError
++	refused := errors.As(err, &stranger)
++	if refused && d.position == 0 {
++		f.sawRefused = true
++	}
++	if d.recheck && ctx.Err() == nil {
++		// what the first candidate met, the choice is kept: the dial goes on with it
++		d.rechecked(path, now, false)
++		return true
++	}
++	// a dial its caller has given up tells nothing of the ClientHello
++	if !d.watched || ctx.Err() != nil || d.position != path.position || now.Before(path.restUntil) {
++		return false
++	}
++	if !refused && path.worked&(1<<d.position) != 0 {
++		// answered, with a failure of another kind, a candidate that has worked here: not
++		// what the fallback is for. A failed verification of a saved choice is still the block
++		// detector's: the list is not walked here, so nothing else would tell it
++		path.suspected = time.Time{}
++		if realityVerificationError(err) {
++			f.outcome.failed(now, adapter.DetectFailed)
++		}
++		return false
++	}
++	// A server that answers the ClientHello as a stranger's takes none of its kind (a
++	// REALITY server since Xray-core v26.9.8 and a ClientHello without the X25519MLKEM768
++	// key share): left at once, whatever worked before the server was updated. A candidate
++	// that has not completed a handshake here is no better than the one it replaced when
++	// its handshake fails in any way: one the server cannot carry would otherwise stay in
++	// use for good.
++	path.worked &^= 1 << d.position
++	if path.last == d.position {
++		path.last = -1
++	}
++	last := f.candidates[d.position].String()
++	f.advance(path)
++	path.refused++
++	if path.failed >= len(f.candidates) {
++		f.exhausted(path, now, destination, last, err)
++		return false
++	}
++	next := f.candidates[path.position].String()
++	why := F.ToString("failed with ", last, " (", err, ")")
++	if refused {
++		why = F.ToString("refused ", last, ", as a REALITY server since Xray-core v26.9.8 does")
++	}
++	// after a handshake that waited out its whole time the dial is not made longer still
++	late := errors.Is(err, context.DeadlineExceeded) || errors.Is(err, os.ErrDeadlineExceeded)
++	if d.attempts >= utlsFallbackAttempts || late {
++		f.warn("tls: the handshake with ", destination, " ", why, ", the next connection tries ", next)
++		return false
++	}
++	f.warn("tls: the handshake with ", destination, " ", why, ", retrying with ", next)
++	return true
++}
++
++func (c *UTLSClientConfig) fingerprintDial() fingerprintDial {
++	if c.fallback == nil {
++		return nil
++	}
++	return &utlsFallbackDial{
++		fallback:   c.fallback,
++		serverName: c.ServerName(),
++		configuration: func(candidate utlsFallbackCandidate) Config {
++			attempt := *c
++			attempt.id = candidate.id
++			attempt.noMLKEM = candidate.noMLKEM
++			return &attempt
++		},
++	}
++}
++
++func (e *RealityClientConfig) fingerprintDial() fingerprintDial {
++	f := e.uClient.fallback
++	if f == nil {
++		return nil
++	}
++	return &utlsFallbackDial{
++		fallback:   f,
++		serverName: e.uClient.ServerName(),
++		configuration: func(candidate utlsFallbackCandidate) Config {
++			uClient := *e.uClient
++			uClient.id = candidate.id
++			uClient.noMLKEM = candidate.noMLKEM
++			attempt := *e
++			attempt.uClient = &uClient
++			// A ClientHello without the key share REALITY servers ask for since Xray-core
++			// v26.9.8 is tried as any other: an older server takes it, and what a newer one
++			// answers names it and moves the fallback on.
++			classic := candidate.noMLKEM || utlsClassicFingerprint(candidate.name)
++			attempt.classicFingerprint = ""
++			if classic {
++				attempt.classicFingerprint = candidate.String()
++			}
++			attempt.classicFallback = classic
++			return &attempt
++		},
++	}
++}
+diff --git a/common/tls/utls_fallback_test.go b/common/tls/utls_fallback_test.go
+new file mode 100644
+index 000000000..b44d71a52
+--- /dev/null
++++ b/common/tls/utls_fallback_test.go
+@@ -0,0 +1,1019 @@
++//go:build with_utls
++
++package tls
++
++import (
++	"context"
++	"errors"
++	"net"
++	"runtime"
++	"strings"
++	"sync"
++	"testing"
++	"time"
++
++	"github.com/sagernet/sing-box/adapter"
++	"github.com/sagernet/sing-box/common/tlsspoof"
++	"github.com/sagernet/sing-box/option"
++	E "github.com/sagernet/sing/common/exceptions"
++	M "github.com/sagernet/sing/common/metadata"
++	"github.com/sagernet/sing/service"
++
++	utls "github.com/metacubex/utls"
++	"github.com/stretchr/testify/require"
++)
++
++type localAddrConn struct {
++	net.Conn
++	local string
++}
++
++func (c localAddrConn) LocalAddr() net.Addr {
++	return &net.TCPAddr{IP: net.ParseIP(c.local), Port: 40000}
++}
++
++// the first candidate of a client configured with chrome
++const chromeWithout = "chrome without X25519MLKEM768"
++
++func setFallback(t *testing.T, on bool) {
++	previous := utlsFallbackEnvironment
++	utlsFallbackEnvironment = ""
++	if on {
++		utlsFallbackEnvironment = "1"
++	}
++	t.Cleanup(func() { utlsFallbackEnvironment = previous })
++}
++
++func quietLog(t *testing.T) {
++	interval := utlsFallbackLogInterval
++	utlsFallbackLogInterval = 0
++	t.Cleanup(func() { utlsFallbackLogInterval = interval })
++}
++
++func fallbackClient(t *testing.T, fingerprint string, reality bool) (Config, *warnLog) {
++	return fallbackClientIn(t, context.Background(), fingerprint, reality)
++}
++
++func fallbackClientIn(t *testing.T, ctx context.Context, fingerprint string, reality bool) (Config, *warnLog) {
++	logger, warnings := newWarnLogger(t)
++	config, err := NewClient(ctx, logger, "192.0.2.1", realityOptionsForTest(fingerprint, reality))
++	require.NoError(t, err)
++	return config, warnings
++}
++
++func newDialOf(config Config) fingerprintDial {
++	return config.(fingerprintFallbackConfig).fingerprintDial()
++}
++
++func attemptName(t *testing.T, dial fingerprintDial, local string) string {
++	name, _ := attemptWatched(t, dial, local)
++	return name
++}
++
++// attemptWatched makes an attempt of a dial and tells its ClientHello and whether it is
++// to be watched.
++func attemptWatched(t *testing.T, dial fingerprintDial, local string) (string, bool) {
++	config, watched := dial.attempt(localAddrConn{local: local})
++	var id utls.ClientHelloID
++	var noMLKEM bool
++	switch config := config.(type) {
++	case *UTLSClientConfig:
++		id, noMLKEM = config.id, config.noMLKEM
++	case *RealityClientConfig:
++		id, noMLKEM = config.uClient.id, config.uClient.noMLKEM
++	default:
++		t.Fatalf("unexpected configuration %T", config)
++	}
++	for _, name := range []string{"chrome", "firefox", "safari", "edge", "ios", "qq", "360", "android", "randomized"} {
++		if known, _ := uTLSClientHelloID(name); known == id {
++			if noMLKEM {
++				name += " without X25519MLKEM768"
++			}
++			return name, watched
++		}
++	}
++	t.Fatalf("unknown fingerprint %v", id)
++	return "", false
++}
++
++// lost tells a dial that the ClientHello of its last attempt went unanswered, and that
++// the dial goes on.
++func lost(t *testing.T, dial fingerprintDial) {
++	t.Helper()
++	again, err := dial.unanswered(fallbackServer)
++	require.True(t, again)
++	require.NoError(t, err)
++}
++
++var fallbackServer = M.ParseSocksaddrHostPort("192.0.2.1", 443)
++
++func namesOf(t *testing.T, config Config) string {
++	dialer, hasFallback := config.(fingerprintFallbackConfig)
++	require.True(t, hasFallback)
++	dial := dialer.fingerprintDial()
++	if dial == nil {
++		return ""
++	}
++	return dial.(*utlsFallbackDial).fallback.names()
++}
++
++// The candidates: the configured fingerprint without its X25519MLKEM768 key share (as it is
++// when it has none), firefox, the configured one as it is; each once.
++func TestUTLSFallbackCandidates(t *testing.T) {
++	setFallback(t, true)
++	for _, reality := range []bool{false, true} {
++		config, _ := fallbackClient(t, "chrome", reality)
++		require.Equal(t, chromeWithout+", firefox, chrome", namesOf(t, config))
++		require.Equal(t, namesOf(t, config), namesOf(t, config.Clone()))
++		config, _ = fallbackClient(t, "", reality)
++		require.Equal(t, chromeWithout+", firefox, chrome", namesOf(t, config))
++		config, _ = fallbackClient(t, "firefox", reality)
++		require.Equal(t, "firefox without X25519MLKEM768, firefox", namesOf(t, config))
++		config, _ = fallbackClient(t, "safari", reality)
++		require.Equal(t, "safari without X25519MLKEM768, firefox, safari", namesOf(t, config))
++		config, _ = fallbackClient(t, "edge", reality)
++		require.Equal(t, "edge, firefox", namesOf(t, config))
++	}
++	config, _ := fallbackClient(t, "android", false)
++	require.Equal(t, "android, firefox", namesOf(t, config))
++	// random that took firefox is not tried again as firefox: the same ClientHello
++	previous := randomFingerprint
++	t.Cleanup(func() { randomFingerprint = previous })
++	randomFingerprint, _ = uTLSClientHelloID("firefox")
++	config, _ = fallbackClient(t, "random", false)
++	require.Equal(t, "random without X25519MLKEM768, random", namesOf(t, config))
++
++	setFallback(t, false)
++	config, _ = fallbackClient(t, "chrome", false)
++	require.Empty(t, namesOf(t, config))
++}
++
++// The configuration turns the fallback off or on whatever the environment says; the list
++// of fingerprints it may carry is read and not used. The environment is read only for a
++// configuration without the option.
++func TestUTLSFallbackOption(t *testing.T) {
++	in := func(ctx context.Context) string {
++		config, _ := fallbackClientIn(t, ctx, "chrome", false)
++		return namesOf(t, config)
++	}
++	names := func(configured *option.UTLSFallbackOptions) string {
++		ctx := context.Background()
++		if configured != nil {
++			ctx = service.ContextWith[*option.UTLSFallbackOptions](ctx, configured)
++		}
++		return in(ctx)
++	}
++	const all = chromeWithout + ", firefox, chrome"
++	setFallback(t, true)
++	require.Equal(t, all, names(nil))
++	require.Empty(t, names(&option.UTLSFallbackOptions{}), "enabled: false turns it off whatever the environment says")
++	require.Equal(t, all, names(&option.UTLSFallbackOptions{Enabled: true}))
++	require.Equal(t, all, names(&option.UTLSFallbackOptions{Enabled: true, Fingerprints: []string{"safari", "randomized", "edge"}}), "the list of earlier revisions is not used")
++
++	setFallback(t, false)
++	require.Empty(t, names(nil))
++	require.Equal(t, all, names(&option.UTLSFallbackOptions{Enabled: true}))
++
++	// A configuration loaded again without the option is registered as none (box.New), in
++	// the registry the one before it was registered in: its option does not stay.
++	ctx := service.ContextWith[*option.UTLSFallbackOptions](context.Background(), &option.UTLSFallbackOptions{Enabled: true})
++	require.Equal(t, all, in(ctx))
++	service.MustRegister[*option.UTLSFallbackOptions](ctx, nil)
++	require.Empty(t, in(ctx))
++}
++
++// The first candidate is left when its ClientHello goes unanswered on two connections in a
++// row; one that has not worked yet, at once. The candidate that was answered is the one the
++// next dials begin with, also from another local address. A dial makes four handshakes at
++// most; when the whole list went unanswered the fallback rests, on the candidate that worked
++// last.
++func TestUTLSFallbackDial(t *testing.T) {
++	setFallback(t, true)
++	quietLog(t)
++	for _, reality := range []bool{false, true} {
++		config, warnings := fallbackClient(t, "chrome", reality)
++		newDial := func() fingerprintDial {
++			return newDialOf(config)
++		}
++
++		dial := newDial()
++		require.NoError(t, dial.ready(context.Background(), fallbackServer))
++		name, watched := attemptWatched(t, dial, "192.0.2.10")
++		require.Equal(t, chromeWithout, name)
++		require.True(t, watched)
++		lost(t, dial)
++		require.Equal(t, chromeWithout, attemptName(t, dial, "192.0.2.10"), "once more with the same ClientHello")
++		lost(t, dial)
++		require.Equal(t, "firefox", attemptName(t, dial, "192.0.2.10"))
++		dial.answered()
++		dial.done()
++		lines := warnings.take()
++		require.Len(t, lines, 3)
++		require.Contains(t, lines[0], "tls: ClientHello to 192.0.2.1:443 unanswered with "+chromeWithout+", trying it once more")
++		require.Contains(t, lines[1], "tls: ClientHello to 192.0.2.1:443 unanswered with "+chromeWithout+", retrying with firefox")
++		require.Contains(t, lines[2], "tls: firefox is answered where "+chromeWithout+" was not; it is used from now on")
++
++		dial = newDial()
++		require.Equal(t, "firefox", attemptName(t, dial, "192.0.2.10"))
++		dial.answered()
++		require.Empty(t, warnings.take())
++
++		// the clone of a transport shares what was learned
++		require.Equal(t, "firefox", attemptName(t, newDialOf(config.Clone()), "192.0.2.10"))
++
++		// another local address begins with what was chosen for the server
++		dial = newDial()
++		require.Equal(t, "firefox", attemptName(t, dial, "198.51.100.7"))
++		dial = newDial()
++		require.Equal(t, "firefox", attemptName(t, dial, "192.0.2.10"))
++
++		// Nothing is answered any more. firefox has worked here: twice; chrome has not: once;
++		// the first candidate: twice. Four handshakes, and the dial ends.
++		lost(t, dial)
++		require.Equal(t, "firefox", attemptName(t, dial, "192.0.2.10"))
++		lost(t, dial)
++		require.Equal(t, "chrome", attemptName(t, dial, "192.0.2.10"))
++		lost(t, dial)
++		require.Equal(t, chromeWithout, attemptName(t, dial, "192.0.2.10"))
++		again, err := dial.unanswered(fallbackServer)
++		require.False(t, again)
++		require.ErrorContains(t, err, "ClientHello unanswered with "+chromeWithout)
++		lines = warnings.take()
++		require.Len(t, lines, 4)
++		require.Contains(t, lines[0], "unanswered with firefox, trying it once more")
++		require.Contains(t, lines[1], "unanswered with firefox, retrying with chrome")
++		require.Contains(t, lines[2], "unanswered with chrome, retrying with "+chromeWithout)
++		require.Contains(t, lines[3], "unanswered with "+chromeWithout+", the next connection tries it once more")
++
++		dial = newDial()
++		require.Equal(t, chromeWithout, attemptName(t, dial, "192.0.2.10"))
++		again, err = dial.unanswered(fallbackServer)
++		require.False(t, again)
++		require.ErrorContains(t, err, "ClientHello unanswered with all of "+chromeWithout+", firefox, chrome")
++		lines = warnings.take()
++		require.Len(t, lines, 1)
++		require.Contains(t, lines[0], "tls: ClientHello to 192.0.2.1:443 unanswered with all of "+chromeWithout+", firefox, chrome; the fallback rests for 30s, firefox is used: it worked here last")
++		require.False(t, strings.Contains(lines[0], "tls.spoof"))
++		for range 2 {
++			dial = newDial()
++			name, watched = attemptWatched(t, dial, "192.0.2.10")
++			require.Equal(t, "firefox", name)
++			require.False(t, watched, "while the fallback rests a connection is made as without it")
++			dial.answered()
++		}
++		require.Empty(t, warnings.take())
++
++		// the configuration itself keeps its fingerprint
++		switch config := config.(type) {
++		case *UTLSClientConfig:
++			require.Equal(t, utls.HelloChrome_Auto, config.id)
++			require.False(t, config.noMLKEM)
++		case *RealityClientConfig:
++			require.Equal(t, utls.HelloChrome_Auto, config.uClient.id)
++			require.False(t, config.uClient.noMLKEM)
++		}
++	}
++}
++
++// While nothing is known of a server, one dial tries the ClientHellos and the others wait
++// for it before they connect; then nobody waits. A dial whose caller gives up does not wait
++// on. While the fallback rests nobody waits either: the dials go as without it; and no dial
++// waits for a probe longer than utlsFallbackProbeWait.
++func TestUTLSFallbackProbe(t *testing.T) {
++	setFallback(t, true)
++	quietLog(t)
++	config, _ := fallbackClient(t, "chrome", true)
++	ctx := context.Background()
++	readyLater := func(dial fingerprintDial) chan error {
++		result := make(chan error, 1)
++		go func() { result <- dial.ready(ctx, fallbackServer) }()
++		return result
++	}
++	waiting := func(result chan error) bool {
++		select {
++		case err := <-result:
++			require.NoError(t, err)
++			return false
++		case <-time.After(150 * time.Millisecond):
++			return true
++		}
++	}
++
++	first := newDialOf(config)
++	require.NoError(t, first.ready(ctx, fallbackServer))
++	require.True(t, first.(*utlsFallbackDial).probe)
++	second := newDialOf(config)
++	secondReady := readyLater(second)
++	require.True(t, waiting(secondReady), "the second dial waits for the probe")
++	cancelled, cancel := context.WithCancel(ctx)
++	cancel()
++	require.ErrorIs(t, newDialOf(config).ready(cancelled, fallbackServer), context.Canceled)
++	// the probe goes on to firefox, which is answered
++	require.Equal(t, chromeWithout, attemptName(t, first, "192.0.2.10"))
++	lost(t, first)
++	require.Equal(t, chromeWithout, attemptName(t, first, "192.0.2.10"))
++	lost(t, first)
++	require.Equal(t, "firefox", attemptName(t, first, "192.0.2.10"))
++	first.answered()
++	first.done()
++	select {
++	case err := <-secondReady:
++		require.NoError(t, err)
++	case <-time.After(time.Second):
++		t.Fatal("the second dial is not let go")
++	}
++	require.False(t, second.(*utlsFallbackDial).probe)
++	require.Equal(t, "firefox", attemptName(t, second, "192.0.2.10"))
++	// known now: nobody waits
++	third := newDialOf(config)
++	require.False(t, waiting(readyLater(third)))
++
++	// a probe that ends without an answer lets the next dial probe in its turn
++	config, _ = fallbackClient(t, "chrome", false)
++	first = newDialOf(config)
++	require.NoError(t, first.ready(ctx, fallbackServer))
++	second = newDialOf(config)
++	secondReady = readyLater(second)
++	require.True(t, waiting(secondReady))
++	require.Equal(t, chromeWithout, attemptName(t, first, "192.0.2.10"))
++	first.done()
++	require.False(t, waiting(secondReady))
++	require.True(t, second.(*utlsFallbackDial).probe)
++	second.done()
++
++	// a probe that goes through the whole list puts the fallback to rest: the dial that
++	// waited is let go without probing, and while it rests no dial waits
++	config, _ = fallbackClient(t, "chrome", false)
++	first = newDialOf(config)
++	require.NoError(t, first.ready(ctx, fallbackServer))
++	second = newDialOf(config)
++	secondReady = readyLater(second)
++	require.True(t, waiting(secondReady))
++	require.Equal(t, chromeWithout, attemptName(t, first, "192.0.2.10"))
++	lost(t, first)
++	require.Equal(t, chromeWithout, attemptName(t, first, "192.0.2.10"))
++	lost(t, first)
++	require.Equal(t, "firefox", attemptName(t, first, "192.0.2.10"))
++	lost(t, first)
++	require.Equal(t, "chrome", attemptName(t, first, "192.0.2.10"))
++	again, err := first.unanswered(fallbackServer)
++	require.False(t, again)
++	require.ErrorContains(t, err, "unanswered with all of")
++	first.done()
++	require.False(t, waiting(secondReady))
++	require.False(t, second.(*utlsFallbackDial).probe)
++	for range 3 {
++		dial := newDialOf(config)
++		require.False(t, waiting(readyLater(dial)))
++		require.False(t, dial.(*utlsFallbackDial).probe)
++	}
++
++	// a probe that takes long (a server that is down, say) holds the others for
++	// utlsFallbackProbeWait at most: then they go on their own, none of them a probe
++	probeWait := utlsFallbackProbeWait
++	utlsFallbackProbeWait = 400 * time.Millisecond
++	t.Cleanup(func() { utlsFallbackProbeWait = probeWait })
++	config, _ = fallbackClient(t, "chrome", false)
++	first = newDialOf(config)
++	require.NoError(t, first.ready(ctx, fallbackServer))
++	second = newDialOf(config)
++	secondReady = readyLater(second)
++	require.True(t, waiting(secondReady))
++	select {
++	case err := <-secondReady:
++		require.NoError(t, err)
++	case <-time.After(time.Second):
++		t.Fatal("the second dial waits on past utlsFallbackProbeWait")
++	}
++	require.False(t, second.(*utlsFallbackDial).probe)
++	first.done()
++}
++
++// A REALITY server since Xray-core v26.9.8 answers the ClientHello without the
++// X25519MLKEM768 key share as a stranger's, with the certificate of its target. The failure
++// names the ClientHello, and the fallback goes on with firefox at once: also when the first
++// candidate has worked, as with a server that was updated since. A stranger's answer to a
++// ClientHello with the key share has another cause (the key, the short id), which no other
++// ClientHello mends: that one is not left for it.
++func TestUTLSFallbackRealityRefused(t *testing.T) {
++	certificate, trusted := trustedServerCertificate()
++	if !trusted {
++		if runtime.GOOS == "linux" {
++			t.Fatal("the system roots of this process cannot be set: were they loaded by an earlier test?")
++		}
++		t.Skip("the system roots of this process cannot be set")
++	}
++	setFallback(t, true)
++	quietLog(t)
++	// The clients of this test ask for a name the certificate of the target is not for: the
++	// handshake with the target fails on the certificate. With a certificate that is valid
++	// here it fails after it, and a request to the target is then made on the connection
++	// (realityClientFallback), in a goroutine a test cannot wait for.
++	var config Config
++	var warnings *warnLog
++	client := func(fingerprint string) {
++		logger, writer := newWarnLogger(t)
++		options := realityOptionsForTest(fingerprint, true)
++		options.ServerName = "other.example"
++		created, err := NewClient(context.Background(), logger, "192.0.2.1", options)
++		require.NoError(t, err)
++		config, warnings = created, writer
++	}
++	attempt := func(dial fingerprintDial) *RealityClientConfig {
++		attempt, _ := dial.attempt(localAddrConn{local: "192.0.2.10"})
++		return attempt.(*RealityClientConfig)
++	}
++	// the handshake of an attempt with a server that answers as the target does
++	asStranger := func(attempt Config) error {
++		listener, err := net.Listen("tcp", "127.0.0.1:0")
++		require.NoError(t, err)
++		defer listener.Close()
++		conn, err := net.Dial("tcp", listener.Addr().String())
++		require.NoError(t, err)
++		defer conn.Close()
++		server, err := listener.Accept()
++		require.NoError(t, err)
++		plainTLSServer(t, server, certificate)
++		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
++		defer cancel()
++		_, err = ClientHandshake(ctx, conn, attempt)
++		require.Error(t, err)
++		return err
++	}
++	ctx := context.Background()
++	var stranger *realityStrangerError
++	const refusal = "reality verification failed, possibly because of the uTLS fingerprint " + chromeWithout + ": REALITY servers since Xray-core v26.9.8 reject a Client Hello without an X25519MLKEM768 key share"
++
++	// a newer server: the first candidate is refused, firefox is tried at once
++	client("chrome")
++	dial := newDialOf(config)
++	first := attempt(dial)
++	require.True(t, first.uClient.noMLKEM)
++	require.Equal(t, chromeWithout, first.classicFingerprint)
++	require.True(t, first.classicFallback)
++	err := asStranger(first)
++	require.ErrorAs(t, err, &stranger)
++	require.True(t, strings.HasPrefix(err.Error(), refusal+": x509: "), err.Error())
++	warnings.take()
++	require.True(t, dial.failed(ctx, fallbackServer, err))
++	lines := warnings.take()
++	require.Len(t, lines, 1)
++	require.Contains(t, lines[0], "tls: the handshake with 192.0.2.1:443 refused "+chromeWithout+", as a REALITY server since Xray-core v26.9.8 does, retrying with firefox")
++	firefoxID, err := uTLSClientHelloID("firefox")
++	require.NoError(t, err)
++	second := attempt(dial)
++	require.Equal(t, firefoxID, second.uClient.id)
++	require.False(t, second.uClient.noMLKEM)
++	require.Empty(t, second.classicFingerprint)
++	dial.answered()
++	require.Equal(t, "firefox", attemptName(t, newDialOf(config), "192.0.2.10"))
++	// the configuration itself is as it was
++	require.Empty(t, config.(*RealityClientConfig).classicFingerprint)
++	require.False(t, config.(*RealityClientConfig).uClient.noMLKEM)
++
++	// an older server takes the first candidate; when it is updated, the first candidate is
++	// left at the first refusal, though it has worked
++	client("chrome")
++	dial = newDialOf(config)
++	require.Equal(t, chromeWithout, attemptName(t, dial, "192.0.2.10"))
++	dial.answered()
++	require.Empty(t, warnings.take(), "the first candidate answered is told at the info level")
++	dial = newDialOf(config)
++	require.False(t, dial.failed(ctx, fallbackServer, attemptAndFail(t, dial, E.New("remote error: tls: handshake failure"))), "another failure is the server's business")
++	dial = newDialOf(config)
++	require.True(t, dial.failed(ctx, fallbackServer, asStranger(attempt(dial))))
++	require.Equal(t, "firefox", attemptName(t, dial, "192.0.2.10"))
++
++	// with the key share, a stranger's answer has another cause: not left for it
++	client("firefox")
++	dial = newDialOf(config)
++	require.Equal(t, "firefox without X25519MLKEM768", attemptName(t, dial, "192.0.2.10"))
++	require.True(t, dial.failed(ctx, fallbackServer, &realityStrangerError{E.New("reality verification failed")}))
++	configured := attempt(dial)
++	require.Equal(t, firefoxID, configured.uClient.id)
++	require.Empty(t, configured.classicFingerprint)
++	err = asStranger(configured)
++	require.True(t, strings.HasPrefix(err.Error(), "x509: "), err.Error())
++	require.False(t, errors.As(err, &stranger))
++	dial.answered()
++	dial = newDialOf(config)
++	require.Equal(t, "firefox", attemptName(t, dial, "192.0.2.10"))
++	require.False(t, dial.failed(ctx, fallbackServer, err))
++
++	// A configured fingerprint without the key share is the first candidate as it is, and a
++	// refusal moves it on to firefox.
++	client("edge")
++	warnings.take()
++	dial = newDialOf(config)
++	edge := attempt(dial)
++	require.Equal(t, utls.HelloEdge_Auto, edge.uClient.id)
++	require.False(t, edge.uClient.noMLKEM)
++	require.Equal(t, "edge", edge.classicFingerprint)
++	err = asStranger(edge)
++	require.ErrorAs(t, err, &stranger)
++	require.True(t, dial.failed(ctx, fallbackServer, err))
++	require.Equal(t, "firefox", attemptName(t, dial, "192.0.2.10"))
++}
++
++// attemptAndFail makes an attempt of a dial and returns err, the failure of its handshake.
++func attemptAndFail(t *testing.T, dial fingerprintDial, err error) error {
++	attemptName(t, dial, "192.0.2.10")
++	return err
++}
++
++// A ClientHello that fails in another way before it has completed a handshake is left, the
++// first candidate too (it is not the configured fingerprint); one that has worked stays
++// through such a failure, as without the fallback. A handshake that waited out its whole
++// time ends the dial.
++func TestUTLSFallbackLeavesWhatFails(t *testing.T) {
++	setFallback(t, true)
++	quietLog(t)
++	config, warnings := fallbackClient(t, "chrome", false)
++	refused := E.New("remote error: tls: handshake failure")
++	ctx := context.Background()
++
++	dial := newDialOf(config)
++	require.Equal(t, chromeWithout, attemptName(t, dial, "192.0.2.10"))
++	require.True(t, dial.failed(ctx, fallbackServer, refused), "the first candidate, never answered, is left")
++	first := warnings.take()
++	require.Len(t, first, 1)
++	require.Contains(t, first[0], "failed with "+chromeWithout+" (remote error: tls: handshake failure), retrying with firefox")
++	require.Equal(t, "firefox", attemptName(t, dial, "192.0.2.10"))
++	// once answered here it stays through such a failure
++	config, warnings = fallbackClient(t, "chrome", false)
++	dial = newDialOf(config)
++	require.Equal(t, chromeWithout, attemptName(t, dial, "192.0.2.10"))
++	dial.answered()
++	dial = newDialOf(config)
++	require.Equal(t, chromeWithout, attemptName(t, dial, "192.0.2.10"))
++	require.False(t, dial.failed(ctx, fallbackServer, refused), "a candidate that has worked fails as without the fallback")
++	warnings.take()
++
++	config, warnings = fallbackClient(t, "chrome", false)
++	dial = newDialOf(config)
++	require.Equal(t, chromeWithout, attemptName(t, dial, "192.0.2.10"))
++	lost(t, dial)
++	require.Equal(t, chromeWithout, attemptName(t, dial, "192.0.2.10"))
++	lost(t, dial)
++	require.Equal(t, "firefox", attemptName(t, dial, "192.0.2.10"))
++	warnings.take()
++	// a dial its caller has given up tells nothing
++	cancelled, cancel := context.WithCancel(ctx)
++	cancel()
++	other := newDialOf(config)
++	require.Equal(t, "firefox", attemptName(t, other, "192.0.2.10"))
++	require.False(t, other.failed(cancelled, fallbackServer, context.Canceled))
++	require.Empty(t, warnings.take())
++	// answered and refused: the next one
++	require.True(t, dial.failed(ctx, fallbackServer, refused))
++	lines := warnings.take()
++	require.Len(t, lines, 1)
++	require.Contains(t, lines[0], "tls: the handshake with 192.0.2.1:443 failed with firefox (remote error: tls: handshake failure), retrying with chrome")
++	require.Equal(t, "chrome", attemptName(t, dial, "192.0.2.10"))
++	dial.answered()
++	lines = warnings.take()
++	require.Len(t, lines, 1)
++	require.Contains(t, lines[0], "tls: chrome is answered where "+chromeWithout+" was not; it is used from now on")
++
++	// A handshake that waited out its whole time moves the path on, and the dial ends there:
++	// it is not made longer by one more such wait.
++	config, warnings = fallbackClient(t, "chrome", false)
++	dial = newDialOf(config)
++	require.Equal(t, chromeWithout, attemptName(t, dial, "192.0.2.10"))
++	lost(t, dial)
++	require.Equal(t, chromeWithout, attemptName(t, dial, "192.0.2.10"))
++	lost(t, dial)
++	require.Equal(t, "firefox", attemptName(t, dial, "192.0.2.10"))
++	warnings.take()
++	require.False(t, dial.failed(ctx, fallbackServer, E.Cause(context.DeadlineExceeded, "tls handshake")))
++	lines = warnings.take()
++	require.Len(t, lines, 1)
++	require.Contains(t, lines[0], "failed with firefox (tls handshake: context deadline exceeded), the next connection tries chrome")
++	// a list of which a part went unanswered and a part was refused says so
++	dial = newDialOf(config)
++	require.Equal(t, "chrome", attemptName(t, dial, "192.0.2.10"))
++	require.False(t, dial.failed(ctx, fallbackServer, refused))
++	lines = warnings.take()
++	require.Contains(t, lines[len(lines)-1], "tls: none of "+chromeWithout+", firefox, chrome got through to 192.0.2.1:443 (1 unanswered, 2 refused; chrome: remote error: tls: handshake failure); the fallback rests for 30s, chrome is used as configured")
++}
++
++// A candidate whose ClientHello went unanswered and is answered on the next connection may
++// not be what the path dropped: the fallback rests, on the candidate it was using.
++func TestUTLSFallbackAnsweredAgain(t *testing.T) {
++	setFallback(t, true)
++	rest, interval := utlsFallbackRest, utlsFallbackLogInterval
++	utlsFallbackRest, utlsFallbackLogInterval = 200*time.Millisecond, 0
++	t.Cleanup(func() { utlsFallbackRest, utlsFallbackLogInterval = rest, interval })
++	config, warnings := fallbackClient(t, "chrome", false)
++
++	dial := newDialOf(config)
++	require.Equal(t, chromeWithout, attemptName(t, dial, "192.0.2.10"))
++	lost(t, dial)
++	require.Equal(t, chromeWithout, attemptName(t, dial, "192.0.2.10"))
++	dial.answered()
++	lines := warnings.take()
++	require.Len(t, lines, 2)
++	require.Contains(t, lines[1], "tls: "+chromeWithout+" is answered after its ClientHello was not: a loss on the way, or something that does not choose by the ClientHello; the fallback rests for 200ms")
++	for range 3 {
++		dial = newDialOf(config)
++		name, watched := attemptWatched(t, dial, "192.0.2.10")
++		require.Equal(t, chromeWithout, name)
++		require.False(t, watched)
++		// what happens to a connection that is not watched changes nothing
++		dial.answered()
++		require.False(t, dial.failed(context.Background(), fallbackServer, context.DeadlineExceeded))
++	}
++	require.Empty(t, warnings.take())
++
++	// after the rest the path is watched again; the candidate is left in the end
++	time.Sleep(250 * time.Millisecond)
++	dial = newDialOf(config)
++	name, watched := attemptWatched(t, dial, "192.0.2.10")
++	require.Equal(t, chromeWithout, name)
++	require.True(t, watched)
++	lost(t, dial)
++	require.Equal(t, chromeWithout, attemptName(t, dial, "192.0.2.10"))
++	lost(t, dial)
++	require.Equal(t, "firefox", attemptName(t, dial, "192.0.2.10"))
++	dial.answered()
++	warnings.take()
++}
++
++// When no candidate is answered, what drops the ClientHello does not choose by it, and the
++// fallback rests on the configured fingerprint as it is; twice as long when the next rest
++// begins soon after.
++func TestUTLSFallbackRests(t *testing.T) {
++	setFallback(t, true)
++	rest, interval := utlsFallbackRest, utlsFallbackLogInterval
++	utlsFallbackRest, utlsFallbackLogInterval = 400*time.Millisecond, 0
++	t.Cleanup(func() { utlsFallbackRest, utlsFallbackLogInterval = rest, interval })
++	config, warnings := fallbackClient(t, "firefox", false)
++	const firefoxWithout = "firefox without X25519MLKEM768"
++	wholeList := func() string {
++		dial := newDialOf(config)
++		name, watched := attemptWatched(t, dial, "192.0.2.10")
++		require.Equal(t, firefoxWithout, name)
++		require.True(t, watched)
++		lost(t, dial)
++		require.Equal(t, firefoxWithout, attemptName(t, dial, "192.0.2.10"))
++		lost(t, dial)
++		require.Equal(t, "firefox", attemptName(t, dial, "192.0.2.10"))
++		again, err := dial.unanswered(fallbackServer)
++		require.False(t, again)
++		require.ErrorContains(t, err, "ClientHello unanswered with all of "+firefoxWithout+", firefox")
++		lines := warnings.take()
++		require.Len(t, lines, 3)
++		return lines[2]
++	}
++	require.Contains(t, wholeList(), "unanswered with all of "+firefoxWithout+", firefox; the fallback rests for 400ms, firefox is used as configured")
++	for range 3 {
++		dial := newDialOf(config)
++		name, watched := attemptWatched(t, dial, "192.0.2.10")
++		require.Equal(t, "firefox", name)
++		require.False(t, watched)
++	}
++	// another local address is another network: it has its own list
++	name, watched := attemptWatched(t, newDialOf(config), "198.51.100.7")
++	require.Equal(t, firefoxWithout, name)
++	require.True(t, watched)
++	time.Sleep(450 * time.Millisecond)
++	require.Contains(t, wholeList(), "the fallback rests for 800ms")
++	time.Sleep(1700 * time.Millisecond)
++	require.Contains(t, wholeList(), "the fallback rests for 400ms")
++}
++
++// choiceCache is the part of a cache file that keeps the choice of the fallback.
++type choiceCache struct {
++	adapter.CacheFile
++	access  sync.Mutex
++	choices map[string]choiceEntry
++	writes  int
++	// the block detector's outcomes, and the writes of them
++	outcomes      map[string]outcomeEntry
++	outcomeWrites int
++}
++
++type outcomeEntry struct {
++	flags       byte
++	fingerprint string
++	at          time.Time
++}
++
++type choiceEntry struct {
++	choice string
++	at     time.Time
++}
++
++func (c *choiceCache) LoadUTLSChoice(key string) (string, time.Time, bool) {
++	c.access.Lock()
++	defer c.access.Unlock()
++	entry, loaded := c.choices[key]
++	return entry.choice, entry.at, loaded
++}
++
++func (c *choiceCache) StoreUTLSChoice(key string, choice string, at time.Time) error {
++	c.access.Lock()
++	defer c.access.Unlock()
++	c.choices[key] = choiceEntry{choice, at}
++	c.writes++
++	return nil
++}
++
++func (c *choiceCache) LoadDetectOutcome(key string) (byte, string, time.Time, bool) {
++	c.access.Lock()
++	defer c.access.Unlock()
++	entry, loaded := c.outcomes[key]
++	return entry.flags, entry.fingerprint, entry.at, loaded
++}
++
++func (c *choiceCache) StoreDetectOutcome(key string, flags byte, fingerprint string, at time.Time) error {
++	c.access.Lock()
++	defer c.access.Unlock()
++	if c.outcomes == nil {
++		c.outcomes = make(map[string]outcomeEntry)
++	}
++	c.outcomes[key] = outcomeEntry{flags, fingerprint, at}
++	c.outcomeWrites++
++	return nil
++}
++
++// wait returns the only entry once it holds the choice: the fallback writes in the
++// background.
++func (c *choiceCache) wait(t *testing.T, choice string) (string, choiceEntry) {
++	t.Helper()
++	deadline := time.Now().Add(time.Second)
++	for {
++		c.access.Lock()
++		if len(c.choices) == 1 {
++			for key, entry := range c.choices {
++				if entry.choice == choice {
++					c.access.Unlock()
++					return key, entry
++				}
++			}
++		}
++		c.access.Unlock()
++		if time.Now().After(deadline) {
++			t.Fatalf("the cache has %v, not the choice %s", c.choices, choice)
++		}
++		time.Sleep(10 * time.Millisecond)
++	}
++}
++
++func (c *choiceCache) writeCount() int {
++	c.access.Lock()
++	defer c.access.Unlock()
++	return c.writes
++}
++
++func (c *choiceCache) only(t *testing.T) (string, choiceEntry) {
++	c.access.Lock()
++	defer c.access.Unlock()
++	require.Len(t, c.choices, 1)
++	for key, entry := range c.choices {
++		return key, entry
++	}
++	return "", choiceEntry{}
++}
++
++// The choice is kept in the cache file: a client made again (a restart) begins with it and
++// does not probe. A choice older than a day is not read; while the client runs, a choice
++// older than a day is checked by one dial with the first candidate.
++func TestUTLSFallbackCache(t *testing.T) {
++	setFallback(t, true)
++	quietLog(t)
++	cache := &choiceCache{choices: make(map[string]choiceEntry)}
++	ctx := service.ContextWith[adapter.CacheFile](context.Background(), adapter.CacheFile(cache))
++	config, _ := fallbackClientIn(t, ctx, "chrome", true)
++	dial := newDialOf(config)
++	require.NoError(t, dial.ready(ctx, fallbackServer))
++	require.Equal(t, chromeWithout, attemptName(t, dial, "192.0.2.10"))
++	lost(t, dial)
++	require.Equal(t, chromeWithout, attemptName(t, dial, "192.0.2.10"))
++	lost(t, dial)
++	require.Equal(t, "firefox", attemptName(t, dial, "192.0.2.10"))
++	dial.answered()
++	dial.done()
++	key, entry := cache.wait(t, "firefox")
++	require.Equal(t, "chrome example.org 192.0.2.1:443", key)
++	require.Equal(t, "firefox", entry.choice)
++	require.WithinDuration(t, time.Now(), entry.at, time.Minute)
++
++	// made again: it begins with firefox, and nobody waits for a probe
++	config, _ = fallbackClientIn(t, ctx, "chrome", true)
++	dial = newDialOf(config)
++	require.NoError(t, dial.ready(ctx, fallbackServer))
++	require.False(t, dial.(*utlsFallbackDial).probe)
++	name, watched := attemptWatched(t, dial, "192.0.2.10")
++	require.Equal(t, "firefox", name)
++	require.True(t, watched)
++	dial.answered()
++
++	// The choice gets old while the client runs: one dial tries the first candidate, the
++	// others go on with firefox. Unanswered: the dial goes on with firefox, the choice is
++	// kept for another day.
++	path := dial.(*utlsFallbackDial).path
++	path.chosen = time.Now().Add(-25 * time.Hour)
++	recheck := newDialOf(config)
++	require.NoError(t, recheck.ready(ctx, fallbackServer))
++	require.Equal(t, chromeWithout, attemptName(t, recheck, "192.0.2.10"))
++	require.Equal(t, "firefox", attemptName(t, newDialOf(config), "192.0.2.10"), "only one dial checks")
++	lost(t, recheck)
++	require.Equal(t, "firefox", attemptName(t, recheck, "192.0.2.10"))
++	recheck.answered()
++	recheck.done()
++	_, entry = cache.wait(t, "firefox")
++	require.Equal(t, "firefox", entry.choice)
++	require.WithinDuration(t, time.Now(), entry.at, time.Minute)
++	require.WithinDuration(t, time.Now(), path.chosen, time.Minute)
++	// answered: the first candidate is used from now on
++	path.chosen = time.Now().Add(-25 * time.Hour)
++	recheck = newDialOf(config)
++	require.Equal(t, chromeWithout, attemptName(t, recheck, "192.0.2.10"))
++	recheck.answered()
++	recheck.done()
++	require.Equal(t, chromeWithout, attemptName(t, newDialOf(config), "192.0.2.10"))
++	_, entry = cache.wait(t, chromeWithout)
++	require.Equal(t, chromeWithout, entry.choice)
++
++	// box.New registers the cache file after it has made the outbounds: it is found at the
++	// first dial
++	late := service.ContextWithDefaultRegistry(context.Background())
++	config, _ = fallbackClientIn(t, late, "chrome", true)
++	service.MustRegister[adapter.CacheFile](late, adapter.CacheFile(cache))
++	dial = newDialOf(config)
++	require.NoError(t, dial.ready(late, fallbackServer))
++	require.False(t, dial.(*utlsFallbackDial).probe)
++	require.Equal(t, chromeWithout, attemptName(t, dial, "192.0.2.10"))
++
++	// a choice older than a day is not read: the client made again probes
++	require.NoError(t, cache.StoreUTLSChoice(key, "firefox", time.Now().Add(-25*time.Hour)))
++	config, _ = fallbackClientIn(t, ctx, "chrome", true)
++	dial = newDialOf(config)
++	require.NoError(t, dial.ready(ctx, fallbackServer))
++	require.True(t, dial.(*utlsFallbackDial).probe)
++	require.Equal(t, chromeWithout, attemptName(t, dial, "192.0.2.10"))
++	dial.done()
++}
++
++// The ClientHello without the X25519MLKEM768 key share: the group is gone from the supported
++// groups and the key shares, X25519 stays, and the ClientHello fits a segment.
++func TestDropMLKEM(t *testing.T) {
++	uConn, err := newUClient(nil, &utls.Config{ServerName: "example.org"}, utls.HelloChrome_Auto)
++	require.NoError(t, err)
++	require.NoError(t, uConn.BuildHandshakeState())
++	groups := func() (shares []utls.CurveID, supported []utls.CurveID) {
++		for _, extension := range uConn.Extensions {
++			switch extension := extension.(type) {
++			case *utls.KeyShareExtension:
++				for _, share := range extension.KeyShares {
++					shares = append(shares, share.Group)
++				}
++			case *utls.SupportedCurvesExtension:
++				supported = append(supported, extension.Curves...)
++			}
++		}
++		return
++	}
++	shares, supported := groups()
++	require.Contains(t, shares, utls.X25519MLKEM768)
++	require.Contains(t, supported, utls.X25519MLKEM768)
++	full := len(uConn.HandshakeState.Hello.Raw)
++	require.Greater(t, full, 1200)
++	dropMLKEM(uConn)
++	require.NoError(t, uConn.BuildHandshakeState())
++	shares, supported = groups()
++	require.NotContains(t, shares, utls.X25519MLKEM768)
++	require.NotContains(t, supported, utls.X25519MLKEM768)
++	require.Contains(t, shares, utls.X25519)
++	require.Less(t, len(uConn.HandshakeState.Hello.Raw), 800)
++}
++
++// With tls.spoof the fallback works the same way, and the report of a list nobody answered
++// names tls.spoof as a possible cause.
++func TestUTLSFallbackWithSpoof(t *testing.T) {
++	setFallback(t, true)
++	quietLog(t)
++	if !tlsspoof.PlatformSupported {
++		t.Skip("tls spoof is not supported here")
++	}
++	logger, warnings := newWarnLogger(t)
++	options := realityOptionsForTest("chrome", false)
++	options.Spoof = "packagist.org"
++	config, err := NewClient(context.Background(), logger, "192.0.2.1", options)
++	require.NoError(t, err)
++	dial := newDialOf(config)
++	for _, name := range []string{chromeWithout, chromeWithout, "firefox"} {
++		require.Equal(t, name, attemptName(t, dial, "192.0.2.10"))
++		lost(t, dial)
++	}
++	require.Equal(t, "chrome", attemptName(t, dial, "192.0.2.10"))
++	again, err := dial.unanswered(fallbackServer)
++	require.False(t, again)
++	require.ErrorContains(t, err, "; tls.spoof is enabled and may be the cause")
++	lines := warnings.take()
++	require.Contains(t, lines[len(lines)-1], "unanswered with all of "+chromeWithout+", firefox, chrome; tls.spoof is enabled and may be the cause; the fallback rests for 30s, chrome is used as configured")
++}
++
++// A line that repeats is written once in a while, then with the number of times it came.
++func TestUTLSFallbackWarnsOnce(t *testing.T) {
++	setFallback(t, true)
++	interval := utlsFallbackLogInterval
++	utlsFallbackLogInterval = 300 * time.Millisecond
++	t.Cleanup(func() { utlsFallbackLogInterval = interval })
++	config, warnings := fallbackClient(t, "chrome", false)
++	fallback := newDialOf(config).(*utlsFallbackDial).fallback
++	warn := func(message ...any) {
++		fallback.access.Lock()
++		defer fallback.access.Unlock()
++		fallback.warn(message...)
++	}
++	for range 5 {
++		warn("tls: the same line ", 1)
++	}
++	warn("tls: another line")
++	lines := warnings.take()
++	require.Len(t, lines, 2)
++	require.Contains(t, lines[0], "tls: the same line 1")
++	require.NotContains(t, lines[0], "more")
++	time.Sleep(350 * time.Millisecond)
++	warn("tls: the same line ", 1)
++	lines = warnings.take()
++	require.Len(t, lines, 1)
++	require.Contains(t, lines[0], "tls: the same line 1 (4 more in the last ")
++	// the lines kept are bounded
++	for index := range 3 * utlsFallbackLines {
++		warn("tls: line ", index)
++	}
++	fallback.access.Lock()
++	require.LessOrEqual(t, len(fallback.lines), utlsFallbackLines)
++	fallback.access.Unlock()
++}
++
++// The choice is written when the choice of a path changes or gets old, in the background:
++// two paths with choices of their own do not write by turns, and what a dial made during a
++// rest got through with is not written.
++func TestUTLSFallbackStores(t *testing.T) {
++	setFallback(t, true)
++	quietLog(t)
++	cache := &choiceCache{choices: make(map[string]choiceEntry)}
++	ctx := service.ContextWith[adapter.CacheFile](context.Background(), adapter.CacheFile(cache))
++	config, _ := fallbackClientIn(t, ctx, "chrome", false)
++	dial := newDialOf(config)
++	require.NoError(t, dial.ready(ctx, fallbackServer))
++	require.Equal(t, chromeWithout, attemptName(t, dial, "192.0.2.10"))
++	dial.answered()
++	dial.done()
++	cache.wait(t, chromeWithout)
++	// another local address, where the first candidate goes unanswered: firefox
++	dial = newDialOf(config)
++	require.Equal(t, chromeWithout, attemptName(t, dial, "198.51.100.7"))
++	lost(t, dial)
++	require.Equal(t, chromeWithout, attemptName(t, dial, "198.51.100.7"))
++	lost(t, dial)
++	require.Equal(t, "firefox", attemptName(t, dial, "198.51.100.7"))
++	dial.answered()
++	cache.wait(t, "firefox")
++	writes := cache.writeCount()
++	require.Equal(t, 2, writes)
++	for range 5 {
++		for _, local := range []string{"192.0.2.10", "198.51.100.7"} {
++			dial = newDialOf(config)
++			attemptName(t, dial, local)
++			dial.answered()
++		}
++	}
++	time.Sleep(100 * time.Millisecond)
++	require.Equal(t, writes, cache.writeCount(), "dials by turns on the two paths write")
++
++	// nothing answered, the fallback rests on chrome as configured; a dial of the rest gets
++	// through with it, and nothing is written
++	rest := utlsFallbackRest
++	utlsFallbackRest = time.Minute
++	t.Cleanup(func() { utlsFallbackRest = rest })
++	cache = &choiceCache{choices: make(map[string]choiceEntry)}
++	ctx = service.ContextWith[adapter.CacheFile](context.Background(), adapter.CacheFile(cache))
++	config, _ = fallbackClientIn(t, ctx, "chrome", false)
++	dial = newDialOf(config)
++	require.NoError(t, dial.ready(ctx, fallbackServer))
++	require.Equal(t, chromeWithout, attemptName(t, dial, "192.0.2.10"))
++	lost(t, dial)
++	require.Equal(t, chromeWithout, attemptName(t, dial, "192.0.2.10"))
++	lost(t, dial)
++	require.Equal(t, "firefox", attemptName(t, dial, "192.0.2.10"))
++	lost(t, dial)
++	require.Equal(t, "chrome", attemptName(t, dial, "192.0.2.10"))
++	again, err := dial.unanswered(fallbackServer)
++	require.False(t, again)
++	require.Error(t, err)
++	dial.done()
++	dial = newDialOf(config)
++	require.NoError(t, dial.ready(ctx, fallbackServer))
++	name, watched := attemptWatched(t, dial, "192.0.2.10")
++	require.Equal(t, "chrome", name)
++	require.False(t, watched)
++	dial.answered()
++	dial.done()
++	time.Sleep(100 * time.Millisecond)
++	require.Zero(t, cache.writeCount())
++}
+diff --git a/common/tls/utls_mlkem.go b/common/tls/utls_mlkem.go
+new file mode 100644
+index 000000000..bcc4791b1
+--- /dev/null
++++ b/common/tls/utls_mlkem.go
+@@ -0,0 +1,27 @@
++//go:build with_utls
++
++package tls
++
++import (
++	"github.com/sagernet/sing/common"
++
++	utls "github.com/metacubex/utls"
++)
++
++// dropMLKEM takes the X25519MLKEM768 group out of the supported groups and the key shares of
++// a ClientHello whose handshake state is built: the ClientHello of the fingerprint as stock
++// sing-box sends it under REALITY. The caller builds the state again.
++func dropMLKEM(uConn *utls.UConn) {
++	for _, extension := range uConn.Extensions {
++		if curves, isCurves := extension.(*utls.SupportedCurvesExtension); isCurves {
++			curves.Curves = common.Filter(curves.Curves, func(curveID utls.CurveID) bool {
++				return curveID != utls.X25519MLKEM768
++			})
++		}
++		if keyShares, isKeyShares := extension.(*utls.KeyShareExtension); isKeyShares {
++			keyShares.KeyShares = common.Filter(keyShares.KeyShares, func(share utls.KeyShare) bool {
++				return share.Group != utls.X25519MLKEM768
++			})
++		}
++	}
++}
+diff --git a/experimental/cachefile/utls_choice.go b/experimental/cachefile/utls_choice.go
+new file mode 100644
+index 000000000..bab296c0a
+--- /dev/null
++++ b/experimental/cachefile/utls_choice.go
+@@ -0,0 +1,43 @@
++package cachefile
++
++import (
++	"encoding/binary"
++	"time"
++
++	"github.com/sagernet/bbolt"
++)
++
++// bucketUTLSChoice keeps what the uTLS fingerprint fallback chose for a server (podkop-engine):
++// the time of the choice, then the name of the ClientHello chosen.
++var bucketUTLSChoice = []byte("utls_choice")
++
++func (c *CacheFile) LoadUTLSChoice(key string) (choice string, at time.Time, loaded bool) {
++	c.view(func(t *bbolt.Tx) error {
++		bucket := c.bucket(t, bucketUTLSChoice)
++		if bucket == nil {
++			return nil
++		}
++		value := bucket.Get([]byte(key))
++		if len(value) <= 8 {
++			return nil
++		}
++		at = time.Unix(int64(binary.BigEndian.Uint64(value[:8])), 0)
++		choice = string(value[8:])
++		loaded = true
++		return nil
++	})
++	return
++}
++
++func (c *CacheFile) StoreUTLSChoice(key string, choice string, at time.Time) error {
++	return c.batch(func(t *bbolt.Tx) error {
++		bucket, err := c.createBucket(t, bucketUTLSChoice)
++		if err != nil {
++			return err
++		}
++		value := make([]byte, 8+len(choice))
++		binary.BigEndian.PutUint64(value, uint64(at.Unix()))
++		copy(value[8:], choice)
++		return bucket.Put([]byte(key), value)
++	})
++}
+diff --git a/option/experimental.go b/option/experimental.go
+index 5cf6f51bd..88eb1e8c1 100644
+--- a/option/experimental.go
++++ b/option/experimental.go
+@@ -7,6 +7,21 @@ type ExperimentalOptions struct {
+ 	ClashAPI  *ClashAPIOptions  `json:"clash_api,omitempty"`
+ 	V2RayAPI  *V2RayAPIOptions  `json:"v2ray_api,omitempty"`
+ 	Debug     *DebugOptions     `json:"debug,omitempty"`
++	// podkop-engine
++	UTLSFallback *UTLSFallbackOptions `json:"utls_fallback,omitempty"`
++}
++
++// UTLSFallbackOptions turn the uTLS fingerprint fallback of TLS clients on or off for the
++// whole configuration (podkop-engine): a client with a uTLS fingerprint tries the
++// fingerprint without its X25519MLKEM768 key share, then firefox, then the fingerprint as it
++// is, and keeps the first that the server takes and the path lets through (see
++// common/tls/hello_watch.go). Without the option the environment decides
++// (SING_BOX_UTLS_FALLBACK, any value turns it on). With it the environment is not read.
++// Fingerprints is no longer used: it is read so that configurations written for the list
++// of earlier revisions stay valid.
++type UTLSFallbackOptions struct {
++	Enabled      bool                       `json:"enabled,omitempty"`
++	Fingerprints badoption.Listable[string] `json:"fingerprints,omitempty"`
+ }
+ 
+ type CacheFileOptions struct {
+-- 
+2.53.0
+

@@ -115,9 +115,9 @@ Package/podkop-engine-full/conffiles=$(Package/podkop-engine/conffiles)
 
 # CLI `sing-box api ...` (gRPC-клиент, ~5 МБ) podkop не нужен: убираем по маске,
 # чтобы новые файлы upstream уходили тоже. Регистрацию api/snell снимает тег podkop_slim.
-# From r15 the mask matches nothing on any line: 1.12 and 1.13 have no api command, and on
-# 1.14 its files are in cmd/sing-box/cli behind the build constraint !podkop_slim. It stays
-# for an upstream that puts them back in cmd/sing-box.
+# 1.12 and 1.13 have no api command. On 1.14 r15-r24 the command line was the package
+# cmd/sing-box/cli, its api files behind the build constraint !podkop_slim; from r25 it is where
+# upstream has it again, and this mask is what keeps the api client out of both packages.
 define Build/Prepare
 	$(call Build/Prepare/Default)
 	$(RM) $(PKG_BUILD_DIR)/cmd/sing-box/cmd_api*.go

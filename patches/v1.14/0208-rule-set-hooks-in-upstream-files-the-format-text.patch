@@ -1,0 +1,76 @@
+From 71660bfc404ec639fce456824eb3adab287699ca Mon Sep 17 00:00:00 2001
+From: FiyeroT <me@fiyero.xyz>
+Date: Thu, 12 Nov 2026 21:41:19 +0300
+Subject: [PATCH 11/57] rule-set, hooks in upstream files: the format text
+
+The lines of upstream files that "rule-set: the format text" needs; the feature itself is its patch
+of layer 03, in files of its own.
+
+Pdk-Feature: ruletext
+Pdk-Zone: core
+Pdk-Layer: 02
+---
+ constant/rule.go              |  3 +++
+ route/rule/rule_set_local.go  | 11 ++++++++++-
+ route/rule/rule_set_remote.go |  9 +++++++++
+ 3 files changed, 22 insertions(+), 1 deletion(-)
+
+diff --git a/constant/rule.go b/constant/rule.go
+index f8670f7d2..fa82ec058 100644
+--- a/constant/rule.go
++++ b/constant/rule.go
+@@ -16,6 +16,9 @@ const (
+ 	RuleSetTypeRemote   = "remote"
+ 	RuleSetFormatSource = "source"
+ 	RuleSetFormatBinary = "binary"
++	// RuleSetFormatText is a list written as plain text, a domain or an IP CIDR a line
++	// (common/ruletext).
++	RuleSetFormatText = "text"
+ )
+ 
+ const RuleSetTagPlaceholder = "{tag}"
+diff --git a/route/rule/rule_set_local.go b/route/rule/rule_set_local.go
+index 9d5d21e83..4314c3271 100644
+--- a/route/rule/rule_set_local.go
++++ b/route/rule/rule_set_local.go
+@@ -114,7 +114,16 @@ func (s *LocalRuleSet) reloadFile(path string) error {
+ 			return err
+ 		}
+ 		defer setFile.Close()
+-		ruleSet, err = srs.Read(setFile, false)
++		ruleSet, err = srs.ReadSets(contextReader{s.ctx, setFile})
++		if err != nil {
++			return err
++		}
++	case C.RuleSetFormatText:
++		content, err := filemanager.ReadFile(s.ctx, path)
++		if err != nil {
++			return err
++		}
++		ruleSet, _, err = ruletext.ReadContext(s.ctx, content)
+ 		if err != nil {
+ 			return err
+ 		}
+diff --git a/route/rule/rule_set_remote.go b/route/rule/rule_set_remote.go
+index 10b1f13c1..e673b74ae 100644
+--- a/route/rule/rule_set_remote.go
++++ b/route/rule/rule_set_remote.go
+@@ -194,6 +194,15 @@ func (s *RemoteRuleSet) loadBytes(content []byte) error {
+ 		if err != nil {
+ 			return err
+ 		}
++	case C.RuleSetFormatText:
++		var skipped ruletext.Skipped
++		ruleSet, skipped, err = ruletext.ReadContext(s.ctx, content)
++		if err != nil {
++			return err
++		}
++		if skipped.Count > 0 {
++			s.logger.Warn("rule-set ", s.tag, ": ", skipped.Count, " line(s) are neither a domain nor an IP CIDR and are left out, the first: ", logText(E.New(skipped.First)))
++		}
+ 	default:
+ 		return E.New("unknown rule-set format: ", s.options.Format)
+ 	}
+-- 
+2.53.0
+

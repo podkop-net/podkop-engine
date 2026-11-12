@@ -1,0 +1,55 @@
+From 30a9ff1d67233e582ec36703ed645647c6206b72 Mon Sep 17 00:00:00 2001
+From: FiyeroT <me@fiyero.xyz>
+Date: Thu, 12 Nov 2026 21:41:19 +0300
+Subject: [PATCH 06/57] listener, hooks in upstream files: an output queue of
+ 1024 UDP packets
+
+The lines of upstream files that "listener: an output queue of 1024 UDP packets" needs; the feature
+itself is its patch of layer 03, in files of its own.
+
+Pdk-Feature: listener-udp
+Pdk-Zone: core
+Pdk-Layer: 02
+---
+ common/listener/listener.go     |  2 +-
+ common/listener/listener_udp.go | 11 +++++++++++
+ 2 files changed, 12 insertions(+), 1 deletion(-)
+
+diff --git a/common/listener/listener.go b/common/listener/listener.go
+index 2cbbbab51..40d9d0271 100644
+--- a/common/listener/listener.go
++++ b/common/listener/listener.go
+@@ -92,7 +92,7 @@ func (l *Listener) Start() error {
+ 			return E.Errors(err, l.Close())
+ 		}
+ 		l.packetOutboundClosed = make(chan struct{})
+-		l.packetOutbound = make(chan *N.PacketBuffer, 64)
++		l.packetOutbound = make(chan *N.PacketBuffer, udpOutputQueueSize)
+ 		go l.loopUDPIn()
+ 		if !l.disablePacketOutput {
+ 			go l.loopUDPOut()
+diff --git a/common/listener/listener_udp.go b/common/listener/listener_udp.go
+index 697ef34d1..b3d5c35a5 100644
+--- a/common/listener/listener_udp.go
++++ b/common/listener/listener_udp.go
+@@ -21,6 +21,17 @@ import (
+ 
+ const udpOutputBatchSize = 128
+ 
++// udpOutputQueueSize is how many packets may wait for the output loop, the one goroutine
++// that writes them to the socket; a packet that finds the queue full is dropped. Packets
++// are made on every core at once, so the queue has to hold what they make while the output
++// loop wakes up or is busy with a write. It held 64: less than a resolver in front has in
++// flight (dnsmasq: 150) and less than the kernel hands the listener in one go (its receive
++// buffer holds a few hundred small packets), so a burst of 70 DNS answers already lost
++// some, and a lost DNS answer costs the client its timeout, seconds. Writers do not wait
++// for room instead: under a flood of queries the waiting writers would be a queue without
++// a bound.
++const udpOutputQueueSize = 1024
++
+ func (l *Listener) ListenUDP() (net.PacketConn, error) {
+ 	return l.ListenUDPWithConfig(net.ListenConfig{})
+ }
+-- 
+2.53.0
+

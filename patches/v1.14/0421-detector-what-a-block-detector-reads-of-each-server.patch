@@ -1,0 +1,2031 @@
+From 8a735c703655659aadc9b9d77b9b28a28d35b276 Mon Sep 17 00:00:00 2001
+From: FiyeroT <me@fiyero.xyz>
+Date: Thu, 12 Nov 2026 21:41:21 +0300
+Subject: [PATCH 56/57] detector: what a block detector reads of each server
+
+What the handshakes, the flows and the download tests of each server came to, for a block detector
+of the program that runs the box.
+
+Made of these commits of the earlier series (branch archive/r25-1.14-commits):
+  00935b403 detector: what a block detector reads of each server
+
+Pdk-Feature: detector
+Pdk-Zone: core
+Pdk-Layer: 04
+---
+ adapter/experimental.go                       |  30 +
+ adapter/router.go                             |   8 +
+ common/tls/client.go                          |   7 +
+ common/tls/detect_outcome.go                  | 101 ++++
+ common/tls/detect_outcome_test.go             | 523 ++++++++++++++++++
+ common/tls/reality_client.go                  |  69 +++
+ common/trafficcontrol/detect_flows_test.go    | 309 +++++++++++
+ common/trafficcontrol/manager.go              | 123 ++++
+ common/trafficcontrol/tracker.go              |  86 ++-
+ common/urltest/history_test.go                |  63 +++
+ experimental/cachefile/detect_outcome.go      |  48 ++
+ experimental/cachefile/detect_outcome_test.go |  31 ++
+ experimental/clashapi/proxies_delay_test.go   |  58 ++
+ .../group/urltestgroup/urltest_detect_test.go | 188 +++++++
+ route/conn.go                                 |   5 +
+ route/conn_podkop_test.go                     | 128 +++++
+ 16 files changed, 1775 insertions(+), 2 deletions(-)
+ create mode 100644 common/tls/detect_outcome.go
+ create mode 100644 common/tls/detect_outcome_test.go
+ create mode 100644 common/trafficcontrol/detect_flows_test.go
+ create mode 100644 common/urltest/history_test.go
+ create mode 100644 experimental/cachefile/detect_outcome.go
+ create mode 100644 experimental/cachefile/detect_outcome_test.go
+ create mode 100644 experimental/clashapi/proxies_delay_test.go
+ create mode 100644 protocol/group/urltestgroup/urltest_detect_test.go
+ create mode 100644 route/conn_podkop_test.go
+
+diff --git a/adapter/experimental.go b/adapter/experimental.go
+index 7df508d49..56fdc47d5 100644
+--- a/adapter/experimental.go
++++ b/adapter/experimental.go
+@@ -46,6 +46,36 @@ type CacheFile interface {
+ 	StoreGroupExpand(group string, expand bool) error
+ 	LoadRuleSet(tag string) *SavedBinary
+ 	SaveRuleSet(tag string, set *SavedBinary) error
++	// what the uTLS fingerprint fallback chose for a server, and when (podkop-engine)
++	LoadUTLSChoice(key string) (choice string, at time.Time, loaded bool)
++	StoreUTLSChoice(key string, choice string, at time.Time) error
++	// what the block detector read of a server (podkop-engine): a flags byte (DetectNoAnswer,
++	// DetectRefused, DetectFailed) and the fingerprint in use, with the time it was recorded
++	LoadDetectOutcome(key string) (flags byte, fingerprint string, at time.Time, loaded bool)
++	StoreDetectOutcome(key string, flags byte, fingerprint string, at time.Time) error
++}
++
++// Flags of a block-detector outcome kept by the cache file (podkop-engine).
++const (
++	// DetectNoAnswer: TCP connects, and no ClientHello tried got an answer. Any completed
++	// handshake clears it.
++	DetectNoAnswer byte = 1 << 0
++	// DetectRefused: the first candidate of the fingerprint fallback, a ClientHello without an
++	// X25519MLKEM768 key share, was answered as a stranger's and a later candidate completed the
++	// handshake: a REALITY server since Xray-core v26.9.8. Informational (the server is new), not
++	// a block. It stays until the first candidate completes a handshake.
++	DetectRefused byte = 1 << 1
++	// DetectFailed: the server answered, and the handshake did not complete. Any completed
++	// handshake clears it.
++	DetectFailed byte = 1 << 2
++)
++
++// RuleSetCheckCache is a cache file that keeps the time a remote rule set was last found
++// up to date apart from its content (podkop-engine): an answer "not modified" writes the
++// time alone, not the whole list again.
++type RuleSetCheckCache interface {
++	LoadRuleSetChecked(tag string) time.Time
++	StoreRuleSetChecked(tag string, at time.Time) error
+ }
+ 
+ type SavedBinary struct {
+diff --git a/adapter/router.go b/adapter/router.go
+index be6267419..f5a8d07ba 100644
+--- a/adapter/router.go
++++ b/adapter/router.go
+@@ -105,6 +105,14 @@ func JudgeFlow(router Router, inbound string, inboundType string, network uint8,
+ 	}
+ }
+ 
++// RemoteEOFMarker is a routed connection that is told when the remote side ended the stream with
++// an EOF (podkop-engine). A connection cut on the way never gets it, and neither does a healthy one
++// its client closed first (the close of a REALITY connection is a full one, so the answer of the
++// server never comes): without it nothing is known of who ended the stream.
++type RemoteEOFMarker interface {
++	MarkRemoteEOF()
++}
++
+ type ConnectionTracker interface {
+ 	RoutedConnection(ctx context.Context, conn net.Conn, metadata InboundContext, matchedRule Rule, matchOutbound Outbound) net.Conn
+ 	RoutedPacketConnection(ctx context.Context, conn N.PacketConn, metadata InboundContext, matchedRule Rule, matchOutbound Outbound) N.PacketConn
+diff --git a/common/tls/client.go b/common/tls/client.go
+index c9116634d..933d1e750 100644
+--- a/common/tls/client.go
++++ b/common/tls/client.go
+@@ -185,6 +185,13 @@ func (d *defaultDialer) DialTLSContext(ctx context.Context, destination M.Socksa
+ 	return d.dialContext(ctx, destination, true)
+ }
+ 
++// detectRecorder is a TLS client that records for the block detector what a handshake met. It is
++// used only when the fingerprint fallback is off, since the fallback records the outcome itself;
++// implemented by the REALITY client (podkop-engine).
++type detectRecorder interface {
++	recordDetectOutcome(ctx context.Context, destination M.Socksaddr, handshakeErr error)
++}
++
+ func (d *defaultDialer) dialContext(ctx context.Context, destination M.Socksaddr, echRetry bool) (Conn, error) {
+ 	// Inside the connection of another outbound the socket is not the server's: there is
+ 	// no ClientHello of this client to watch on it, and a forged one would be sent to the
+diff --git a/common/tls/detect_outcome.go b/common/tls/detect_outcome.go
+new file mode 100644
+index 000000000..81251af90
+--- /dev/null
++++ b/common/tls/detect_outcome.go
+@@ -0,0 +1,101 @@
++//go:build with_utls
++
++package tls
++
++import (
++	"sync"
++	"sync/atomic"
++	"time"
++
++	"github.com/sagernet/sing-box/adapter"
++)
++
++// detectOutcomeWriter keeps in the cache file what the block detector reads of one server
++// (podkop-engine). It is shared by a client configuration and its clones. The cache file is on
++// flash by default, so a handshake that changes nothing writes nothing: there is no write by
++// time, and a restart begins with what the file holds. The writes are made in the order of the
++// changes by one goroutine at most, which takes the latest state when several came meanwhile.
++type detectOutcomeWriter struct {
++	access sync.Mutex
++	// set once, by open: the box registers the cache file after it has made the outbounds
++	cache adapter.CacheFile
++	key   string
++	// the state, and the time it took effect
++	flags       byte
++	fingerprint string
++	at          time.Time
++	// the state was read from the file and no handshake of this process has confirmed it
++	seeded bool
++	// a change is waiting for the goroutine; the goroutine runs
++	dirty   bool
++	writing bool
++	// handshakes in a row that met their deadline, with the fallback off
++	deadlines atomic.Int32
++}
++
++// open gives the writer its place in the cache file, once.
++func (w *detectOutcomeWriter) open(cache adapter.CacheFile, key string) {
++	w.access.Lock()
++	defer w.access.Unlock()
++	if w.cache != nil {
++		return
++	}
++	w.cache, w.key = cache, key
++	flags, fingerprint, at, loaded := cache.LoadDetectOutcome(key)
++	if loaded {
++		w.flags, w.fingerprint, w.at, w.seeded = flags, fingerprint, at, true
++	}
++}
++
++// answered records a completed handshake: change makes the state of it from the one known.
++func (w *detectOutcomeWriter) answered(now time.Time, change func(flags byte, fingerprint string) (byte, string)) {
++	w.access.Lock()
++	defer w.access.Unlock()
++	if w.cache == nil {
++		return
++	}
++	flags, fingerprint := change(w.flags, w.fingerprint)
++	w.commit(now, flags, fingerprint, false)
++}
++
++// failed records that no handshake was completed, for the reason in flag (DetectNoAnswer,
++// DetectFailed). DetectRefused is a fact of the server and stays. The time of a failure says how
++// fresh it is, and one of an earlier run says nothing of this one, so the first failure of a
++// process is written even when it is the same as the state read from the file.
++func (w *detectOutcomeWriter) failed(now time.Time, flag byte) {
++	w.access.Lock()
++	defer w.access.Unlock()
++	if w.cache == nil {
++		return
++	}
++	w.commit(now, w.flags&adapter.DetectRefused|flag, "", w.seeded)
++}
++
++// commit takes the state and has it written if it changed. The caller holds the lock.
++func (w *detectOutcomeWriter) commit(now time.Time, flags byte, fingerprint string, force bool) {
++	w.seeded = false
++	if !force && flags == w.flags && fingerprint == w.fingerprint {
++		return
++	}
++	w.flags, w.fingerprint, w.at = flags, fingerprint, now
++	w.dirty = true
++	if !w.writing {
++		w.writing = true
++		go w.write()
++	}
++}
++
++func (w *detectOutcomeWriter) write() {
++	for {
++		w.access.Lock()
++		if !w.dirty {
++			w.writing = false
++			w.access.Unlock()
++			return
++		}
++		w.dirty = false
++		flags, fingerprint, at := w.flags, w.fingerprint, w.at
++		w.access.Unlock()
++		_ = w.cache.StoreDetectOutcome(w.key, flags, fingerprint, at)
++	}
++}
+diff --git a/common/tls/detect_outcome_test.go b/common/tls/detect_outcome_test.go
+new file mode 100644
+index 000000000..8a79b7148
+--- /dev/null
++++ b/common/tls/detect_outcome_test.go
+@@ -0,0 +1,523 @@
++//go:build with_utls
++
++package tls
++
++import (
++	"context"
++	"errors"
++	"io"
++	"os"
++	"strings"
++	"sync"
++	"testing"
++	"time"
++
++	"github.com/sagernet/sing-box/adapter"
++	E "github.com/sagernet/sing/common/exceptions"
++	M "github.com/sagernet/sing/common/metadata"
++	"github.com/sagernet/sing/service"
++
++	"github.com/stretchr/testify/require"
++)
++
++const outcomeLocal = "192.0.2.10"
++
++// outcomeClient makes a client with the fallback on over the cache; called again, it is the
++// client after a restart.
++func outcomeClient(t *testing.T, cache *choiceCache) (Config, context.Context) {
++	t.Helper()
++	setFallback(t, true)
++	quietLog(t)
++	ctx := service.ContextWith[adapter.CacheFile](context.Background(), adapter.CacheFile(cache))
++	config, _ := fallbackClientIn(t, ctx, "chrome", true)
++	return config, ctx
++}
++
++// settled waits for the writer of a client to have written all it was given.
++func settled(t *testing.T, writer *detectOutcomeWriter) {
++	t.Helper()
++	require.Eventually(t, func() bool {
++		writer.access.Lock()
++		defer writer.access.Unlock()
++		return !writer.writing && !writer.dirty
++	}, 2*time.Second, time.Millisecond)
++}
++
++func writerOf(config Config) *detectOutcomeWriter {
++	return &config.(*RealityClientConfig).uClient.fallback.outcome
++}
++
++// outcomeOf waits for the writes of the client and returns the only outcome in the cache.
++func outcomeOf(t *testing.T, cache *choiceCache, writer *detectOutcomeWriter) outcomeEntry {
++	t.Helper()
++	settled(t, writer)
++	cache.access.Lock()
++	defer cache.access.Unlock()
++	require.Len(t, cache.outcomes, 1)
++	for _, entry := range cache.outcomes {
++		return entry
++	}
++	return outcomeEntry{}
++}
++
++func (c *choiceCache) outcomeWriteCount() int {
++	c.access.Lock()
++	defer c.access.Unlock()
++	return c.outcomeWrites
++}
++
++// answerOnce makes one dial whose first attempt completes the handshake.
++func answerOnce(t *testing.T, ctx context.Context, config Config) string {
++	t.Helper()
++	dial := newDialOf(config)
++	defer dial.done()
++	require.NoError(t, dial.ready(ctx, fallbackServer))
++	name := attemptName(t, dial, outcomeLocal)
++	dial.answered()
++	return name
++}
++
++// goThroughList makes dials whose ClientHellos all go unanswered until the list ends.
++func goThroughList(t *testing.T, ctx context.Context, config Config) {
++	t.Helper()
++	for range 16 {
++		dial := newDialOf(config)
++		require.NoError(t, dial.ready(ctx, fallbackServer))
++		for {
++			attemptName(t, dial, outcomeLocal)
++			again, err := dial.unanswered(fallbackServer)
++			if again {
++				continue
++			}
++			dial.done()
++			if err != nil && strings.Contains(err.Error(), "unanswered with all of") {
++				return
++			}
++			break
++		}
++	}
++	t.Fatal("the list did not end")
++}
++
++// failList makes one dial of which the first candidate meets first and the others other.
++func failList(t *testing.T, ctx context.Context, config Config, first error, other error) {
++	t.Helper()
++	dial := newDialOf(config)
++	defer dial.done()
++	require.NoError(t, dial.ready(ctx, fallbackServer))
++	require.True(t, dial.failed(ctx, fallbackServer, attemptAndFail(t, dial, first)))
++	require.True(t, dial.failed(ctx, fallbackServer, attemptAndFail(t, dial, other)))
++	require.False(t, dial.failed(ctx, fallbackServer, attemptAndFail(t, dial, other)))
++}
++
++// firstRefused is what the first candidate meets at a server that takes it for a stranger's.
++func firstRefused() error {
++	return &realityStrangerError{E.New(realityVerificationFailed)}
++}
++
++// No ClientHello answered: no answer, and nothing else; a list that ends so does not say the
++// server refused anything.
++func TestDetectOutcomeNoAnswer(t *testing.T) {
++	cache := &choiceCache{choices: make(map[string]choiceEntry)}
++	config, ctx := outcomeClient(t, cache)
++	goThroughList(t, ctx, config)
++	entry := outcomeOf(t, cache, writerOf(config))
++	require.Equal(t, adapter.DetectNoAnswer, entry.flags)
++	require.Empty(t, entry.fingerprint)
++}
++
++// A wrong key: the first candidate is refused as a stranger's and the others fail. That is a
++// failure of the handshake, and the refusal alone says nothing of the server.
++func TestDetectOutcomeWrongKey(t *testing.T) {
++	cache := &choiceCache{choices: make(map[string]choiceEntry)}
++	config, ctx := outcomeClient(t, cache)
++	failList(t, ctx, config, firstRefused(), E.New(realityVerificationFailed))
++	entry := outcomeOf(t, cache, writerOf(config))
++	require.Equal(t, adapter.DetectFailed, entry.flags)
++	require.Empty(t, entry.fingerprint)
++	require.False(t, config.(*RealityClientConfig).uClient.fallback.sawRefused, "what the list told is over with it")
++}
++
++// Refused takes a refusal of the first candidate and a later one that completes; it stays until
++// the first one completes, and it is kept through a failure.
++func TestDetectOutcomeRefused(t *testing.T) {
++	cache := &choiceCache{choices: make(map[string]choiceEntry)}
++	config, ctx := outcomeClient(t, cache)
++	writer := writerOf(config)
++	dial := newDialOf(config)
++	require.NoError(t, dial.ready(ctx, fallbackServer))
++	require.True(t, dial.failed(ctx, fallbackServer, attemptAndFail(t, dial, firstRefused())))
++	settled(t, writer)
++	require.Zero(t, cache.outcomeWriteCount(), "refused before anything completed")
++	require.Equal(t, "firefox", attemptName(t, dial, outcomeLocal))
++	dial.answered()
++	dial.done()
++	entry := outcomeOf(t, cache, writer)
++	require.Equal(t, adapter.DetectRefused, entry.flags)
++	require.Equal(t, "firefox", entry.fingerprint)
++	cache.wait(t, "firefox")
++
++	// kept after a restart, and through a failure of the whole list
++	config, ctx = outcomeClient(t, cache)
++	writer = writerOf(config)
++	require.Equal(t, "firefox", answerOnce(t, ctx, config))
++	require.Equal(t, adapter.DetectRefused, outcomeOf(t, cache, writer).flags)
++	rest := utlsFallbackRest
++	utlsFallbackRest = time.Millisecond
++	t.Cleanup(func() { utlsFallbackRest = rest })
++	goThroughList(t, ctx, config)
++	require.Equal(t, adapter.DetectRefused|adapter.DetectNoAnswer, outcomeOf(t, cache, writer).flags)
++	time.Sleep(5 * time.Millisecond)
++	require.Equal(t, "firefox", answerOnce(t, ctx, config))
++	entry = outcomeOf(t, cache, writer)
++	require.Equal(t, adapter.DetectRefused, entry.flags)
++	require.Equal(t, "firefox", entry.fingerprint)
++
++	// the choice got old: the first candidate is tried again, and it completes
++	fallback := config.(*RealityClientConfig).uClient.fallback
++	fallback.access.Lock()
++	fallback.paths[0].chosen = time.Now().Add(-2 * utlsFallbackRecheck)
++	fallback.access.Unlock()
++	require.Equal(t, chromeWithout, answerOnce(t, ctx, config))
++	entry = outcomeOf(t, cache, writer)
++	require.Zero(t, entry.flags)
++	require.Equal(t, chromeWithout, entry.fingerprint)
++}
++
++// A saved choice has worked here, so a failure of another kind does not walk the list. A failed
++// verification of it is still a failure of the handshake: the key of the link has changed, and the
++// record says so. The dial goes as it did, and a handshake that completes clears it.
++func TestDetectOutcomeFailedOnSavedChoice(t *testing.T) {
++	cache := &choiceCache{choices: make(map[string]choiceEntry)}
++	config, ctx := outcomeClient(t, cache)
++	dial := newDialOf(config)
++	require.NoError(t, dial.ready(ctx, fallbackServer))
++	require.True(t, dial.failed(ctx, fallbackServer, attemptAndFail(t, dial, firstRefused())))
++	require.Equal(t, "firefox", attemptName(t, dial, outcomeLocal))
++	dial.answered()
++	dial.done()
++	cache.wait(t, "firefox")
++	require.Equal(t, adapter.DetectRefused, outcomeOf(t, cache, writerOf(config)).flags)
++
++	config, ctx = outcomeClient(t, cache)
++	writer := writerOf(config)
++	failSaved := func(ctx context.Context, err error) {
++		t.Helper()
++		dial := newDialOf(config)
++		defer dial.done()
++		require.NoError(t, dial.ready(context.Background(), fallbackServer))
++		require.False(t, dial.failed(ctx, fallbackServer, attemptAndFail(t, dial, err)), "the dial ends as it did")
++	}
++
++	// another failure says nothing of the key, and a dial its caller gave up nothing at all
++	failSaved(ctx, io.ErrUnexpectedEOF)
++	canceled, cancel := context.WithCancel(ctx)
++	cancel()
++	failSaved(canceled, E.New(realityVerificationFailed))
++	settled(t, writer)
++	require.Equal(t, adapter.DetectRefused, outcomeOf(t, cache, writer).flags)
++
++	failSaved(ctx, E.New(realityVerificationFailed))
++	entry := outcomeOf(t, cache, writer)
++	require.Equal(t, adapter.DetectRefused|adapter.DetectFailed, entry.flags)
++	require.Empty(t, entry.fingerprint)
++	// the same state again writes nothing
++	writes := cache.outcomeWriteCount()
++	failSaved(ctx, E.New(realityVerificationFailed))
++	settled(t, writer)
++	require.Equal(t, writes, cache.outcomeWriteCount())
++
++	require.Equal(t, "firefox", answerOnce(t, ctx, config))
++	require.Equal(t, adapter.DetectRefused, outcomeOf(t, cache, writer).flags)
++}
++
++// A path with a saved choice writes no choice when it recovers: its handshake clears the failure
++// all the same, during the rest and after it.
++func TestDetectOutcomeRecoveryWithSavedChoice(t *testing.T) {
++	cache := &choiceCache{choices: make(map[string]choiceEntry)}
++	config, ctx := outcomeClient(t, cache)
++	dial := newDialOf(config)
++	require.NoError(t, dial.ready(ctx, fallbackServer))
++	attemptName(t, dial, outcomeLocal)
++	lost(t, dial)
++	attemptName(t, dial, outcomeLocal)
++	lost(t, dial)
++	require.Equal(t, "firefox", attemptName(t, dial, outcomeLocal))
++	dial.answered()
++	dial.done()
++	cache.wait(t, "firefox")
++	require.Equal(t, "firefox", outcomeOf(t, cache, writerOf(config)).fingerprint)
++
++	for _, inRest := range []bool{true, false} {
++		config, ctx = outcomeClient(t, cache)
++		writer := writerOf(config)
++		choiceWrites := cache.writeCount()
++		goThroughList(t, ctx, config)
++		entry := outcomeOf(t, cache, writer)
++		require.Equal(t, adapter.DetectNoAnswer, entry.flags)
++		if !inRest {
++			fallback := config.(*RealityClientConfig).uClient.fallback
++			fallback.access.Lock()
++			fallback.paths[0].restUntil = time.Time{}
++			fallback.access.Unlock()
++		}
++		require.Equal(t, "firefox", answerOnce(t, ctx, config))
++		require.Equal(t, choiceWrites, cache.writeCount(), "the choice did not change")
++		entry = outcomeOf(t, cache, writer)
++		require.Zero(t, entry.flags)
++		require.Equal(t, "firefox", entry.fingerprint)
++	}
++}
++
++// A dial of a candidate the path has left clears the failure and gives no fingerprint, even when
++// none is known: the next dial of the candidate in use does.
++func TestDetectOutcomeLeftCandidate(t *testing.T) {
++	cache := &choiceCache{choices: make(map[string]choiceEntry)}
++	config, ctx := outcomeClient(t, cache)
++	writer := writerOf(config)
++	slow := newDialOf(config)
++	require.NoError(t, slow.ready(ctx, fallbackServer))
++	require.Equal(t, chromeWithout, attemptName(t, slow, outcomeLocal))
++	dial := newDialOf(config)
++	attemptName(t, dial, outcomeLocal)
++	lost(t, dial)
++	attemptName(t, dial, outcomeLocal)
++	lost(t, dial)
++	require.Equal(t, "firefox", attemptName(t, dial, outcomeLocal))
++	dial.answered()
++	require.Equal(t, "firefox", outcomeOf(t, cache, writer).fingerprint)
++	writer.failed(time.Now(), adapter.DetectNoAnswer)
++	slow.answered()
++	slow.done()
++	entry := outcomeOf(t, cache, writer)
++	require.Zero(t, entry.flags)
++	require.Empty(t, entry.fingerprint)
++	require.Equal(t, "firefox", answerOnce(t, ctx, config))
++	entry = outcomeOf(t, cache, writer)
++	require.Zero(t, entry.flags)
++	require.Equal(t, "firefox", entry.fingerprint)
++}
++
++// Written only on a change: not by more handshakes, a restart or another list that ends the same;
++// two paths with candidates of their own do not write by turns.
++func TestDetectOutcomeWritesOnChange(t *testing.T) {
++	cache := &choiceCache{choices: make(map[string]choiceEntry)}
++	config, ctx := outcomeClient(t, cache)
++	writer := writerOf(config)
++	for range 5 {
++		require.Equal(t, chromeWithout, answerOnce(t, ctx, config))
++	}
++	settled(t, writer)
++	require.Equal(t, 1, cache.outcomeWriteCount())
++	require.Equal(t, chromeWithout, outcomeOf(t, cache, writer).fingerprint)
++	cache.wait(t, chromeWithout)
++
++	// a restart reads the state
++	config, ctx = outcomeClient(t, cache)
++	writer = writerOf(config)
++	for range 5 {
++		require.Equal(t, chromeWithout, answerOnce(t, ctx, config))
++	}
++	settled(t, writer)
++	require.Equal(t, 1, cache.outcomeWriteCount())
++
++	// the same failure twice is one write
++	rest := utlsFallbackRest
++	utlsFallbackRest = time.Millisecond
++	t.Cleanup(func() { utlsFallbackRest = rest })
++	goThroughList(t, ctx, config)
++	settled(t, writer)
++	require.Equal(t, 2, cache.outcomeWriteCount())
++	time.Sleep(5 * time.Millisecond)
++	goThroughList(t, ctx, config)
++	settled(t, writer)
++	require.Equal(t, 2, cache.outcomeWriteCount())
++	require.Equal(t, adapter.DetectNoAnswer, outcomeOf(t, cache, writer).flags)
++
++	// another path goes on to its own candidate: told once, then the paths do not write by turns
++	time.Sleep(5 * time.Millisecond)
++	require.Equal(t, chromeWithout, answerOnce(t, ctx, config))
++	settled(t, writer)
++	require.Equal(t, 3, cache.outcomeWriteCount())
++	second := newDialOf(config)
++	require.Equal(t, chromeWithout, attemptName(t, second, "198.51.100.7"))
++	lost(t, second)
++	attemptName(t, second, "198.51.100.7")
++	lost(t, second)
++	require.Equal(t, "firefox", attemptName(t, second, "198.51.100.7"))
++	second.answered()
++	second.done()
++	settled(t, writer)
++	require.Equal(t, 4, cache.outcomeWriteCount())
++	for range 5 {
++		dial := newDialOf(config)
++		attemptName(t, dial, outcomeLocal)
++		dial.answered()
++		dial.done()
++		dial = newDialOf(config)
++		require.Equal(t, "firefox", attemptName(t, dial, "198.51.100.7"))
++		dial.answered()
++		dial.done()
++	}
++	settled(t, writer)
++	require.Equal(t, 4, cache.outcomeWriteCount())
++}
++
++// The failure of an earlier run tells nothing of this one: the first failure of a process is
++// written with its own time, once.
++func TestDetectOutcomeFailureAfterRestart(t *testing.T) {
++	old := time.Now().Add(-time.Hour).Truncate(time.Second)
++	cache := &choiceCache{choices: make(map[string]choiceEntry)}
++	key := "chrome example.org " + fallbackServer.String()
++	require.NoError(t, cache.StoreDetectOutcome(key, adapter.DetectNoAnswer, "", old))
++	config, ctx := outcomeClient(t, cache)
++	writer := writerOf(config)
++	rest := utlsFallbackRest
++	utlsFallbackRest = time.Millisecond
++	t.Cleanup(func() { utlsFallbackRest = rest })
++	goThroughList(t, ctx, config)
++	entry := outcomeOf(t, cache, writer)
++	require.Equal(t, adapter.DetectNoAnswer, entry.flags)
++	require.True(t, entry.at.After(old), "the failure kept the time of the earlier run")
++	require.Equal(t, 2, cache.outcomeWriteCount())
++	time.Sleep(5 * time.Millisecond)
++	goThroughList(t, ctx, config)
++	settled(t, writer)
++	require.Equal(t, 2, cache.outcomeWriteCount())
++}
++
++// blockingCache holds the writes until told to go on, and watches how many run at once.
++type blockingCache struct {
++	choiceCache
++	gate    chan struct{}
++	running int
++	most    int
++	order   []byte
++	guard   sync.Mutex
++}
++
++func (c *blockingCache) StoreDetectOutcome(key string, flags byte, fingerprint string, at time.Time) error {
++	c.guard.Lock()
++	c.running++
++	c.most = max(c.most, c.running)
++	c.order = append(c.order, flags)
++	c.guard.Unlock()
++	<-c.gate
++	c.guard.Lock()
++	c.running--
++	c.guard.Unlock()
++	return nil
++}
++
++// One goroutine at most, in order, and what came meanwhile is written as the latest state.
++func TestDetectOutcomeWriterOrder(t *testing.T) {
++	cache := &blockingCache{gate: make(chan struct{})}
++	writer := new(detectOutcomeWriter)
++	writer.open(cache, "key")
++	now := time.Now()
++	writer.failed(now, adapter.DetectNoAnswer)
++	require.Eventually(t, func() bool {
++		cache.guard.Lock()
++		defer cache.guard.Unlock()
++		return cache.running == 1
++	}, 2*time.Second, time.Millisecond)
++	writer.failed(now, adapter.DetectFailed)
++	writer.failed(now, adapter.DetectNoAnswer)
++	writer.answered(now, func(byte, string) (byte, string) { return 0, "firefox" })
++	close(cache.gate)
++	settled(t, writer)
++	require.Equal(t, 1, cache.most)
++	require.Equal(t, []byte{adapter.DetectNoAnswer, 0}, cache.order)
++}
++
++// The fallback off: a success clears all, no answer takes two deadlines in a row, a failed
++// verification is a failure at once, and nothing is written when nothing changes.
++func TestDetectOutcomeFallbackOff(t *testing.T) {
++	setFallback(t, false)
++	cache := &choiceCache{choices: make(map[string]choiceEntry)}
++	ctx := service.ContextWith[adapter.CacheFile](context.Background(), adapter.CacheFile(cache))
++	config, _ := fallbackClientIn(t, ctx, "chrome", true)
++	reality := config.(*RealityClientConfig)
++	require.Nil(t, reality.uClient.fallback)
++	writer := reality.outcome
++	// a clone records with the same writer
++	recorder := config.Clone().(detectRecorder)
++	require.Same(t, writer, config.Clone().(*RealityClientConfig).outcome)
++
++	recorder.recordDetectOutcome(context.Background(), fallbackServer, nil)
++	entry := outcomeOf(t, cache, writer)
++	require.Zero(t, entry.flags)
++	require.Equal(t, "chrome", entry.fingerprint)
++	for range 5 {
++		recorder.recordDetectOutcome(context.Background(), fallbackServer, nil)
++	}
++	settled(t, writer)
++	require.Equal(t, 1, cache.outcomeWriteCount())
++	cache.access.Lock()
++	for key := range cache.outcomes {
++		require.Equal(t, "chrome example.org "+fallbackServer.String(), key)
++	}
++	cache.access.Unlock()
++
++	// one deadline, broken by a server that answered: nothing
++	recorder.recordDetectOutcome(context.Background(), fallbackServer, context.DeadlineExceeded)
++	recorder.recordDetectOutcome(context.Background(), fallbackServer, io.EOF)
++	recorder.recordDetectOutcome(context.Background(), fallbackServer, E.Cause(context.DeadlineExceeded, "handshake"))
++	settled(t, writer)
++	require.Equal(t, 1, cache.outcomeWriteCount())
++	// a caller that gave up neither counts nor breaks the row
++	recorder.recordDetectOutcome(context.Background(), fallbackServer, context.Canceled)
++	settled(t, writer)
++	require.Equal(t, 1, cache.outcomeWriteCount())
++	// nor does a deadline of the caller's that cut it, whether its context knows it yet or not
++	// (the round of a group test that ran out)
++	ended, cancel := context.WithDeadline(context.Background(), time.Now().Add(-time.Second))
++	defer cancel()
++	for _, caller := range []context.Context{ended, deadlinePassed{}} {
++		recorder.recordDetectOutcome(caller, fallbackServer, E.Cause(context.DeadlineExceeded, "handshake"))
++		recorder.recordDetectOutcome(caller, fallbackServer, os.ErrDeadlineExceeded)
++	}
++	settled(t, writer)
++	require.Equal(t, 1, cache.outcomeWriteCount())
++	// the second in a row
++	recorder.recordDetectOutcome(context.Background(), fallbackServer, E.Cause(context.DeadlineExceeded, "handshake"))
++	entry = outcomeOf(t, cache, writer)
++	require.Equal(t, adapter.DetectNoAnswer, entry.flags)
++	require.Empty(t, entry.fingerprint)
++
++	recorder.recordDetectOutcome(context.Background(), fallbackServer, nil)
++	entry = outcomeOf(t, cache, writer)
++	require.Zero(t, entry.flags)
++	require.Equal(t, "chrome", entry.fingerprint)
++
++	// a failed verification, in each form it comes in
++	for _, failure := range []error{
++		E.New(realityVerificationFailed),
++		firstRefused(),
++		E.Cause(errors.New("x"), realityVerificationFailed),
++	} {
++		recorder.recordDetectOutcome(context.Background(), fallbackServer, failure)
++		entry = outcomeOf(t, cache, writer)
++		require.Equal(t, adapter.DetectFailed, entry.flags)
++		recorder.recordDetectOutcome(context.Background(), fallbackServer, nil)
++		require.Zero(t, outcomeOf(t, cache, writer).flags)
++	}
++}
++
++// deadlinePassed is the context of a dial whose deadline has come while its timer has not closed
++// it yet.
++type deadlinePassed struct{}
++
++func (deadlinePassed) Deadline() (time.Time, bool) { return time.Now().Add(-time.Millisecond), true }
++func (deadlinePassed) Done() <-chan struct{}       { return nil }
++func (deadlinePassed) Err() error                  { return nil }
++func (deadlinePassed) Value(any) any               { return nil }
++
++// Without a cache file in the context (a probe of the backend) nothing is recorded.
++func TestDetectOutcomeWithoutCache(t *testing.T) {
++	setFallback(t, false)
++	config, _ := fallbackClientIn(t, context.Background(), "chrome", true)
++	reality := config.(*RealityClientConfig)
++	reality.recordDetectOutcome(context.Background(), M.ParseSocksaddrHostPort("192.0.2.1", 443), nil)
++	require.Nil(t, reality.outcome.cache)
++}
+diff --git a/common/tls/reality_client.go b/common/tls/reality_client.go
+index e96afc3c1..82d390c57 100644
+--- a/common/tls/reality_client.go
++++ b/common/tls/reality_client.go
+@@ -17,11 +17,13 @@ import (
+ 	"encoding/base64"
+ 	"encoding/binary"
+ 	"encoding/hex"
++	"errors"
+ 	"fmt"
+ 	"io"
+ 	mRand "math/rand"
+ 	"net"
+ 	"net/http"
++	"os"
+ 	"reflect"
+ 	"strings"
+ 	"time"
+@@ -37,6 +39,7 @@ import (
+ 	M "github.com/sagernet/sing/common/metadata"
+ 	"github.com/sagernet/sing/common/ntp"
+ 	aTLS "github.com/sagernet/sing/common/tls"
++	"github.com/sagernet/sing/service"
+ 
+ 	utls "github.com/metacubex/utls"
+ 	"golang.org/x/crypto/hkdf"
+@@ -196,6 +199,68 @@ func (e *RealityClientConfig) SetServerName(serverName string) {
+ 	e.uClient.SetServerName(serverName)
+ }
+ 
++// recordDetectOutcome tells the block detector what this handshake met, used when the uTLS
++// fingerprint fallback is off (the fallback records the outcome itself when on). The key matches
++// the fallback's: the configured fingerprint, the server name, the server (podkop-engine). ctx is
++// the dial's: a deadline of its caller tells nothing of the server.
++func (e *RealityClientConfig) recordDetectOutcome(ctx context.Context, destination M.Socksaddr, handshakeErr error) {
++	cache := service.FromContext[adapter.CacheFile](e.ctx)
++	if cache == nil {
++		return
++	}
++	e.outcome.open(cache, e.fingerprint+" "+e.ServerName()+" "+destination.String())
++	now := time.Now()
++	switch {
++	case handshakeErr == nil:
++		e.outcome.deadlines.Store(0)
++		e.outcome.answered(now, func(byte, string) (byte, string) {
++			return 0, e.fingerprint
++		})
++	case errors.Is(handshakeErr, context.Canceled):
++		// the caller gave up: nothing about the server
++	case errors.Is(handshakeErr, context.DeadlineExceeded) || errors.Is(handshakeErr, os.ErrDeadlineExceeded):
++		if callerEnded(ctx) {
++			// the caller's deadline cut the handshake, such as the end of the round of a group
++			// test: neither counts nor breaks the row
++			return
++		}
++		// one may be a lost ClientHello or a deadline of the caller's
++		if e.outcome.deadlines.Add(1) >= 2 {
++			e.outcome.failed(now, adapter.DetectNoAnswer)
++		}
++	case realityVerificationError(handshakeErr):
++		e.outcome.deadlines.Store(0)
++		e.outcome.failed(now, adapter.DetectFailed)
++	default:
++		// another handshake error is no signal the detector uses, but the server was reached
++		e.outcome.deadlines.Store(0)
++	}
++}
++
++// callerEnded tells whether the caller of a dial has given it up: canceled, or its deadline has
++// come (podkop-engine). The timer of the context closes it a moment after the deadline, and a
++// handshake the deadline cut fails meanwhile, while Err is still nil.
++func callerEnded(ctx context.Context) bool {
++	if ctx.Err() != nil {
++		return true
++	}
++	deadline, hasDeadline := ctx.Deadline()
++	return hasDeadline && !time.Now().Before(deadline)
++}
++
++// realityVerificationError tells a handshake that ended in a certificate that is not the server's:
++// the verification of REALITY, or of the certificate of the target it passed the connection on to.
++func realityVerificationError(err error) bool {
++	var (
++		stranger         *realityStrangerError
++		unknownAuthority x509.UnknownAuthorityError
++		hostname         x509.HostnameError
++		invalid          x509.CertificateInvalidError
++	)
++	return errors.As(err, &stranger) || errors.As(err, &unknownAuthority) || errors.As(err, &hostname) || errors.As(err, &invalid) ||
++		strings.Contains(err.Error(), realityVerificationFailed)
++}
++
+ func (e *RealityClientConfig) NextProtos() []string {
+ 	return e.uClient.NextProtos()
+ }
+@@ -388,6 +453,10 @@ func (e *RealityClientConfig) Clone() Config {
+ 		e.uClient.Clone().(*UTLSClientConfig),
+ 		e.publicKey,
+ 		e.shortID,
++		e.classicFingerprint,
++		e.classicFallback,
++		e.fingerprint,
++		e.outcome,
+ 	}
+ }
+ 
+diff --git a/common/trafficcontrol/detect_flows_test.go b/common/trafficcontrol/detect_flows_test.go
+new file mode 100644
+index 000000000..0252be1d7
+--- /dev/null
++++ b/common/trafficcontrol/detect_flows_test.go
+@@ -0,0 +1,309 @@
++package trafficcontrol
++
++import (
++	"context"
++	"net"
++	"testing"
++	"time"
++
++	"github.com/sagernet/sing-box/adapter"
++	C "github.com/sagernet/sing-box/constant"
++
++	"github.com/stretchr/testify/require"
++)
++
++type detectTestOutbound struct {
++	adapter.Outbound
++	outboundType string
++	tag          string
++}
++
++func (o *detectTestOutbound) Type() string { return o.outboundType }
++func (o *detectTestOutbound) Tag() string  { return o.tag }
++
++// openFlow makes a TCP connection through an outbound with so many bytes.
++func openFlow(t *testing.T, manager *Manager, outboundType, tag string, download, upload int64) *connTracker {
++	t.Helper()
++	client, server := net.Pipe()
++	t.Cleanup(func() {
++		client.Close()
++		server.Close()
++	})
++	chain := []adapter.Outbound{&detectTestOutbound{outboundType: outboundType, tag: tag}}
++	conn := manager.RoutedConnection(context.Background(), client, adapter.InboundContext{OutboundChain: chain}, nil, chain[0])
++	tracker := conn.(*connTracker)
++	tracker.metadata.Download.Store(download)
++	tracker.metadata.Upload.Store(upload)
++	return tracker
++}
++
++// closeFlow makes a TCP connection through an outbound and closes it with so many bytes, its client
++// waiting for the server for long enough to be a cut.
++func closeFlow(t *testing.T, manager *Manager, outboundType, tag string, download, upload int64, remoteEOF bool) {
++	t.Helper()
++	closeFlowWaited(t, manager, outboundType, tag, download, upload, remoteEOF, 2*detectCutWait)
++}
++
++// closeFlowWaited is closeFlow of a connection whose client has waited so long; 0: it does not wait.
++func closeFlowWaited(t *testing.T, manager *Manager, outboundType, tag string, download, upload int64, remoteEOF bool, waited time.Duration) {
++	t.Helper()
++	tracker := openFlow(t, manager, outboundType, tag, download, upload)
++	if waited > 0 {
++		tracker.metadata.stamp.pendingSince.Store(detectClock() - int64(waited))
++	}
++	if remoteEOF {
++		tracker.MarkRemoteEOF()
++	}
++	require.NoError(t, tracker.Close())
++}
++
++// Only what ended inside the band and was not ended by the server may be a cut.
++func TestDetectFlowsBand(t *testing.T) {
++	manager := NewManager()
++	before := time.Now()
++	closeFlow(t, manager, C.TypeVLESS, "s", 0, 100, false)
++	require.Empty(t, manager.DetectFlows())
++	closeFlow(t, manager, C.TypeVLESS, "s", DetectBandLow-1, 100, false)
++	sample := manager.DetectFlows()["s"]
++	require.Empty(t, sample.Cuts)
++	require.True(t, sample.LastBigAt.IsZero())
++	require.False(t, sample.LastDataAt.Before(before))
++
++	closeFlow(t, manager, C.TypeVLESS, "s", DetectBandLow, 100, false)
++	closeFlow(t, manager, C.TypeVLESS, "s", DetectBandHigh, 200, false)
++	sample = manager.DetectFlows()["s"]
++	require.Len(t, sample.Cuts, 2)
++	require.Equal(t, int64(DetectBandLow), sample.Cuts[0].Download)
++	require.Equal(t, int64(DetectBandHigh), sample.Cuts[1].Download)
++	require.Equal(t, int64(200), sample.Cuts[1].Upload)
++	require.False(t, sample.Cuts[1].CreatedAt.IsZero())
++	require.False(t, sample.Cuts[1].ClosedAt.Before(sample.Cuts[1].CreatedAt))
++	require.True(t, sample.LastBigAt.IsZero())
++
++	closeFlow(t, manager, C.TypeVLESS, "s", DetectBandHigh+1, 100, false)
++	sample = manager.DetectFlows()["s"]
++	require.Len(t, sample.Cuts, 2)
++	require.False(t, sample.LastBigAt.IsZero())
++}
++
++// The server ended it: a short answer, no cut. It counts as data all the same, and a big one as
++// big.
++func TestDetectFlowsRemoteEOF(t *testing.T) {
++	manager := NewManager()
++	closeFlow(t, manager, C.TypeVLESS, "s", 16<<10, 100, true)
++	sample := manager.DetectFlows()["s"]
++	require.Empty(t, sample.Cuts)
++	require.False(t, sample.LastDataAt.IsZero())
++	require.True(t, sample.LastBigAt.IsZero())
++	closeFlow(t, manager, C.TypeVLESS, "s", DetectBandHigh+1, 100, true)
++	require.False(t, manager.DetectFlows()["s"].LastBigAt.IsZero())
++}
++
++// Proxy outbounds and TCP only.
++func TestDetectFlowsTCPThroughProxyOnly(t *testing.T) {
++	manager := NewManager()
++	closeFlow(t, manager, C.TypeDirect, "direct", 16<<10, 100, false)
++	closeFlow(t, manager, C.TypeBlock, "block", 16<<10, 100, false)
++	require.Empty(t, manager.DetectFlows())
++
++	chain := []adapter.Outbound{&detectTestOutbound{outboundType: C.TypeVLESS, tag: "s"}}
++	packet := manager.RoutedPacketConnection(context.Background(), nil, adapter.InboundContext{OutboundChain: chain}, nil, chain[0])
++	tracker := packet.(*packetConnTracker)
++	tracker.metadata.Download.Store(16 << 10)
++	manager.join(tracker)
++	manager.leave(tracker)
++	flow := manager.RoutedFlow(context.Background(), adapter.InboundContext{OutboundChain: chain}, nil, chain[0]).(*flowTracker)
++	flow.metadata.Download.Store(16 << 10)
++	manager.join(flow)
++	manager.leave(flow)
++	require.Empty(t, manager.DetectFlows())
++}
++
++// Small flows do not push a big one out, and the ring keeps the last possible cuts.
++func TestDetectFlowsRing(t *testing.T) {
++	manager := NewManager()
++	closeFlow(t, manager, C.TypeVLESS, "s", DetectBandHigh+1, 100, false)
++	big := manager.DetectFlows()["s"].LastBigAt
++	for index := range 2 * detectCutsPerOutbound {
++		closeFlow(t, manager, C.TypeVLESS, "s", int64(DetectBandLow+index), 100, false)
++	}
++	for range 100 {
++		closeFlow(t, manager, C.TypeVLESS, "s", 100, 100, false)
++	}
++	sample := manager.DetectFlows()["s"]
++	require.True(t, big.Equal(sample.LastBigAt))
++	require.Len(t, sample.Cuts, detectCutsPerOutbound)
++	require.Equal(t, int64(DetectBandLow+detectCutsPerOutbound), sample.Cuts[0].Download)
++	require.Equal(t, int64(DetectBandLow+2*detectCutsPerOutbound-1), sample.Cuts[detectCutsPerOutbound-1].Download)
++
++	// the outbounds are apart, and the sample returned is the reader's own
++	closeFlow(t, manager, C.TypeVLESS, "other", DetectBandLow, 100, false)
++	samples := manager.DetectFlows()
++	require.Len(t, samples["other"].Cuts, 1)
++	samples["s"].Cuts[0].Download = 1
++	require.NotEqual(t, int64(1), manager.DetectFlows()["s"].Cuts[0].Download)
++}
++
++// Clear runs on every GC, and wipes the list of closed connections only.
++func TestDetectFlowsSurviveClear(t *testing.T) {
++	manager := NewManager()
++	closeFlow(t, manager, C.TypeVLESS, "s", DetectBandHigh+1, 100, false)
++	closeFlow(t, manager, C.TypeVLESS, "s", DetectBandLow, 100, false)
++	manager.Clear()
++	require.Empty(t, manager.ClosedConnections())
++	sample := manager.DetectFlows()["s"]
++	require.Len(t, sample.Cuts, 1)
++	require.False(t, sample.LastBigAt.IsZero())
++}
++
++// A healthy flow its client closes first has no EOF of the server either: a cut is a flow whose
++// client was waiting for the server at the close, for long enough that it is not a close_notify.
++func TestDetectFlowsCutNeedsWaitingClient(t *testing.T) {
++	manager := NewManager()
++	closeFlowWaited(t, manager, C.TypeVLESS, "s", 16<<10, 100, false, 0)
++	closeFlowWaited(t, manager, C.TypeVLESS, "s", 16<<10, 100, false, detectCutWait-time.Second)
++	sample := manager.DetectFlows()["s"]
++	require.Empty(t, sample.Cuts)
++	require.False(t, sample.LastDataAt.IsZero())
++
++	closeFlowWaited(t, manager, C.TypeVLESS, "s", 16<<10, 100, false, detectCutWait+time.Second)
++	require.Len(t, manager.DetectFlows()["s"].Cuts, 1)
++
++	// the EOF of the server still decides
++	closeFlowWaited(t, manager, C.TypeVLESS, "s", 16<<10, 100, true, detectCutWait+time.Second)
++	require.Len(t, manager.DetectFlows()["s"].Cuts, 1)
++}
++
++// A cut tells since when its client waited, to the nanosecond of the stamp and on the monotonic
++// clock: the reader compares it with when other flows were opened, whatever the wall clock did, to
++// tell a cut from an outage.
++func TestDetectFlowPendingSince(t *testing.T) {
++	manager := NewManager()
++	tracker := openFlow(t, manager, C.TypeVLESS, "s", 16<<10, 100)
++	stamp := detectClock() - int64(2*detectCutWait)
++	tracker.metadata.stamp.pendingSince.Store(stamp)
++	require.NoError(t, tracker.Close())
++
++	sample := manager.DetectFlows()["s"]
++	require.Len(t, sample.Cuts, 1)
++	cut := sample.Cuts[0]
++	require.Equal(t, time.Duration(stamp), cut.PendingSince.Sub(detectEpoch))
++	require.GreaterOrEqual(t, cut.ClosedAt.Sub(cut.PendingSince), 2*detectCutWait)
++	require.Less(t, cut.ClosedAt.Sub(cut.PendingSince), 2*detectCutWait+10*time.Second)
++	require.Contains(t, cut.PendingSince.String(), " m=", "a monotonic reading, as CreatedAt has")
++	require.Contains(t, cut.CreatedAt.String(), " m=")
++
++	// the copy a reader gets holds it as well, and a wait too short leaves neither a cut nor a time
++	closeFlowWaited(t, manager, C.TypeVLESS, "s", 16<<10, 100, false, detectCutWait-time.Second)
++	require.Len(t, manager.DetectFlows()["s"].Cuts, 1)
++	waited, ok := (&detectStamp{}).waitedAt(time.Now())
++	require.False(t, ok)
++	require.True(t, waited.IsZero())
++}
++
++// The stamp through the counters of a connection: a write of the client after a quiet time sets it,
++// the first byte of the server clears it, and the open connection shows it.
++func TestDetectStampOfConnection(t *testing.T) {
++	manager := NewManager()
++	client, lan := net.Pipe()
++	defer lan.Close()
++	chain := []adapter.Outbound{&detectTestOutbound{outboundType: C.TypeVLESS, tag: "s"}}
++	conn := manager.RoutedConnection(context.Background(), client, adapter.InboundContext{OutboundChain: chain}, nil, chain[0])
++	stamp := conn.(*connTracker).metadata.stamp
++	open := manager.Connections()
++	require.Len(t, open, 1)
++	metadata := open[0]
++	upload := func() {
++		go lan.Write([]byte{1})
++		_, err := conn.Read(make([]byte, 1))
++		require.NoError(t, err)
++	}
++	download := func() {
++		go lan.Read(make([]byte, 1))
++		_, err := conn.Write([]byte{1})
++		require.NoError(t, err)
++	}
++	quiet := func() { stamp.lastDownAt.Store(detectClock() - int64(detectPendingGap) - int64(time.Second)) }
++
++	// nothing came yet: the request of a connection is no waiting for the server
++	quiet()
++	upload()
++	require.True(t, metadata.PendingSince().IsZero())
++	// the client answers what came at once
++	download()
++	upload()
++	require.True(t, metadata.PendingSince().IsZero())
++
++	quiet()
++	before := time.Now()
++	upload()
++	since := metadata.PendingSince()
++	require.False(t, since.IsZero())
++	require.WithinDuration(t, before, since, time.Second)
++	// it waits since the first write
++	stamp.pendingSince.Store(stamp.pendingSince.Load() - int64(time.Hour))
++	upload()
++	require.WithinDuration(t, before.Add(-time.Hour), metadata.PendingSince(), time.Second)
++
++	download()
++	require.True(t, metadata.PendingSince().IsZero())
++	require.NoError(t, conn.Close())
++}
++
++// Only a TCP connection has a stamp.
++func TestDetectStampTCPOnly(t *testing.T) {
++	manager := NewManager()
++	chain := []adapter.Outbound{&detectTestOutbound{outboundType: C.TypeVLESS, tag: "s"}}
++	packet := manager.RoutedPacketConnection(context.Background(), nil, adapter.InboundContext{OutboundChain: chain}, nil, chain[0])
++	require.True(t, packet.(*packetConnTracker).metadata.PendingSince().IsZero())
++	flow := manager.RoutedFlow(context.Background(), adapter.InboundContext{OutboundChain: chain}, nil, chain[0]).(*flowTracker)
++	require.True(t, flow.metadata.PendingSince().IsZero())
++}
++
++// LastDataAt is the newest flow opened that got data, not the last close: an old flow that closes
++// after a handshake failed says nothing of it.
++func TestDetectFlowsLastDataAtIsOpenTime(t *testing.T) {
++	manager := NewManager()
++	older := openFlow(t, manager, C.TypeVLESS, "s", 100, 100)
++	older.metadata.CreatedAt = time.Now().Add(-time.Hour)
++	newer := openFlow(t, manager, C.TypeVLESS, "s", 100, 100)
++	newer.metadata.CreatedAt = time.Now().Add(-time.Minute)
++	empty := openFlow(t, manager, C.TypeVLESS, "s", 0, 100)
++
++	require.NoError(t, older.Close())
++	require.True(t, older.metadata.CreatedAt.Equal(manager.DetectFlows()["s"].LastDataAt))
++	require.NoError(t, newer.Close())
++	require.True(t, newer.metadata.CreatedAt.Equal(manager.DetectFlows()["s"].LastDataAt))
++
++	// neither an older one nor one with nothing moves it back or forward
++	late := openFlow(t, manager, C.TypeVLESS, "s", 100, 100)
++	late.metadata.CreatedAt = time.Now().Add(-2 * time.Hour)
++	require.NoError(t, late.Close())
++	require.NoError(t, empty.Close())
++	require.True(t, newer.metadata.CreatedAt.Equal(manager.DetectFlows()["s"].LastDataAt))
++}
++
++// The outbound of a tag was replaced: what its old connections did is gone, also of those that close
++// afterwards, and what the new one carries counts.
++func TestForgetDetectFlows(t *testing.T) {
++	manager := NewManager()
++	closeFlow(t, manager, C.TypeVLESS, "s", DetectBandHigh+1, 100, false)
++	closeFlow(t, manager, C.TypeVLESS, "s", DetectBandLow, 100, false)
++	closeFlow(t, manager, C.TypeVLESS, "kept", DetectBandLow, 100, false)
++	old := openFlow(t, manager, C.TypeVLESS, "s", 16<<10, 100)
++	old.metadata.stamp.pendingSince.Store(detectClock() - int64(2*detectCutWait))
++
++	manager.ForgetDetectFlows([]string{"s"})
++	samples := manager.DetectFlows()
++	require.NotContains(t, samples, "s")
++	require.Len(t, samples["kept"].Cuts, 1)
++
++	require.NoError(t, old.Close())
++	require.NotContains(t, manager.DetectFlows(), "s")
++
++	closeFlow(t, manager, C.TypeVLESS, "s", DetectBandLow, 100, false)
++	sample := manager.DetectFlows()["s"]
++	require.Len(t, sample.Cuts, 1)
++	require.True(t, sample.LastBigAt.IsZero())
++	require.False(t, sample.LastDataAt.IsZero())
++}
+diff --git a/common/trafficcontrol/manager.go b/common/trafficcontrol/manager.go
+index 34eb216b2..324caeeb2 100644
+--- a/common/trafficcontrol/manager.go
++++ b/common/trafficcontrol/manager.go
+@@ -1,11 +1,13 @@
+ package trafficcontrol
+ 
+ import (
++	"slices"
+ 	"sync"
+ 	"time"
+ 
+ 	"github.com/sagernet/sing-box/adapter"
+ 	"github.com/sagernet/sing-box/common/compatible"
++	C "github.com/sagernet/sing-box/constant"
+ 	"github.com/sagernet/sing/common/cleanup"
+ 	"github.com/sagernet/sing/common/observable"
+ 	"github.com/sagernet/sing/common/x/list"
+@@ -40,13 +42,60 @@ type Manager struct {
+ 	closedConnections       list.List[TrackerMetadata]
+ 	closedUploadTotal       int64
+ 	closedDownloadTotal     int64
++	// detectFlows is what the block detector reads of the closed TCP connections of the proxy
++	// outbounds, by outbound; guarded by closedConnectionsAccess and NOT cleared by Clear()
++	// (podkop-engine)
++	detectFlows map[string]*DetectFlowSample
++	// detectForgotten is when the outbound of a tag was replaced: the flows opened before that are
++	// not of what the tag means now (ForgetDetectFlows); guarded by closedConnectionsAccess
++	detectForgotten map[string]time.Time
+ 
+ 	eventSubscriber *observable.Subscriber[ConnectionEvent]
+ 	eventObserver   *observable.Observer[ConnectionEvent]
+ }
+ 
++// A connection that ends with so many bytes received may have been cut, and one above the band
++// went past any limit seen on the way (podkop-engine).
++const (
++	DetectBandLow  = 4 << 10
++	DetectBandHigh = 48 << 10
++
++	detectCutsPerOutbound = 16
++
++	detectPendingGap = 5 * time.Second
++	detectCutWait    = 3 * time.Second
++)
++
++// DetectFlow is a closed connection the block detector may read as cut on the way: it received
++// DetectBandLow to DetectBandHigh bytes, the server did not end it, and its client was waiting for
++// the server when it closed (detectStamp) (podkop-engine).
++type DetectFlow struct {
++	Download  int64
++	Upload    int64
++	CreatedAt time.Time
++	ClosedAt  time.Time
++	// PendingSince is since when its client had been waiting for the server when it closed, from the
++	// same monotonic stamp as TrackerMetadata.PendingSince: the reader asks whether anything came
++	// through the outbound after the wait began, which tells a cut from an outage.
++	PendingSince time.Time
++}
++
++// DetectFlowSample is what the block detector reads of the closed TCP connections of a proxy
++// outbound (podkop-engine). Open connections are not here: see Connections.
++type DetectFlowSample struct {
++	// the last detectCutsPerOutbound possible cuts, the oldest first
++	Cuts []DetectFlow
++	// when the last connection that went above DetectBandHigh closed
++	LastBigAt time.Time
++	// when the newest connection that received anything was opened: a connection that closes late
++	// says nothing of the handshakes made after it opened
++	LastDataAt time.Time
++}
++
+ func NewManager() *Manager {
+ 	return &Manager{
++		detectFlows:     make(map[string]*DetectFlowSample),
++		detectForgotten: make(map[string]time.Time),
+ 		eventSubscriber: observable.NewSubscriber[ConnectionEvent](256),
+ 	}
+ }
+@@ -106,6 +155,10 @@ func (m *Manager) leave(tracker Tracker) {
+ 		m.closedDownloadTotal += evicted.Download.Load()
+ 	}
+ 	m.closedConnections.PushBack(metadataCopy)
++	// only the trackers of TCP connections are of this type (podkop-engine)
++	if conn, isConn := tracker.(*connTracker); isConn {
++		m.recordDetectFlow(metadata, conn.remoteEOF.Load(), closedAt)
++	}
+ 	m.closedConnectionsAccess.Unlock()
+ 	m.eventSubscriber.Emit(ConnectionEvent{
+ 		Type:     ConnectionEventClosed,
+@@ -175,6 +228,76 @@ func (m *Manager) CloseAllConnections() {
+ 	})
+ }
+ 
++// recordDetectFlow adds a closed TCP connection to what the block detector reads. The caller holds
++// closedConnectionsAccess.
++func (m *Manager) recordDetectFlow(metadata *TrackerMetadata, remoteEOF bool, closedAt time.Time) {
++	if metadata.OutboundType == C.TypeDirect || metadata.OutboundType == C.TypeBlock {
++		return
++	}
++	if forgotten, isForgotten := m.detectForgotten[metadata.Outbound]; isForgotten && metadata.CreatedAt.Before(forgotten) {
++		return
++	}
++	download := metadata.Download.Load()
++	if download == 0 {
++		return
++	}
++	sample := m.detectFlows[metadata.Outbound]
++	if sample == nil {
++		sample = new(DetectFlowSample)
++		m.detectFlows[metadata.Outbound] = sample
++	}
++	if metadata.CreatedAt.After(sample.LastDataAt) {
++		sample.LastDataAt = metadata.CreatedAt
++	}
++	switch {
++	case download > DetectBandHigh:
++		sample.LastBigAt = closedAt
++	case download >= DetectBandLow && !remoteEOF:
++		pendingSince, waited := metadata.stamp.waitedAt(closedAt)
++		if !waited {
++			return
++		}
++		if len(sample.Cuts) >= detectCutsPerOutbound {
++			sample.Cuts = append(sample.Cuts[:0], sample.Cuts[1:]...)
++		}
++		sample.Cuts = append(sample.Cuts, DetectFlow{
++			Download:     download,
++			Upload:       metadata.Upload.Load(),
++			CreatedAt:    metadata.CreatedAt,
++			ClosedAt:     closedAt,
++			PendingSince: pendingSince,
++		})
++	}
++}
++
++// DetectFlows returns what the block detector reads of the closed TCP connections, by outbound
++// tag (podkop-engine). Unlike ClosedConnections it is not wiped by Clear(). The tags of outbounds
++// gone stay; the reader asks for the ones it knows.
++func (m *Manager) DetectFlows() map[string]DetectFlowSample {
++	m.closedConnectionsAccess.Lock()
++	defer m.closedConnectionsAccess.Unlock()
++	samples := make(map[string]DetectFlowSample, len(m.detectFlows))
++	for tag, sample := range m.detectFlows {
++		copied := *sample
++		copied.Cuts = slices.Clone(sample.Cuts)
++		samples[tag] = copied
++	}
++	return samples
++}
++
++// ForgetDetectFlows drops what the block detector reads of the tags, whose outbounds were replaced
++// while the manager stays (podkop-engine): the old outbounds keep their connections, and those are
++// not counted when they close either. A tag takes one small entry for good.
++func (m *Manager) ForgetDetectFlows(tags []string) {
++	now := time.Now()
++	m.closedConnectionsAccess.Lock()
++	defer m.closedConnectionsAccess.Unlock()
++	for _, tag := range tags {
++		delete(m.detectFlows, tag)
++		m.detectForgotten[tag] = now
++	}
++}
++
+ func (m *Manager) Clear() {
+ 	m.closedConnectionsAccess.Lock()
+ 	defer m.closedConnectionsAccess.Unlock()
+diff --git a/common/trafficcontrol/tracker.go b/common/trafficcontrol/tracker.go
+index 25d8cd823..f6565d80d 100644
+--- a/common/trafficcontrol/tracker.go
++++ b/common/trafficcontrol/tracker.go
+@@ -27,6 +27,72 @@ type TrackerMetadata struct {
+ 	Rule         adapter.Rule
+ 	Outbound     string
+ 	OutboundType string
++	// nil but for the TCP connections (podkop-engine)
++	stamp *detectStamp
++}
++
++// PendingSince returns since when the client of the connection has been waiting for the server
++// (detectStamp); zero when it is not, and always for what is not a TCP connection (podkop-engine).
++func (m *TrackerMetadata) PendingSince() time.Time {
++	if m.stamp == nil {
++		return time.Time{}
++	}
++	since := m.stamp.pendingSince.Load()
++	if since == 0 {
++		return time.Time{}
++	}
++	return time.Now().Add(time.Duration(since - detectClock()))
++}
++
++// detectStamp tells a client that waits for the server (podkop-engine). A connection cut on the way
++// and a healthy one closed by its client look the same at the close, so what the block detector
++// reads as a cut is a connection whose client wrote after detectPendingGap with nothing from the
++// server, and that got nothing since. A close_notify written at the close does not make one: it has
++// to stand for detectCutWait before the close. A client that never writes after the cut is missed.
++//
++// The times are offsets from detectEpoch, so the first step of the clock of a router with no RTC
++// does not make a gap. The download side writes one atomic and reads the clock on every write; the
++// upload side reads two atomics, and the clock only while it is not waiting yet.
++type detectStamp struct {
++	lastDownAt   atomic.Int64
++	pendingSince atomic.Int64
++}
++
++var detectEpoch = time.Now()
++
++func detectClock() int64 {
++	return int64(time.Since(detectEpoch))
++}
++
++func (s *detectStamp) downloaded() {
++	s.lastDownAt.Store(detectClock())
++	if s.pendingSince.Load() != 0 {
++		s.pendingSince.Store(0)
++	}
++}
++
++func (s *detectStamp) uploaded(download int64) {
++	if download == 0 || s.pendingSince.Load() != 0 {
++		return
++	}
++	now := detectClock()
++	if now-s.lastDownAt.Load() >= int64(detectPendingGap) {
++		s.pendingSince.CompareAndSwap(0, now)
++	}
++}
++
++// waitedAt reports whether a connection closed at closedAt was waiting by then for detectCutWait,
++// and since when: one read of the stamp, on the monotonic clock of closedAt.
++func (s *detectStamp) waitedAt(closedAt time.Time) (time.Time, bool) {
++	since := s.pendingSince.Load()
++	if since == 0 {
++		return time.Time{}, false
++	}
++	waited := closedAt.Sub(detectEpoch) - time.Duration(since)
++	if waited < detectCutWait {
++		return time.Time{}, false
++	}
++	return closedAt.Add(-waited), true
+ }
+ 
+ type Tracker interface {
+@@ -37,11 +103,22 @@ type Tracker interface {
+ func (m *Manager) RoutedConnection(ctx context.Context, conn net.Conn, metadata adapter.InboundContext, matchedRule adapter.Rule, matchOutbound adapter.Outbound) net.Conn {
+ 	upload := new(atomic.Int64)
+ 	download := new(atomic.Int64)
++	stamp := new(detectStamp)
++	countUpload := func(n int64) {
++		upload.Add(n)
++		stamp.uploaded(download.Load())
++	}
++	countDownload := func(n int64) {
++		// the stamp first: who sees the bytes finds their time
++		stamp.downloaded()
++		download.Add(n)
++	}
+ 	tracker := &connTracker{
+ 		ExtendedConn: bufio.NewCounterConn(conn, []N.CountFunc{countUpload}, []N.CountFunc{countDownload}),
+ 		metadata:     m.newTrackerMetadata(metadata, matchedRule, matchOutbound, upload, download),
+ 		manager:      m,
+ 	}
++	tracker.metadata.stamp = stamp
+ 	m.join(tracker)
+ 	return tracker
+ }
+@@ -99,8 +176,13 @@ var _ adapter.RemoteEOFMarker = (*connTracker)(nil)
+ 
+ type connTracker struct {
+ 	N.ExtendedConn
+-	metadata TrackerMetadata
+-	manager  *Manager
++	metadata  TrackerMetadata
++	manager   *Manager
++	remoteEOF atomic.Bool
++}
++
++func (t *connTracker) MarkRemoteEOF() {
++	t.remoteEOF.Store(true)
+ }
+ 
+ func (t *connTracker) Metadata() *TrackerMetadata {
+diff --git a/common/urltest/history_test.go b/common/urltest/history_test.go
+new file mode 100644
+index 000000000..368fe11e4
+--- /dev/null
++++ b/common/urltest/history_test.go
+@@ -0,0 +1,63 @@
++package urltest
++
++import (
++	"testing"
++	"time"
++
++	"github.com/sagernet/sing-box/adapter"
++
++	"github.com/stretchr/testify/require"
++)
++
++// A failure takes the result away and is kept until a test passes; forgetting a tag is no failure
++// and leaves nothing of it.
++func TestHistoryStorageFailure(t *testing.T) {
++	storage := NewHistoryStorage()
++	at := time.Unix(100, 0)
++	storage.StoreURLTestHistory("s", &adapter.URLTestHistory{Time: at, Delay: 10})
++	_, loaded := storage.LoadURLTestFailure("s")
++	require.False(t, loaded)
++
++	storage.StoreURLTestFailure("s", at)
++	require.Nil(t, storage.LoadURLTestHistory("s"))
++	failed, loaded := storage.LoadURLTestFailure("s")
++	require.True(t, loaded)
++	require.True(t, at.Equal(failed))
++
++	storage.StoreURLTestHistory("s", &adapter.URLTestHistory{Time: at, Delay: 10})
++	_, loaded = storage.LoadURLTestFailure("s")
++	require.False(t, loaded)
++
++	storage.DeleteURLTestHistory("s")
++	require.Nil(t, storage.LoadURLTestHistory("s"))
++	_, loaded = storage.LoadURLTestFailure("s")
++	require.False(t, loaded, "forgetting a tag recorded a failure")
++
++	storage.StoreURLTestFailure("s", at)
++	storage.StoreDownloadResult("s", DownloadResult{At: at, Received: 16 << 10, Stopped: true})
++	storage.DeleteURLTestHistory("s")
++	_, loaded = storage.LoadURLTestFailure("s")
++	require.False(t, loaded, "the failure of what the tag was before")
++	_, loaded = storage.LoadDownloadResult("s")
++	require.False(t, loaded, "the download of what the tag was before")
++}
++
++// A passed URL test says nothing of a download; a failed one neither.
++func TestHistoryStorageDownload(t *testing.T) {
++	storage := NewHistoryStorage()
++	_, loaded := storage.LoadDownloadResult("s")
++	require.False(t, loaded)
++	result := DownloadResult{At: time.Unix(100, 0), Received: 16 << 10, Stopped: true}
++	storage.StoreDownloadResult("s", result)
++	storage.StoreURLTestHistory("s", &adapter.URLTestHistory{Delay: 10})
++	storage.StoreURLTestFailure("s", time.Unix(200, 0))
++	found, loaded := storage.LoadDownloadResult("s")
++	require.True(t, loaded)
++	require.Equal(t, result, found)
++
++	var none *HistoryStorage
++	_, loaded = none.LoadURLTestFailure("s")
++	require.False(t, loaded)
++	_, loaded = none.LoadDownloadResult("s")
++	require.False(t, loaded)
++}
+diff --git a/experimental/cachefile/detect_outcome.go b/experimental/cachefile/detect_outcome.go
+new file mode 100644
+index 000000000..bb083a621
+--- /dev/null
++++ b/experimental/cachefile/detect_outcome.go
+@@ -0,0 +1,48 @@
++package cachefile
++
++import (
++	"encoding/binary"
++	"time"
++
++	"github.com/sagernet/bbolt"
++)
++
++// bucketDetectOutcome keeps what the block detector read of a server (podkop-engine): the time
++// of the reading, a flags byte (adapter.DetectNoAnswer, adapter.DetectRefused,
++// adapter.DetectFailed), then the fingerprint in use (empty when nothing got through). The key is
++// the one the uTLS fallback uses for its choice: the configured fingerprint, the server name and
++// the server.
++var bucketDetectOutcome = []byte("detect_outcome")
++
++func (c *CacheFile) LoadDetectOutcome(key string) (flags byte, fingerprint string, at time.Time, loaded bool) {
++	c.view(func(t *bbolt.Tx) error {
++		bucket := c.bucket(t, bucketDetectOutcome)
++		if bucket == nil {
++			return nil
++		}
++		value := bucket.Get([]byte(key))
++		if len(value) < 9 {
++			return nil
++		}
++		at = time.Unix(int64(binary.BigEndian.Uint64(value[:8])), 0)
++		flags = value[8]
++		fingerprint = string(value[9:])
++		loaded = true
++		return nil
++	})
++	return
++}
++
++func (c *CacheFile) StoreDetectOutcome(key string, flags byte, fingerprint string, at time.Time) error {
++	return c.batch(func(t *bbolt.Tx) error {
++		bucket, err := c.createBucket(t, bucketDetectOutcome)
++		if err != nil {
++			return err
++		}
++		value := make([]byte, 9+len(fingerprint))
++		binary.BigEndian.PutUint64(value, uint64(at.Unix()))
++		value[8] = flags
++		copy(value[9:], fingerprint)
++		return bucket.Put([]byte(key), value)
++	})
++}
+diff --git a/experimental/cachefile/detect_outcome_test.go b/experimental/cachefile/detect_outcome_test.go
+new file mode 100644
+index 000000000..adf1d992b
+--- /dev/null
++++ b/experimental/cachefile/detect_outcome_test.go
+@@ -0,0 +1,31 @@
++package cachefile
++
++import (
++	"path/filepath"
++	"testing"
++	"time"
++
++	"github.com/sagernet/sing-box/adapter"
++
++	"github.com/stretchr/testify/require"
++)
++
++// The block detector's outcome stays across a reopen: the start of the cache file deletes the
++// buckets it does not know.
++func TestDetectOutcome(t *testing.T) {
++	path := filepath.Join(t.TempDir(), "cache.db")
++	cacheFile := openTestCacheFile(t, path)
++	at := time.Unix(1000, 0)
++	require.NoError(t, cacheFile.StoreDetectOutcome("key", adapter.DetectRefused|adapter.DetectFailed, "firefox", at))
++	_, _, _, loaded := cacheFile.LoadDetectOutcome("other")
++	require.False(t, loaded)
++	require.NoError(t, cacheFile.Close())
++
++	cacheFile = openTestCacheFile(t, path)
++	defer cacheFile.Close()
++	flags, fingerprint, stored, loaded := cacheFile.LoadDetectOutcome("key")
++	require.True(t, loaded)
++	require.Equal(t, adapter.DetectRefused|adapter.DetectFailed, flags)
++	require.Equal(t, "firefox", fingerprint)
++	require.True(t, at.Equal(stored))
++}
+diff --git a/experimental/clashapi/proxies_delay_test.go b/experimental/clashapi/proxies_delay_test.go
+new file mode 100644
+index 000000000..a7d12517a
+--- /dev/null
++++ b/experimental/clashapi/proxies_delay_test.go
+@@ -0,0 +1,58 @@
++package clashapi
++
++import (
++	"context"
++	"net"
++	"net/http"
++	"net/http/httptest"
++	"syscall"
++	"testing"
++	"time"
++
++	"github.com/sagernet/sing-box/adapter"
++	"github.com/sagernet/sing-box/common/urltest"
++	M "github.com/sagernet/sing/common/metadata"
++
++	"github.com/stretchr/testify/require"
++)
++
++type delayTestOutbound struct {
++	adapter.Outbound
++	tag string
++}
++
++func (o *delayTestOutbound) Tag() string { return o.tag }
++
++func (o *delayTestOutbound) DialContext(context.Context, string, M.Socksaddr) (net.Conn, error) {
++	return nil, syscall.ECONNREFUSED
++}
++
++type delayTestManager struct {
++	adapter.OutboundManager
++}
++
++func (m *delayTestManager) Outbounds() []adapter.Outbound { return nil }
++
++// A manual test that fails is a failure with its time, as one of a round: it takes the delay away,
++// and what the download test found stays. The block detector reads both.
++func TestProxyDelayFailureIsKept(t *testing.T) {
++	history := urltest.NewHistoryStorage()
++	history.StoreURLTestHistory("s", &adapter.URLTestHistory{Time: time.Now(), Delay: 10})
++	history.StoreDownloadResult("s", urltest.DownloadResult{At: time.Now(), Received: 16 << 10, Stopped: true})
++	server := &Server{urlTestHistory: history, outbound: &delayTestManager{}}
++	before := time.Now()
++
++	request := httptest.NewRequest(http.MethodGet, "/delay?url=https%3A%2F%2Fexample.invalid%2F&timeout=1000", nil)
++	request = request.WithContext(context.WithValue(request.Context(), CtxKeyProxy, &delayTestOutbound{tag: "s"}))
++	recorder := httptest.NewRecorder()
++	getProxyDelay(server)(recorder, request)
++	require.Equal(t, http.StatusServiceUnavailable, recorder.Code)
++
++	require.Nil(t, history.LoadURLTestHistory("s"))
++	failed, loaded := history.LoadURLTestFailure("s")
++	require.True(t, loaded)
++	require.False(t, failed.Before(before))
++	download, loaded := history.LoadDownloadResult("s")
++	require.True(t, loaded)
++	require.True(t, download.Stopped)
++}
+diff --git a/protocol/group/urltestgroup/urltest_detect_test.go b/protocol/group/urltestgroup/urltest_detect_test.go
+new file mode 100644
+index 000000000..041c2debb
+--- /dev/null
++++ b/protocol/group/urltestgroup/urltest_detect_test.go
+@@ -0,0 +1,188 @@
++package urltestgroup
++
++import (
++	"context"
++	"net"
++	"os"
++	"testing"
++	"time"
++
++	"github.com/sagernet/sing-box/adapter"
++	"github.com/sagernet/sing-box/common/urltest"
++	C "github.com/sagernet/sing-box/constant"
++	"github.com/sagernet/sing-box/log"
++	M "github.com/sagernet/sing/common/metadata"
++	N "github.com/sagernet/sing/common/network"
++
++	"github.com/stretchr/testify/require"
++)
++
++// The failure of a dial, which takes the result of the member away, is kept with its time.
++func TestURLTestRecordsDialFailure(t *testing.T) {
++	link, _ := testURL(t, 0)
++	dead := newTestMember(C.TypeVLESS, "dead", dialRefused)
++	spare := newTestMember(C.TypeVLESS, "spare", dialWorking)
++	urlTest, group := newTestURLTest(t, link, dead, spare)
++	before := time.Now()
++
++	_, err := urlTest.DialContext(context.Background(), N.NetworkTCP, M.ParseSocksaddr("1.2.3.4:443"))
++	require.Error(t, err)
++	require.Nil(t, group.history.LoadURLTestHistory("dead"))
++	at, loaded := group.history.LoadURLTestFailure("dead")
++	require.True(t, loaded)
++	require.False(t, at.Before(before))
++	_, loaded = group.history.LoadURLTestFailure("spare")
++	require.False(t, loaded)
++}
++
++// A round: the member that fails has a failure, and the next test it passes clears that.
++func TestURLTestRoundRecordsFailure(t *testing.T) {
++	link, _ := testURL(t, 0)
++	history := urltest.NewHistoryStorage()
++	member := newTestMember(C.TypeVLESS, "m", dialRefused)
++	logger := log.NewNOPFactory().Logger()
++
++	URLTestOutbounds(context.Background(), nil, history, logger, []adapter.Outbound{member}, link, time.Minute, true, true)
++	_, loaded := history.LoadURLTestFailure("m")
++	require.True(t, loaded)
++
++	member.dial = dialWorking
++	URLTestOutbounds(context.Background(), nil, history, logger, []adapter.Outbound{member}, link, time.Minute, true, true)
++	require.NotNil(t, history.LoadURLTestHistory("m"))
++	_, loaded = history.LoadURLTestFailure("m")
++	require.False(t, loaded)
++}
++
++// lateTimerContext is a context whose deadline has come and whose timer has not closed it yet, as
++// any context with a deadline is for a moment: Err is nil.
++type lateTimerContext struct {
++	context.Context
++	deadline time.Time
++}
++
++func (c lateTimerContext) Deadline() (time.Time, bool) { return c.deadline, true }
++
++// A test that the deadline of its round cut is no failure of the member, though the context does
++// not say so yet (GC-F1: live servers lost their delay and got a failure after a delay test of
++// the Clash API), while a failure within the deadline still is one.
++func TestURLTestRoundCutIsNoFailure(t *testing.T) {
++	link, _ := testURL(t, 0)
++	history := urltest.NewHistoryStorage()
++	logger := log.NewNOPFactory().Logger()
++	member := newTestMember(C.TypeVLESS, "m", dialWorking)
++	history.StoreURLTestHistory("m", &adapter.URLTestHistory{Time: time.Now(), Delay: 44})
++
++	// the slot came in the moment after the deadline: the dialer takes the deadline of the
++	// context and fails at once with "i/o timeout"
++	cut := lateTimerContext{Context: context.Background(), deadline: time.Now().Add(-time.Millisecond)}
++	_, err := probeOutbound(cut, link, member)
++	require.ErrorIs(t, err, context.DeadlineExceeded)
++	require.NoError(t, cut.Err())
++	URLTestOutbounds(cut, nil, history, logger, []adapter.Outbound{member}, link, time.Minute, true, true)
++	require.Equal(t, int32(2), member.dials.Load())
++	_, failed := history.LoadURLTestFailure("m")
++	require.False(t, failed, "a test the deadline cut is recorded as a failure")
++	require.NotNil(t, history.LoadURLTestHistory("m"), "a test the deadline cut took the delay away")
++
++	// a dial under way times out at the deadline of the round
++	slow := newTestMember(C.TypeVLESS, "slow", func(ctx context.Context, network string, destination M.Socksaddr) (net.Conn, error) {
++		deadline, _ := ctx.Deadline()
++		time.Sleep(time.Until(deadline))
++		return nil, os.ErrDeadlineExceeded
++	})
++	history.StoreURLTestHistory("slow", &adapter.URLTestHistory{Time: time.Now(), Delay: 44})
++	cut = lateTimerContext{Context: context.Background(), deadline: time.Now().Add(50 * time.Millisecond)}
++	URLTestOutbounds(cut, nil, history, logger, []adapter.Outbound{slow}, link, time.Minute, true, true)
++	_, failed = history.LoadURLTestFailure("slow")
++	require.False(t, failed, "a test under way the deadline cut is recorded as a failure")
++	require.NotNil(t, history.LoadURLTestHistory("slow"))
++
++	// a member that fails within the deadline has failed
++	dead := newTestMember(C.TypeVLESS, "dead", dialRefused)
++	history.StoreURLTestHistory("dead", &adapter.URLTestHistory{Time: time.Now(), Delay: 44})
++	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
++	defer cancel()
++	URLTestOutbounds(ctx, nil, history, logger, []adapter.Outbound{dead}, link, time.Minute, true, true)
++	_, failed = history.LoadURLTestFailure("dead")
++	require.True(t, failed)
++	require.Nil(t, history.LoadURLTestHistory("dead"))
++}
++
++// The test that confirms a failure, when the destination may be what failed.
++func TestURLTestConfirmRecordsFailure(t *testing.T) {
++	link, _ := testURL(t, 0)
++	member := newTestMember(C.TypeVLESS, "m", dialRefused)
++	spare := newTestMember(C.TypeVLESS, "spare", dialWorking)
++	_, group := newTestURLTest(t, link, member, spare)
++	require.True(t, group.confirmFailure("m", member))
++	waitConfirmed(t, group, "m")
++	require.Eventually(t, func() bool {
++		_, loaded := group.history.LoadURLTestFailure("m")
++		return loaded
++	}, 2*time.Second, 5*time.Millisecond)
++	require.Nil(t, group.history.LoadURLTestHistory("m"))
++}
++
++// What a download test found is kept when it says something of the member: passed or stopped on
++// the way. One that could not run leaves nothing.
++func TestURLTestDownloadRecords(t *testing.T) {
++	shortDownloadTimeout(t)
++	full := newDownloadServer(t, "full")
++	stall := newDownloadServer(t, "stall")
++	short := newDownloadServer(t, "short")
++	a := newTestMember(C.TypeVLESS, "a", dialTo(full))
++	_, group := newTestURLTest(t, full.URL, a)
++	before := time.Now()
++
++	group.downloadLink = full.URL
++	require.False(t, group.downloadStopped("full", a))
++	result, loaded := group.history.LoadDownloadResult("full")
++	require.True(t, loaded)
++	require.False(t, result.Stopped)
++	require.Equal(t, int64(urltest.DownloadTestSize), result.Received)
++	require.False(t, result.At.Before(before))
++
++	stalled := newTestMember(C.TypeVLESS, "stalled", dialTo(stall))
++	group.downloadLink = stall.URL
++	require.True(t, group.downloadStopped("stalled", stalled))
++	result, loaded = group.history.LoadDownloadResult("stalled")
++	require.True(t, loaded)
++	require.True(t, result.Stopped)
++	require.Equal(t, int64(16<<10), result.Received)
++
++	shortMember := newTestMember(C.TypeVLESS, "short", dialTo(short))
++	group.downloadLink = short.URL
++	require.False(t, group.downloadStopped("short", shortMember))
++	_, loaded = group.history.LoadDownloadResult("short")
++	require.False(t, loaded)
++}
++
++// A download cut by the close of the group or by a change of the network says nothing of the member:
++// it is not kept, and the test ends as it did.
++func TestURLTestDownloadStoppedByOwnCause(t *testing.T) {
++	shortDownloadTimeout(t)
++	stall := newDownloadServer(t, "stall")
++	member := newTestMember(C.TypeVLESS, "m", dialTo(stall))
++
++	_, group := newTestURLTest(t, stall.URL, member)
++	group.downloadLink = stall.URL
++	timer := time.AfterFunc(100*time.Millisecond, group.networkReset)
++	defer timer.Stop()
++	require.True(t, group.downloadStopped("m", member))
++	_, loaded := group.history.LoadDownloadResult("m")
++	require.False(t, loaded, "the network changed during the test")
++
++	// the network has not changed since: the same stop is the member's
++	require.True(t, group.downloadStopped("m", member))
++	result, loaded := group.history.LoadDownloadResult("m")
++	require.True(t, loaded)
++	require.True(t, result.Stopped)
++
++	_, group = newTestURLTest(t, stall.URL, member)
++	group.downloadLink = stall.URL
++	timer = time.AfterFunc(100*time.Millisecond, group.cancel)
++	defer timer.Stop()
++	require.True(t, group.downloadStopped("m", member))
++	_, loaded = group.history.LoadDownloadResult("m")
++	require.False(t, loaded, "the group was closed during the test")
++}
+diff --git a/route/conn.go b/route/conn.go
+index e83116e82..89206c3d3 100644
+--- a/route/conn.go
++++ b/route/conn.go
+@@ -291,6 +291,11 @@ func (m *ConnectionManager) connectionCopy(ctx context.Context, source net.Conn,
+ 	if err != nil {
+ 		common.Close(source, destination)
+ 	} else {
++		if direction {
++			if marker, isMarker := common.Cast[adapter.RemoteEOFMarker](destination); isMarker {
++				marker.MarkRemoteEOF()
++			}
++		}
+ 		destinationWriter, _ := N.UnwrapCountWriter(destination, nil)
+ 		duplexDst, isDuplex := N.UnwrapWriter(destinationWriter).(N.WriteCloser)
+ 		if isDuplex {
+diff --git a/route/conn_podkop_test.go b/route/conn_podkop_test.go
+new file mode 100644
+index 000000000..15ae16f85
+--- /dev/null
++++ b/route/conn_podkop_test.go
+@@ -0,0 +1,128 @@
++package route
++
++import (
++	"context"
++	"io"
++	"net"
++	"os"
++	"sync/atomic"
++	"testing"
++	"time"
++
++	"github.com/sagernet/sing-box/adapter"
++	"github.com/sagernet/sing-box/adapter/outbound"
++	"github.com/sagernet/sing-box/common/trafficcontrol"
++	C "github.com/sagernet/sing-box/constant"
++	"github.com/sagernet/sing/common/logger"
++	M "github.com/sagernet/sing/common/metadata"
++
++	"github.com/stretchr/testify/require"
++)
++
++type levelLogger struct {
++	logger.ContextLogger
++	debug, errors int
++}
++
++func (l *levelLogger) DebugContext(context.Context, ...any) { l.debug++ }
++func (l *levelLogger) ErrorContext(context.Context, ...any) { l.errors++ }
++
++type typedOutbound struct {
++	outbound.Adapter
++}
++
++func (o *typedOutbound) DialContext(context.Context, string, M.Socksaddr) (net.Conn, error) {
++	return nil, os.ErrInvalid
++}
++
++func (o *typedOutbound) ListenPacket(context.Context, M.Socksaddr) (net.PacketConn, error) {
++	return nil, os.ErrInvalid
++}
++
++// A connection a block outbound refused is logged at debug, as one the reject action refused;
++// another that could not be opened stays an error.
++func TestLogDialError(t *testing.T) {
++	logged := &levelLogger{}
++	manager := &ConnectionManager{logger: logged}
++	manager.logDialError(context.Background(), &typedOutbound{Adapter: outbound.NewAdapter(C.TypeBlock, "block-out", nil, nil)}, os.ErrPermission)
++	require.Equal(t, 1, logged.debug)
++	require.Zero(t, logged.errors)
++	manager.logDialError(context.Background(), &typedOutbound{Adapter: outbound.NewAdapter(C.TypeVLESS, "server", nil, nil)}, os.ErrDeadlineExceeded)
++	require.Equal(t, 1, logged.errors)
++}
++
++// The copies of both directions feed what the block detector reads, through the counters they take
++// out of the tracker. A cut is a connection closed on this side, never told the server ended the
++// stream, whose client was waiting for the server; the other two are not. The wait is real: the
++// copies take the counters as they are, and the test goes through them.
++func TestConnectionCopyDetectFlows(t *testing.T) {
++	const size = 16 << 10
++	flows := func(t *testing.T, waits bool, serverCloses bool) trafficcontrol.DetectFlowSample {
++		manager := trafficcontrol.NewManager()
++		connections := NewConnectionManager(context.Background(), logger.NOP())
++		member := &typedOutbound{outbound.NewAdapter(C.TypeVLESS, "s", nil, nil)}
++		client, lan := net.Pipe()
++		defer lan.Close()
++		go io.Copy(io.Discard, lan)
++		tracked := manager.RoutedConnection(context.Background(), client, adapter.InboundContext{OutboundChain: []adapter.Outbound{member}}, nil, member)
++		remote, server := net.Pipe()
++		defer server.Close()
++		var done atomic.Bool
++		downloaded := make(chan struct{})
++		go func() {
++			defer close(downloaded)
++			connections.connectionCopy(context.Background(), remote, tracked, true, &done, nil)
++		}()
++		uploaded := make(chan struct{})
++		go func() {
++			defer close(uploaded)
++			connections.connectionCopy(context.Background(), tracked, remote, false, &done, nil)
++		}()
++		go io.Copy(io.Discard, server)
++		_, err := server.Write(make([]byte, size))
++		require.NoError(t, err)
++		open := manager.Connections()
++		require.Len(t, open, 1)
++		require.True(t, open[0].PendingSince().IsZero())
++		if waits {
++			time.Sleep(5*time.Second + 500*time.Millisecond)
++			_, err = lan.Write([]byte{1})
++			require.NoError(t, err)
++			require.Eventually(t, func() bool {
++				return !open[0].PendingSince().IsZero()
++			}, time.Second, 5*time.Millisecond, "the client wrote after a quiet time")
++			time.Sleep(3*time.Second + 200*time.Millisecond)
++		}
++		if serverCloses {
++			require.NoError(t, server.Close())
++		} else {
++			require.NoError(t, remote.Close())
++		}
++		<-downloaded
++		<-uploaded
++		require.NoError(t, tracked.Close())
++		return manager.DetectFlows()["s"]
++	}
++	t.Run("healthy flow closed on this side", func(t *testing.T) {
++		t.Parallel()
++		sample := flows(t, false, false)
++		require.Empty(t, sample.Cuts)
++		require.False(t, sample.LastDataAt.IsZero())
++	})
++	t.Run("the server ended a flow that waited", func(t *testing.T) {
++		t.Parallel()
++		sample := flows(t, true, true)
++		require.Empty(t, sample.Cuts)
++		require.False(t, sample.LastDataAt.IsZero())
++	})
++	t.Run("cut", func(t *testing.T) {
++		t.Parallel()
++		sample := flows(t, true, false)
++		require.Len(t, sample.Cuts, 1)
++		require.Equal(t, int64(size), sample.Cuts[0].Download)
++		require.Equal(t, int64(1), sample.Cuts[0].Upload)
++		// the wait began after the flow opened, and stood for its 3 s before the close
++		require.True(t, sample.Cuts[0].PendingSince.After(sample.Cuts[0].CreatedAt))
++		require.GreaterOrEqual(t, sample.Cuts[0].ClosedAt.Sub(sample.Cuts[0].PendingSince), 3*time.Second)
++	})
++}
+-- 
+2.53.0
+

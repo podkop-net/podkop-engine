@@ -1,0 +1,99 @@
+From a163ab17f5685b8d3c1665052770b45c5e111298 Mon Sep 17 00:00:00 2001
+From: FiyeroT <me@fiyero.xyz>
+Date: Thu, 12 Nov 2026 21:41:20 +0300
+Subject: [PATCH 18/57] probesock, hooks in upstream files: the TCP of a probe
+ connection, for the loss of a member
+
+The lines of upstream files that "probesock: the TCP of a probe connection, for the loss of a
+member" needs; the feature itself is its patch of layer 03, in files of its own.
+
+Pdk-Feature: probesock
+Pdk-Zone: groups
+Pdk-Layer: 02
+---
+ common/dialer/default.go | 13 +++++++++++++
+ common/dialer/resolve.go |  9 +++++----
+ 2 files changed, 18 insertions(+), 4 deletions(-)
+
+diff --git a/common/dialer/default.go b/common/dialer/default.go
+index 75fac2f3d..88d6566fa 100644
+--- a/common/dialer/default.go
++++ b/common/dialer/default.go
+@@ -11,6 +11,7 @@ import (
+ 
+ 	"github.com/sagernet/sing-box/adapter"
+ 	"github.com/sagernet/sing-box/common/listener"
++	"github.com/sagernet/sing-box/common/probesock"
+ 	C "github.com/sagernet/sing-box/constant"
+ 	"github.com/sagernet/sing-box/option"
+ 	"github.com/sagernet/sing-box/service/powerreport"
+@@ -273,6 +274,18 @@ func (d *DefaultDialer) DialContext(ctx context.Context, network string, address
+ 	} else if address.IsDomain() {
+ 		return nil, E.New("domain not resolved")
+ 	}
++	if probe := probesock.From(ctx); probe != nil && N.NetworkName(network) == N.NetworkTCP {
++		// the connection of a loss probe (podkop-engine): its own small receive buffer and a
++		// capture of its packets; a network strategy does not choose its interface
++		dialer := d.dialer4.Dialer
++		if address.IsIPv6() {
++			dialer = d.dialer6.Dialer
++		}
++		conn, err := listener.ListenNetworkNamespace[net.Conn](ctx, d.netns, func() (net.Conn, error) {
++			return probe.Dial(ctx, dialer, network, address.String())
++		})
++		return d.trackConn(ctx, address, conn, err)
++	}
+ 	if d.networkStrategy == nil {
+ 		conn, err := listener.ListenNetworkNamespace[net.Conn](ctx, d.netns, func() (net.Conn, error) {
+ 			switch N.NetworkName(network) {
+diff --git a/common/dialer/resolve.go b/common/dialer/resolve.go
+index 8fa48f6b3..3001e130c 100644
+--- a/common/dialer/resolve.go
++++ b/common/dialer/resolve.go
+@@ -7,6 +7,7 @@ import (
+ 	"time"
+ 
+ 	"github.com/sagernet/sing-box/adapter"
++	"github.com/sagernet/sing-box/common/probesock"
+ 	C "github.com/sagernet/sing-box/constant"
+ 	"github.com/sagernet/sing-box/log"
+ 	"github.com/sagernet/sing/common/bufio"
+@@ -100,7 +101,7 @@ func (d *resolveDialer) DialContext(ctx context.Context, network string, destina
+ 		return d.dialer.DialContext(ctx, network, destination)
+ 	}
+ 	ctx = log.ContextWithOverrideLevel(ctx, log.LevelDebug)
+-	addresses, err := d.router.Lookup(ctx, destination.Fqdn, d.queryOptions)
++	addresses, err := d.router.Lookup(probesock.Without(ctx), destination.Fqdn, d.queryOptions)
+ 	if err != nil {
+ 		return nil, err
+ 	}
+@@ -120,7 +121,7 @@ func (d *resolveDialer) ListenPacket(ctx context.Context, destination M.Socksadd
+ 		return d.dialer.ListenPacket(ctx, destination)
+ 	}
+ 	ctx = log.ContextWithOverrideLevel(ctx, log.LevelDebug)
+-	addresses, err := d.router.Lookup(ctx, destination.Fqdn, d.queryOptions)
++	addresses, err := d.router.Lookup(probesock.Without(ctx), destination.Fqdn, d.queryOptions)
+ 	if err != nil {
+ 		return nil, err
+ 	}
+@@ -148,7 +149,7 @@ func (d *resolveParallelNetworkDialer) DialParallelInterface(ctx context.Context
+ 		return d.dialer.DialContext(ctx, network, destination)
+ 	}
+ 	ctx = log.ContextWithOverrideLevel(ctx, log.LevelDebug)
+-	addresses, err := d.router.Lookup(ctx, destination.Fqdn, d.queryOptions)
++	addresses, err := d.router.Lookup(probesock.Without(ctx), destination.Fqdn, d.queryOptions)
+ 	if err != nil {
+ 		return nil, err
+ 	}
+@@ -171,7 +172,7 @@ func (d *resolveParallelNetworkDialer) ListenSerialInterfacePacket(ctx context.C
+ 		return d.dialer.ListenPacket(ctx, destination)
+ 	}
+ 	ctx = log.ContextWithOverrideLevel(ctx, log.LevelDebug)
+-	addresses, err := d.router.Lookup(ctx, destination.Fqdn, d.queryOptions)
++	addresses, err := d.router.Lookup(probesock.Without(ctx), destination.Fqdn, d.queryOptions)
+ 	if err != nil {
+ 		return nil, err
+ 	}
+-- 
+2.53.0
+

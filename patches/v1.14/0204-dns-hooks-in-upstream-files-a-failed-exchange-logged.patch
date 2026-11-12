@@ -1,0 +1,54 @@
+From c5588bcaa24aa9d5ba4c9a3dfc7e4109a69d87b5 Mon Sep 17 00:00:00 2001
+From: FiyeroT <me@fiyero.xyz>
+Date: Thu, 12 Nov 2026 21:41:19 +0300
+Subject: [PATCH 07/57] dns, hooks in upstream files: a failed exchange logged
+ once per server, with a count
+
+The lines of upstream files that "dns: a failed exchange logged once per server, with a count"
+needs; the feature itself is its patch of layer 03, in files of its own.
+
+Pdk-Feature: dns-log
+Pdk-Zone: core
+Pdk-Layer: 02
+---
+ dns/client.go |  2 ++
+ dns/router.go | 10 ++++++----
+ 2 files changed, 8 insertions(+), 4 deletions(-)
+
+diff --git a/dns/client.go b/dns/client.go
+index 51cedd60c..61769494f 100644
+--- a/dns/client.go
++++ b/dns/client.go
+@@ -51,6 +51,8 @@ type Client struct {
+ 	cache             *freelru.Cache[dnsCacheKey, *dns.Msg]
+ 	cacheLock         compatible.Map[dnsExchangeKey, chan struct{}]
+ 	backgroundRefresh compatible.Map[dnsCacheKey, struct{}]
++	failures          failureLog
++	ipv6IfNoIPv4      bool
+ }
+ 
+ type ClientOptions struct {
+diff --git a/dns/router.go b/dns/router.go
+index 40107d9e0..dec640141 100644
+--- a/dns/router.go
++++ b/dns/router.go
+@@ -1174,10 +1174,12 @@ func (r *Router) exchangeLegacy(ctx context.Context, exchangeCtx *dnsExchangeCon
+ 			} else if errors.Is(err, ErrResponseRejected) {
+ 				rejected = true
+ 				r.logger.DebugContext(ctx, E.Cause(err, "response rejected for ", FormatQuestion(message.Question[0].String())))
+-			} else if len(message.Question) > 0 {
+-				r.logger.ErrorContext(ctx, E.Cause(err, "exchange failed for ", FormatQuestion(message.Question[0].String())))
+-			} else {
+-				r.logger.ErrorContext(ctx, E.Cause(err, "exchange failed for <empty query>"))
++			} else if !IsLoggedFailure(err) {
++				if len(message.Question) > 0 {
++					r.logger.ErrorContext(ctx, E.Cause(err, "exchange failed for ", FormatQuestion(message.Question[0].String())))
++				} else {
++					r.logger.ErrorContext(ctx, E.Cause(err, "exchange failed for <empty query>"))
++				}
+ 			}
+ 		}
+ 		if responseCheck != nil && rejected {
+-- 
+2.53.0
+

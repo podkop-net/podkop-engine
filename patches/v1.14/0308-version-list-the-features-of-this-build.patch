@@ -1,0 +1,53 @@
+From 7c2f556e6a07f46eb1ca485851938e0533d9195a Mon Sep 17 00:00:00 2001
+From: FiyeroT <me@fiyero.xyz>
+Date: Thu, 12 Nov 2026 21:41:20 +0300
+Subject: [PATCH 26/57] version: list the features of this build
+
+sing-box version lists the features of the build.
+
+Made of these commits of the earlier series (branch archive/r25-1.14-commits):
+  ca5c147c4 version: list the features of this build
+  a688f549b cmd/sing-box: the command line where upstream has it
+
+Pdk-Feature: version
+Pdk-Zone: tools
+Pdk-Layer: 03
+---
+ cmd/sing-box/version_features.go | 25 +++++++++++++++++++++++++
+ 1 file changed, 25 insertions(+)
+ create mode 100644 cmd/sing-box/version_features.go
+
+diff --git a/cmd/sing-box/version_features.go b/cmd/sing-box/version_features.go
+new file mode 100644
+index 000000000..c5b410ff5
+--- /dev/null
++++ b/cmd/sing-box/version_features.go
+@@ -0,0 +1,25 @@
++package main
++
++import "strings"
++
++// versionLine is the line "Features:" of sing-box version (cmd_version.go).
++func versionLine() string {
++	return "Features: " + strings.Join(versionFeatures, ",") + "\n"
++}
++
++// versionFeatures names what this build adds to sing-box that a configuration
++// or a script may depend on, for those that write configurations to ask
++// ("sing-box version", the line "Features:") instead of guessing by the
++// version. A name is never removed or given another meaning.
++var versionFeatures = []string{
++	// urltest: the "fallbacks" list of an outbound group
++	"urltest.fallbacks",
++	// urltest: "download_url", the download check before a switch
++	"urltest.download_url",
++	// the xhttp client transport (V2Ray transport type "xhttp")
++	"transport.xhttp",
++	// the command "sing-box tools decode-link"
++	"tools.decode-link",
++	// the uTLS fingerprint fallback (SING_BOX_UTLS_FALLBACK)
++	"tls.utls-fallback",
++}
+-- 
+2.53.0
+

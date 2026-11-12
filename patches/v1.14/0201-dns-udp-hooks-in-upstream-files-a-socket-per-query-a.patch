@@ -1,0 +1,61 @@
+From 9b2d2454b16bbb579080f53db7832b8fb2c6a204 Mon Sep 17 00:00:00 2001
+From: FiyeroT <me@fiyero.xyz>
+Date: Thu, 12 Nov 2026 21:41:19 +0300
+Subject: [PATCH 04/57] dns/udp, hooks in upstream files: a socket per query, a
+ query sent again while no answer came
+
+The lines of upstream files that "dns/udp: a socket per query, a query sent again while no answer
+came" needs; the feature itself is its patch of layer 03, in files of its own.
+
+Pdk-Feature: dns-udp
+Pdk-Zone: core
+Pdk-Layer: 02
+---
+ dns/transport/udp.go | 10 +++++++---
+ 1 file changed, 7 insertions(+), 3 deletions(-)
+
+diff --git a/dns/transport/udp.go b/dns/transport/udp.go
+index a6bcd1885..1b841dc4d 100644
+--- a/dns/transport/udp.go
++++ b/dns/transport/udp.go
+@@ -40,6 +40,8 @@ type UDPTransport struct {
+ 	udpSize    atomic.Int32
+ 
+ 	multiplexer *queryMultiplexer
++
++	fresh *freshSocket // one socket per query, see udp_fresh.go
+ }
+ 
+ func NewUDP(ctx context.Context, logger log.ContextLogger, tag string, options option.RemoteDNSServerOptions) (adapter.DNSTransport, error) {
+@@ -54,7 +56,9 @@ func NewUDP(ctx context.Context, logger log.ContextLogger, tag string, options o
+ 	if !serverAddr.IsValid() {
+ 		return nil, E.New("invalid server address: ", serverAddr)
+ 	}
+-	return NewUDPRaw(logger, dns.NewTransportAdapterWithRemoteOptions(C.DNSTypeUDP, tag, options), transportDialer, serverAddr), nil
++	transport := NewUDPRaw(logger, dns.NewTransportAdapterWithRemoteOptions(C.DNSTypeUDP, tag, options), transportDialer, serverAddr)
++	transport.fresh = &freshSocket{ctx: ctx, options: options}
++	return transport, nil
+ }
+ 
+ func NewUDPRaw(logger logger.ContextLogger, adapter dns.TransportAdapter, dialerInstance N.Dialer, serverAddr M.Socksaddr) *UDPTransport {
+@@ -101,7 +105,7 @@ func (t *UDPTransport) CloseIdleConnections() {
+ 
+ func (t *UDPTransport) Exchange(ctx context.Context, message *mDNS.Msg) (*mDNS.Msg, error) {
+ 	t.updateUDPSize(message)
+-	response, err := t.multiplexer.Exchange(ctx, message)
++	response, err := t.exchangeQuery(ctx, message)
+ 	if err != nil {
+ 		return nil, err
+ 	}
+@@ -114,7 +118,7 @@ func (t *UDPTransport) Exchange(ctx context.Context, message *mDNS.Msg) (*mDNS.M
+ 
+ func (t *UDPTransport) ExchangeAsync(ctx context.Context, message *mDNS.Msg, callback func(response *mDNS.Msg, err error)) {
+ 	t.updateUDPSize(message)
+-	t.multiplexer.ExchangeAsync(ctx, message, func(response *mDNS.Msg, err error) {
++	t.exchangeQueryAsync(ctx, message, func(response *mDNS.Msg, err error) {
+ 		if err == nil && response.Truncated {
+ 			t.logger.InfoContext(ctx, "response truncated, retrying with TCP")
+ 			go func() {
+-- 
+2.53.0
+

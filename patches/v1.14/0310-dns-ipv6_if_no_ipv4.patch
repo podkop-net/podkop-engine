@@ -1,0 +1,308 @@
+From 2edd16a9da66a5bf0d2ff01fca6a77b55a6dcadf Mon Sep 17 00:00:00 2001
+From: FiyeroT <me@fiyero.xyz>
+Date: Thu, 12 Nov 2026 21:41:20 +0300
+Subject: [PATCH 28/57] dns: ipv6_if_no_ipv4
+
+The AAAA question of a name without an IPv4 address goes out under ipv4_only.
+
+Made of these commits of the earlier series (branch archive/r25-1.14-commits):
+  b1ad46b28 dns: the AAAA question of a name without an IPv4 address goes out under ipv4_only
+  ef67c2584 tls, dns: fixes from the review of the fallback and of ipv6_if_no_ipv4
+
+Pdk-Feature: dns-ipv6
+Pdk-Zone: core
+Pdk-Layer: 03
+---
+ dns/client_ipv6.go      |  49 +++++++++
+ dns/client_ipv6_test.go | 223 ++++++++++++++++++++++++++++++++++++++++
+ 2 files changed, 272 insertions(+)
+ create mode 100644 dns/client_ipv6.go
+ create mode 100644 dns/client_ipv6_test.go
+
+diff --git a/dns/client_ipv6.go b/dns/client_ipv6.go
+new file mode 100644
+index 000000000..fd161bda8
+--- /dev/null
++++ b/dns/client_ipv6.go
+@@ -0,0 +1,49 @@
++package dns
++
++import (
++	"context"
++
++	"github.com/sagernet/sing-box/adapter"
++	C "github.com/sagernet/sing-box/constant"
++
++	"github.com/miekg/dns"
++)
++
++// podkop-engine: dns.ipv6_if_no_ipv4. The strategy ipv4_only answers every AAAA question
++// with no address, so a name that has only IPv6 addresses does not resolve at all. With
++// the option an AAAA question goes out when the A question of its name, through the same
++// server, is answered without an A record; a lookup of such a name takes its IPv6
++// addresses (Lookup, Router.lookupWithRules). A name that has an IPv4 address keeps the
++// answer of the strategy. The A question goes through the cache: a client asks A and
++// AAAA together, and the two share one exchange.
++
++// mayAskIPv6 tells whether an AAAA question the strategy turns away may go out: the
++// option is on and the server is no FakeIP server, which has an address for every name.
++func (c *Client) mayAskIPv6(transport adapter.DNSTransport, message *dns.Msg, options adapter.DNSQueryOptions) bool {
++	return c.ipv6IfNoIPv4 && options.Strategy == C.DomainStrategyIPv4Only &&
++		len(message.Question) > 0 && message.Question[0].Qtype == dns.TypeAAAA &&
++		transport.Type() != C.DNSTypeFakeIP
++}
++
++// noIPv4 asks the A question of the name of an AAAA question through the same server, with
++// the check of the addresses of the rule (a refused answer is not cached, as for the A
++// question of a client). A success without an A record tells that the name has no IPv4
++// address; an error, a refused answer, another rcode or an A record tell nothing of the
++// kind.
++func (c *Client) noIPv4(ctx context.Context, transport adapter.DNSTransport, message *dns.Msg, options adapter.DNSQueryOptions, responseChecker func(response *dns.Msg) bool) bool {
++	question := message.Copy()
++	question.Question[0].Qtype = dns.TypeA
++	response, err := c.exchange(ctx, transport, question, options, responseChecker)
++	if err != nil || response == nil || response.Rcode != dns.RcodeSuccess {
++		return false
++	}
++	for _, record := range response.Answer {
++		if _, isA := record.(*dns.A); isA {
++			return false
++		}
++	}
++	if c.logger != nil {
++		c.logger.DebugContext(ctx, "no IPv4 address, IPv6 asked for ", FqdnToDomain(message.Question[0].Name))
++	}
++	return true
++}
+diff --git a/dns/client_ipv6_test.go b/dns/client_ipv6_test.go
+new file mode 100644
+index 000000000..c3e3948e9
+--- /dev/null
++++ b/dns/client_ipv6_test.go
+@@ -0,0 +1,223 @@
++package dns
++
++import (
++	"context"
++	"net/netip"
++	"sync"
++	"testing"
++
++	"github.com/sagernet/sing-box/adapter"
++	C "github.com/sagernet/sing-box/constant"
++	"github.com/sagernet/sing-box/log"
++
++	mDNS "github.com/miekg/dns"
++	"github.com/stretchr/testify/require"
++)
++
++// ipv6TestTransport answers from a table of names: a name it has no address of the type
++// for gets a success without records, a name not in the table NXDOMAIN. It counts the
++// questions it was asked by type.
++type ipv6TestTransport struct {
++	tag           string
++	transportType string
++	records       map[string]map[uint16][]netip.Addr
++
++	access  sync.Mutex
++	queries map[uint16]int
++}
++
++func newIPv6TestTransport(tag string, transportType string) *ipv6TestTransport {
++	return &ipv6TestTransport{
++		tag: tag, transportType: transportType, queries: make(map[uint16]int),
++		records: map[string]map[uint16][]netip.Addr{
++			"v6only.test.": {mDNS.TypeAAAA: {netip.MustParseAddr("2001:db8::1")}},
++			"dual.test.":   {mDNS.TypeA: {netip.MustParseAddr("192.0.2.2")}, mDNS.TypeAAAA: {netip.MustParseAddr("2001:db8::2")}},
++		},
++	}
++}
++
++func (t *ipv6TestTransport) Start(stage adapter.StartStage, scope *adapter.Scope) error {
++	return nil
++}
++func (t *ipv6TestTransport) Type() string           { return t.transportType }
++func (t *ipv6TestTransport) Tag() string            { return t.tag }
++func (t *ipv6TestTransport) Dependencies() []string { return nil }
++func (t *ipv6TestTransport) Reset()                 {}
++
++func (t *ipv6TestTransport) Exchange(ctx context.Context, message *mDNS.Msg) (*mDNS.Msg, error) {
++	question := message.Question[0]
++	t.access.Lock()
++	t.queries[question.Qtype]++
++	t.access.Unlock()
++	types, known := t.records[question.Name]
++	if !known {
++		return FixedResponseStatus(message, mDNS.RcodeNameError), nil
++	}
++	return FixedResponse(message.Id, question, types[question.Qtype], 300), nil
++}
++
++func (t *ipv6TestTransport) ExchangeAsync(ctx context.Context, message *mDNS.Msg, callback func(response *mDNS.Msg, err error)) {
++	go func() {
++		callback(t.Exchange(ctx, message))
++	}()
++}
++
++func (t *ipv6TestTransport) asked(qType uint16) int {
++	t.access.Lock()
++	defer t.access.Unlock()
++	return t.queries[qType]
++}
++
++func ipv6TestClient(enabled bool) *Client {
++	return NewClient(ClientOptions{
++		Context:      context.Background(),
++		Logger:       log.NewNOPFactory().Logger(),
++		IPv6IfNoIPv4: enabled,
++	})
++}
++
++func ipv6TestQuestion(name string, qType uint16) *mDNS.Msg {
++	message := new(mDNS.Msg)
++	message.SetQuestion(name, qType)
++	return message
++}
++
++func answerAddresses(response *mDNS.Msg) []netip.Addr {
++	if response == nil {
++		return nil
++	}
++	return MessageToAddresses(response)
++}
++
++var ipv4Only = adapter.DNSQueryOptions{Strategy: C.DomainStrategyIPv4Only}
++
++// With ipv4_only and the option an AAAA question goes out for a name without an IPv4
++// address; a name with one, a name that does not exist, and every name without the option
++// or through a FakeIP server keep the empty answer of the strategy.
++func TestIPv6IfNoIPv4Exchange(t *testing.T) {
++	ctx := context.Background()
++	transport := newIPv6TestTransport("server", C.DNSTypeUDP)
++	client := ipv6TestClient(true)
++
++	response, err := client.Exchange(ctx, transport, ipv6TestQuestion("v6only.test.", mDNS.TypeAAAA), ipv4Only, nil)
++	require.NoError(t, err)
++	require.Equal(t, mDNS.RcodeSuccess, response.Rcode)
++	require.Equal(t, []netip.Addr{netip.MustParseAddr("2001:db8::1")}, answerAddresses(response))
++	require.Equal(t, 1, transport.asked(mDNS.TypeA))
++	require.Equal(t, 1, transport.asked(mDNS.TypeAAAA))
++
++	// the client asks A and AAAA: the A answer in the cache serves the AAAA question too
++	response, err = client.Exchange(ctx, transport, ipv6TestQuestion("dual.test.", mDNS.TypeA), ipv4Only, nil)
++	require.NoError(t, err)
++	require.Equal(t, []netip.Addr{netip.MustParseAddr("192.0.2.2")}, answerAddresses(response))
++	response, err = client.Exchange(ctx, transport, ipv6TestQuestion("dual.test.", mDNS.TypeAAAA), ipv4Only, nil)
++	require.NoError(t, err)
++	require.Equal(t, mDNS.RcodeSuccess, response.Rcode)
++	require.Empty(t, response.Answer)
++	require.Equal(t, 2, transport.asked(mDNS.TypeA), "the A answer of dual.test was not taken from the cache")
++	require.Equal(t, 1, transport.asked(mDNS.TypeAAAA))
++
++	response, err = client.Exchange(ctx, transport, ipv6TestQuestion("missing.test.", mDNS.TypeAAAA), ipv4Only, nil)
++	require.NoError(t, err)
++	require.Equal(t, mDNS.RcodeSuccess, response.Rcode)
++	require.Empty(t, response.Answer)
++	require.Equal(t, 1, transport.asked(mDNS.TypeAAAA))
++
++	// without the option nothing is asked
++	plain := newIPv6TestTransport("server", C.DNSTypeUDP)
++	response, err = ipv6TestClient(false).Exchange(ctx, plain, ipv6TestQuestion("v6only.test.", mDNS.TypeAAAA), ipv4Only, nil)
++	require.NoError(t, err)
++	require.Empty(t, response.Answer)
++	require.Zero(t, plain.asked(mDNS.TypeA)+plain.asked(mDNS.TypeAAAA))
++
++	// a FakeIP server is not asked for A
++	fakeIP := newIPv6TestTransport("fakeip", C.DNSTypeFakeIP)
++	response, err = client.Exchange(ctx, fakeIP, ipv6TestQuestion("v6only.test.", mDNS.TypeAAAA), ipv4Only, nil)
++	require.NoError(t, err)
++	require.Empty(t, response.Answer)
++	require.Zero(t, fakeIP.asked(mDNS.TypeA)+fakeIP.asked(mDNS.TypeAAAA))
++
++	// another strategy: AAAA goes out as ever, without an A question
++	other := newIPv6TestTransport("server", C.DNSTypeUDP)
++	response, err = client.Exchange(ctx, other, ipv6TestQuestion("dual.test.", mDNS.TypeAAAA), adapter.DNSQueryOptions{Strategy: C.DomainStrategyPreferIPv4}, nil)
++	require.NoError(t, err)
++	require.Equal(t, []netip.Addr{netip.MustParseAddr("2001:db8::2")}, answerAddresses(response))
++	require.Zero(t, other.asked(mDNS.TypeA))
++}
++
++// The asynchronous exchange, which the DNS inbound uses, answers the same.
++func TestIPv6IfNoIPv4ExchangeAsync(t *testing.T) {
++	transport := newIPv6TestTransport("server", C.DNSTypeUDP)
++	client := ipv6TestClient(true)
++	exchange := func(name string) *mDNS.Msg {
++		done := make(chan *mDNS.Msg, 1)
++		client.ExchangeAsync(context.Background(), transport, ipv6TestQuestion(name, mDNS.TypeAAAA), ipv4Only, nil, func(response *mDNS.Msg, err error) {
++			require.NoError(t, err)
++			done <- response
++		})
++		return <-done
++	}
++	require.Equal(t, []netip.Addr{netip.MustParseAddr("2001:db8::1")}, answerAddresses(exchange("v6only.test.")))
++	response := exchange("dual.test.")
++	require.Equal(t, mDNS.RcodeSuccess, response.Rcode)
++	require.Empty(t, response.Answer)
++	require.Equal(t, 1, transport.asked(mDNS.TypeAAAA))
++}
++
++// A lookup with ipv4_only takes the IPv6 addresses of a name without an IPv4 address,
++// through the client and through the rules of the router.
++func TestIPv6IfNoIPv4Lookup(t *testing.T) {
++	ctx := context.Background()
++	transport := newIPv6TestTransport("final", C.DNSTypeUDP)
++	client := ipv6TestClient(true)
++	addresses, err := client.Lookup(ctx, transport, "v6only.test", ipv4Only, nil)
++	require.NoError(t, err)
++	require.Equal(t, []netip.Addr{netip.MustParseAddr("2001:db8::1")}, addresses)
++	addresses, err = client.Lookup(ctx, transport, "dual.test", ipv4Only, nil)
++	require.NoError(t, err)
++	require.Equal(t, []netip.Addr{netip.MustParseAddr("192.0.2.2")}, addresses)
++	_, err = client.Lookup(ctx, transport, "missing.test", ipv4Only, nil)
++	require.Error(t, err)
++	addresses, err = ipv6TestClient(false).Lookup(ctx, transport, "v6only.test", ipv4Only, nil)
++	require.NoError(t, err)
++	require.Empty(t, addresses)
++
++	for _, enabled := range []bool{true, false} {
++		router := &Router{
++			ctx:       context.Background(),
++			logger:    log.NewNOPFactory().Logger(),
++			transport: &fakeDNSTransportManager{transports: map[string]adapter.DNSTransport{"final": transport}, defaultTransport: transport},
++			client:    ipv6TestClient(enabled),
++			// the strategy of the configuration
++			defaultDomainStrategy: C.DomainStrategyIPv4Only,
++			ipv6IfNoIPv4:          enabled,
++		}
++		addresses, err = router.lookupWithRules(ctx, nil, "v6only.test", adapter.DNSQueryOptions{})
++		require.NoError(t, err)
++		if enabled {
++			require.Equal(t, []netip.Addr{netip.MustParseAddr("2001:db8::1")}, addresses)
++		} else {
++			require.Empty(t, addresses)
++		}
++		addresses, err = router.lookupWithRules(ctx, nil, "dual.test", adapter.DNSQueryOptions{})
++		require.NoError(t, err)
++		require.Equal(t, []netip.Addr{netip.MustParseAddr("192.0.2.2")}, addresses)
++	}
++}
++
++// The A question goes with the check of the addresses of the rule: an answer the rule
++// refuses tells nothing and is not cached, as for the A question of a client.
++func TestIPv6IfNoIPv4Checked(t *testing.T) {
++	ctx := context.Background()
++	transport := newIPv6TestTransport("server", C.DNSTypeUDP)
++	client := ipv6TestClient(true)
++	refuse := func(*mDNS.Msg) bool { return false }
++	response, err := client.Exchange(ctx, transport, ipv6TestQuestion("dual.test.", mDNS.TypeAAAA), ipv4Only, refuse)
++	require.NoError(t, err)
++	require.Empty(t, response.Answer)
++	require.Equal(t, 1, transport.asked(mDNS.TypeA))
++	require.Zero(t, transport.asked(mDNS.TypeAAAA))
++	_, err = client.Exchange(ctx, transport, ipv6TestQuestion("dual.test.", mDNS.TypeA), ipv4Only, nil)
++	require.NoError(t, err)
++	require.Equal(t, 2, transport.asked(mDNS.TypeA), "the refused answer was cached")
++}
+-- 
+2.53.0
+

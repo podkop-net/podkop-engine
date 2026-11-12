@@ -1,0 +1,2510 @@
+From 2dff1e605ba139e810e0ac0da9bdc6764c00b86f Mon Sep 17 00:00:00 2001
+From: FiyeroT <me@fiyero.xyz>
+Date: Thu, 12 Nov 2026 21:41:20 +0300
+Subject: [PATCH 37/57] rule-set: the download, the start and the update of
+ remote rule-sets
+
+A remote rule-set starts empty when its first download fails and retries, its fetch is bounded by
+stalls and by a start deadline, what cannot be a rule-set is refused before it is read, an answer
+"not modified" writes the time alone, the download goes as an external connection, big lists update
+one at a time, sets can be updated on request, the callbacks run after the cache write, a closed set
+stops reading.
+
+Made of these commits of the earlier series (branch archive/r25-1.14-commits):
+  9fc6e7edb rule-set: start empty when the first download fails, retry, run a hook
+  212c548f1 rule-set: bound a remote fetch by stalls, start without a list that does not come
+  2189fd7c6 rule-set: collect garbage after a load only, log repeated failures sparingly
+  d66ef7ec7 rule-set: report how the recovered hook ended
+  2f1b01f5d rule-set: read and drop the rules of a local set under its lock
+  da13cdc32 rule-set: refuse what cannot be a rule-set before reading it, say what came
+  f80bb7308 rule-set: download as an external connection
+  4e7d6771b httpclient: test that what a request's context carries reaches the dialer
+  a642e5c8c rule-set: one plain line of what the server said
+  16cffb606 route: remote rule-sets can be updated on request
+  7b78d1f9a route/rule: rule-set callbacks after the cache write; start empty on request
+  3a214dab6 rule-set: a closed rule-set does not parse or save a list that came in
+  dc4a0c7e7 rule-set: a rule set closed while it reads a list stops reading it
+  3c1838a1b rule-set: an answer "not modified" writes the time alone to the cache file
+  41f832ef9 patches: adapt to sing-box 1.14.4
+  a1068a5cf rule-set updater: big lists one at a time
+
+Pdk-Feature: rule-set
+Pdk-Zone: core
+Pdk-Layer: 04
+---
+ common/domainset/stop_test.go                 |  52 +++
+ common/httpclient/dial_context_test.go        | 103 +++++
+ common/ruletext/stop_test.go                  |  25 ++
+ experimental/cachefile/cache.go               |  32 +-
+ .../cachefile/rule_set_checked_test.go        |  30 ++
+ route/router.go                               |   9 +
+ route/rule/export_test.go                     |   8 +
+ route/rule/rule_set_hook.go                   |  65 +++
+ route/rule/rule_set_hook_test.go              |  74 ++++
+ route/rule/rule_set_local.go                  |  38 +-
+ route/rule/rule_set_local_race_test.go        |  61 +++
+ route/rule/rule_set_remote.go                 | 417 ++++++++++++++++--
+ route/rule/rule_set_remote_body_test.go       | 172 ++++++++
+ route/rule/rule_set_remote_checked_test.go    |  69 +++
+ route/rule/rule_set_remote_race_test.go       |  47 ++
+ route/rule/rule_set_remote_start_test.go      | 100 +++++
+ route/rule/rule_set_remote_stop_test.go       |  48 ++
+ route/rule/rule_set_remote_timeout_test.go    | 107 +++++
+ route/rule/rule_set_start_empty_test.go       | 139 ++++++
+ route/rule/rule_set_update_log_test.go        | 101 +++++
+ route/rule/rule_set_updater.go                | 146 +++++-
+ route/rule/rule_set_updater_test.go           | 161 +++++++
+ 22 files changed, 1948 insertions(+), 56 deletions(-)
+ create mode 100644 common/domainset/stop_test.go
+ create mode 100644 common/httpclient/dial_context_test.go
+ create mode 100644 common/ruletext/stop_test.go
+ create mode 100644 experimental/cachefile/rule_set_checked_test.go
+ create mode 100644 route/rule/export_test.go
+ create mode 100644 route/rule/rule_set_hook.go
+ create mode 100644 route/rule/rule_set_hook_test.go
+ create mode 100644 route/rule/rule_set_local_race_test.go
+ create mode 100644 route/rule/rule_set_remote_body_test.go
+ create mode 100644 route/rule/rule_set_remote_checked_test.go
+ create mode 100644 route/rule/rule_set_remote_race_test.go
+ create mode 100644 route/rule/rule_set_remote_start_test.go
+ create mode 100644 route/rule/rule_set_remote_stop_test.go
+ create mode 100644 route/rule/rule_set_remote_timeout_test.go
+ create mode 100644 route/rule/rule_set_start_empty_test.go
+ create mode 100644 route/rule/rule_set_update_log_test.go
+ create mode 100644 route/rule/rule_set_updater_test.go
+
+diff --git a/common/domainset/stop_test.go b/common/domainset/stop_test.go
+new file mode 100644
+index 000000000..fe08c2db7
+--- /dev/null
++++ b/common/domainset/stop_test.go
+@@ -0,0 +1,52 @@
++package domainset
++
++import (
++	"context"
++	"fmt"
++	"strings"
++	"testing"
++
++	"github.com/stretchr/testify/require"
++)
++
++// bigSource is a rule set of the source format with count names in one rule.
++func bigSource(count int) []byte {
++	var text strings.Builder
++	text.WriteString(`{"version":3,"rules":[{"domain_suffix":[`)
++	for index := range count {
++		if index > 0 {
++			text.WriteByte(',')
++		}
++		fmt.Fprintf(&text, `"host%d.example%d.com"`, index, index%97)
++	}
++	text.WriteString(`]}]}`)
++	return []byte(text.String())
++}
++
++// A rule set read for a context that is done stops with its error, and is not read by
++// sing-box instead; one read for a live context is read as before.
++func TestReadSourceContextStops(t *testing.T) {
++	text := bigSource(50000)
++	done, cancel := context.WithCancel(context.Background())
++	cancel()
++	_, err := ReadSourceContext(done, text)
++	require.ErrorIs(t, err, context.Canceled)
++	compat, err := ReadSourceContext(context.Background(), text)
++	require.NoError(t, err)
++	require.NotNil(t, compat.Options.Rules[0].DefaultOptions.DomainSet)
++}
++
++// The build of the trie stops too: the names are gathered, the context ends, the set is
++// not made.
++func TestCollectorContextStops(t *testing.T) {
++	ctx, cancel := context.WithCancel(context.Background())
++	names := NewCollectorContext(ctx, nil)
++	for index := range 50000 {
++		require.NoError(t, names.AddString(fmt.Sprintf("host%d.example.com", index), true))
++	}
++	cancel()
++	_, err := names.Set("")
++	require.ErrorIs(t, err, context.Canceled)
++	_, err = NewCollectorContext(context.Background(), nil).Set("")
++	require.Error(t, err, "no domain to build")
++}
+diff --git a/common/httpclient/dial_context_test.go b/common/httpclient/dial_context_test.go
+new file mode 100644
+index 000000000..4872f01cb
+--- /dev/null
++++ b/common/httpclient/dial_context_test.go
+@@ -0,0 +1,103 @@
++package httpclient
++
++import (
++	"context"
++	"io"
++	"net"
++	"net/http"
++	"net/http/httptest"
++	"os"
++	"sync"
++	"testing"
++
++	"github.com/sagernet/sing-box/common/interrupt"
++	"github.com/sagernet/sing-box/common/tls"
++	"github.com/sagernet/sing-box/log"
++	"github.com/sagernet/sing-box/option"
++	M "github.com/sagernet/sing/common/metadata"
++
++	"github.com/stretchr/testify/require"
++)
++
++type markRecordingDialer struct {
++	access   sync.Mutex
++	external []bool
++}
++
++func (d *markRecordingDialer) DialContext(ctx context.Context, network string, destination M.Socksaddr) (net.Conn, error) {
++	d.access.Lock()
++	d.external = append(d.external, interrupt.IsExternalConnectionFromContext(ctx))
++	d.access.Unlock()
++	return (&net.Dialer{}).DialContext(ctx, network, destination.String())
++}
++
++func (d *markRecordingDialer) ListenPacket(ctx context.Context, destination M.Socksaddr) (net.PacketConn, error) {
++	return nil, os.ErrInvalid
++}
++
++func (d *markRecordingDialer) take() []bool {
++	d.access.Lock()
++	defer d.access.Unlock()
++	external := d.external
++	d.external = nil
++	return external
++}
++
++// What a request's context carries reaches the dialer of every connection made for it:
++// the mark of an external connection, by which a group switching members leaves the
++// connection alone, is read there. Each case names the transport that dials.
++func TestRequestContextReachesDialer(t *testing.T) {
++	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		io.WriteString(w, r.Proto)
++	})
++	plain := httptest.NewServer(handler)
++	defer plain.Close()
++	http1Only := httptest.NewTLSServer(handler)
++	defer http1Only.Close()
++	http2 := httptest.NewUnstartedServer(handler)
++	http2.EnableHTTP2 = true
++	http2.StartTLS()
++	defer http2.Close()
++
++	tlsConfig, err := tls.NewSTDClient(context.Background(), log.NewNOPFactory().NewLogger("test"), "", option.OutboundTLSOptions{Enabled: true, Insecure: true})
++	require.NoError(t, err)
++
++	for _, testCase := range []struct {
++		name    string
++		link    string
++		options option.HTTPClientOptions
++		proto   string
++		dials   int
++	}{
++		{name: "plain HTTP", link: plain.URL, proto: "HTTP/1.1", dials: 1},
++		{name: "HTTP/2", link: http2.URL, proto: "HTTP/2.0", dials: 1},
++		// the HTTP/2 transport dials, finds HTTP/1.1 negotiated and leaves the request to
++		// the HTTP/1.1 transport, which dials again
++		{name: "HTTP/1.1 after the HTTP/2 attempt", link: http1Only.URL, proto: "HTTP/1.1", dials: 2},
++		{name: "HTTP/1.1 by option", link: http1Only.URL, options: option.HTTPClientOptions{Version: 1}, proto: "HTTP/1.1", dials: 1},
++	} {
++		for _, marked := range []bool{true, false} {
++			dialer := &markRecordingDialer{}
++			transport, err := newTransport(dialer, tlsConfig, testCase.options)
++			require.NoError(t, err, testCase.name)
++			ctx := context.Background()
++			if marked {
++				ctx = interrupt.ContextWithIsExternalConnection(ctx, true)
++			}
++			request, err := http.NewRequestWithContext(ctx, http.MethodGet, testCase.link, nil)
++			require.NoError(t, err, testCase.name)
++			response, err := transport.RoundTrip(request)
++			require.NoError(t, err, testCase.name)
++			proto, err := io.ReadAll(response.Body)
++			response.Body.Close()
++			require.NoError(t, err, testCase.name)
++			require.Equal(t, testCase.proto, string(proto), testCase.name)
++			external := dialer.take()
++			require.Len(t, external, testCase.dials, testCase.name)
++			for _, isExternal := range external {
++				require.Equal(t, marked, isExternal, testCase.name)
++			}
++			transport.Close()
++		}
++	}
++}
+diff --git a/common/ruletext/stop_test.go b/common/ruletext/stop_test.go
+new file mode 100644
+index 000000000..e6e925255
+--- /dev/null
++++ b/common/ruletext/stop_test.go
+@@ -0,0 +1,25 @@
++package ruletext
++
++import (
++	"context"
++	"fmt"
++	"strings"
++	"testing"
++
++	"github.com/stretchr/testify/require"
++)
++
++// A text list read for a context that is done stops with its error.
++func TestReadContextStops(t *testing.T) {
++	var text strings.Builder
++	for index := range 50000 {
++		fmt.Fprintf(&text, "host%d.example.com\n", index)
++	}
++	done, cancel := context.WithCancel(context.Background())
++	cancel()
++	_, _, err := ReadContext(done, []byte(text.String()))
++	require.ErrorIs(t, err, context.Canceled)
++	compat, _, err := ReadContext(context.Background(), []byte(text.String()))
++	require.NoError(t, err)
++	require.Len(t, compat.Options.Rules, 1)
++}
+diff --git a/experimental/cachefile/cache.go b/experimental/cachefile/cache.go
+index b4f97d110..daf94ba61 100644
+--- a/experimental/cachefile/cache.go
++++ b/experimental/cachefile/cache.go
+@@ -2,6 +2,7 @@ package cachefile
+ 
+ import (
+ 	"context"
++	"encoding/binary"
+ 	"errors"
+ 	"net/netip"
+ 	"os"
+@@ -25,12 +26,18 @@ var (
+ 	bucketExpand   = []byte("group_expand")
+ 	bucketMode     = []byte("clash_mode")
+ 	bucketRuleSet  = []byte("rule_set")
++	// when each remote rule set was last found up to date (podkop-engine)
++	bucketRuleSetChecked = []byte("rule_set_checked")
+ 
+ 	bucketNameList = []string{
+ 		string(bucketSelected),
+ 		string(bucketExpand),
+ 		string(bucketMode),
+ 		string(bucketRuleSet),
++		string(bucketRuleSetChecked),
++		string(bucketRuleSetFile),
++		string(bucketUTLSChoice),
++		string(bucketDetectOutcome),
+ 		string(bucketRDRC),
+ 		string(bucketDNSCache),
+ 	}
+@@ -466,9 +473,30 @@ func (c *CacheFile) LoadRuleSet(tag string) *adapter.SavedBinary {
+ 	return &savedSet
+ }
+ 
+-func (c *CacheFile) SaveRuleSet(tag string, set *adapter.SavedBinary) error {
++var _ adapter.RuleSetCheckCache = (*CacheFile)(nil)
++
++// LoadRuleSetChecked is when the rule set was last found up to date, the zero time when
++// that is not kept.
++func (c *CacheFile) LoadRuleSetChecked(tag string) time.Time {
++	var at time.Time
++	_ = c.view(func(t *bbolt.Tx) error {
++		bucket := c.bucket(t, bucketRuleSetChecked)
++		if bucket == nil {
++			return nil
++		}
++		if value := bucket.Get([]byte(tag)); len(value) == 8 {
++			at = time.Unix(0, int64(binary.BigEndian.Uint64(value)))
++		}
++		return nil
++	})
++	return at
++}
++
++// StoreRuleSetChecked keeps when the rule set was found up to date: eight bytes, where a
++// save of the rule set writes its whole content again.
++func (c *CacheFile) StoreRuleSetChecked(tag string, at time.Time) error {
+ 	return c.batch(func(t *bbolt.Tx) error {
+-		bucket, err := c.createBucket(t, bucketRuleSet)
++		bucket, err := c.createBucket(t, bucketRuleSetChecked)
+ 		if err != nil {
+ 			return err
+ 		}
+diff --git a/experimental/cachefile/rule_set_checked_test.go b/experimental/cachefile/rule_set_checked_test.go
+new file mode 100644
+index 000000000..90c260238
+--- /dev/null
++++ b/experimental/cachefile/rule_set_checked_test.go
+@@ -0,0 +1,30 @@
++package cachefile
++
++import (
++	"path/filepath"
++	"testing"
++	"time"
++
++	"github.com/sagernet/sing-box/adapter"
++
++	"github.com/stretchr/testify/require"
++)
++
++// The time a rule set was found up to date is kept apart from its content, and stays
++// across a reopen; a rule set without one has the zero time.
++func TestRuleSetChecked(t *testing.T) {
++	path := filepath.Join(t.TempDir(), "cache.db")
++	cacheFile := openTestCacheFile(t, path)
++	require.NoError(t, cacheFile.SaveRuleSet("lists", &adapter.SavedBinary{Content: []byte("list"), LastUpdated: time.Unix(100, 0)}))
++	checked := time.Unix(200, 5)
++	require.NoError(t, cacheFile.StoreRuleSetChecked("lists", checked))
++	require.True(t, cacheFile.LoadRuleSetChecked("other").IsZero())
++	require.NoError(t, cacheFile.Close())
++
++	cacheFile = openTestCacheFile(t, path)
++	defer cacheFile.Close()
++	require.True(t, checked.Equal(cacheFile.LoadRuleSetChecked("lists")))
++	saved := cacheFile.LoadRuleSet("lists")
++	require.Equal(t, "list", string(saved.Content))
++	require.True(t, time.Unix(100, 0).Equal(saved.LastUpdated), "the content is not written again")
++}
+diff --git a/route/router.go b/route/router.go
+index 0673ddef8..9e129c490 100644
+--- a/route/router.go
++++ b/route/router.go
+@@ -232,6 +232,15 @@ func (r *Router) RuleSet(tag string) (adapter.RuleSet, bool) {
+ 	return ruleSet, loaded
+ }
+ 
++// UpdateRuleSets updates the remote rule-sets now instead of at their update_interval and
++// returns what that came to. With no remote rule-set there is nothing to do.
++func (r *Router) UpdateRuleSets(ctx context.Context) (R.RuleSetUpdateSummary, error) {
++	if r.ruleSetUpdater == nil {
++		return R.RuleSetUpdateSummary{}, nil
++	}
++	return r.ruleSetUpdater.UpdateNow(ctx)
++}
++
+ func (r *Router) Rules() []adapter.Rule {
+ 	return r.rules
+ }
+diff --git a/route/rule/export_test.go b/route/rule/export_test.go
+new file mode 100644
+index 000000000..5507de93c
+--- /dev/null
++++ b/route/rule/export_test.go
+@@ -0,0 +1,8 @@
++package rule
++
++import "time"
++
++// SwapTimeoutsForTest exposes the fetch bounds to the tests outside the package.
++func SwapTimeoutsForTest(stall, startDeadline time.Duration) func() {
++	return swapTimeouts(stall, startDeadline)
++}
+diff --git a/route/rule/rule_set_hook.go b/route/rule/rule_set_hook.go
+new file mode 100644
+index 000000000..1ab470a4e
+--- /dev/null
++++ b/route/rule/rule_set_hook.go
+@@ -0,0 +1,65 @@
++package rule
++
++import (
++	"os"
++	"os/exec"
++	"strings"
++	"sync"
++	"time"
++
++	"github.com/sagernet/sing/common/logger"
++)
++
++// RuleSetRecoveredHookEnv names a command run once remote rule-sets that could
++// not be downloaded at start have been downloaded after all: the network path
++// to the lists works now, so whatever else depends on it (e.g. podkop's own
++// list download) can be retried. Unset: nothing happens.
++const RuleSetRecoveredHookEnv = "SING_BOX_RULESET_RECOVERED_HOOK"
++
++// Rule-sets recovering close together are reported by a single run.
++var ruleSetRecoveredHookDelay = 5 * time.Second
++
++var ruleSetRecovered struct {
++	access sync.Mutex
++	timer  *time.Timer
++	tags   []string
++}
++
++func notifyRuleSetRecovered(logger logger.ContextLogger, tag string) {
++	command := os.Getenv(RuleSetRecoveredHookEnv)
++	if command == "" {
++		return
++	}
++	ruleSetRecovered.access.Lock()
++	defer ruleSetRecovered.access.Unlock()
++	ruleSetRecovered.tags = append(ruleSetRecovered.tags, tag)
++	if ruleSetRecovered.timer != nil {
++		return
++	}
++	ruleSetRecovered.timer = time.AfterFunc(ruleSetRecoveredHookDelay, func() {
++		ruleSetRecovered.access.Lock()
++		tags := strings.Join(ruleSetRecovered.tags, ",")
++		ruleSetRecovered.tags = nil
++		ruleSetRecovered.timer = nil
++		ruleSetRecovered.access.Unlock()
++		cmd := exec.Command("/bin/sh", "-c", command)
++		cmd.Env = append(os.Environ(), "SING_BOX_RULESET_TAGS="+tags)
++		// The output of the command is not taken: the command may outlive this process
++		// (a list update that restarts the service), and a pipe whose reader is gone
++		// would end it at its next write. How it ended is in its exit status.
++		err := cmd.Start()
++		if err != nil {
++			logger.Error("run rule-set recovered hook: ", err)
++			return
++		}
++		logger.Info("rule-set recovered hook started for ", tags)
++		go func() {
++			err := cmd.Wait()
++			if err != nil {
++				logger.Error("rule-set recovered hook for ", tags, ": ", err)
++			} else {
++				logger.Debug("rule-set recovered hook for ", tags, " finished")
++			}
++		}()
++	})
++}
+diff --git a/route/rule/rule_set_hook_test.go b/route/rule/rule_set_hook_test.go
+new file mode 100644
+index 000000000..442d6f697
+--- /dev/null
++++ b/route/rule/rule_set_hook_test.go
+@@ -0,0 +1,74 @@
++package rule
++
++import (
++	"context"
++	"io"
++	"os"
++	"path/filepath"
++	"strings"
++	"testing"
++	"time"
++
++	"github.com/sagernet/sing-box/log"
++
++	"github.com/stretchr/testify/require"
++)
++
++// runRecoveredHook reports a recovered rule-set with command as the hook and returns the
++// log lines up to the one that tells how the command ended.
++func runRecoveredHook(t *testing.T, command string) (lines []string) {
++	t.Setenv(RuleSetRecoveredHookEnv, command)
++	savedDelay := ruleSetRecoveredHookDelay
++	ruleSetRecoveredHookDelay = 10 * time.Millisecond
++	defer func() { ruleSetRecoveredHookDelay = savedDelay }()
++
++	writer := &levelLog{}
++	factory := log.NewDefaultFactory(context.Background(), log.Formatter{BaseTime: time.Now()}, io.Discard, "", writer, false)
++	factory.SetLevel(log.LevelDebug)
++	require.NoError(t, factory.Start())
++	defer factory.Close()
++
++	notifyRuleSetRecovered(factory.NewLogger("rule-set"), "first")
++	notifyRuleSetRecovered(factory.NewLogger("rule-set"), "second")
++	require.Eventually(t, func() bool {
++		lines = append(lines, writer.take()...)
++		// the line of the start, then the line of the end
++		return len(lines) >= 2
++	}, 30*time.Second, 10*time.Millisecond, "the end of the hook is not logged")
++	return lines
++}
++
++// The command of the hook is run once for the rule-sets that recovered together, with their
++// tags in its environment; its end is logged, at debug level when it succeeded.
++func TestRuleSetRecoveredHookSuccess(t *testing.T) {
++	tagsPath := filepath.Join(t.TempDir(), "tags")
++	lines := runRecoveredHook(t, `echo "$SING_BOX_RULESET_TAGS" > `+tagsPath)
++	require.Len(t, lines, 2)
++	require.True(t, strings.HasPrefix(lines[0], "INFO "), lines[0])
++	require.Contains(t, lines[0], "first,second")
++	require.True(t, strings.HasPrefix(lines[1], "DEBUG "), lines[1])
++	require.Contains(t, lines[1], "finished")
++	tags, err := os.ReadFile(tagsPath)
++	require.NoError(t, err)
++	require.Equal(t, "first,second\n", string(tags))
++}
++
++// A command that fails is logged as an error with its exit status.
++func TestRuleSetRecoveredHookFailure(t *testing.T) {
++	lines := runRecoveredHook(t, `echo "cannot update" >&2; exit 3`)
++	require.Len(t, lines, 2)
++	require.True(t, strings.HasPrefix(lines[0], "INFO "), lines[0])
++	require.True(t, strings.HasPrefix(lines[1], "ERROR "), lines[1])
++	require.Contains(t, lines[1], "first,second")
++	require.Contains(t, lines[1], "exit status 3")
++}
++
++// A command that does not exist is found only by the shell: the status the shell exits
++// with is logged as an error.
++func TestRuleSetRecoveredHookCommandMissing(t *testing.T) {
++	lines := runRecoveredHook(t, filepath.Join(t.TempDir(), "no-such-hook"))
++	require.Len(t, lines, 2)
++	require.True(t, strings.HasPrefix(lines[0], "INFO "), lines[0])
++	require.True(t, strings.HasPrefix(lines[1], "ERROR "), lines[1])
++	require.Contains(t, lines[1], "exit status 127")
++}
+diff --git a/route/rule/rule_set_local.go b/route/rule/rule_set_local.go
+index 4314c3271..183e1d6cf 100644
+--- a/route/rule/rule_set_local.go
++++ b/route/rule/rule_set_local.go
+@@ -15,7 +15,6 @@ import (
+ 	"github.com/sagernet/sing/common"
+ 	E "github.com/sagernet/sing/common/exceptions"
+ 	F "github.com/sagernet/sing/common/format"
+-	"github.com/sagernet/sing/common/json"
+ 	"github.com/sagernet/sing/common/logger"
+ 	"github.com/sagernet/sing/common/x/list"
+ 	"github.com/sagernet/sing/service/filemanager"
+@@ -31,6 +30,7 @@ type LocalRuleSet struct {
+ 	tag        string
+ 	access     sync.RWMutex
+ 	rules      []adapter.HeadlessRule
++	closed     bool
+ 	metadata   adapter.RuleSetMetadata
+ 	fileFormat string
+ 	watcher    *fswatch.Watcher
+@@ -82,7 +82,22 @@ func (s *LocalRuleSet) Name() string {
+ }
+ 
+ func (s *LocalRuleSet) String() string {
+-	return strings.Join(F.MapToString(s.rules), " ")
++	return strings.Join(F.MapToString(s.currentRules()), " ")
++}
++
++// currentRules reads the rules under the lock that reloadRules swaps them under: the file
++// watcher reloads a local set while connections match it.
++func (s *LocalRuleSet) currentRules() []adapter.HeadlessRule {
++	s.access.RLock()
++	defer s.access.RUnlock()
++	return s.rules
++}
++
++// dropRules forgets the rules, under the same lock.
++func (s *LocalRuleSet) dropRules() {
++	s.access.Lock()
++	s.rules = nil
++	s.access.Unlock()
+ }
+ 
+ func (s *LocalRuleSet) StartContext(ctx context.Context, startContext *adapter.HTTPStartContext) error {
+@@ -103,7 +118,7 @@ func (s *LocalRuleSet) reloadFile(path string) error {
+ 		if err != nil {
+ 			return err
+ 		}
+-		ruleSet, err = json.UnmarshalExtended[option.PlainRuleSetCompat](content)
++		ruleSet, err = domainset.ReadSourceContext(s.ctx, content)
+ 		if err != nil {
+ 			return err
+ 		}
+@@ -152,6 +167,11 @@ func (s *LocalRuleSet) reloadRules(headlessRules []option.HeadlessRule) error {
+ 		return err
+ 	}
+ 	s.access.Lock()
++	if s.closed {
++		// a reload the watcher had already started when the set was closed
++		s.access.Unlock()
++		return nil
++	}
+ 	s.rules = rules
+ 	s.metadata = metadata
+ 	callbacks := s.callbacks.Array()
+@@ -186,7 +206,7 @@ func (s *LocalRuleSet) DecRef() {
+ 
+ func (s *LocalRuleSet) Cleanup() {
+ 	if s.refs.Load() == 0 {
+-		s.rules = nil
++		s.dropRules()
+ 	}
+ }
+ 
+@@ -203,14 +223,18 @@ func (s *LocalRuleSet) UnregisterCallback(element *list.Element[adapter.RuleSetU
+ }
+ 
+ func (s *LocalRuleSet) Close() error {
++	err := common.Close(common.PtrOrNil(s.watcher))
++	s.access.Lock()
++	s.closed = true
+ 	s.rules = nil
+-	return common.Close(common.PtrOrNil(s.watcher))
++	s.access.Unlock()
++	return err
+ }
+ 
+ func (s *LocalRuleSet) Match(metadata *adapter.InboundContext) bool {
+-	return matchAnyHeadlessRule(s.rules, metadata)
++	return matchAnyHeadlessRule(s.currentRules(), metadata)
+ }
+ 
+ func (s *LocalRuleSet) mergeableRule() *DefaultHeadlessRule {
+-	return mergeableRuleIn(s.rules)
++	return mergeableRuleIn(s.currentRules())
+ }
+diff --git a/route/rule/rule_set_local_race_test.go b/route/rule/rule_set_local_race_test.go
+new file mode 100644
+index 000000000..21f95d2b9
+--- /dev/null
++++ b/route/rule/rule_set_local_race_test.go
+@@ -0,0 +1,61 @@
++package rule
++
++import (
++	"context"
++	"sync"
++	"testing"
++
++	"github.com/sagernet/sing-box/adapter"
++	"github.com/sagernet/sing-box/option"
++	"github.com/sagernet/sing/common/json"
++	M "github.com/sagernet/sing/common/metadata"
++
++	"github.com/stretchr/testify/require"
++)
++
++// The file watcher swaps the rules of a local set while connections match it: a list
++// manager that rewrites the file (podkop does, once per thousand entries) reloads the set
++// under traffic. Run with -race.
++func TestLocalRuleSetMatchWhileReloading(t *testing.T) {
++	s := &LocalRuleSet{ctx: context.Background(), tag: "test"}
++	rules := func(content string) []option.HeadlessRule {
++		plain, err := json.UnmarshalExtended[option.PlainRuleSetCompat]([]byte(content))
++		require.NoError(t, err)
++		upgraded, err := plain.Upgrade()
++		require.NoError(t, err)
++		return upgraded.Rules
++	}
++	one := rules(`{"version":3,"rules":[{"domain_suffix":["example.com"]}]}`)
++	two := rules(`{"version":3,"rules":[{"domain_suffix":["example.com"]},{"domain_suffix":["example.org"]}]}`)
++	require.NoError(t, s.reloadRules(one))
++	var wg sync.WaitGroup
++	stop := make(chan struct{})
++	for range 4 {
++		wg.Add(1)
++		go func() {
++			defer wg.Done()
++			for {
++				select {
++				case <-stop:
++					return
++				default:
++				}
++				metadata := adapter.InboundContext{Domain: "www.example.com", Destination: M.ParseSocksaddr("1.2.3.4:443")}
++				s.Match(&metadata)
++				_ = s.String()
++				_ = s.mergeableRule()
++			}
++		}()
++	}
++	for i := range 50 {
++		if i%2 == 0 {
++			require.NoError(t, s.reloadRules(two))
++		} else {
++			require.NoError(t, s.reloadRules(one))
++		}
++		s.Cleanup()
++	}
++	require.NoError(t, s.Close())
++	close(stop)
++	wg.Wait()
++}
+diff --git a/route/rule/rule_set_remote.go b/route/rule/rule_set_remote.go
+index e673b74ae..fec3b987f 100644
+--- a/route/rule/rule_set_remote.go
++++ b/route/rule/rule_set_remote.go
+@@ -1,18 +1,27 @@
+ package rule
+ 
+ import (
++	"bufio"
+ 	"bytes"
+ 	"context"
+ 	"crypto/sha256"
++	"errors"
+ 	"io"
+ 	"net/http"
++	"os"
+ 	"path/filepath"
++	"strconv"
+ 	"strings"
+ 	"sync"
+ 	"sync/atomic"
+ 	"time"
++	"unicode"
++	"unicode/utf8"
+ 
+ 	"github.com/sagernet/sing-box/adapter"
++	"github.com/sagernet/sing-box/common/domainset"
++	"github.com/sagernet/sing-box/common/interrupt"
++	"github.com/sagernet/sing-box/common/ruletext"
+ 	"github.com/sagernet/sing-box/common/srs"
+ 	C "github.com/sagernet/sing-box/constant"
+ 	"github.com/sagernet/sing-box/experimental/deprecated"
+@@ -20,7 +29,6 @@ import (
+ 	"github.com/sagernet/sing/common"
+ 	E "github.com/sagernet/sing/common/exceptions"
+ 	F "github.com/sagernet/sing/common/format"
+-	"github.com/sagernet/sing/common/json"
+ 	"github.com/sagernet/sing/common/logger"
+ 	"github.com/sagernet/sing/common/x/list"
+ 	"github.com/sagernet/sing/service"
+@@ -49,10 +57,19 @@ type RemoteRuleSet struct {
+ 	metadata       adapter.RuleSetMetadata
+ 	lastUpdated    time.Time
+ 	lastEtag       string
++	startedEmpty   bool
++	contentUnknown bool
+ 	cacheFile      adapter.CacheFile
+ 	pauseManager   pause.Manager
+ 	callbacks      list.List[adapter.RuleSetUpdateCallback]
+ 	refs           atomic.Int32
++	// the updater's own: whether the last fetch loaded a list, and the failed updates
++	// since the last success (see fetchFailed)
++	fetchLoaded   bool
++	failures      int
++	failureLogged time.Time
++	// the size of the list it holds: big lists are updated one at a time (heavyRuleSetSize)
++	contentSize atomic.Int64
+ }
+ 
+ func NewRemoteRuleSet(ctx context.Context, logger logger.ContextLogger, tag string, options option.RuleSet) (*RemoteRuleSet, error) {
+@@ -89,7 +106,22 @@ func (s *RemoteRuleSet) Name() string {
+ }
+ 
+ func (s *RemoteRuleSet) String() string {
+-	return strings.Join(F.MapToString(s.rules), " ")
++	return strings.Join(F.MapToString(s.currentRules()), " ")
++}
++
++// currentRules reads the rules under the lock that loadBytes swaps them under: since the
++// start deadline (podkop-engine) a set routinely gets its rules while connections match it.
++func (s *RemoteRuleSet) currentRules() []adapter.HeadlessRule {
++	s.access.RLock()
++	defer s.access.RUnlock()
++	return s.rules
++}
++
++// dropRules forgets the rules, under the same lock.
++func (s *RemoteRuleSet) dropRules() {
++	s.access.Lock()
++	s.rules = nil
++	s.access.Unlock()
+ }
+ 
+ func (s *RemoteRuleSet) StartContext(ctx context.Context, startContext *adapter.HTTPStartContext) error {
+@@ -100,21 +132,9 @@ func (s *RemoteRuleSet) StartContext(ctx context.Context, startContext *adapter.
+ 	}
+ 	startContext.Register(transport)
+ 	s.httpClient = &http.Client{Transport: transport}
+-	if s.cacheFile != nil {
+-		savedSet := s.cacheFile.LoadRuleSet(s.tag)
+-		if savedSet != nil {
+-			if len(savedSet.URLHash) > 0 && !bytes.Equal(savedSet.URLHash, s.urlHash[:]) {
+-				s.logger.Info("cached rule-set was downloaded from another URL, will refetch")
+-			} else {
+-				err = s.loadBytes(savedSet.Content)
+-				if err != nil {
+-					s.logger.Warn(E.Cause(err, "restore cached rule-set, will refetch"))
+-				} else {
+-					s.lastUpdated = savedSet.LastUpdated
+-					s.lastEtag = savedSet.LastEtag
+-				}
+-			}
+-		}
++	fallbacks, err := s.resolveFallbacks()
++	if err != nil {
++		return E.Cause(err, "create rule-set http client")
+ 	}
+ 	var loadedFromInitialPath bool
+ 	if s.lastUpdated.IsZero() && s.initialPath != "" {
+@@ -130,17 +150,88 @@ func (s *RemoteRuleSet) StartContext(ctx context.Context, startContext *adapter.
+ 		}
+ 	}
+ 	if s.lastUpdated.IsZero() && !loadedFromInitialPath {
+-		err = s.fetch(ctx, true)
+-		if err != nil {
+-			return E.Cause(err, "initial rule-set: ", s.tag)
+-		}
++		s.startWithNothingLoaded(ctx)
+ 	}
+ 	return nil
+ }
+ 
++// loadCached takes the content of the cache file, when there is one, made from the URL of
++// the set, and when it was last downloaded or found up to date.
++func (s *RemoteRuleSet) loadCached() {
++	if s.cacheFile == nil {
++		return
++	}
++	savedSet := s.cacheFile.LoadRuleSet(s.tag)
++	if savedSet != nil {
++		if len(savedSet.URLHash) > 0 && !bytes.Equal(savedSet.URLHash, s.urlHash[:]) {
++			s.logger.Info("cached rule-set was downloaded from another URL, will refetch")
++		} else {
++			err := s.loadBytes(savedSet.Content)
++			if err != nil {
++				s.logger.Warn(E.Cause(err, "restore cached rule-set, will refetch"))
++			} else {
++				s.lastUpdated = savedSet.LastUpdated
++				s.lastEtag = savedSet.LastEtag
++				// found up to date since the content was saved
++				if checks, kept := s.cacheFile.(adapter.RuleSetCheckCache); kept {
++					if checked := checks.LoadRuleSetChecked(s.tag); checked.After(s.lastUpdated) {
++						s.lastUpdated = checked
++					}
++				}
++			}
++		}
++	}
++}
++
++// startWithNothingLoaded starts a set that has neither a cached nor an initial content.
++func (s *RemoteRuleSet) startWithNothingLoaded(ctx context.Context) {
++	if ruleSetStartEmpty() {
++		// nothing waits for the download: the inbounds start now, the updater fetches the
++		// set right after the start and the callbacks tell who needs to know
++		s.logger.Info("initial rule-set: ", s.tag, ", nothing cached: starting empty, downloading in the background")
++		s.startEmpty()
++		return
++	}
++	err := s.fetch(ctx, true)
++	if err != nil {
++		// Start with an empty rule-set instead of failing the whole start:
++		// RuleSetUpdater keeps retrying until the first download succeeds.
++		s.logger.Error("initial rule-set: ", s.tag, ", starting empty and retrying: ", logText(err))
++		s.startEmpty()
++	}
++}
++
++// ruleSetStartEmpty tells whether a remote rule-set with nothing cached and no initial
++// file starts empty at once instead of downloading its list during the start
++// (SING_BOX_RULE_SET_START_EMPTY set to anything). The start downloads the sets five at
++// a time, each up to the start deadline, and the inbounds wait for all of them: a box
++// that replaces another one (a program that applies a new configuration, a restart) is
++// deaf for that long. Starting empty, the box answers at once and the rules that use
++// the set match nothing until the download comes; what they would have matched in the
++// meantime goes by the other rules.
++var ruleSetStartEmpty = func() bool {
++	return os.Getenv("SING_BOX_RULE_SET_START_EMPTY") != ""
++}
++
++// startEmpty marks a set that starts without content; the updater fetches it at once
++// and then retries with a backoff until the first download succeeds.
++func (s *RemoteRuleSet) startEmpty() {
++	s.startedEmpty = true
++	// The DNS router decides its rule mode from the metadata of the referenced sets
++	// when it starts, right after this. Until the content is known, report it as
++	// mixed (domains and IP CIDRs): that is the only answer every later content is
++	// compatible with under the DNS router's update validator.
++	s.access.Lock()
++	s.contentUnknown = true
++	s.access.Unlock()
++}
++
+ func (s *RemoteRuleSet) Metadata() adapter.RuleSetMetadata {
+ 	s.access.RLock()
+ 	defer s.access.RUnlock()
++	if s.contentUnknown {
++		return adapter.RuleSetMetadata{ContainsIPCIDRRule: true, ContainsNonIPCIDRRule: true}
++	}
+ 	return s.metadata
+ }
+ 
+@@ -162,7 +253,7 @@ func (s *RemoteRuleSet) DecRef() {
+ 
+ func (s *RemoteRuleSet) Cleanup() {
+ 	if s.refs.Load() == 0 {
+-		s.rules = nil
++		s.dropRules()
+ 	}
+ }
+ 
+@@ -178,19 +269,33 @@ func (s *RemoteRuleSet) UnregisterCallback(element *list.Element[adapter.RuleSet
+ 	s.callbacks.Remove(element)
+ }
+ 
++// loadBytes takes a new content and runs the callbacks.
+ func (s *RemoteRuleSet) loadBytes(content []byte) error {
++	err := s.commitBytes(content)
++	if err != nil {
++		return err
++	}
++	s.notifyUpdated()
++	return nil
++}
++
++// commitBytes takes a new content without telling anyone: a download tells the callbacks
++// once the content is in the cache file too. A rule set closed meanwhile stops reading it:
++// the box that replaces this one reads its own, and two reads of a big list at once are
++// the most memory an apply takes.
++func (s *RemoteRuleSet) commitBytes(content []byte) error {
+ 	var (
+ 		ruleSet option.PlainRuleSetCompat
+ 		err     error
+ 	)
+ 	switch s.options.Format {
+ 	case C.RuleSetFormatSource:
+-		ruleSet, err = json.UnmarshalExtended[option.PlainRuleSetCompat](content)
++		ruleSet, err = domainset.ReadSourceContext(s.ctx, content)
+ 		if err != nil {
+ 			return err
+ 		}
+ 	case C.RuleSetFormatBinary:
+-		ruleSet, err = srs.Read(bytes.NewReader(content), false)
++		ruleSet, err = srs.ReadSets(contextReader{s.ctx, bytes.NewReader(content)})
+ 		if err != nil {
+ 			return err
+ 		}
+@@ -212,6 +317,9 @@ func (s *RemoteRuleSet) loadBytes(content []byte) error {
+ 	}
+ 	rules := make([]adapter.HeadlessRule, len(plainRuleSet.Rules))
+ 	for i, ruleOptions := range plainRuleSet.Rules {
++		if s.ctx.Err() != nil {
++			return s.ctx.Err()
++		}
+ 		rules[i], err = NewHeadlessRule(s.ctx, ruleOptions)
+ 		if err != nil {
+ 			return E.Cause(err, "parse rule_set.rules.[", i, "]")
+@@ -225,25 +333,224 @@ func (s *RemoteRuleSet) loadBytes(content []byte) error {
+ 	s.access.Lock()
+ 	s.metadata = metadata
+ 	s.rules = rules
+-	callbacks := s.callbacks.Array()
++	s.contentUnknown = false
+ 	s.access.Unlock()
++	s.contentSize.Store(int64(len(content)))
++	return nil
++}
++
++// contextReader ends with the error of ctx once it is done: a rule set of the binary
++// format closed while it is read stops at the next read.
++type contextReader struct {
++	ctx    context.Context
++	reader io.Reader
++}
++
++func (r contextReader) Read(p []byte) (int, error) {
++	if err := r.ctx.Err(); err != nil {
++		return 0, err
++	}
++	return r.reader.Read(p)
++}
++
++// notifyUpdated runs the callbacks of a new content. A download calls it once the content
++// is saved to the cache file as well: a callback may read the set from there.
++func (s *RemoteRuleSet) notifyUpdated() {
++	s.access.RLock()
++	callbacks := s.callbacks.Array()
++	s.access.RUnlock()
+ 	for _, callback := range callbacks {
+ 		callback(s)
+ 	}
+-	return nil
+ }
+ 
+-func (s *RemoteRuleSet) updateOnce() {
++// updateOnce updates the rule-set and reports whether it loaded a new list.
++func (s *RemoteRuleSet) updateOnce() bool {
++	s.fetchLoaded = false
+ 	err := s.fetch(s.ctx, false)
+ 	if err != nil {
+-		s.logger.Error("fetch rule-set ", s.tag, ": ", err)
+-	} else if s.refs.Load() == 0 {
+-		s.rules = nil
++		if s.ctx.Err() != nil {
++			// cut by the shutdown, not a failed update
++			return false
++		}
++		s.fetchFailed(err)
++		return false
++	}
++	if s.failures > 0 {
++		s.logger.Info("fetch rule-set ", s.tag, ": succeeded after ", s.failures, " failed attempts")
++		s.failures = 0
++	}
++	if s.refs.Load() == 0 {
++		s.dropRules()
++	}
++	return s.fetchLoaded
++}
++
++// ruleSetFailureLogInterval is how often a rule-set that keeps failing to update logs its
++// failures as an error.
++const ruleSetFailureLogInterval = 10 * time.Minute
++
++// fetchFailed logs a failed update: the first of a series as an error, then a count with
++// the last error once every ruleSetFailureLogInterval, the others at debug. A list that
++// never came at the start is retried every 30 s, which logged 2880 errors a day.
++func (s *RemoteRuleSet) fetchFailed(err error) {
++	s.failures++
++	switch {
++	case s.failures == 1:
++		s.failureLogged = time.Now()
++		s.logger.Error("fetch rule-set ", s.tag, ": ", logText(err))
++	case time.Since(s.failureLogged) >= ruleSetFailureLogInterval:
++		s.failureLogged = time.Now()
++		s.logger.Error("fetch rule-set ", s.tag, ": ", s.failures, " failed attempts, the last: ", logText(err))
++	default:
++		s.logger.Debug("fetch rule-set ", s.tag, ": ", logText(err))
++	}
++}
++
++// logText makes one line of the error of a fetch. It may carry what the server sent: the
++// status line of the answer, the text of a rule that does not parse. That text is cut,
++// and what is not printable in it is replaced.
++func logText(err error) string {
++	text := err.Error()
++	if len(text) > 512 {
++		text = strings.ToValidUTF8(text[:512], "") + "..."
++	}
++	return strings.Map(func(r rune) rune {
++		if r == utf8.RuneError || !unicode.IsPrint(r) {
++			return '?'
++		}
++		return r
++	}, text)
++}
++
++// A rule-set download must not hang the start (the inbounds listen only after every rule-set
++// has started) nor the background updates, yet a large list on a slow router link is normal
++// and must still load. So the start gets a short TOTAL deadline — on timeout it starts empty
++// and the updater fills it in later — while every fetch, start or update, is bounded by a
++// no-progress (stall) timer that fires only when the transfer delivers nothing for a while,
++// never cutting off a slow but steady download. ruleSetMaxSize caps the bytes read into
++// memory: a backstop against an endless stream, not a memory guarantee (parsing a list costs
++// several times its wire size, so a genuinely large list is a separate memory concern).
++var (
++	ruleSetStartDeadline = 30 * time.Second
++	ruleSetStallTimeout  = 30 * time.Second
++	ruleSetMaxSize       = 50 << 20
++)
++
++// stallResetReader resets a watchdog on every read that carries data, so a transfer making
++// steady progress is never cut off while one that goes silent is.
++type stallResetReader struct {
++	reader io.Reader
++	reset  func()
++}
++
++func (r *stallResetReader) Read(p []byte) (int, error) {
++	n, err := r.reader.Read(p)
++	if n > 0 {
++		r.reset()
+ 	}
++	return n, err
+ }
+ 
++// readRuleSetBody reads the body of a 200 response. What cannot be a rule-set is refused
++// before it is held in memory: a declared length above the cap, and for the binary format a
++// body that does not start with the magic bytes (an error or login page served with status
++// 200). The slice is sized by the declared length, so a normal download is read without
++// regrowing.
++func (s *RemoteRuleSet) readRuleSetBody(response *http.Response, body io.Reader) ([]byte, error) {
++	if response.ContentLength > int64(ruleSetMaxSize) {
++		return nil, E.New("rule-set larger than ", ruleSetMaxSize>>20, " MB")
++	}
++	reader := bufio.NewReader(io.LimitReader(body, int64(ruleSetMaxSize)+1))
++	if s.options.Format == C.RuleSetFormatBinary {
++		head, err := reader.Peek(len(srs.MagicBytes))
++		if err != nil && err != io.EOF {
++			return nil, err
++		}
++		if !bytes.Equal(head, srs.MagicBytes[:]) {
++			sample, _ := reader.Peek(ruleSetSampleSize)
++			return nil, E.New("not a binary rule-set: ", describeRuleSetBody(response, response.ContentLength, sample))
++		}
++	}
++	capacity := 512
++	if response.ContentLength > 0 {
++		// one byte more: the read that finds the end must not regrow the slice
++		capacity = int(response.ContentLength) + 1
++	}
++	content := make([]byte, 0, capacity)
++	for {
++		if len(content) == cap(content) {
++			content = append(content, 0)[:len(content)]
++		}
++		n, err := reader.Read(content[len(content):cap(content)])
++		content = content[:len(content)+n]
++		if err == io.EOF {
++			break
++		}
++		if err != nil {
++			return nil, err
++		}
++	}
++	if len(content) > ruleSetMaxSize {
++		return nil, E.New("rule-set larger than ", ruleSetMaxSize>>20, " MB")
++	}
++	return content, nil
++}
++
++// ruleSetSampleSize is how much of a body that is not a rule-set an error shows.
++const ruleSetSampleSize = 16
++
++// describeRuleSetBody tells a page from a damaged file in the log: the size, the declared
++// type and the first bytes. The header and the bytes come from the server, so they are
++// quoted and cut.
++func describeRuleSetBody(response *http.Response, size int64, sample []byte) string {
++	var description strings.Builder
++	if size >= 0 {
++		description.WriteString(strconv.FormatInt(size, 10))
++		description.WriteString(" bytes, ")
++	}
++	contentType := response.Header.Get("Content-Type")
++	if len(contentType) > 64 {
++		contentType = contentType[:64]
++	}
++	description.WriteString("Content-Type ")
++	description.WriteString(strconv.Quote(contentType))
++	if len(sample) > ruleSetSampleSize {
++		sample = sample[:ruleSetSampleSize]
++	}
++	description.WriteString(", starts with ")
++	description.WriteString(strconv.Quote(string(sample)))
++	return description.String()
++}
++
++// fetch downloads the list through the http client of the rule-set and, while that fails, through
++// each of its fallback clients in turn. Each way has the whole stall timeout of its own; the start
++// deadline bounds them all. The error is that of every way.
+ func (s *RemoteRuleSet) fetch(ctx context.Context, isStart bool) error {
+ 	s.logger.Debug("updating rule-set ", s.tag, " from URL: ", s.url)
++	// a group that switches members closes the connections it does not know as routed
++	// ones: a list half downloaded through it would wait for the next update_interval
++	ctx = interrupt.ContextWithIsExternalConnection(ctx, true)
++	ctx, cancel := context.WithCancel(ctx)
++	defer cancel()
++	// Fire the stall timer if the request produces nothing (no response headers, then no body
++	// bytes) for the stall timeout; each read that carries data resets it below.
++	var stalled atomic.Bool
++	stall := time.AfterFunc(ruleSetStallTimeout, func() {
++		stalled.Store(true)
++		cancel()
++	})
++	defer stall.Stop()
++	// name the bound that cut the fetch: the context errors alone read like a shutdown
++	describe := func(err error) error {
++		if stalled.Load() {
++			return E.Cause(err, "no data for ", ruleSetStallTimeout)
++		}
++		if isStart && errors.Is(err, context.DeadlineExceeded) {
++			return E.Cause(err, "start deadline of ", ruleSetStartDeadline, " reached")
++		}
++		return err
++	}
+ 	request, err := http.NewRequest("GET", s.url, nil)
+ 	if err != nil {
+ 		return err
+@@ -252,18 +559,32 @@ func (s *RemoteRuleSet) fetch(ctx context.Context, isStart bool) error {
+ 		request.Header.Set("If-None-Match", s.lastEtag)
+ 	}
+ 	if !isStart {
+-		defer s.httpClient.CloseIdleConnections()
++		defer client.CloseIdleConnections()
+ 	}
+-	response, err := s.httpClient.Do(request.WithContext(ctx))
++	response, err := client.Do(request.WithContext(ctx))
+ 	if err != nil {
+-		return err
++		if isStart {
++			// the start fetches share pooled connections: one that stalled would carry the
++			// next batch of rule-sets into the same wait
++			client.Transport.(adapter.HTTPTransport).Reset()
++		}
++		return describe(err)
+ 	}
+ 	defer response.Body.Close()
++	stall.Reset(ruleSetStallTimeout)
+ 	switch response.StatusCode {
+ 	case http.StatusOK:
+ 	case http.StatusNotModified:
+ 		s.lastUpdated = time.Now()
+-		if s.cacheFile != nil {
++		if checks, kept := s.cacheFile.(adapter.RuleSetCheckCache); kept {
++			// the time alone: a save of the set writes the whole list again, at every
++			// update_interval, to a cache file that may be on flash
++			err = checks.StoreRuleSetChecked(s.tag, s.lastUpdated)
++			if err != nil {
++				s.logger.Error("save rule-set updated time: ", err)
++				return nil
++			}
++		} else if s.cacheFile != nil {
+ 			savedRuleSet := s.cacheFile.LoadRuleSet(s.tag)
+ 			if savedRuleSet != nil {
+ 				savedRuleSet.LastUpdated = s.lastUpdated
+@@ -280,14 +601,27 @@ func (s *RemoteRuleSet) fetch(ctx context.Context, isStart bool) error {
+ 	default:
+ 		return E.New("unexpected status: ", response.Status)
+ 	}
+-	content, err := io.ReadAll(response.Body)
++	body := &stallResetReader{reader: response.Body, reset: func() { stall.Reset(ruleSetStallTimeout) }}
++	content, err := s.readRuleSetBody(response, body)
++	// the transfer is over: parsing a large list must not look like a stalled download
++	stall.Stop()
+ 	if err != nil {
+-		return err
++		return describe(err)
++	}
++	// a rule-set closed while its list came in does not parse it: the parse of a big list
++	// is the most an update costs, and a box that replaces this one fetches its own
++	if s.ctx.Err() != nil {
++		return s.ctx.Err()
+ 	}
+-	err = s.loadBytes(content)
++	err = s.commitBytes(content)
+ 	if err != nil {
+-		return err
++		return E.Cause(err, "read rule-set (", describeRuleSetBody(response, int64(len(content)), content), ")")
++	}
++	if s.ctx.Err() != nil {
++		// closed during the parse: its cache file and the callbacks are closed too
++		return s.ctx.Err()
+ 	}
++	s.fetchLoaded = true
+ 	eTagHeader := response.Header.Get("Etag")
+ 	if eTagHeader != "" {
+ 		s.lastEtag = eTagHeader
+@@ -305,6 +639,7 @@ func (s *RemoteRuleSet) fetch(ctx context.Context, isStart bool) error {
+ 		}
+ 	}
+ 	s.logger.Info("updated rule-set ", s.tag)
++	s.notifyUpdated()
+ 	return nil
+ }
+ 
+@@ -333,15 +668,15 @@ func (s *RemoteRuleSet) resolveTransport() (adapter.HTTPTransport, error) {
+ }
+ 
+ func (s *RemoteRuleSet) Close() error {
+-	s.rules = nil
++	s.dropRules()
+ 	s.cancel()
+ 	return nil
+ }
+ 
+ func (s *RemoteRuleSet) Match(metadata *adapter.InboundContext) bool {
+-	return matchAnyHeadlessRule(s.rules, metadata)
++	return matchAnyHeadlessRule(s.currentRules(), metadata)
+ }
+ 
+ func (s *RemoteRuleSet) mergeableRule() *DefaultHeadlessRule {
+-	return mergeableRuleIn(s.rules)
++	return mergeableRuleIn(s.currentRules())
+ }
+diff --git a/route/rule/rule_set_remote_body_test.go b/route/rule/rule_set_remote_body_test.go
+new file mode 100644
+index 000000000..e4a1ad995
+--- /dev/null
++++ b/route/rule/rule_set_remote_body_test.go
+@@ -0,0 +1,172 @@
++package rule
++
++import (
++	"context"
++	"io"
++	"net"
++	"net/http"
++	"net/http/httptest"
++	"strconv"
++	"strings"
++	"testing"
++	"time"
++	"unicode/utf8"
++
++	"github.com/sagernet/sing-box/common/interrupt"
++	C "github.com/sagernet/sing-box/constant"
++	"github.com/sagernet/sing-box/log"
++	E "github.com/sagernet/sing/common/exceptions"
++
++	"github.com/stretchr/testify/require"
++)
++
++func swapMaxSize(size int) func() {
++	old := ruleSetMaxSize
++	ruleSetMaxSize = size
++	return func() { ruleSetMaxSize = old }
++}
++
++const testSourceSet = `{"version":3,"rules":[{"domain_suffix":["example.com"]}]}`
++
++// A response that declares more than the cap is refused by its length: nothing of the body
++// is read into memory.
++func TestRemoteRuleSetDeclaredTooLarge(t *testing.T) {
++	defer swapMaxSize(1 << 20)()
++	// far more than the socket buffers of both ends take in: a server whose answer is
++	// not read cannot have written all of it
++	const declared = 64 << 20
++	var sent int
++	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		w.Header().Set("Content-Length", strconv.Itoa(declared))
++		w.WriteHeader(http.StatusOK)
++		chunk := []byte(strings.Repeat("A", 64<<10))
++		for sent < declared {
++			n, err := w.Write(chunk)
++			sent += n
++			if err != nil {
++				return
++			}
++		}
++	}))
++	set := newTestRuleSet(server.URL)
++	set.ctx = context.Background()
++	set.options.Format = C.RuleSetFormatSource
++	err := set.fetch(context.Background(), false)
++	require.Error(t, err)
++	require.Contains(t, err.Error(), "larger than 1 MB")
++	server.Close()
++	require.Less(t, sent, declared, "the client must stop the transfer instead of reading it")
++}
++
++// A page served with status 200 where a binary rule-set is expected is refused by its first
++// bytes, and the error says what came: size, type and the first bytes, quoted.
++func TestRemoteRuleSetNotBinary(t *testing.T) {
++	page := "<!DOCTYPE html>\n<html><body>blocked\x1b[31m</body></html>"
++	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		w.Header().Set("Content-Type", "text/html; charset=utf-8")
++		io.WriteString(w, page)
++	}))
++	defer server.Close()
++	set := newTestRuleSet(server.URL)
++	set.ctx = context.Background()
++	set.options.Format = C.RuleSetFormatBinary
++	err := set.fetch(context.Background(), false)
++	require.Error(t, err)
++	message := err.Error()
++	require.Contains(t, message, "not a binary rule-set")
++	require.Contains(t, message, strconv.Itoa(len(page))+" bytes")
++	require.Contains(t, message, `Content-Type "text/html; charset=utf-8"`)
++	require.Contains(t, message, `starts with "<!DOCTYPE html>\n"`)
++	require.NotContains(t, message, "\n", "the server's bytes must not break the log line")
++}
++
++// A source rule-set that does not parse reports the same description.
++func TestRemoteRuleSetSourceParseError(t *testing.T) {
++	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		w.Header().Set("Content-Type", "text/html")
++		io.WriteString(w, "<html>not a list</html>")
++	}))
++	defer server.Close()
++	set := newTestRuleSet(server.URL)
++	set.ctx = context.Background()
++	set.options.Format = C.RuleSetFormatSource
++	err := set.fetch(context.Background(), false)
++	require.Error(t, err)
++	require.Contains(t, err.Error(), `read rule-set (23 bytes, Content-Type "text/html", starts with "<html>not a list")`)
++}
++
++// A list loads with a declared length and without one (chunked).
++func TestRemoteRuleSetBodyLoads(t *testing.T) {
++	for _, chunked := range []bool{false, true} {
++		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++			if chunked {
++				w.(http.Flusher).Flush()
++			}
++			io.WriteString(w, testSourceSet)
++		}))
++		set := newTestRuleSet(server.URL)
++		set.ctx = context.Background()
++		set.options.Format = C.RuleSetFormatSource
++		require.NoError(t, set.fetch(context.Background(), false), "chunked=%v", chunked)
++		require.Len(t, set.currentRules(), 1)
++		server.Close()
++	}
++}
++
++// An update cut by the shutdown is not a failed update: no error line, no failure counted.
++func TestRemoteRuleSetUpdateCancelledByShutdown(t *testing.T) {
++	release := make(chan struct{})
++	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		w.(http.Flusher).Flush()
++		<-release
++	}))
++	defer server.Close()
++	defer close(release)
++
++	writer := &levelLog{}
++	factory := log.NewDefaultFactory(context.Background(), log.Formatter{BaseTime: time.Now()}, io.Discard, "", writer, false)
++	factory.SetLevel(log.LevelDebug)
++	require.NoError(t, factory.Start())
++	ctx, cancel := context.WithCancel(context.Background())
++	set := newTestRuleSet(server.URL)
++	set.ctx = ctx
++	set.logger = factory.NewLogger("rule-set")
++	set.options.Format = C.RuleSetFormatSource
++	time.AfterFunc(200*time.Millisecond, cancel)
++	require.False(t, set.updateOnce())
++	require.Zero(t, set.failures)
++	require.Zero(t, countPrefix(writer.take(), "ERROR"))
++}
++
++// The download is dialed as an external connection, so that a group switching members does
++// not close it together with its own connections.
++func TestRemoteRuleSetFetchIsExternalConnection(t *testing.T) {
++	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		io.WriteString(w, testSourceSet)
++	}))
++	defer server.Close()
++	var external bool
++	set := newTestRuleSet(server.URL)
++	set.ctx = context.Background()
++	set.options.Format = C.RuleSetFormatSource
++	set.httpClient = &http.Client{Transport: &http.Transport{
++		DialContext: func(ctx context.Context, network, address string) (net.Conn, error) {
++			external = interrupt.IsExternalConnectionFromContext(ctx)
++			return (&net.Dialer{}).DialContext(ctx, network, address)
++		},
++	}}
++	require.NoError(t, set.fetch(context.Background(), false))
++	require.True(t, external)
++}
++
++// What a server sends reaches the log as one printable line of a bounded length.
++func TestRuleSetLogText(t *testing.T) {
++	t.Parallel()
++	require.Equal(t, "unexpected status: 404 Not?Found??[31m", logText(E.New("unexpected status: 404 Not\nFound\r\x1b[31m")))
++	require.Equal(t, "rules[0]: unknown rule type: x?y", logText(E.New("rules[0]: unknown rule type: x\x00y")))
++	long := logText(E.New(strings.Repeat("\u044f", 600)))
++	require.LessOrEqual(t, len(long), 515)
++	require.True(t, strings.HasSuffix(long, "..."))
++	require.True(t, utf8.ValidString(long))
++	require.NotContains(t, long, "?")
++}
+diff --git a/route/rule/rule_set_remote_checked_test.go b/route/rule/rule_set_remote_checked_test.go
+new file mode 100644
+index 000000000..59807cef7
+--- /dev/null
++++ b/route/rule/rule_set_remote_checked_test.go
+@@ -0,0 +1,69 @@
++package rule
++
++import (
++	"context"
++	"net/http"
++	"net/http/httptest"
++	"testing"
++	"time"
++
++	"github.com/sagernet/sing-box/adapter"
++	C "github.com/sagernet/sing-box/constant"
++
++	"github.com/stretchr/testify/require"
++)
++
++// checkingCache is a cache file that keeps rule sets and the times they were found up to
++// date, and counts the saves of rule sets.
++type checkingCache struct {
++	savingCache
++	saves   int
++	checked map[string]time.Time
++}
++
++func (c *checkingCache) SaveRuleSet(tag string, set *adapter.SavedBinary) error {
++	c.saves++
++	return c.savingCache.SaveRuleSet(tag, set)
++}
++
++func (c *checkingCache) LoadRuleSetChecked(tag string) time.Time { return c.checked[tag] }
++
++func (c *checkingCache) StoreRuleSetChecked(tag string, at time.Time) error {
++	c.checked[tag] = at
++	return nil
++}
++
++// An answer "not modified" keeps the time alone: the list is not written again. The next
++// start takes the set as found up to date then.
++func TestRemoteRuleSetNotModifiedKeepsTheTimeOnly(t *testing.T) {
++	content := []byte(`{"version":3,"rules":[{"domain_suffix":["example.com"]}]}`)
++	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		if r.Header.Get("If-None-Match") == `"v1"` {
++			w.WriteHeader(http.StatusNotModified)
++			return
++		}
++		w.Header().Set("Etag", `"v1"`)
++		w.Write(content)
++	}))
++	defer server.Close()
++	cache := &checkingCache{savingCache: savingCache{saved: make(map[string]*adapter.SavedBinary)}, checked: make(map[string]time.Time)}
++	set := newTestRuleSet(server.URL)
++	set.options.Format = C.RuleSetFormatSource
++	set.cacheFile = cache
++	require.NoError(t, set.fetch(context.Background(), false))
++	require.Equal(t, 1, cache.saves)
++	downloaded := cache.saved["test"].LastUpdated
++
++	time.Sleep(10 * time.Millisecond)
++	require.NoError(t, set.fetch(context.Background(), false))
++	require.Equal(t, 1, cache.saves, "the list is not saved again")
++	require.True(t, cache.checked["test"].After(downloaded))
++
++	next := newTestRuleSet(server.URL)
++	next.options.Format = C.RuleSetFormatSource
++	next.cacheFile = cache
++	next.loadCached()
++	require.True(t, next.lastUpdated.Equal(cache.checked["test"]))
++	require.Equal(t, `"v1"`, next.lastEtag)
++	require.NotNil(t, next.rules)
++}
+diff --git a/route/rule/rule_set_remote_race_test.go b/route/rule/rule_set_remote_race_test.go
+new file mode 100644
+index 000000000..a424f91b2
+--- /dev/null
++++ b/route/rule/rule_set_remote_race_test.go
+@@ -0,0 +1,47 @@
++package rule
++
++import (
++	"context"
++	"sync"
++	"testing"
++
++	"github.com/sagernet/sing-box/adapter"
++	C "github.com/sagernet/sing-box/constant"
++	M "github.com/sagernet/sing/common/metadata"
++
++	"github.com/stretchr/testify/require"
++)
++
++// The rules are swapped while connections match them: since the start deadline a set that
++// started empty gets its rules half a minute after the start, under traffic. Run with -race.
++func TestRemoteRuleSetMatchWhileLoading(t *testing.T) {
++	s := newTestRuleSet("")
++	s.ctx = context.Background()
++	s.options.Format = C.RuleSetFormatSource
++	content := []byte(`{"version":3,"rules":[{"domain_suffix":["example.com"]}]}`)
++	require.NoError(t, s.loadBytes(content))
++	var wg sync.WaitGroup
++	stop := make(chan struct{})
++	for range 4 {
++		wg.Add(1)
++		go func() {
++			defer wg.Done()
++			for {
++				select {
++				case <-stop:
++					return
++				default:
++				}
++				metadata := adapter.InboundContext{Domain: "www.example.com", Destination: M.ParseSocksaddr("1.2.3.4:443")}
++				s.Match(&metadata)
++				_ = s.String()
++			}
++		}()
++	}
++	for range 50 {
++		require.NoError(t, s.loadBytes(content))
++	}
++	s.Cleanup()
++	close(stop)
++	wg.Wait()
++}
+diff --git a/route/rule/rule_set_remote_start_test.go b/route/rule/rule_set_remote_start_test.go
+new file mode 100644
+index 000000000..08fbe9cec
+--- /dev/null
++++ b/route/rule/rule_set_remote_start_test.go
+@@ -0,0 +1,100 @@
++package rule
++
++import (
++	"context"
++	"net/http"
++	"net/http/httptest"
++	"sync/atomic"
++	"testing"
++
++	"github.com/sagernet/sing-box/adapter"
++	C "github.com/sagernet/sing-box/constant"
++
++	"github.com/stretchr/testify/require"
++)
++
++// With SING_BOX_RULE_SET_START_EMPTY a set that has nothing cached does not download at
++// the start: it starts empty, its content unknown to the DNS router, and the updater
++// fetches it. Without it, the start downloads it.
++func TestRemoteRuleSetStartEmpty(t *testing.T) {
++	var requests atomic.Int32
++	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		requests.Add(1)
++		w.Write([]byte(`{"version":3,"rules":[{"domain_suffix":["example.com"]}]}`))
++	}))
++	defer server.Close()
++	defer func(saved func() bool) { ruleSetStartEmpty = saved }(ruleSetStartEmpty)
++
++	ruleSetStartEmpty = func() bool { return true }
++	set := newTestRuleSet(server.URL)
++	set.ctx = context.Background()
++	set.options.Format = C.RuleSetFormatSource
++	set.startWithNothingLoaded(context.Background())
++	require.Zero(t, requests.Load(), "the start downloaded the set")
++	require.True(t, set.startedEmpty)
++	require.True(t, set.Metadata().ContainsIPCIDRRule && set.Metadata().ContainsNonIPCIDRRule, "an empty set's content is unknown: mixed")
++
++	ruleSetStartEmpty = func() bool { return false }
++	set = newTestRuleSet(server.URL)
++	set.ctx = context.Background()
++	set.options.Format = C.RuleSetFormatSource
++	set.startWithNothingLoaded(context.Background())
++	require.Equal(t, int32(1), requests.Load())
++	require.False(t, set.startedEmpty)
++}
++
++// savingCache is a cache file that keeps the rule sets it is given; nothing else of it is used.
++type savingCache struct {
++	adapter.CacheFile
++	saved map[string]*adapter.SavedBinary
++}
++
++func (c *savingCache) LoadRuleSet(tag string) *adapter.SavedBinary { return c.saved[tag] }
++
++func (c *savingCache) SaveRuleSet(tag string, set *adapter.SavedBinary) error {
++	c.saved[tag] = set
++	return nil
++}
++
++// A callback is run after a download has saved the content to the cache file: a callback
++// that reads the set from there gets the new content, not the previous one.
++func TestRemoteRuleSetCallbackAfterCache(t *testing.T) {
++	content := []byte(`{"version":3,"rules":[{"ip_cidr":["192.0.2.0/24"]}]}`)
++	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		w.Write(content)
++	}))
++	defer server.Close()
++	set := newTestRuleSet(server.URL)
++	set.ctx = context.Background()
++	set.options.Format = C.RuleSetFormatSource
++	cache := &savingCache{saved: make(map[string]*adapter.SavedBinary)}
++	set.cacheFile = cache
++	var seen []byte
++	set.RegisterCallback(func(adapter.RuleSet) {
++		if saved := cache.LoadRuleSet("test"); saved != nil {
++			seen = saved.Content
++		}
++	})
++	require.NoError(t, set.fetch(context.Background(), false))
++	require.Equal(t, string(content), string(seen))
++}
++
++// A list written as text is downloaded and matched as any rule-set; a page served in its
++// place is refused, and the rules it had stay.
++func TestRemoteRuleSetText(t *testing.T) {
++	var body atomic.Value
++	body.Store("example.com\n10.0.0.0/8\n")
++	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		w.Write([]byte(body.Load().(string)))
++	}))
++	defer server.Close()
++	set := newTestRuleSet(server.URL)
++	set.ctx = context.Background()
++	set.options.Format = C.RuleSetFormatText
++	require.NoError(t, set.fetch(context.Background(), false))
++	require.True(t, set.Match(&adapter.InboundContext{Domain: "www.example.com"}))
++	require.False(t, set.Match(&adapter.InboundContext{Domain: "example.org"}))
++	body.Store("<html><body>\nAccess to this resource is blocked\n</body></html>\n")
++	require.Error(t, set.fetch(context.Background(), false))
++	require.True(t, set.Match(&adapter.InboundContext{Domain: "www.example.com"}))
++}
+diff --git a/route/rule/rule_set_remote_stop_test.go b/route/rule/rule_set_remote_stop_test.go
+new file mode 100644
+index 000000000..62c61a447
+--- /dev/null
++++ b/route/rule/rule_set_remote_stop_test.go
+@@ -0,0 +1,48 @@
++package rule
++
++import (
++	"bytes"
++	"context"
++	"fmt"
++	"strings"
++	"testing"
++
++	C "github.com/sagernet/sing-box/constant"
++	"github.com/sagernet/sing-box/option"
++
++	"github.com/stretchr/testify/require"
++)
++
++// A rule set closed while it reads a downloaded list stops reading it: the content it had
++// stays, and the error is the one of its context.
++func TestRemoteRuleSetClosedStopsReading(t *testing.T) {
++	var source, text strings.Builder
++	source.WriteString(`{"version":3,"rules":[{"domain_suffix":[`)
++	for index := range 50000 {
++		if index > 0 {
++			source.WriteByte(',')
++		}
++		fmt.Fprintf(&source, `"host%d.example.com"`, index)
++		fmt.Fprintf(&text, "host%d.example.com\n", index)
++	}
++	source.WriteString(`]}]}`)
++	for format, content := range map[string]string{C.RuleSetFormatSource: source.String(), C.RuleSetFormatText: text.String()} {
++		ctx, cancel := context.WithCancel(context.Background())
++		ruleSet := &RemoteRuleSet{ctx: ctx, tag: "big", options: option.RuleSet{Format: format}}
++		cancel()
++		require.ErrorIs(t, ruleSet.commitBytes([]byte(content)), context.Canceled, format)
++		require.Nil(t, ruleSet.rules, format)
++	}
++}
++
++func TestContextReader(t *testing.T) {
++	ctx, cancel := context.WithCancel(context.Background())
++	reader := contextReader{ctx, bytes.NewReader([]byte("abcdef"))}
++	buffer := make([]byte, 3)
++	count, err := reader.Read(buffer)
++	require.NoError(t, err)
++	require.Equal(t, 3, count)
++	cancel()
++	_, err = reader.Read(buffer)
++	require.ErrorIs(t, err, context.Canceled)
++}
+diff --git a/route/rule/rule_set_remote_timeout_test.go b/route/rule/rule_set_remote_timeout_test.go
+new file mode 100644
+index 000000000..a86ced09a
+--- /dev/null
++++ b/route/rule/rule_set_remote_timeout_test.go
+@@ -0,0 +1,107 @@
++package rule
++
++import (
++	"context"
++	"net/http"
++	"net/http/httptest"
++	"strings"
++	"testing"
++	"time"
++
++	"github.com/sagernet/sing-box/log"
++
++	"github.com/stretchr/testify/require"
++)
++
++func newTestRuleSet(url string) *RemoteRuleSet {
++	return &RemoteRuleSet{
++		ctx:        context.Background(),
++		logger:     log.NewNOPFactory().NewLogger("test"),
++		tag:        "test",
++		url:        url,
++		httpClient: &http.Client{},
++	}
++}
++
++// A download that sends its headers and then goes silent must not hold the caller: the stall
++// timer ends it. At start this is the difference between the LAN getting DNS after a bounded
++// wait and having no DNS until the TCP connection dies (about 16 minutes).
++func TestRemoteRuleSetFetchStalls(t *testing.T) {
++	release := make(chan struct{})
++	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		w.WriteHeader(http.StatusOK)
++		w.(http.Flusher).Flush()
++		<-release // headers sent, then no body bytes ever
++	}))
++	defer server.Close()
++	defer close(release)
++
++	defer swapTimeouts(50*time.Millisecond, time.Hour)()
++	set := newTestRuleSet(server.URL)
++
++	done := make(chan error, 1)
++	start := time.Now()
++	go func() { done <- set.fetch(context.Background(), false) }()
++	select {
++	case err := <-done:
++		require.Error(t, err)
++		require.Less(t, time.Since(start), 2*time.Second)
++	case <-time.After(5 * time.Second):
++		t.Fatal("fetch did not return after the stall timeout")
++	}
++}
++
++// The point of the stall timer over a total deadline: a slow but STEADY download, whose total
++// time far exceeds the stall timeout, must still succeed. A big list on a slow router link is
++// exactly this case. The old total-deadline algorithm failed it.
++func TestRemoteRuleSetFetchSlowButSteady(t *testing.T) {
++	// 20 chunks, 40ms apart => ~0.8s total, each gap well under the 200ms stall timeout.
++	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		w.Header().Set("Content-Type", "application/octet-stream")
++		flusher := w.(http.Flusher)
++		for i := 0; i < 20; i++ {
++			w.Write([]byte(strings.Repeat("x", 256)))
++			flusher.Flush()
++			time.Sleep(40 * time.Millisecond)
++		}
++	}))
++	defer server.Close()
++
++	defer swapTimeouts(200*time.Millisecond, 200*time.Millisecond)()
++	set := newTestRuleSet(server.URL)
++
++	// loadBytes will reject the body as a non-rule-set, but the fetch must get PAST the read
++	// (reach parsing) rather than time out mid-transfer.
++	err := set.fetch(context.Background(), false)
++	require.Error(t, err)
++	require.NotContains(t, err.Error(), "context") // not a deadline/stall cancellation
++}
++
++// A body larger than any real rule-set is refused instead of being read into memory without
++// bound.
++func TestRemoteRuleSetFetchSizeCap(t *testing.T) {
++	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		w.Header().Set("Content-Type", "application/octet-stream")
++		w.WriteHeader(http.StatusOK)
++		flusher := w.(http.Flusher)
++		chunk := strings.Repeat("A", 1<<20)
++		for range (ruleSetMaxSize >> 20) + 2 {
++			if _, err := w.Write([]byte(chunk)); err != nil {
++				return
++			}
++			flusher.Flush()
++		}
++	}))
++	defer server.Close()
++
++	set := newTestRuleSet(server.URL)
++	err := set.fetch(context.Background(), false)
++	require.Error(t, err)
++	require.Contains(t, err.Error(), "larger than")
++}
++
++func swapTimeouts(stall, startDeadline time.Duration) func() {
++	oldStall, oldStart := ruleSetStallTimeout, ruleSetStartDeadline
++	ruleSetStallTimeout, ruleSetStartDeadline = stall, startDeadline
++	return func() { ruleSetStallTimeout, ruleSetStartDeadline = oldStall, oldStart }
++}
+diff --git a/route/rule/rule_set_start_empty_test.go b/route/rule/rule_set_start_empty_test.go
+new file mode 100644
+index 000000000..d032fb877
+--- /dev/null
++++ b/route/rule/rule_set_start_empty_test.go
+@@ -0,0 +1,139 @@
++package rule_test
++
++import (
++	"context"
++	"net/http"
++	"net/http/httptest"
++	"strings"
++	"sync"
++	"sync/atomic"
++	"testing"
++	"time"
++
++	box "github.com/sagernet/sing-box"
++	"github.com/sagernet/sing-box/experimental/deprecated"
++	"github.com/sagernet/sing-box/include"
++	"github.com/sagernet/sing-box/log"
++	"github.com/sagernet/sing-box/option"
++	"github.com/sagernet/sing-box/route/rule"
++	"github.com/sagernet/sing/service"
++
++	"github.com/stretchr/testify/require"
++)
++
++// A remote rule-set whose first download is slower than the start deadline starts empty
++// (podkop-engine). The DNS router decides its rule mode from the sets' metadata right after
++// the sets start, and an empty set would make it fix the non-legacy mode; the content that
++// arrives later, with ip_cidr entries, would then be rejected by its validator for ever,
++// and re-downloaded every few seconds. Until its content is known the set reports it as
++// mixed, the one answer every later content is compatible with.
++
++const mixedList = `{"version":3,"rules":[{"domain_suffix":["example.com"]},{"ip_cidr":["10.0.0.0/8"]}]}`
++
++type memLog struct {
++	mu    sync.Mutex
++	lines []string
++}
++
++func (l *memLog) WriteMessage(level log.Level, message string) {
++	l.mu.Lock()
++	l.lines = append(l.lines, message)
++	l.mu.Unlock()
++}
++
++func (l *memLog) count(sub string) int {
++	l.mu.Lock()
++	defer l.mu.Unlock()
++	n := 0
++	for _, line := range l.lines {
++		if strings.Contains(line, sub) {
++			n++
++		}
++	}
++	return n
++}
++
++func (l *memLog) dump() string {
++	l.mu.Lock()
++	defer l.mu.Unlock()
++	return strings.Join(l.lines, "\n")
++}
++
++// slowFirstListServer serves the list; the first request streams it over about a second,
++// slow but steady, every later one answers at once.
++func slowFirstListServer(t *testing.T, content string) (*httptest.Server, *atomic.Int32) {
++	var requests atomic.Int32
++	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		w.Header().Set("Content-Type", "application/json")
++		if requests.Add(1) == 1 {
++			flusher := w.(http.Flusher)
++			step := (len(content) + 9) / 10
++			for i := 0; i < len(content); i += step {
++				if _, err := w.Write([]byte(content[i:min(i+step, len(content))])); err != nil {
++					return
++				}
++				flusher.Flush()
++				time.Sleep(100 * time.Millisecond)
++			}
++			return
++		}
++		w.Write([]byte(content))
++	}))
++	t.Cleanup(server.Close)
++	return server, &requests
++}
++
++func startEmptyConfig(url string, dnsRules string) string {
++	return `{
++  "log": {"level": "debug"},
++  "dns": {
++    "servers": [{"type": "udp", "tag": "dns-x", "server": "127.0.0.1", "server_port": 1}],
++    "rules": [` + dnsRules + `]
++  },
++  "route": {
++    "rule_set": [{"type": "remote", "tag": "list", "format": "source", "url": "` + url + `", "update_interval": "1h"}],
++    "rules": [{"rule_set": ["list"], "outbound": "direct"}],
++    "final": "direct"
++  },
++  "outbounds": [{"type": "direct", "tag": "direct"}]
++}`
++}
++
++func startBox(t *testing.T, cfg string, logs *memLog) *box.Box {
++	t.Chdir(t.TempDir()) // whatever the box writes (its cache file) stays out of the package
++	ctx := include.Context(service.ContextWith[deprecated.Manager](context.Background(), deprecated.NewStderrManager(log.StdLogger())))
++	var options option.Options
++	require.NoError(t, options.UnmarshalJSONContext(ctx, []byte(cfg)))
++	instance, err := box.New(box.Options{Context: ctx, Options: options, PlatformLogWriter: logs})
++	require.NoError(t, err)
++	require.NoError(t, instance.Start(), "the box must start, the set empty")
++	t.Cleanup(func() { instance.Close() })
++	return instance
++}
++
++func TestRuleSetStartedEmptyLoadsLater(t *testing.T) {
++	for _, testCase := range []struct {
++		name     string
++		dnsRules string
++	}{
++		// a DNS rule without any legacy-disabling field: the mode is decided by the sets
++		{"plain DNS rule", `{"rule_set": ["list"], "action": "route", "server": "dns-x"}`},
++		// podkop's generated config: a query_type rule first pins the non-legacy mode
++		{"podkop's rules", `{"action": "reject", "query_type": "HTTPS"}, {"rule_set": ["list"], "action": "route", "server": "dns-x"}`},
++	} {
++		t.Run(testCase.name, func(t *testing.T) {
++			defer rule.SwapTimeoutsForTest(10*time.Second, 300*time.Millisecond)()
++			server, requests := slowFirstListServer(t, mixedList)
++			logs := &memLog{}
++			instance := startBox(t, startEmptyConfig(server.URL, testCase.dnsRules), logs)
++			require.Equal(t, 1, logs.count("starting empty and retrying"), logs.dump())
++
++			require.Eventually(t, func() bool { return logs.count("updated rule-set list") > 0 }, 10*time.Second, 100*time.Millisecond, "the list did not load afterwards:\n%s", logs.dump())
++			ruleSet, loaded := instance.Router().RuleSet("list")
++			require.True(t, loaded)
++			require.True(t, ruleSet.Metadata().ContainsIPCIDRRule)
++			require.Equal(t, 0, logs.count("Legacy Address Filter Fields"), logs.dump())
++			require.Equal(t, int32(2), requests.Load(), "the start fetch and one load")
++		})
++	}
++}
+diff --git a/route/rule/rule_set_update_log_test.go b/route/rule/rule_set_update_log_test.go
+new file mode 100644
+index 000000000..adafc6d13
+--- /dev/null
++++ b/route/rule/rule_set_update_log_test.go
+@@ -0,0 +1,101 @@
++package rule
++
++import (
++	"context"
++	"io"
++	"net/http"
++	"net/http/httptest"
++	"strings"
++	"sync"
++	"sync/atomic"
++	"testing"
++	"time"
++
++	C "github.com/sagernet/sing-box/constant"
++	"github.com/sagernet/sing-box/log"
++
++	"github.com/stretchr/testify/require"
++)
++
++type levelLog struct {
++	access sync.Mutex
++	lines  []string
++}
++
++func (l *levelLog) WriteMessage(level log.Level, message string) {
++	l.access.Lock()
++	defer l.access.Unlock()
++	name := map[log.Level]string{log.LevelError: "ERROR", log.LevelInfo: "INFO", log.LevelDebug: "DEBUG"}[level]
++	l.lines = append(l.lines, name+" "+message)
++}
++
++func (l *levelLog) take() []string {
++	l.access.Lock()
++	defer l.access.Unlock()
++	lines := l.lines
++	l.lines = nil
++	return lines
++}
++
++// A rule-set that keeps failing to update logs the first failure as an error, the next ones
++// at debug and, every ruleSetFailureLogInterval, a count; the success after them says how
++// many there were. Only an update that loaded a list reports it (the updater collects
++// garbage after one), a failed or not-modified one does not.
++func TestRemoteRuleSetUpdateFailuresLogged(t *testing.T) {
++	var mode atomic.Value
++	mode.Store("fail")
++	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		switch mode.Load().(string) {
++		case "fail":
++			w.WriteHeader(http.StatusBadGateway)
++		case "list":
++			w.Header().Set("Etag", `"v1"`)
++			io.WriteString(w, `{"version":3,"rules":[{"domain_suffix":["example.com"]}]}`)
++		case "same":
++			w.WriteHeader(http.StatusNotModified)
++		}
++	}))
++	defer server.Close()
++
++	writer := &levelLog{}
++	factory := log.NewDefaultFactory(context.Background(), log.Formatter{BaseTime: time.Now()}, io.Discard, "", writer, false)
++	factory.SetLevel(log.LevelDebug)
++	require.NoError(t, factory.Start())
++	set := newTestRuleSet(server.URL)
++	set.ctx = context.Background()
++	set.logger = factory.NewLogger("rule-set")
++	set.options.Format = C.RuleSetFormatSource
++
++	for range 3 {
++		require.False(t, set.updateOnce())
++	}
++	lines := writer.take()
++	require.Len(t, lines, 6) // each attempt also logs "updating rule-set" at debug
++	require.Equal(t, 1, countPrefix(lines, "ERROR"))
++	require.Equal(t, 5, countPrefix(lines, "DEBUG"))
++
++	set.failureLogged = time.Now().Add(-ruleSetFailureLogInterval)
++	require.False(t, set.updateOnce())
++	lines = writer.take()
++	require.Equal(t, 1, countPrefix(lines, "ERROR"))
++	require.Contains(t, strings.Join(lines, "\n"), "4 failed attempts")
++
++	mode.Store("list")
++	require.True(t, set.updateOnce())
++	require.Contains(t, strings.Join(writer.take(), "\n"), "succeeded after 4 failed attempts")
++	require.Zero(t, set.failures)
++
++	mode.Store("same")
++	require.False(t, set.updateOnce())
++	require.Zero(t, countPrefix(writer.take(), "ERROR"))
++}
++
++func countPrefix(lines []string, prefix string) int {
++	var count int
++	for _, line := range lines {
++		if strings.HasPrefix(line, prefix) {
++			count++
++		}
++	}
++	return count
++}
+diff --git a/route/rule/rule_set_updater.go b/route/rule/rule_set_updater.go
+index 66148c620..e6b3b3144 100644
+--- a/route/rule/rule_set_updater.go
++++ b/route/rule/rule_set_updater.go
+@@ -1,8 +1,11 @@
+ package rule
+ 
+ import (
++	"cmp"
+ 	"context"
+ 	"runtime"
++	"slices"
++	"sync"
+ 	"time"
+ 
+ 	"github.com/sagernet/sing-box/adapter"
+@@ -12,6 +15,18 @@ type RuleSetUpdater struct {
+ 	ctx      context.Context
+ 	cancel   context.CancelFunc
+ 	ruleSets []*RemoteRuleSet
++	// requests are updates asked for now, each with where to answer
++	requests chan chan RuleSetUpdateSummary
++}
++
++// RuleSetUpdateSummary is what an update of the remote rule-sets came to.
++type RuleSetUpdateSummary struct {
++	// Total is the number of remote rule-sets.
++	Total int
++	// Loaded is how many of them got a new list.
++	Loaded int
++	// Failed is how many could not be downloaded or read.
++	Failed int
+ }
+ 
+ func NewRuleSetUpdater(ctx context.Context, ruleSets []adapter.RuleSet) *RuleSetUpdater {
+@@ -30,6 +45,7 @@ func NewRuleSetUpdater(ctx context.Context, ruleSets []adapter.RuleSet) *RuleSet
+ 		ctx:      ctx,
+ 		cancel:   cancel,
+ 		ruleSets: remoteRuleSets,
++		requests: make(chan chan RuleSetUpdateSummary),
+ 	}
+ }
+ 
+@@ -42,36 +58,154 @@ func (u *RuleSetUpdater) Close() error {
+ 	return nil
+ }
+ 
++// ruleSetUpdateConcurrency is how many rule-sets an update downloads at once, as many as
++// the start does (route.Router): rule-sets that start empty, or that are due together,
++// are not fetched one after another.
++const ruleSetUpdateConcurrency = 5
++
++// UpdateNow updates every remote rule-set at once, whatever its update_interval, and
++// returns what that came to. The update runs where the scheduled ones run, up to
++// ruleSetUpdateConcurrency rule-sets at a time; the next scheduled update of each is
++// counted from now.
++func (u *RuleSetUpdater) UpdateNow(ctx context.Context) (RuleSetUpdateSummary, error) {
++	reply := make(chan RuleSetUpdateSummary, 1)
++	select {
++	case u.requests <- reply:
++	case <-u.ctx.Done():
++		return RuleSetUpdateSummary{}, u.ctx.Err()
++	case <-ctx.Done():
++		return RuleSetUpdateSummary{}, ctx.Err()
++	}
++	select {
++	case summary := <-reply:
++		return summary, nil
++	case <-u.ctx.Done():
++		return RuleSetUpdateSummary{}, u.ctx.Err()
++	case <-ctx.Done():
++		return RuleSetUpdateSummary{}, ctx.Err()
++	}
++}
++
+ func (u *RuleSetUpdater) loopUpdate() {
+ 	nextUpdates := make([]time.Time, len(u.ruleSets))
++	retryDelays := make([]time.Duration, len(u.ruleSets))
+ 	for i, ruleSet := range u.ruleSets {
+ 		nextUpdates[i] = ruleSet.lastUpdated.Add(ruleSet.updateInterval)
+ 	}
+ 	timer := time.NewTimer(0)
+ 	defer timer.Stop()
+ 	for {
++		// an update asked for now takes every rule-set, due or not
++		var reply chan RuleSetUpdateSummary
+ 		select {
+ 		case <-u.ctx.Done():
+ 			return
+ 		case <-timer.C:
++		case reply = <-u.requests:
+ 		}
+ 		now := time.Now()
+-		var updated bool
+-		for i, ruleSet := range u.ruleSets {
+-			if now.Before(nextUpdates[i]) {
++		var loaded bool
++		summary := RuleSetUpdateSummary{Total: len(u.ruleSets)}
++		var due []int
++		for i := range u.ruleSets {
++			if reply == nil && now.Before(nextUpdates[i]) {
+ 				continue
+ 			}
+-			ruleSet.updateOnce()
++			due = append(due, i)
++		}
++		results := u.updateAll(due)
++		if u.ctx.Err() != nil {
++			// closed during the update: nothing recovered is told of a closed box
++			return
++		}
++		for _, i := range due {
++			ruleSet := u.ruleSets[i]
++			if results[i].loaded {
++				loaded = true
++				summary.Loaded++
++			} else if results[i].failed {
++				summary.Failed++
++			}
+ 			nextUpdates[i] = now.Add(ruleSet.updateInterval)
+-			updated = true
++			if ruleSet.startedEmpty {
++				if ruleSet.lastUpdated.IsZero() {
++					// Never downloaded (initial fetch failed): retry with backoff
++					// instead of waiting a whole update_interval.
++					retryDelays[i] = min(max(retryDelays[i]*2, 5*time.Second), 30*time.Second)
++					nextUpdates[i] = now.Add(retryDelays[i])
++				} else {
++					ruleSet.startedEmpty = false
++					notifyRuleSetRecovered(ruleSet.logger, ruleSet.tag)
++				}
++			}
+ 		}
+-		if updated {
++		if reply != nil {
++			reply <- summary
++		}
++		// the old list is garbage once a new one is loaded; a failed or not-modified
++		// update leaves nothing to collect
++		if loaded {
+ 			runtime.GC()
+ 		}
+ 		timer.Reset(waitUntilNext(nextUpdates))
+ 	}
+ }
+ 
++// updateResult is what one update of a rule-set came to.
++type updateResult struct {
++	loaded bool
++	failed bool
++}
++
++// heavyRuleSetSize is the size of a list from which its update waits for the update of
++// any other such list (podkop-engine): the download holds the list, the parse builds the
++// next one beside the one in use, and the save writes it; big lists updated together took
++// all of that at once. Small lists, and those that hold nothing yet, go together as before.
++const heavyRuleSetSize = 1 << 20
++
++// updateAll updates the rule-sets of the indexes, ruleSetUpdateConcurrency at a time and
++// the big ones one at a time, and returns what each came to, by index. A rule-set is
++// touched by one goroutine only.
++func (u *RuleSetUpdater) updateAll(indexes []int) []updateResult {
++	results := make([]updateResult, len(u.ruleSets))
++	slots := make(chan struct{}, ruleSetUpdateConcurrency)
++	heavy := make(chan struct{}, 1)
++	isHeavy := func(i int) bool {
++		return u.ruleSets[i].contentSize.Load() >= heavyRuleSetSize
++	}
++	// the small ones first: big ones waiting for each other hold slots meanwhile
++	indexes = slices.Clone(indexes)
++	slices.SortStableFunc(indexes, func(left int, right int) int {
++		return cmp.Compare(boolOrder(isHeavy(left)), boolOrder(isHeavy(right)))
++	})
++	var group sync.WaitGroup
++	for _, i := range indexes {
++		group.Add(1)
++		slots <- struct{}{}
++		go func(i int) {
++			defer group.Done()
++			defer func() { <-slots }()
++			if isHeavy(i) {
++				heavy <- struct{}{}
++				defer func() { <-heavy }()
++			}
++			ruleSet := u.ruleSets[i]
++			failures := ruleSet.failures
++			results[i].loaded = ruleSet.updateOnce()
++			results[i].failed = !results[i].loaded && ruleSet.failures > failures
++		}(i)
++	}
++	group.Wait()
++	return results
++}
++
++func boolOrder(value bool) int {
++	if value {
++		return 1
++	}
++	return 0
++}
++
+ func waitUntilNext(nextUpdates []time.Time) time.Duration {
+ 	next := nextUpdates[0]
+ 	for _, nextUpdate := range nextUpdates[1:] {
+diff --git a/route/rule/rule_set_updater_test.go b/route/rule/rule_set_updater_test.go
+new file mode 100644
+index 000000000..0772e140f
+--- /dev/null
++++ b/route/rule/rule_set_updater_test.go
+@@ -0,0 +1,161 @@
++package rule
++
++import (
++	"context"
++	"io"
++	"net/http"
++	"net/http/httptest"
++	"sync/atomic"
++	"testing"
++	"time"
++
++	"github.com/sagernet/sing-box/adapter"
++	C "github.com/sagernet/sing-box/constant"
++
++	"github.com/stretchr/testify/require"
++)
++
++// An update asked for now takes every remote rule-set, due or not, and tells how many
++// got a new list and how many failed; a scheduled update is not made earlier by it.
++func TestRuleSetUpdaterUpdateNow(t *testing.T) {
++	var served atomic.Int32
++	good := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		served.Add(1)
++		io.WriteString(w, testSourceSet)
++	}))
++	defer good.Close()
++	bad := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		http.Error(w, "gone", http.StatusNotFound)
++	}))
++	defer bad.Close()
++
++	ctx, cancel := context.WithCancel(context.Background())
++	defer cancel()
++	sets := make([]adapter.RuleSet, 2)
++	for index, url := range []string{good.URL, bad.URL} {
++		set := newTestRuleSet(url)
++		set.ctx = ctx
++		set.options.Format = C.RuleSetFormatSource
++		// downloaded a moment ago: not due for an hour
++		set.updateInterval = time.Hour
++		set.lastUpdated = time.Now()
++		sets[index] = set
++	}
++	updater := NewRuleSetUpdater(ctx, sets)
++	updater.Start()
++
++	time.Sleep(100 * time.Millisecond)
++	require.Zero(t, served.Load(), "a rule-set that is not due was updated by the schedule")
++	for round := int32(1); round <= 2; round++ {
++		summary, err := updater.UpdateNow(ctx)
++		require.NoError(t, err)
++		require.Equal(t, RuleSetUpdateSummary{Total: 2, Loaded: 1, Failed: 1}, summary)
++		require.Equal(t, round, served.Load())
++	}
++	time.Sleep(100 * time.Millisecond)
++	require.EqualValues(t, 2, served.Load(), "the update asked for was followed by one more")
++
++	// one that waits is let go when the caller gives up, and when the updater is closed
++	short, stop := context.WithTimeout(context.Background(), 50*time.Millisecond)
++	defer stop()
++	require.NoError(t, updater.Close())
++	_, err := updater.UpdateNow(short)
++	require.Error(t, err)
++}
++
++// With no remote rule-set there is no updater, and nothing to wait for.
++func TestRuleSetUpdaterWithoutRemoteRuleSets(t *testing.T) {
++	require.Nil(t, NewRuleSetUpdater(context.Background(), nil))
++}
++
++// Rule-sets due together are downloaded together, ruleSetUpdateConcurrency at a time: six
++// sets whose server answers after 300 ms take two rounds, not six.
++func TestRuleSetUpdaterConcurrent(t *testing.T) {
++	var inFlight, most atomic.Int32
++	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		now := inFlight.Add(1)
++		defer inFlight.Add(-1)
++		for {
++			seen := most.Load()
++			if now <= seen || most.CompareAndSwap(seen, now) {
++				break
++			}
++		}
++		time.Sleep(300 * time.Millisecond)
++		io.WriteString(w, testSourceSet)
++	}))
++	defer server.Close()
++	ctx, cancel := context.WithCancel(context.Background())
++	defer cancel()
++	sets := make([]adapter.RuleSet, 6)
++	for index := range sets {
++		set := newTestRuleSet(server.URL)
++		set.ctx = ctx
++		set.options.Format = C.RuleSetFormatSource
++		set.updateInterval = time.Hour
++		set.lastUpdated = time.Now()
++		sets[index] = set
++	}
++	updater := NewRuleSetUpdater(ctx, sets)
++	updater.Start()
++	defer updater.Close()
++	started := time.Now()
++	summary, err := updater.UpdateNow(ctx)
++	require.NoError(t, err)
++	require.Equal(t, RuleSetUpdateSummary{Total: 6, Loaded: 6}, summary)
++	require.EqualValues(t, ruleSetUpdateConcurrency, most.Load())
++	require.Less(t, time.Since(started), 1500*time.Millisecond, "the sets were downloaded one by one")
++}
++
++// Big lists are updated one at a time, small ones together as before: two sets that hold a
++// big list each never download at once, while the three small ones do.
++func TestRuleSetUpdaterBigOneAtATime(t *testing.T) {
++	var bigInFlight, bigMost, smallInFlight, smallMost atomic.Int32
++	raise := func(most *atomic.Int32, now int32) {
++		for {
++			seen := most.Load()
++			if now <= seen || most.CompareAndSwap(seen, now) {
++				return
++			}
++		}
++	}
++	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		inFlight, most := &smallInFlight, &smallMost
++		if r.URL.Path == "/big" {
++			inFlight, most = &bigInFlight, &bigMost
++		}
++		raise(most, inFlight.Add(1))
++		defer inFlight.Add(-1)
++		time.Sleep(200 * time.Millisecond)
++		io.WriteString(w, testSourceSet)
++	}))
++	defer server.Close()
++	ctx, cancel := context.WithCancel(context.Background())
++	defer cancel()
++	var sets []adapter.RuleSet
++	for index := range 5 {
++		path := "/small"
++		if index%2 == 0 && index < 4 {
++			path = "/big"
++		}
++		set := newTestRuleSet(server.URL + path)
++		set.ctx = ctx
++		set.options.Format = C.RuleSetFormatSource
++		set.updateInterval = time.Hour
++		set.lastUpdated = time.Now()
++		if path == "/big" {
++			set.contentSize.Store(heavyRuleSetSize)
++		}
++		sets = append(sets, set)
++	}
++	updater := NewRuleSetUpdater(ctx, sets)
++	updater.Start()
++	defer updater.Close()
++	summary, err := updater.UpdateNow(ctx)
++	require.NoError(t, err)
++	require.Equal(t, RuleSetUpdateSummary{Total: 5, Loaded: 5}, summary)
++	require.EqualValues(t, 1, bigMost.Load(), "two big lists were downloaded at once")
++	require.EqualValues(t, 3, smallMost.Load())
++	// what was loaded tells its size: the small list of the test is small
++	require.Less(t, sets[0].(*RemoteRuleSet).contentSize.Load(), int64(heavyRuleSetSize))
++}
+-- 
+2.53.0
+

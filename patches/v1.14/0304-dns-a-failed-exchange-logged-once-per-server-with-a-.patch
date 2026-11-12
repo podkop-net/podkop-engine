@@ -1,0 +1,212 @@
+From 90ad7ea5279ef49f66853793e7ecd0509f76c775 Mon Sep 17 00:00:00 2001
+From: FiyeroT <me@fiyero.xyz>
+Date: Thu, 12 Nov 2026 21:41:20 +0300
+Subject: [PATCH 22/57] dns: a failed exchange logged once per server, with a
+ count
+
+Failed exchanges are logged once per server, then counted every 10 s.
+
+Made of these commits of the earlier series (branch archive/r25-1.14-commits):
+  cb79ec504 dns: log failed exchanges once per server, with a count every 10 s
+
+Pdk-Feature: dns-log
+Pdk-Zone: core
+Pdk-Layer: 03
+---
+ dns/client_failure_log.go      | 90 ++++++++++++++++++++++++++++++++++
+ dns/client_failure_log_test.go | 86 ++++++++++++++++++++++++++++++++
+ 2 files changed, 176 insertions(+)
+ create mode 100644 dns/client_failure_log.go
+ create mode 100644 dns/client_failure_log_test.go
+
+diff --git a/dns/client_failure_log.go b/dns/client_failure_log.go
+new file mode 100644
+index 000000000..df54aad65
+--- /dev/null
++++ b/dns/client_failure_log.go
+@@ -0,0 +1,90 @@
++package dns
++
++import (
++	"context"
++	"errors"
++	"sync"
++	"time"
++
++	E "github.com/sagernet/sing/common/exceptions"
++	"github.com/sagernet/sing/common/logger"
++
++	"github.com/miekg/dns"
++)
++
++// Failed exchanges are logged here, by server (podkop-engine). The first failure of a
++// server is logged at once with its query; while the server goes on failing, one line
++// every failureLogInterval counts the failures in between and shows the last one. A
++// timeout is a failure; a query its caller gave up (context.Canceled) is not. Upstream
++// logged nothing for most failures (the rule path of 1.14, and timeouts or closed
++// connections on the path of clients) or one line per query, which floods the log of
++// a router when a server is down.
++var failureLogInterval = 10 * time.Second
++
++type failureLog struct {
++	access  sync.Mutex
++	windows map[string]*failureWindow
++}
++
++type failureWindow struct {
++	count    int
++	question string
++	err      error
++}
++
++// loggedFailure marks an error that the failure log has taken: callers do not log it
++// again.
++type loggedFailure struct {
++	error
++}
++
++func (e *loggedFailure) Unwrap() error {
++	return e.error
++}
++
++// IsLoggedFailure tells whether the failure log has taken the error.
++func IsLoggedFailure(err error) bool {
++	var logged *loggedFailure
++	return errors.As(err, &logged)
++}
++
++func (l *failureLog) failed(ctx context.Context, logger logger.ContextLogger, server string, message *dns.Msg, err error) error {
++	if logger == nil || errors.Is(err, context.Canceled) || IsLoggedFailure(err) {
++		return err
++	}
++	question := "<empty query>"
++	if len(message.Question) > 0 {
++		question = FormatQuestion(message.Question[0].String())
++	}
++	l.access.Lock()
++	if l.windows == nil {
++		l.windows = make(map[string]*failureWindow)
++	}
++	window, open := l.windows[server]
++	if open {
++		window.count++
++		window.question, window.err = question, err
++		l.access.Unlock()
++		return &loggedFailure{err}
++	}
++	l.windows[server] = &failureWindow{}
++	l.access.Unlock()
++	logger.ErrorContext(ctx, E.Cause(err, "server ", server, ": exchange failed for ", question))
++	time.AfterFunc(failureLogInterval, func() { l.flush(logger, server) })
++	return &loggedFailure{err}
++}
++
++func (l *failureLog) flush(logger logger.ContextLogger, server string) {
++	l.access.Lock()
++	window := l.windows[server]
++	if window.count == 0 {
++		delete(l.windows, server)
++		l.access.Unlock()
++		return
++	}
++	count, question, err := window.count, window.question, window.err
++	window.count = 0
++	l.access.Unlock()
++	logger.Error(E.Cause(err, "server ", server, ": ", count, " more exchanges failed in ", failureLogInterval, ", the last for ", question))
++	time.AfterFunc(failureLogInterval, func() { l.flush(logger, server) })
++}
+diff --git a/dns/client_failure_log_test.go b/dns/client_failure_log_test.go
+new file mode 100644
+index 000000000..1c8409742
+--- /dev/null
++++ b/dns/client_failure_log_test.go
+@@ -0,0 +1,86 @@
++package dns
++
++import (
++	"bytes"
++	"context"
++	"strings"
++	"sync"
++	"testing"
++	"time"
++
++	"github.com/sagernet/sing-box/log"
++	E "github.com/sagernet/sing/common/exceptions"
++
++	mDNS "github.com/miekg/dns"
++)
++
++type lockedBuffer struct {
++	access sync.Mutex
++	buffer bytes.Buffer
++}
++
++func (b *lockedBuffer) Write(p []byte) (int, error) {
++	b.access.Lock()
++	defer b.access.Unlock()
++	return b.buffer.Write(p)
++}
++
++func (b *lockedBuffer) lines() []string {
++	b.access.Lock()
++	defer b.access.Unlock()
++	return strings.Split(strings.TrimSpace(b.buffer.String()), "\n")
++}
++
++// A real logger: it panics on argument types it does not format.
++func TestFailureLog(t *testing.T) {
++	failureLogInterval = 100 * time.Millisecond
++	defer func() { failureLogInterval = 10 * time.Second }()
++	output := new(lockedBuffer)
++	factory := log.NewDefaultFactory(context.Background(), log.Formatter{BaseTime: time.Now(), DisableColors: true}, output, "", nil, false)
++	if err := factory.Start(); err != nil {
++		t.Fatal(err)
++	}
++	logger := factory.NewLogger("dns")
++	message := new(mDNS.Msg)
++	message.SetQuestion("example.com.", mDNS.TypeA)
++	var failures failureLog
++
++	if err := failures.failed(context.Background(), logger, "doh", message, context.Canceled); IsLoggedFailure(err) {
++		t.Fatal("a query given up by its caller was logged")
++	}
++	timeout := E.Cause(context.DeadlineExceeded, "dial")
++	err := failures.failed(context.Background(), logger, "doh", message, timeout)
++	if !IsLoggedFailure(err) || !E.IsCanceled(err) {
++		t.Fatal("the logged failure lost its cause: ", err)
++	}
++	if failures.failed(context.Background(), logger, "doh", message, err) != err {
++		t.Fatal("a logged failure was taken again")
++	}
++	for i := 0; i < 5; i++ {
++		failures.failed(context.Background(), logger, "doh", message, timeout)
++	}
++	failures.failed(context.Background(), logger, "dot", message, timeout)
++	// the windows close one interval after their last summary: wait for it, timers can
++	// run late on a loaded machine
++	for deadline := time.Now().Add(5 * time.Second); ; time.Sleep(10 * time.Millisecond) {
++		failures.access.Lock()
++		open := len(failures.windows)
++		failures.access.Unlock()
++		if open == 0 {
++			break
++		}
++		if time.Now().After(deadline) {
++			t.Fatal("windows stay open after the failures stopped: ", open)
++		}
++	}
++
++	lines := output.lines()
++	if len(lines) != 3 {
++		t.Fatalf("want 3 lines, got %d: %q", len(lines), lines)
++	}
++	if !strings.Contains(lines[0], "server doh: exchange failed for example.com. IN A: dial: context deadline exceeded") ||
++		!strings.Contains(lines[1], "server dot: exchange failed for") ||
++		!strings.Contains(lines[2], "server doh: 5 more exchanges failed in 100ms, the last for example.com. IN A") {
++		t.Fatalf("unexpected lines: %q", lines)
++	}
++}
+-- 
+2.53.0
+

@@ -1,0 +1,49 @@
+From d02ca6de3a0cc96bf5e3c115bd3977650bccd303 Mon Sep 17 00:00:00 2001
+From: FiyeroT <me@fiyero.xyz>
+Date: Thu, 12 Nov 2026 21:41:20 +0300
+Subject: [PATCH 33/57] route: a connection a block outbound refused is logged
+ at debug
+
+A connection the block outbound refused is logged at debug.
+
+Made of these commits of the earlier series (branch archive/r25-1.14-commits):
+  4afd29d33 route: a connection a block outbound refused is logged at debug
+
+Pdk-Feature: route-block-log
+Pdk-Zone: core
+Pdk-Layer: 03
+---
+ route/conn_podkop.go | 21 +++++++++++++++++++++
+ 1 file changed, 21 insertions(+)
+ create mode 100644 route/conn_podkop.go
+
+diff --git a/route/conn_podkop.go b/route/conn_podkop.go
+new file mode 100644
+index 000000000..7453d4bc0
+--- /dev/null
++++ b/route/conn_podkop.go
+@@ -0,0 +1,21 @@
++package route
++
++import (
++	"context"
++
++	"github.com/sagernet/sing-box/adapter"
++	C "github.com/sagernet/sing-box/constant"
++	N "github.com/sagernet/sing/common/network"
++)
++
++// logDialError logs a connection that could not be opened. One a block outbound refused was
++// refused on purpose, as the reject action refuses (logged at debug there): a section of
++// podkop whose group has no server goes to a block outbound, and an error line a connection
++// would flood the log (podkop-engine).
++func (m *ConnectionManager) logDialError(ctx context.Context, this N.Dialer, err error) {
++	if outbound, isOutbound := this.(adapter.Outbound); isOutbound && outbound.Type() == C.TypeBlock {
++		m.logger.DebugContext(ctx, err)
++		return
++	}
++	m.logger.ErrorContext(ctx, err)
++}
+-- 
+2.53.0
+

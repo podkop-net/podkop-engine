@@ -1,0 +1,523 @@
+From d54557f6bf276b57cd0fd6f062b2a0d556a1253b Mon Sep 17 00:00:00 2001
+From: FiyeroT <me@fiyero.xyz>
+Date: Thu, 12 Nov 2026 21:41:20 +0300
+Subject: [PATCH 27/57] rule-set: the format text
+
+A rule-set may be a plain text list of domains and IP CIDRs (format text), remote or local; its
+names are built in place into a domain set, its addresses into a cidrset.
+
+Made of these commits of the earlier series (branch archive/r25-1.14-commits):
+  01f958ab5 rule-set: format text, a list of domains and IP CIDRs as plain text
+  1c91f79a9 rule-set: a local list in the format text is read; due rule-sets download five at a time
+  c4958ce9f route/rule: a benchmark of what a rule set of 100000 names written as text costs to load
+  26937d763 ruletext: domains of a text list built in place by common/domainset
+  e358865ef ruletext: room for the names of a list made once, a name a line at most
+  64c70134e ruletext: text lists carry their trie as DomainSet
+  ae1c07f7b ruletext: addresses of a text list as a cidrset.Set
+
+Pdk-Feature: ruletext
+Pdk-Zone: core
+Pdk-Layer: 03
+---
+ common/ruletext/ruletext.go             | 305 ++++++++++++++++++++++++
+ common/ruletext/ruletext_test.go        |  79 ++++++
+ route/rule/rule_set_local_text_test.go  |  27 +++
+ route/rule/rule_set_text_memory_test.go |  54 +++++
+ 4 files changed, 465 insertions(+)
+ create mode 100644 common/ruletext/ruletext.go
+ create mode 100644 common/ruletext/ruletext_test.go
+ create mode 100644 route/rule/rule_set_local_text_test.go
+ create mode 100644 route/rule/rule_set_text_memory_test.go
+
+diff --git a/common/ruletext/ruletext.go b/common/ruletext/ruletext.go
+new file mode 100644
+index 000000000..f453310c5
+--- /dev/null
++++ b/common/ruletext/ruletext.go
+@@ -0,0 +1,305 @@
++// Package ruletext reads rule-sets written as plain text (format "text"): the lists of
++// domains and addresses many sites publish, one item a line, with no rule-set around
++// them. Each item becomes a rule of the set: a domain matches itself and its subdomains
++// (domain_suffix), an IP address or CIDR matches by destination (ip_cidr). The set is
++// matched as any other: the text is only how it is written.
++package ruletext
++
++import (
++	"bytes"
++	"context"
++	"net/netip"
++	"strings"
++
++	"github.com/sagernet/sing-box/common/cidrset"
++	"github.com/sagernet/sing-box/common/domainset"
++	C "github.com/sagernet/sing-box/constant"
++	"github.com/sagernet/sing-box/option"
++	E "github.com/sagernet/sing/common/exceptions"
++)
++
++// Skipped is what a list had that is neither a domain nor an IP address or CIDR.
++type Skipped struct {
++	// Count is how many lines were left out.
++	Count int
++	// First is the first of them, cut to 64 bytes.
++	First string
++}
++
++// Read returns the rule-set of a list written as text, and what it left out. An item is
++// a line; "#" and "//" begin a comment that runs to the end of the line, and spaces
++// around the item are dropped. A domain has a dot in it, or begins with one (".ru", a
++// top-level domain): a word alone is taken for text, not for a name. It may begin with
++// "." or "+." (a suffix either way) and is taken in lower case. A list without a single
++// item is an error: a page served in place of the list (a block page, a captive
++// portal) is no list, and a line of it is no item.
++//
++// The domains come as the trie of the rule (DomainSet), built by common/domainset from
++// where they are in the content: a name in lower case already is not copied.
++func Read(content []byte) (option.PlainRuleSetCompat, Skipped, error) {
++	return read(context.Background(), content, true)
++}
++
++// ReadContext is Read that stops with the error of ctx once it is done: a rule set closed
++// while it reads a big list does not read it to the end.
++func ReadContext(ctx context.Context, content []byte) (option.PlainRuleSetCompat, Skipped, error) {
++	return read(ctx, content, true)
++}
++
++// ReadAddresses is Read without the matcher of the domains, for those who want the
++// addresses of the list and whether sing-box takes it: the domains are checked and
++// counted, not built.
++func ReadAddresses(content []byte) (option.PlainRuleSetCompat, Skipped, error) {
++	return read(context.Background(), content, false)
++}
++
++// stopEvery is how many lines go between two looks at the context: a mask.
++const stopEvery = 1<<12 - 1
++
++func read(ctx context.Context, content []byte, build bool) (option.PlainRuleSetCompat, Skipped, error) {
++	var (
++		skipped Skipped
++		domains int
++		// the first names, for the description of the rule
++		first []string
++		// the addresses, how many items there are, the first of them
++		addresses    cidrset.Builder
++		addressCount int
++		addressFirst []string
++		items        int
++		lines        = bytes.Count(content, []byte{'\n'}) + 1
++	)
++	names := domainset.NewCollectorContext(ctx, content)
++	for offset, number := 0, 0; offset < len(content); number++ {
++		if number&stopEvery == 0 && ctx.Err() != nil {
++			return option.PlainRuleSetCompat{}, skipped, ctx.Err()
++		}
++		lineStart := offset
++		lineEnd := bytes.IndexByte(content[offset:], '\n')
++		if lineEnd < 0 {
++			lineEnd = len(content)
++			offset = len(content)
++		} else {
++			lineEnd += offset
++			offset = lineEnd + 1
++		}
++		line := content[lineStart:lineEnd]
++		if comment := bytes.IndexByte(line, '#'); comment >= 0 {
++			line = line[:comment]
++		}
++		if comment := bytes.Index(line, []byte("//")); comment >= 0 {
++			line = line[:comment]
++		}
++		item := bytes.TrimSpace(line)
++		if len(item) == 0 {
++			continue
++		}
++		items++
++		if mayBeAddress(item) {
++			if addressCount == 0 {
++				// an item a line at most from here: room made once
++				addresses.Grow(lines - items + 1)
++			}
++			if from, to, ok := cidrset.Parse4(item); ok {
++				addresses.Add4(from, to)
++				addressCount++
++				if len(addressFirst) < 3 {
++					prefix, _ := parsePrefix(string(item))
++					addressFirst = append(addressFirst, prefix.String())
++				}
++				continue
++			}
++			if prefix, isPrefix := parsePrefix(string(item)); isPrefix && addresses.AddPrefix(prefix) {
++				addressCount++
++				if len(addressFirst) < 3 {
++					addressFirst = append(addressFirst, prefix.String())
++				}
++				continue
++			}
++		}
++		if from, to, isDomain := parseASCIIDomain(item); isDomain {
++			domains++
++			if build {
++				if domains == 1 {
++					// a name a line at most from here: room made once
++					names.Grow(lines - items + 1)
++				}
++				// the item is a part of the content: where it is, from what is left after it
++				start := cap(content) - cap(item[from:])
++				if len(first) < 3 {
++					first = append(first, strings.ToLower(string(item[from:to])))
++				}
++				if hasUpper(item[from:to]) {
++					err := names.AddBytes(bytes.ToLower(item[from:to]), true)
++					if err != nil {
++						return option.PlainRuleSetCompat{}, skipped, err
++					}
++				} else {
++					err := names.Add(start, start+to-from, true)
++					if err != nil {
++						return option.PlainRuleSetCompat{}, skipped, err
++					}
++				}
++			}
++			continue
++		}
++		if !isASCII(item) {
++			// as strings.ToLower has it: a rune that is not ASCII may become ASCII
++			if domain, isDomain := parseDomain(string(item)); isDomain {
++				domains++
++				if build {
++					if len(first) < 3 {
++						first = append(first, domain)
++					}
++					err := names.AddString(domain, true)
++					if err != nil {
++						return option.PlainRuleSetCompat{}, skipped, err
++					}
++				}
++				continue
++			}
++		}
++		if skipped.Count == 0 {
++			skipped.First = string(item)
++			if len(skipped.First) > 64 {
++				skipped.First = skipped.First[:64]
++			}
++		}
++		skipped.Count++
++	}
++	if domains == 0 && addressCount == 0 {
++		if skipped.Count > 0 {
++			return option.PlainRuleSetCompat{}, skipped, E.New("no domain and no IP CIDR in the list, the first line: ", skipped.First)
++		}
++		return option.PlainRuleSetCompat{}, skipped, E.New("no domain and no IP CIDR in the list")
++	}
++	var rules []option.HeadlessRule
++	if build && names.Len() > 0 {
++		set, err := names.Set(domainset.Describe(nil, 0, first, domains))
++		if err != nil {
++			return option.PlainRuleSetCompat{}, skipped, err
++		}
++		rules = append(rules, option.HeadlessRule{Type: C.RuleTypeDefault, DefaultOptions: option.DefaultHeadlessRule{DomainSet: set}})
++	}
++	if addressCount > 0 {
++		set := addresses.Set(cidrset.Describe(false, addressFirst, addressCount))
++		rules = append(rules, option.HeadlessRule{Type: C.RuleTypeDefault, DefaultOptions: option.DefaultHeadlessRule{IPRanges: set}})
++	}
++	return option.PlainRuleSetCompat{Version: C.RuleSetVersionCurrent, Options: option.PlainRuleSet{Rules: rules}}, skipped, nil
++}
++
++// mayBeAddress tells an item that netip may read as an address or a CIDR: one with a
++// colon (IPv6), or of digits, dots and a slash only. The others are not tried: a failed
++// parse costs an error.
++func mayBeAddress(item []byte) bool {
++	if bytes.IndexByte(item, ':') >= 0 {
++		return true
++	}
++	for _, character := range item {
++		if !(character >= '0' && character <= '9' || character == '.' || character == '/') {
++			return false
++		}
++	}
++	return true
++}
++
++func isASCII(item []byte) bool {
++	for _, character := range item {
++		if character >= 0x80 {
++			return false
++		}
++	}
++	return true
++}
++
++func hasUpper(name []byte) bool {
++	for _, character := range name {
++		if character >= 'A' && character <= 'Z' {
++			return true
++		}
++	}
++	return false
++}
++
++// parseASCIIDomain is parseDomain of an item of ASCII, in place: where the name is in
++// the item. Its letters may be capitals still.
++func parseASCIIDomain(item []byte) (int, int, bool) {
++	if !isASCII(item) {
++		return 0, 0, false
++	}
++	from, to := 0, len(item)
++	suffix := item[0] == '.' || bytes.HasPrefix(item, []byte("+."))
++	if item[from] == '+' {
++		from++
++	}
++	if from < to && item[from] == '.' {
++		from++
++	}
++	if from < to && item[to-1] == '.' {
++		to--
++	}
++	name := item[from:to]
++	if len(name) == 0 || len(name) > 253 || !suffix && bytes.IndexByte(name, '.') < 0 {
++		return 0, 0, false
++	}
++	for len(name) > 0 {
++		label := name
++		if dot := bytes.IndexByte(name, '.'); dot >= 0 {
++			label, name = name[:dot], name[dot+1:]
++			if len(name) == 0 {
++				// a dot at the end, the second one: an empty label
++				return 0, 0, false
++			}
++		} else {
++			name = nil
++		}
++		if len(label) == 0 || len(label) > 63 || label[0] == '-' || label[len(label)-1] == '-' {
++			return 0, 0, false
++		}
++		for _, character := range label {
++			if !(character >= 'a' && character <= 'z' || character >= 'A' && character <= 'Z' || character >= '0' && character <= '9' || character == '-' || character == '_') {
++				return 0, 0, false
++			}
++		}
++	}
++	return from, to, true
++}
++
++func parsePrefix(item string) (netip.Prefix, bool) {
++	if strings.Contains(item, "/") {
++		prefix, err := netip.ParsePrefix(item)
++		if err != nil {
++			return netip.Prefix{}, false
++		}
++		return prefix.Masked(), true
++	}
++	address, err := netip.ParseAddr(item)
++	if err != nil {
++		return netip.Prefix{}, false
++	}
++	address = address.Unmap()
++	return netip.PrefixFrom(address, address.BitLen()), true
++}
++
++// parseDomain takes a name of letters, digits, "-" and "_", labels joined by dots, none
++// empty and none longer than 63 bytes; a name of one label only as an explicit suffix.
++func parseDomain(item string) (string, bool) {
++	suffix := strings.HasPrefix(item, ".") || strings.HasPrefix(item, "+.")
++	item = strings.TrimPrefix(strings.TrimPrefix(item, "+"), ".")
++	item = strings.TrimSuffix(strings.ToLower(item), ".")
++	if item == "" || len(item) > 253 || !suffix && !strings.Contains(item, ".") {
++		return "", false
++	}
++	for _, label := range strings.Split(item, ".") {
++		if label == "" || len(label) > 63 || label[0] == '-' || label[len(label)-1] == '-' {
++			return "", false
++		}
++		for index := 0; index < len(label); index++ {
++			character := label[index]
++			if !(character >= 'a' && character <= 'z' || character >= '0' && character <= '9' || character == '-' || character == '_') {
++				return "", false
++			}
++		}
++	}
++	return item, true
++}
+diff --git a/common/ruletext/ruletext_test.go b/common/ruletext/ruletext_test.go
+new file mode 100644
+index 000000000..bad820595
+--- /dev/null
++++ b/common/ruletext/ruletext_test.go
+@@ -0,0 +1,79 @@
++package ruletext
++
++import (
++	"bytes"
++	"net/netip"
++	"strings"
++	"testing"
++
++	"github.com/sagernet/sing/common/domain"
++	"github.com/sagernet/sing/common/varbin"
++
++	"github.com/stretchr/testify/require"
++)
++
++func TestRead(t *testing.T) {
++	t.Parallel()
++	ruleSet, skipped, err := Read([]byte("# a list\nexample.com\n.Sub.Example.ORG\n+.x.example\n  .ru  \n10.0.0.0/8\n192.0.2.1 # one address\n2001:db8::/32 // addresses\nnot a domain\nwords\nexample.com\nlast.example"))
++	require.NoError(t, err)
++	require.Len(t, ruleSet.Options.Rules, 2)
++	require.Equal(t, written(t, domain.NewMatcher(nil, []string{"example.com", "sub.example.org", "x.example", "ru", "last.example"}, false)),
++		written(t, ruleSet.Options.Rules[0].DefaultOptions.DomainSet))
++	require.Equal(t, []netip.Prefix{netip.MustParsePrefix("10.0.0.0/8"), netip.MustParsePrefix("192.0.2.1/32"), netip.MustParsePrefix("2001:db8::/32")},
++		ruleSet.Options.Rules[1].DefaultOptions.IPRanges.Prefixes())
++	require.Equal(t, "ip_cidr=[10.0.0.0/8 192.0.2.1/32 2001:db8::/32]", ruleSet.Options.Rules[1].DefaultOptions.IPRanges.String())
++	require.Equal(t, Skipped{Count: 2, First: "not a domain"}, skipped)
++
++	// the last line without a line end is read; a list of names alone has one rule
++	ruleSet, _, err = Read([]byte("only.example"))
++	require.NoError(t, err)
++	require.Len(t, ruleSet.Options.Rules, 1)
++
++	// a page served in place of the list is no list
++	_, skipped, err = Read([]byte("<html><body>\nAccess to this resource is blocked\nForbidden\n</body></html>\n"))
++	require.Error(t, err)
++	require.Equal(t, 4, skipped.Count)
++	_, _, err = Read([]byte("\n# nothing\n"))
++	require.Error(t, err)
++}
++
++// written is a trie as a rule set carries it.
++func written(t *testing.T, matcher interface{ Write(varbin.Writer) error }) []byte {
++	var content bytes.Buffer
++	require.NoError(t, matcher.Write(&content))
++	return content.Bytes()
++}
++
++// The names of a list come in place or copied, in capitals or not, with a "+." or a dot
++// in front or after them, not of ASCII: the matcher is the one of the names as the
++// reading of a list takes them one by one (parseDomain).
++func TestReadNames(t *testing.T) {
++	lines := []string{
++		"plain.example", "Capital.Example", "+.plus.example", ".dot.example", "end.example.", "  spaced.example  ",
++		"\u212aelvin.example", "дом.рф", "under_score.example", "x--y.example", "a.b.c.d.e", "plain.example", ".ru",
++		"-bad.example", "bad-.example", "a..b", "word", "10.0.0.1", "10.0.0.0/8", "2001:db8::/32", "1.2.3.example",
++	}
++	var expected []string
++	for _, line := range lines {
++		item := strings.TrimSpace(line)
++		if _, isPrefix := parsePrefix(item); isPrefix {
++			continue
++		}
++		if domain, isDomain := parseDomain(item); isDomain {
++			expected = append(expected, domain)
++		}
++	}
++	ruleSet, skipped, err := Read([]byte(strings.Join(lines, "\n")))
++	require.NoError(t, err)
++	require.Equal(t, 5, skipped.Count)
++	require.Equal(t, written(t, domain.NewMatcher(nil, expected, false)), written(t, ruleSet.Options.Rules[0].DefaultOptions.DomainSet))
++	// 10.0.0.1 is in 10.0.0.0/8: the set holds the network
++	require.Equal(t, []netip.Prefix{netip.MustParsePrefix("10.0.0.0/8"), netip.MustParsePrefix("2001:db8::/32")},
++		ruleSet.Options.Rules[1].DefaultOptions.IPRanges.Prefixes())
++	// without the matcher: the same addresses, the same lines left out
++	addresses, skippedToo, err := ReadAddresses([]byte(strings.Join(lines, "\n")))
++	require.NoError(t, err)
++	require.Equal(t, skipped, skippedToo)
++	require.Len(t, addresses.Options.Rules, 1)
++	require.Equal(t, ruleSet.Options.Rules[1], addresses.Options.Rules[0])
++}
+diff --git a/route/rule/rule_set_local_text_test.go b/route/rule/rule_set_local_text_test.go
+new file mode 100644
+index 000000000..cf61afb9a
+--- /dev/null
++++ b/route/rule/rule_set_local_text_test.go
+@@ -0,0 +1,27 @@
++package rule
++
++import (
++	"context"
++	"os"
++	"path/filepath"
++	"testing"
++
++	"github.com/sagernet/sing-box/adapter"
++	C "github.com/sagernet/sing-box/constant"
++
++	"github.com/stretchr/testify/require"
++)
++
++// A local list written as text is read from its file as any rule-set; a file with no
++// item in it is refused.
++func TestLocalRuleSetText(t *testing.T) {
++	path := filepath.Join(t.TempDir(), "list.lst")
++	require.NoError(t, os.WriteFile(path, []byte("example.com\n10.0.0.0/8\n"), 0o644))
++	s := &LocalRuleSet{ctx: context.Background(), tag: "test", fileFormat: C.RuleSetFormatText}
++	require.NoError(t, s.reloadFile(path))
++	require.True(t, s.Match(&adapter.InboundContext{Domain: "www.example.com"}))
++	require.False(t, s.Match(&adapter.InboundContext{Domain: "example.org"}))
++	require.NoError(t, os.WriteFile(path, []byte("<html>blocked</html>\n"), 0o644))
++	require.Error(t, s.reloadFile(path))
++	require.True(t, s.Match(&adapter.InboundContext{Domain: "www.example.com"}), "a file that is no list took away the rules there were")
++}
+diff --git a/route/rule/rule_set_text_memory_test.go b/route/rule/rule_set_text_memory_test.go
+new file mode 100644
+index 000000000..3acb86215
+--- /dev/null
++++ b/route/rule/rule_set_text_memory_test.go
+@@ -0,0 +1,54 @@
++package rule
++
++import (
++	"context"
++	"math/rand"
++	"runtime"
++	"strings"
++	"testing"
++
++	"github.com/sagernet/sing-box/common/ruletext"
++)
++
++// What a local rule set of 100000 names written as text costs to load: the read of the
++// text, the upgrade and the rules built as sing-box builds them. Run with -memprofile to see
++// where the memory goes.
++func BenchmarkLoadTextList(b *testing.B) {
++	random := rand.New(rand.NewSource(1))
++	letters := "abcdefghijklmnopqrstuvwxyz0123456789"
++	tlds := []string{"com", "net", "org", "ru", "io", "info", "xyz", "co.uk"}
++	var text strings.Builder
++	for index := 0; index < 100000; index++ {
++		for range 5 + random.Intn(8) {
++			text.WriteByte(letters[random.Intn(len(letters))])
++		}
++		text.WriteByte('.')
++		for range 3 + random.Intn(7) {
++			text.WriteByte(letters[random.Intn(26)])
++		}
++		text.WriteString("." + tlds[random.Intn(len(tlds))] + "\n")
++	}
++	content := []byte(text.String())
++	b.ReportAllocs()
++	b.ResetTimer()
++	for range b.N {
++		compat, _, err := ruletext.Read(content)
++		if err != nil {
++			b.Fatal(err)
++		}
++		plain, err := compat.Upgrade()
++		if err != nil {
++			b.Fatal(err)
++		}
++		for _, options := range plain.Rules {
++			_, err = NewHeadlessRule(context.Background(), options)
++			if err != nil {
++				b.Fatal(err)
++			}
++		}
++	}
++	b.StopTimer()
++	var stats runtime.MemStats
++	runtime.ReadMemStats(&stats)
++	b.ReportMetric(float64(stats.TotalAlloc)/float64(b.N)/(1<<20), "MiB-allocated/op")
++}
+-- 
+2.53.0
+

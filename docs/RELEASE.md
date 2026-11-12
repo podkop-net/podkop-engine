@@ -17,15 +17,21 @@
    git format-patch v1.14.4 -o /path/podkop-engine/patches/v1.14/   # заменить старые файлы
    ```
    Форк — это тег плюс патчи и ничего больше: ветка `podkop-engine-<ветка>` в podkop-net/sing-box
-   продвигается только коммитами, которые становятся патчами этого репозитория. Новые коммиты
-   форка — новые файлы в конце серии (`git format-patch v1.14.4..<коммит>`); старые файлы при этом
-   меняются только в счётчике `[PATCH n/N]`.
+   продвигается только коммитами, которые становятся патчами этого репозитория. На 1.12 и 1.13
+   новые коммиты форка — новые файлы в конце серии (`git format-patch v1.14.4..<коммит>`); старые
+   файлы при этом меняются только в счётчике `[PATCH n/N]`.
+   На 1.14 (с r25) серия — один патч на функцию, по слоям (`00xx`–`04xx`, см. README, «Устройство»):
+   исправление функции вливается в её патч (`git commit --fixup` и `git rebase --autosquash`),
+   новая функция — новый патч в своём слое. Файлы — `git format-patch --no-renames` (quilt пакета
+   не читает переименований git), номер файла — слой·100 + место в слое; проверка —
+   `scripts/check-fork.sh`. Перенос на новый тег: `git rebase --onto <тег> v1.14.4` и сверка
+   `git range-diff` старой и новой серий; конфликты бывают только в патчах слоёв 02 и 04.
    Для патча include (0035 в r9) проверить, не появились ли в `include/registry.go` новые
    регистрации: новый тип выхода — в `include/podkop_full.go` и `podkop_full_stub.go`, новый вход,
    DNS-сервер или служба — в `podkop_slim.go` и `podkop_slim_stub.go` (иначе он молча попадёт в
-   `podkop-engine`); и что `cmd/sing-box/cmd_api*.go` по-прежнему исчерпывают CLI `api`
-   (на 1.14 с r15 командная строка — пакет `cmd/sing-box/cli`, и её файлы `cmd_api*.go` закрыты
-   ограничением сборки `!podkop_slim`: у нового файла `api` оно должно быть тоже).
+   `podkop-engine`); и что `cmd/sing-box/cmd_api*.go` по-прежнему исчерпывают CLI `api` (на 1.14
+   r15–r24 командная строка была пакетом `cmd/sing-box/cli` с ограничением `!podkop_slim` на этих
+   файлах; с r25 она снова там, где у upstream, и их убирает маска в Makefile пакета).
    При новой версии cronet-go сверить `openwrt/podkop-engine/naive.pkgarchs` со строками
    `openwrt:` матрицы naive в `.github/workflows/build.yml` sing-box, а `LLD_URL`/`LLD_SHA256`
    в `versions.env` — с `CLANG_REVISION`/`CLANG_SUB_REVISION` в

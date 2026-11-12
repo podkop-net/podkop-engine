@@ -1,0 +1,698 @@
+From fcc52fe271d0384188101c5103571f1891373518 Mon Sep 17 00:00:00 2001
+From: FiyeroT <me@fiyero.xyz>
+Date: Thu, 12 Nov 2026 21:41:21 +0300
+Subject: [PATCH 48/57] tlsspoof: the forged ClientHello the way the connection
+ goes, REALITY takes it
+
+The forged ClientHello of tls.spoof goes out the way the connection goes and nothing else does;
+REALITY takes the spoof options.
+
+Made of these commits of the earlier series (branch archive/r25-1.14-commits):
+  1dfa4d379 tlsspoof: send the forged ClientHello the way the connection goes, and nothing else
+  94d0be40d reality: take the tls spoof options
+  0b4b1e56c tlsspoof: what the review of the forged ClientHello showed
+
+Pdk-Feature: tlsspoof
+Pdk-Zone: protocols
+Pdk-Layer: 04
+---
+ common/tls/reality_spoof_test.go         |  36 ++++
+ common/tlsspoof/endpoints.go             |   5 +-
+ common/tlsspoof/integration_unix_test.go |  10 +
+ common/tlsspoof/packet_vectors_test.go   |  46 +++++
+ common/tlsspoof/raw_linux.go             | 206 ++++++++++++++------
+ common/tlsspoof/raw_linux_test.go        | 230 +++++++++++++++++++++++
+ 6 files changed, 476 insertions(+), 57 deletions(-)
+ create mode 100644 common/tls/reality_spoof_test.go
+ create mode 100644 common/tlsspoof/packet_vectors_test.go
+ create mode 100644 common/tlsspoof/raw_linux_test.go
+
+diff --git a/common/tls/reality_spoof_test.go b/common/tls/reality_spoof_test.go
+new file mode 100644
+index 000000000..8151dd42c
+--- /dev/null
++++ b/common/tls/reality_spoof_test.go
+@@ -0,0 +1,36 @@
++//go:build with_utls && linux
++
++package tls
++
++import (
++	"context"
++	"testing"
++
++	"github.com/sagernet/sing-box/common/tlsspoof"
++
++	"github.com/stretchr/testify/require"
++)
++
++// A REALITY client takes the spoof options as the other TLS clients do, with their
++// checks: the forged name must differ from the server name.
++func TestRealityClientTakesSpoof(t *testing.T) {
++	logger, _ := newWarnLogger(t)
++	options := realityOptionsForTest("chrome", true)
++	options.Spoof = "packagist.org"
++	options.SpoofMethod = tlsspoof.MethodNameWrongMD5Sig
++	config, err := NewClient(context.Background(), logger, "192.0.2.1", options)
++	require.NoError(t, err)
++	reality, isReality := config.(*RealityClientConfig)
++	require.True(t, isReality)
++	require.Equal(t, "packagist.org", reality.uClient.spoof)
++	require.Equal(t, tlsspoof.MethodWrongMD5Sig, reality.uClient.spoofMethod)
++
++	options.Spoof = options.ServerName
++	_, err = NewClient(context.Background(), logger, "192.0.2.1", options)
++	require.ErrorContains(t, err, "must differ from `server_name`")
++
++	options.Spoof = "packagist.org"
++	options.SpoofMethod = "wrong-everything"
++	_, err = NewClient(context.Background(), logger, "192.0.2.1", options)
++	require.ErrorContains(t, err, "unknown method")
++}
+diff --git a/common/tlsspoof/endpoints.go b/common/tlsspoof/endpoints.go
+index 2cc8df122..74c6a8ad0 100644
+--- a/common/tlsspoof/endpoints.go
++++ b/common/tlsspoof/endpoints.go
+@@ -15,7 +15,10 @@ import (
+ func tcpEndpoints(conn net.Conn) (*net.TCPConn, netip.AddrPort, netip.AddrPort, error) {
+ 	tcpConn, isTCP := common.Cast[*net.TCPConn](conn)
+ 	if !isTCP {
+-		return nil, netip.AddrPort{}, netip.AddrPort{}, E.New("tls_spoof: underlying conn is not *net.TCPConn")
++		// not one of its own to the server (a transport that carries several streams
++		// over one connection), or not made yet (tcp_fast_open sends its first data
++		// with the connection attempt) (podkop-engine)
++		return nil, netip.AddrPort{}, netip.AddrPort{}, E.New("tls_spoof: no established TCP connection of its own under this one (it does not work with tcp_fast_open, nor over a multiplexed transport)")
+ 	}
+ 	local := M.AddrPortFromNet(tcpConn.LocalAddr())
+ 	remote := M.AddrPortFromNet(tcpConn.RemoteAddr())
+diff --git a/common/tlsspoof/integration_unix_test.go b/common/tlsspoof/integration_unix_test.go
+index 6b262ff71..762dd976e 100644
+--- a/common/tlsspoof/integration_unix_test.go
++++ b/common/tlsspoof/integration_unix_test.go
+@@ -6,7 +6,9 @@ import (
+ 	"encoding/hex"
+ 	"io"
+ 	"net"
++	"os"
+ 	"runtime"
++	"strings"
+ 	"testing"
+ 	"time"
+ 
+@@ -38,6 +40,9 @@ func TestIntegrationSpoofer(t *testing.T) {
+ 				if tc.method == MethodWrongTimestamp && runtime.GOOS == "darwin" {
+ 					t.Skip("wrong-timestamp is not supported on macOS")
+ 				}
++				if tc.method == MethodWrongTimestamp && tcpTimestampsOff() {
++					t.Skip("wrong-timestamp is refused on a connection without TCP timestamps")
++				}
+ 				client, serverPort := family.dial(t)
+ 				spoofer, err := newRawSpoofer(client, tc.method)
+ 				require.NoError(t, err)
+@@ -183,3 +188,8 @@ func runInjectsThenForwardsRealCH(t *testing.T, network, address string) {
+ 		t.Fatal("echo server did not receive real ClientHello")
+ 	}
+ }
++
++func tcpTimestampsOff() bool {
++	setting, err := os.ReadFile("/proc/sys/net/ipv4/tcp_timestamps")
++	return err == nil && strings.TrimSpace(string(setting)) == "0"
++}
+diff --git a/common/tlsspoof/packet_vectors_test.go b/common/tlsspoof/packet_vectors_test.go
+new file mode 100644
+index 000000000..4784e58df
+--- /dev/null
++++ b/common/tlsspoof/packet_vectors_test.go
+@@ -0,0 +1,46 @@
++//go:build linux || darwin || (windows && (amd64 || 386))
++
++package tlsspoof
++
++import (
++	"encoding/hex"
++	"net/netip"
++	"testing"
++
++	"github.com/stretchr/testify/require"
++)
++
++// The forged segment of every method, byte for byte, for IPv4 and IPv6: the sequence
++// number moved back by the payload, the checksum inverted, the acknowledgment moved back,
++// the MD5 signature option, the timestamp option an hour back (and at zero when the clock
++// is younger than that). The packets are the ones the encoder of sing-box 1.14 makes.
++var spoofFrameVectors = []struct {
++	family    string
++	source    string
++	target    string
++	method    Method
++	timestamp uint32
++	frame     string
++}{
++	{"IPv4", "192.0.2.10:40000", "203.0.113.5:443", MethodWrongSequence, 0xa1b2c3, "4500003b0000000040067cadc000020acb0071059c4001bb123456659abcdef05018ffff3bf10000666f726765642d636c69656e742d68656c6c6f"},
++	{"IPv4", "192.0.2.10:40000", "203.0.113.5:443", MethodWrongChecksum, 0xa1b2c3, "4500003b0000000040067cadc000020acb0071059c4001bb123456789abcdef05018ffffc4210000666f726765642d636c69656e742d68656c6c6f"},
++	{"IPv4", "192.0.2.10:40000", "203.0.113.5:443", MethodWrongAcknowledgment, 0xa1b2c3, "4500003b0000000040067cadc000020acb0071059c4001bb123456789abc5ef15018ffffbbdd0000666f726765642d636c69656e742d68656c6c6f"},
++	{"IPv4", "192.0.2.10:40000", "203.0.113.5:443", MethodWrongMD5Sig, 0xa1b2c3, "4500004f0000000040067c99c000020acb0071059c4001bb123456789abcdef0a018ffffd8b700001312000000000000000000000000000000000000666f726765642d636c69656e742d68656c6c6f"},
++	{"IPv4", "192.0.2.10:40000", "203.0.113.5:443", MethodWrongTimestamp, 0xa1b2c3, "450000470000000040067ca1c000020acb0071059c4001bb123456789abcdef08018ffff3f1a0000080a006ac443000000000000666f726765642d636c69656e742d68656c6c6f"},
++	{"IPv4", "192.0.2.10:40000", "203.0.113.5:443", MethodWrongTimestamp, 0x3e8, "450000470000000040067ca1c000020acb0071059c4001bb123456789abcdef08018ffff03c80000080a00000000000000000000666f726765642d636c69656e742d68656c6c6f"},
++	{"IPv6", "[2001:db8::10]:40000", "[2001:db8:1::5]:443", MethodWrongSequence, 0xa1b2c3, "600000000027064020010db800000000000000000000001020010db80001000000000000000000059c4001bb123456659abcdef05018ffffde790000666f726765642d636c69656e742d68656c6c6f"},
++	{"IPv6", "[2001:db8::10]:40000", "[2001:db8:1::5]:443", MethodWrongChecksum, 0xa1b2c3, "600000000027064020010db800000000000000000000001020010db80001000000000000000000059c4001bb123456789abcdef05018ffff21990000666f726765642d636c69656e742d68656c6c6f"},
++	{"IPv6", "[2001:db8::10]:40000", "[2001:db8:1::5]:443", MethodWrongAcknowledgment, 0xa1b2c3, "600000000027064020010db800000000000000000000001020010db80001000000000000000000059c4001bb123456789abc5ef15018ffff5e660000666f726765642d636c69656e742d68656c6c6f"},
++	{"IPv6", "[2001:db8::10]:40000", "[2001:db8:1::5]:443", MethodWrongMD5Sig, 0xa1b2c3, "60000000003b064020010db800000000000000000000001020010db80001000000000000000000059c4001bb123456789abcdef0a018ffff7b4000001312000000000000000000000000000000000000666f726765642d636c69656e742d68656c6c6f"},
++	{"IPv6", "[2001:db8::10]:40000", "[2001:db8:1::5]:443", MethodWrongTimestamp, 0xa1b2c3, "600000000033064020010db800000000000000000000001020010db80001000000000000000000059c4001bb123456789abcdef08018ffffe1a20000080a006ac443000000000000666f726765642d636c69656e742d68656c6c6f"},
++	{"IPv6", "[2001:db8::10]:40000", "[2001:db8:1::5]:443", MethodWrongTimestamp, 0x3e8, "600000000033064020010db800000000000000000000001020010db80001000000000000000000059c4001bb123456789abcdef08018ffffa6500000080a00000000000000000000666f726765642d636c69656e742d68656c6c6f"},
++}
++
++func TestSpoofFrameVectors(t *testing.T) {
++	for _, vector := range spoofFrameVectors {
++		frame, err := buildSpoofFrame(vector.method, netip.MustParseAddrPort(vector.source), netip.MustParseAddrPort(vector.target),
++			0x12345678, 0x9abcdef0, vector.timestamp, nil, []byte("forged-client-hello"))
++		require.NoError(t, err)
++		require.Equal(t, vector.frame, hex.EncodeToString(frame), "%s %s timestamp %d", vector.family, vector.method, vector.timestamp)
++	}
++}
+diff --git a/common/tlsspoof/raw_linux.go b/common/tlsspoof/raw_linux.go
+index bca7b5920..65747419f 100644
+--- a/common/tlsspoof/raw_linux.go
++++ b/common/tlsspoof/raw_linux.go
+@@ -1,8 +1,10 @@
+ package tlsspoof
+ 
+ import (
++	"errors"
+ 	"net"
+ 	"net/netip"
++	"sync"
+ 
+ 	"github.com/sagernet/sing/common/control"
+ 	E "github.com/sagernet/sing/common/exceptions"
+@@ -17,48 +19,134 @@ const (
+ 	// include/net/tcp.h; not exported by golang.org/x/sys/unix.
+ 	tcpRecvQueue = 1
+ 	tcpSendQueue = 2
++	// TCPI_OPT_TIMESTAMPS of include/uapi/linux/tcp.h, a bit of tcp_info.tcpi_options
++	tcpInfoOptionTimestamps = 1
+ )
+ 
++// errCarriedData tells that the connection is past its first flight: it is not one that
++// was just dialed to the TLS server.
++var errCarriedData = errors.New("the connection has carried data already")
++
+ type linuxSpoofer struct {
+-	method      Method
+-	src         netip.AddrPort
+-	dst         netip.AddrPort
++	method  Method
++	tcpConn *net.TCPConn
++	src     netip.AddrPort
++	dst     netip.AddrPort
++	// Inject and Close may come from different goroutines: a handshake that is given
++	// up closes the connection while its first write is on the way
++	access      sync.Mutex
+ 	rawFD       int
+ 	rawSockAddr unix.Sockaddr
+ 	sendNext    uint32
+ 	receiveNext uint32
+ 	timestamp   uint32
++	// the time to live (hop limit) of the connection's own segments, when it is known
++	hopLimit int
+ }
+ 
++// The raw socket is opened when the forged ClientHello is sent (Inject), not here. A
++// handshake that fails before its first write is ended by closing the underlying
++// connection, which does not reach the spoofer: a socket opened here would stay open
++// for the life of the process.
+ func newRawSpoofer(conn net.Conn, method Method) (rawSpoofer, error) {
+ 	tcpConn, src, dst, err := tcpEndpoints(conn)
+ 	if err != nil {
+ 		return nil, err
+ 	}
+-	fd, sockaddr, err := openLinuxRawSocket(dst)
++	return &linuxSpoofer{
++		method:  method,
++		tcpConn: tcpConn,
++		src:     src,
++		dst:     dst,
++		rawFD:   -1,
++	}, nil
++}
++
++func (s *linuxSpoofer) open() error {
++	fd, sockaddr, err := openLinuxRawSocket(s.dst)
+ 	if err != nil {
+-		return nil, err
++		if errors.Is(err, unix.EPERM) || errors.Is(err, unix.EACCES) {
++			return E.Cause(err, "CAP_NET_RAW and CAP_NET_ADMIN are needed (sing-box run as root)")
++		}
++		return err
+ 	}
+-	err = control.Conn(tcpConn, func(raw uintptr) error {
+-		return inheritRouting(fd, int(raw), src)
+-	})
++	s.rawFD = fd
++	s.rawSockAddr = sockaddr
++	err = s.followConnection(s.tcpConn)
+ 	if err != nil {
+-		unix.Close(fd)
+-		return nil, err
++		return err
+ 	}
+-	spoofer := &linuxSpoofer{
+-		method:      method,
+-		src:         src,
+-		dst:         dst,
+-		rawFD:       fd,
+-		rawSockAddr: sockaddr,
++	return s.loadSequenceNumbers(s.tcpConn)
++}
++
++// followConnection makes the raw socket send the way the connection does: with its mark,
++// through its device, from its address. Routing takes all three from the socket, not
++// from the packet, so a raw socket without them is routed by the destination alone, past
++// the rules the connection was dialed under (routing_mark, bind_interface,
++// auto_detect_interface, a rule by source address), and the forged ClientHello may leave
++// through another interface than the connection it belongs to.
++func (s *linuxSpoofer) followConnection(tcpConn *net.TCPConn) error {
++	return control.Conn(tcpConn, func(raw uintptr) error {
++		fd := int(raw)
++		mark, err := unix.GetsockoptInt(fd, unix.SOL_SOCKET, unix.SO_MARK)
++		if err == nil && mark != 0 {
++			err = unix.SetsockoptInt(s.rawFD, unix.SOL_SOCKET, unix.SO_MARK, mark)
++			if err != nil {
++				return E.Cause(err, "set the mark of the connection")
++			}
++		}
++		device, err := unix.GetsockoptString(fd, unix.SOL_SOCKET, unix.SO_BINDTODEVICE)
++		if err == nil && device != "" {
++			err = unix.BindToDevice(s.rawFD, device)
++			if err != nil {
++				return E.Cause(err, "bind to the device of the connection")
++			}
++		}
++		var local unix.Sockaddr
++		if s.src.Addr().Is4() {
++			local = &unix.SockaddrInet4{Addr: s.src.Addr().As4()}
++		} else {
++			local6 := &unix.SockaddrInet6{Addr: s.src.Addr().As16()}
++			if zone := s.src.Addr().Zone(); zone != "" {
++				zoneInterface, err := net.InterfaceByName(zone)
++				if err != nil {
++					return E.Cause(err, "find the interface of the local address")
++				}
++				local6.ZoneId = uint32(zoneInterface.Index)
++			}
++			local = local6
++		}
++		err = unix.Bind(s.rawFD, local)
++		if err != nil {
++			return E.Cause(err, "bind to the local address of the connection")
++		}
++		// The forged segment is written with its IP header, which the kernel leaves as
++		// it is, a time to live of 64 in it. Where the system's is another
++		// (net.ipv4.ip_default_ttl, set so on routers behind a modem of a mobile
++		// operator) it would be the one packet of the connection that differs.
++		if s.src.Addr().Is4() {
++			s.hopLimit, _ = unix.GetsockoptInt(fd, unix.IPPROTO_IP, unix.IP_TTL)
++		} else {
++			s.hopLimit, _ = unix.GetsockoptInt(fd, unix.IPPROTO_IPV6, unix.IPV6_UNICAST_HOPS)
++		}
++		return nil
++	})
++}
++
++// likeConnection gives the IP header of a forged frame the time to live (hop limit) the
++// connection's own segments have. The kernel fills in the checksum of an IPv4 header
++// written by the sender.
++func (s *linuxSpoofer) likeConnection(frame []byte) {
++	if s.hopLimit <= 0 || s.hopLimit > 255 {
++		return
+ 	}
+-	err = spoofer.loadSequenceNumbers(tcpConn)
+-	if err != nil {
+-		unix.Close(fd)
+-		return nil, err
++	if s.src.Addr().Is4() {
++		if len(frame) >= 20 {
++			frame[8] = byte(s.hopLimit)
++		}
++	} else if len(frame) >= 40 {
++		frame[7] = byte(s.hopLimit)
+ 	}
+-	return spoofer, nil
+ }
+ 
+ func openLinuxRawSocket(dst netip.AddrPort) (int, unix.Sockaddr, error) {
+@@ -82,40 +170,6 @@ func openLinuxRawSocket(dst netip.AddrPort) (int, unix.Sockaddr, error) {
+ 	return fd, sockaddr, nil
+ }
+ 
+-// Linux routes IP_HDRINCL packets by the raw socket's bound device, mark and
+-// bound address (raw_sendmsg), not by the addresses in the supplied header.
+-func inheritRouting(rawSocket, tcpSocket int, src netip.AddrPort) error {
+-	bindInterface, err := unix.GetsockoptString(tcpSocket, unix.SOL_SOCKET, unix.SO_BINDTODEVICE)
+-	if err != nil {
+-		return E.Cause(err, "read SO_BINDTODEVICE")
+-	}
+-	if bindInterface != "" {
+-		err = unix.BindToDevice(rawSocket, bindInterface)
+-		if err != nil {
+-			return E.Cause(err, "bind raw socket to interface ", bindInterface)
+-		}
+-	}
+-	routingMark, err := unix.GetsockoptInt(tcpSocket, unix.SOL_SOCKET, unix.SO_MARK)
+-	if err != nil {
+-		return E.Cause(err, "read SO_MARK")
+-	}
+-	if routingMark != 0 {
+-		err = unix.SetsockoptInt(rawSocket, unix.SOL_SOCKET, unix.SO_MARK, routingMark)
+-		if err != nil {
+-			return E.Cause(err, "set raw socket SO_MARK")
+-		}
+-	}
+-	if src.Addr().Is4() {
+-		err = unix.Bind(rawSocket, &unix.SockaddrInet4{Addr: src.Addr().As4()})
+-	} else {
+-		err = unix.Bind(rawSocket, &unix.SockaddrInet6{Addr: src.Addr().As16()})
+-	}
+-	if err != nil {
+-		return E.Cause(err, "bind raw socket to ", src.Addr())
+-	}
+-	return nil
+-}
+-
+ // loadSequenceNumbers puts the socket briefly into TCP_REPAIR mode to read
+ // snd_nxt and rcv_nxt from the kernel. TCP_REPAIR requires CAP_NET_ADMIN;
+ // callers must run as root or grant both CAP_NET_RAW and CAP_NET_ADMIN.
+@@ -127,7 +181,24 @@ func (s *linuxSpoofer) loadSequenceNumbers(tcpConn *net.TCPConn) error {
+ 	return control.Conn(tcpConn, func(raw uintptr) (err error) {
+ 		fd := int(raw)
+ 
++		info, err := unix.GetsockoptTCPInfo(fd, unix.IPPROTO_TCP, unix.TCP_INFO)
++		if err != nil {
++			return E.Cause(err, "read TCP_INFO")
++		}
++		// More than the SYN acknowledged, or anything received: a connection of a
++		// tunnel that has made its own handshake (a detour, a proxy outbound under the
++		// route option), or one the server speaks first on. A ClientHello forged into
++		// it is no first packet for a middlebox to see.
++		if info.Bytes_received > 0 || info.Bytes_acked > 1 {
++			return errCarriedData
++		}
+ 		if s.method == MethodWrongTimestamp {
++			// a peer that has not agreed on timestamps does not look at the option: it
++			// would take the forged ClientHello, in sequence and with a valid checksum,
++			// for the data of the connection
++			if info.Options&tcpInfoOptionTimestamps == 0 {
++				return E.New("wrong-timestamp needs TCP timestamps, and this connection has none; use another spoof_method")
++			}
+ 			timestamp, err := unix.GetsockoptInt(fd, unix.IPPROTO_TCP, unix.TCP_TIMESTAMP)
+ 			if err != nil {
+ 				return E.Cause(err, "read timestamp")
+@@ -140,7 +211,12 @@ func (s *linuxSpoofer) loadSequenceNumbers(tcpConn *net.TCPConn) error {
+ 			return E.Cause(err, "enter TCP_REPAIR (need CAP_NET_ADMIN)")
+ 		}
+ 		defer func() {
+-			offErr := unix.SetsockoptInt(fd, unix.IPPROTO_TCP, unix.TCP_REPAIR, unix.TCP_REPAIR_OFF)
++			// without the window probe that leaving the plain way sends: a segment before
++			// the ClientHello that no connection of its own sends
++			offErr := unix.SetsockoptInt(fd, unix.IPPROTO_TCP, unix.TCP_REPAIR, unix.TCP_REPAIR_OFF_NO_WP)
++			if errors.Is(offErr, unix.EINVAL) { // Linux before 4.19
++				offErr = unix.SetsockoptInt(fd, unix.IPPROTO_TCP, unix.TCP_REPAIR, unix.TCP_REPAIR_OFF)
++			}
+ 			if err == nil && offErr != nil {
+ 				err = E.Cause(offErr, "leave TCP_REPAIR")
+ 			}
+@@ -169,10 +245,22 @@ func (s *linuxSpoofer) loadSequenceNumbers(tcpConn *net.TCPConn) error {
+ }
+ 
+ func (s *linuxSpoofer) Inject(payload []byte) error {
++	s.access.Lock()
++	defer s.access.Unlock()
++	defer s.closeRaw()
++	err := s.open()
++	if errors.Is(err, errCarriedData) {
++		// nothing to forge there: the connection goes on without it
++		return nil
++	}
++	if err != nil {
++		return err
++	}
+ 	frame, err := buildSpoofFrame(s.method, s.src, s.dst, s.sendNext, s.receiveNext, s.timestamp, nil, payload)
+ 	if err != nil {
+ 		return err
+ 	}
++	s.likeConnection(frame)
+ 	err = unix.Sendto(s.rawFD, frame, 0, s.rawSockAddr)
+ 	if err != nil {
+ 		return E.Cause(err, "sendto raw socket")
+@@ -181,6 +269,12 @@ func (s *linuxSpoofer) Inject(payload []byte) error {
+ }
+ 
+ func (s *linuxSpoofer) Close() error {
++	s.access.Lock()
++	defer s.access.Unlock()
++	return s.closeRaw()
++}
++
++func (s *linuxSpoofer) closeRaw() error {
+ 	if s.rawFD < 0 {
+ 		return nil
+ 	}
+diff --git a/common/tlsspoof/raw_linux_test.go b/common/tlsspoof/raw_linux_test.go
+new file mode 100644
+index 000000000..d9aa3181a
+--- /dev/null
++++ b/common/tlsspoof/raw_linux_test.go
+@@ -0,0 +1,230 @@
++package tlsspoof
++
++import (
++	"context"
++	"io"
++	"net"
++	"os"
++	"syscall"
++	"testing"
++	"time"
++
++	"github.com/sagernet/sing/common/control"
++
++	"github.com/stretchr/testify/require"
++	"golang.org/x/sys/unix"
++)
++
++func dialLocalWith(t *testing.T, dialControl func(fd int)) (*net.TCPConn, chan []byte) {
++	t.Helper()
++	listener, err := net.Listen("tcp4", "127.0.0.1:0")
++	require.NoError(t, err)
++	received := make(chan []byte, 1)
++	served := make(chan struct{})
++	go func() {
++		defer close(served)
++		conn, err := listener.Accept()
++		if err != nil {
++			return
++		}
++		defer conn.Close()
++		_ = conn.SetReadDeadline(time.Now().Add(time.Second))
++		data, _ := io.ReadAll(conn)
++		received <- data
++	}()
++	dialer := net.Dialer{Control: func(network, address string, conn syscall.RawConn) error {
++		return conn.Control(func(fd uintptr) {
++			if dialControl != nil {
++				dialControl(int(fd))
++			}
++		})
++	}}
++	client, err := dialer.DialContext(context.Background(), "tcp4", listener.Addr().String())
++	require.NoError(t, err)
++	// the server's side is closed before the next test counts descriptors
++	t.Cleanup(func() {
++		client.Close()
++		listener.Close()
++		<-served
++	})
++	return client.(*net.TCPConn), received
++}
++
++// The raw socket takes the mark, the device and the local address of the connection: the
++// kernel routes by them, and without them the forged ClientHello may leave another way.
++func TestIntegrationSpooferFollowsConnection(t *testing.T) {
++	requireRoot(t)
++	client, _ := dialLocalWith(t, func(fd int) {
++		require.NoError(t, unix.SetsockoptInt(fd, unix.SOL_SOCKET, unix.SO_MARK, 0x29a))
++		require.NoError(t, unix.BindToDevice(fd, loopbackInterface))
++	})
++	created, err := newRawSpoofer(client, MethodWrongSequence)
++	require.NoError(t, err)
++	spoofer := created.(*linuxSpoofer)
++	require.NoError(t, spoofer.open())
++	defer spoofer.Close()
++
++	mark, err := unix.GetsockoptInt(spoofer.rawFD, unix.SOL_SOCKET, unix.SO_MARK)
++	require.NoError(t, err)
++	require.Equal(t, 0x29a, mark)
++	device, err := unix.GetsockoptString(spoofer.rawFD, unix.SOL_SOCKET, unix.SO_BINDTODEVICE)
++	require.NoError(t, err)
++	require.Equal(t, loopbackInterface, device)
++	local, err := unix.Getsockname(spoofer.rawFD)
++	require.NoError(t, err)
++	require.Equal(t, client.LocalAddr().(*net.TCPAddr).IP.To4(), net.IP(local.(*unix.SockaddrInet4).Addr[:]))
++}
++
++func segmentsSent(t *testing.T, conn *net.TCPConn) uint32 {
++	t.Helper()
++	var sent uint32
++	require.NoError(t, control.Conn(conn, func(fd uintptr) error {
++		info, err := unix.GetsockoptTCPInfo(int(fd), unix.IPPROTO_TCP, unix.TCP_INFO)
++		if err != nil {
++			return err
++		}
++		sent = info.Segs_out
++		return nil
++	}))
++	return sent
++}
++
++// Reading the sequence numbers sends nothing on the connection. Leaving the repair mode
++// the plain way sends a window probe, which the control shows on the same kernel.
++func TestIntegrationSpooferSendsNoWindowProbe(t *testing.T) {
++	requireRoot(t)
++	client, _ := dialLocalWith(t, nil)
++	before := segmentsSent(t, client)
++	created, err := newRawSpoofer(client, MethodWrongSequence)
++	require.NoError(t, err)
++	spoofer := created.(*linuxSpoofer)
++	require.NoError(t, spoofer.open())
++	require.NoError(t, spoofer.Close())
++	require.Equal(t, before, segmentsSent(t, client), "segments sent by the connection while the spoofer read its state")
++
++	control1, _ := dialLocalWith(t, nil)
++	before = segmentsSent(t, control1)
++	require.NoError(t, control.Conn(control1, func(fd uintptr) error {
++		err := unix.SetsockoptInt(int(fd), unix.IPPROTO_TCP, unix.TCP_REPAIR, unix.TCP_REPAIR_ON)
++		if err != nil {
++			return err
++		}
++		return unix.SetsockoptInt(int(fd), unix.IPPROTO_TCP, unix.TCP_REPAIR, unix.TCP_REPAIR_OFF)
++	}))
++	require.Equal(t, before+1, segmentsSent(t, control1), "the control: the plain way out of the repair mode sends a window probe")
++}
++
++func openDescriptors(t *testing.T) int {
++	t.Helper()
++	entries, err := os.ReadDir("/proc/self/fd")
++	require.NoError(t, err)
++	return len(entries)
++}
++
++// A connection wrapped and never written to holds no raw socket, and one that has sent its
++// forged ClientHello has closed it: closing the underlying connection alone, as a failed
++// handshake does, leaves nothing open.
++func TestIntegrationSpooferHoldsNoSocket(t *testing.T) {
++	requireRoot(t)
++	client, received := dialLocalWith(t, nil)
++	before := openDescriptors(t)
++	for range 20 {
++		_, err := NewConn(client, MethodWrongSequence, "letsencrypt.org")
++		require.NoError(t, err)
++	}
++	require.Equal(t, before, openDescriptors(t), "descriptors after wrapping without a write")
++	wrapped, err := NewConn(client, MethodWrongSequence, "letsencrypt.org")
++	require.NoError(t, err)
++	_, err = wrapped.Write([]byte("real"))
++	require.NoError(t, err)
++	require.Equal(t, before, openDescriptors(t), "descriptors after the forged ClientHello was sent")
++	require.NoError(t, client.Close())
++	require.Equal(t, []byte("real"), <-received)
++}
++
++// wrong-timestamp is refused on a connection without TCP timestamps: the peer would take
++// the forged ClientHello for data. Runs where net.ipv4.tcp_timestamps is 0.
++func TestIntegrationWrongTimestampNeedsTimestamps(t *testing.T) {
++	requireRoot(t)
++	if !tcpTimestampsOff() {
++		t.Skip("net.ipv4.tcp_timestamps is not 0")
++	}
++	client, received := dialLocalWith(t, nil)
++	wrapped, err := NewConn(client, MethodWrongTimestamp, "letsencrypt.org")
++	require.NoError(t, err)
++	_, err = wrapped.Write([]byte("real"))
++	require.ErrorContains(t, err, "wrong-timestamp needs TCP timestamps")
++	require.NoError(t, client.Close())
++	require.Empty(t, <-received, "nothing reaches the peer: neither the forged ClientHello nor the write that was refused")
++
++	other, received := dialLocalWith(t, nil)
++	wrapped, err = NewConn(other, MethodWrongSequence, "letsencrypt.org")
++	require.NoError(t, err)
++	_, err = wrapped.Write([]byte("real"))
++	require.NoError(t, err)
++	require.NoError(t, other.Close())
++	require.Equal(t, []byte("real"), <-received)
++}
++
++// The forged segment leaves with the time to live of the connection's own segments, not
++// with the 64 written into its header.
++func TestIntegrationSpooferTakesTheHopLimit(t *testing.T) {
++	requireRoot(t)
++	client, _ := dialLocalWith(t, func(fd int) {
++		require.NoError(t, unix.SetsockoptInt(fd, unix.IPPROTO_IP, unix.IP_TTL, 65))
++	})
++	created, err := newRawSpoofer(client, MethodWrongSequence)
++	require.NoError(t, err)
++	spoofer := created.(*linuxSpoofer)
++	require.NoError(t, spoofer.open())
++	defer spoofer.Close()
++	require.Equal(t, 65, spoofer.hopLimit)
++	frame, err := buildSpoofFrame(spoofer.method, spoofer.src, spoofer.dst, spoofer.sendNext, spoofer.receiveNext, 0, nil, []byte("hello"))
++	require.NoError(t, err)
++	require.Equal(t, byte(64), frame[8], "the header as it is built")
++	spoofer.likeConnection(frame)
++	require.Equal(t, byte(65), frame[8])
++
++	// the system's own, when the socket has none set
++	plain, _ := dialLocalWith(t, nil)
++	created, err = newRawSpoofer(plain, MethodWrongSequence)
++	require.NoError(t, err)
++	spoofer = created.(*linuxSpoofer)
++	require.NoError(t, spoofer.open())
++	defer spoofer.Close()
++	require.Greater(t, spoofer.hopLimit, 0)
++}
++
++// A connection that has carried data is not one just dialed to the TLS server (a tunnel
++// of a detour or of a proxy outbound has made its handshake): nothing is forged into it,
++// and it goes on.
++func TestIntegrationSpooferLeavesAConnectionThatCarriedData(t *testing.T) {
++	requireRoot(t)
++	client, received := dialLocalWith(t, nil)
++	_, err := client.Write([]byte("the handshake of a tunnel"))
++	require.NoError(t, err)
++	// until the server has acknowledged it
++	require.Eventually(t, func() bool {
++		var acknowledged uint64
++		require.NoError(t, control.Conn(client, func(fd uintptr) error {
++			info, err := unix.GetsockoptTCPInfo(int(fd), unix.IPPROTO_TCP, unix.TCP_INFO)
++			if err != nil {
++				return err
++			}
++			acknowledged = info.Bytes_acked
++			return nil
++		}))
++		return acknowledged > 1
++	}, time.Second, 5*time.Millisecond)
++	before := segmentsSent(t, client)
++	created, err := newRawSpoofer(client, MethodWrongSequence)
++	require.NoError(t, err)
++	spoofer := created.(*linuxSpoofer)
++	require.ErrorIs(t, spoofer.open(), errCarriedData)
++	require.NoError(t, spoofer.Close())
++	require.NoError(t, created.Inject([]byte("forged")))
++	require.Equal(t, -1, spoofer.rawFD, "no raw socket is left open")
++	require.Equal(t, before, segmentsSent(t, client))
++	require.NoError(t, client.Close())
++	require.Equal(t, "the handshake of a tunnel", string(<-received))
++}
+-- 
+2.53.0
+

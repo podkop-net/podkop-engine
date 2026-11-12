@@ -1,0 +1,313 @@
+From 3f09adff7c5b37f9d69e81dcbd903adbb37ef237 Mon Sep 17 00:00:00 2001
+From: FiyeroT <me@fiyero.xyz>
+Date: Thu, 12 Nov 2026 21:41:21 +0300
+Subject: [PATCH 46/57] log: entries for the Clash API formatted only while
+ read; a platform writer's level
+
+Entries for the Clash API are formatted only while its logs are read; a platform writer may name its
+level and ask for no colours.
+
+Made of these commits of the earlier series (branch archive/r25-1.14-commits):
+  4281b344d log: format entries for the Clash API only while its logs are read
+  a3093600c log: a platform writer may name its level and ask for no colours
+
+Pdk-Feature: log
+Pdk-Zone: other
+Pdk-Layer: 04
+---
+ log/observable.go            | 54 +++++++++++++++++++++-----
+ log/observable_bench_test.go | 68 ++++++++++++++++++++++++++++++++
+ log/observable_test.go       | 75 ++++++++++++++++++++++++++++++++++++
+ log/platform.go              | 26 +++++++++++++
+ 4 files changed, 214 insertions(+), 9 deletions(-)
+ create mode 100644 log/observable_bench_test.go
+ create mode 100644 log/observable_test.go
+
+diff --git a/log/observable.go b/log/observable.go
+index ab50e56be..c6c592984 100644
+--- a/log/observable.go
++++ b/log/observable.go
+@@ -26,6 +26,7 @@ type defaultFactory struct {
+ 	platformWriters   atomic.Pointer[[]PlatformWriter]
+ 	needConsole       bool
+ 	needObservable    bool
++	subscriptions     atomic.Int32 // entries are formatted for the observer only while it has some
+ 	level             Level
+ 	subscriber        *observable.Subscriber[Entry]
+ 	observer          *observable.Observer[Entry]
+@@ -139,13 +140,25 @@ func (f *defaultFactory) NewLogger(tag string) ContextLogger {
+ }
+ 
+ func (f *defaultFactory) Subscribe() (subscription observable.Subscription[Entry], done <-chan struct{}, err error) {
+-	return f.observer.Subscribe()
++	subscription, done, err = f.observer.Subscribe()
++	if err == nil {
++		f.subscriptions.Add(1)
++	}
++	return
+ }
+ 
+ func (f *defaultFactory) UnSubscribe(sub observable.Subscription[Entry]) {
++	f.subscriptions.Add(-1)
+ 	f.observer.UnSubscribe(sub)
+ }
+ 
++// observed reports whether an entry goes to the observer: with the Clash API on, and only
++// while someone reads its logs. Formatting every entry below the level for nobody cost each
++// log call of the router and DNS some ten times the call itself.
++func (f *defaultFactory) observed() bool {
++	return f.needObservable && f.subscriptions.Load() > 0
++}
++
+ func (f *defaultFactory) output(ctx context.Context, level Level, tag string, message string, timestamp time.Time) {
+ 	if level <= f.level && (f.needConsole || level == LevelPanic || level == LevelFatal) {
+ 		formatted := f.formatter.Format(ctx, level, tag, message, timestamp)
+@@ -157,16 +170,40 @@ func (f *defaultFactory) output(ctx context.Context, level Level, tag string, me
+ 			os.Exit(1)
+ 		}
+ 	}
+-	if f.needObservable {
++	if f.observed() {
+ 		f.subscriber.Emit(Entry{level, f.formatter.FormatSimple(ctx, tag, message)})
+ 	}
+-	platformWriters := f.loadPlatformWriters()
+-	if len(platformWriters) > 0 {
+-		platformMessage := f.platformFormatter.Format(ctx, level, tag, message, timestamp)
+-		for _, platformWriter := range platformWriters {
+-			platformWriter.WriteMessage(level, platformMessage)
++	// formatted once for the writers that want colours and once for those that do not,
++	// and only when one of them takes the level
++	var coloured, plain string
++	for _, platformWriter := range f.loadPlatformWriters() {
++		if !platformTakes(platformWriter, level) {
++			continue
++		}
++		if platformPlain(platformWriter) {
++			if plain == "" {
++				formatter := f.platformFormatter
++				formatter.DisableColors = true
++				plain = formatter.Format(ctx, level, tag, message, timestamp)
++			}
++			platformWriter.WriteMessage(level, plain)
++		} else {
++			if coloured == "" {
++				coloured = f.platformFormatter.Format(ctx, level, tag, message, timestamp)
++			}
++			platformWriter.WriteMessage(level, coloured)
++		}
++	}
++}
++
++// platformWants tells whether a platform writer takes an entry of the level.
++func (f *defaultFactory) platformWants(level Level) bool {
++	for _, platformWriter := range f.loadPlatformWriters() {
++		if platformTakes(platformWriter, level) {
++			return true
+ 		}
+ 	}
++	return false
+ }
+ 
+ var _ ContextLogger = (*observableLogger)(nil)
+@@ -178,8 +215,7 @@ type observableLogger struct {
+ 
+ func (l *observableLogger) Log(ctx context.Context, level Level, args []any) {
+ 	level = OverrideLevelFromContext(level, ctx)
+-	platformWriters := l.loadPlatformWriters()
+-	if level > l.level && len(platformWriters) == 0 && !l.needObservable {
++	if level > l.level && !l.platformWants(level) && !l.observed() {
+ 		return
+ 	}
+ 	nowTime := time.Now()
+diff --git a/log/observable_bench_test.go b/log/observable_bench_test.go
+new file mode 100644
+index 000000000..5c0b3e563
+--- /dev/null
++++ b/log/observable_bench_test.go
+@@ -0,0 +1,68 @@
++package log
++
++import (
++	"context"
++	"testing"
++	"time"
++)
++
++// consoleWriter stands for the console sing-box writes to: anything but io.Discard.
++type consoleWriter struct{}
++
++func (consoleWriter) Write(p []byte) (int, error) { return len(p), nil }
++
++// platformWriter stands for the writer of an app or of a program that embeds sing-box:
++// one that takes every level, and one with a level of its own that wants no colours.
++type platformWriter struct{}
++
++func (platformWriter) WriteMessage(level Level, message string) {}
++
++type leveledPlatformWriter struct{ level Level }
++
++func (leveledPlatformWriter) WriteMessage(level Level, message string) {}
++func (w leveledPlatformWriter) Level() Level                           { return w.level }
++func (leveledPlatformWriter) DisableColors() bool                      { return true }
++
++// A debug line below the warn level, as the router and DNS write for every connection and
++// query, with the Clash API on (observable) or off.
++func BenchmarkLogBelowLevel(b *testing.B) {
++	for _, testCase := range []struct {
++		name       string
++		observable bool
++		subscribe  bool
++		platform   PlatformWriter
++	}{
++		{"clash api off", false, false, nil},
++		{"clash api on", true, false, nil},
++		{"clash api on, logs subscribed", true, true, nil},
++		{"platform writer without a level", false, false, platformWriter{}},
++		{"platform writer at warn", false, false, leveledPlatformWriter{LevelWarn}},
++	} {
++		b.Run(testCase.name, func(b *testing.B) {
++			factory := NewDefaultFactory(context.Background(), Formatter{BaseTime: time.Now()}, consoleWriter{}, "", testCase.platform, testCase.observable)
++			factory.SetLevel(LevelWarn)
++			if err := factory.Start(); err != nil {
++				b.Fatal(err)
++			}
++			defer factory.Close()
++			if testCase.subscribe {
++				subscription, _, err := factory.Subscribe()
++				if err != nil {
++					b.Fatal(err)
++				}
++				defer factory.UnSubscribe(subscription)
++				go func() {
++					for range subscription {
++					}
++				}()
++			}
++			logger := factory.NewLogger("dns")
++			ctx := context.Background()
++			b.ReportAllocs()
++			b.ResetTimer()
++			for i := 0; i < b.N; i++ {
++				logger.DebugContext(ctx, "exchanged ", "www.example.com", " IN A ", 1234, " in ", 12, "ms")
++			}
++		})
++	}
++}
+diff --git a/log/observable_test.go b/log/observable_test.go
+new file mode 100644
+index 000000000..5b7238407
+--- /dev/null
++++ b/log/observable_test.go
+@@ -0,0 +1,75 @@
++package log
++
++import (
++	"context"
++	"testing"
++	"time"
++
++	"github.com/stretchr/testify/require"
++)
++
++// Entries go to the observer while someone reads them (the Clash API's /logs), all levels
++// included; before and after, nothing is formatted for it.
++func TestObservableOnlyWhileSubscribed(t *testing.T) {
++	factory := NewDefaultFactory(context.Background(), Formatter{BaseTime: time.Now()}, consoleWriter{}, "", nil, true)
++	factory.SetLevel(LevelWarn)
++	require.NoError(t, factory.Start())
++	defer factory.Close()
++	internal := factory.(*defaultFactory)
++	logger := factory.NewLogger("dns")
++	require.False(t, internal.observed())
++
++	subscription, _, err := factory.Subscribe()
++	require.NoError(t, err)
++	require.True(t, internal.observed())
++	logger.Debug("below the level")
++	select {
++	case entry := <-subscription:
++		require.Equal(t, LevelDebug, entry.Level)
++		require.Contains(t, entry.Message, "below the level")
++	case <-time.After(2 * time.Second):
++		t.Fatal("the subscription got no entry")
++	}
++
++	factory.UnSubscribe(subscription)
++	require.False(t, internal.observed())
++}
++
++// recordingWriter keeps what a platform writer is given.
++type recordingWriter struct {
++	level    Level
++	messages *[]string
++}
++
++func (w recordingWriter) WriteMessage(level Level, message string) {
++	*w.messages = append(*w.messages, FormatLevel(level)+" "+message)
++}
++
++type leveledRecordingWriter struct{ recordingWriter }
++
++func (w leveledRecordingWriter) Level() Level      { return w.level }
++func (leveledRecordingWriter) DisableColors() bool { return true }
++
++// A platform writer with a level is given the entries of its level and below, without
++// colours; one without a level is given every entry, whatever the level of the log.
++func TestPlatformWriterLevel(t *testing.T) {
++	var leveled, every []string
++	factory := NewDefaultFactory(context.Background(), Formatter{BaseTime: time.Now()}, consoleWriter{}, "", leveledRecordingWriter{recordingWriter{level: LevelWarn, messages: &leveled}}, false)
++	factory.SetLevel(LevelError)
++	require.NoError(t, factory.Start())
++	defer factory.Close()
++	logger := factory.NewLogger("dns")
++	logger.Debug("debug line")
++	logger.Warn("warn line")
++	require.Len(t, leveled, 1)
++	require.Contains(t, leveled[0], "warn line")
++	require.NotContains(t, leveled[0], "\x1b[")
++
++	factory.AttachPlatformWriter(recordingWriter{messages: &every})
++	logger.Debug("second debug line")
++	logger.Warn("second warn line")
++	require.Len(t, leveled, 2)
++	require.Len(t, every, 2)
++	require.Contains(t, every[0], "second debug line")
++	require.Contains(t, every[1], "\x1b[", "a writer that does not ask otherwise gets the colours")
++}
+diff --git a/log/platform.go b/log/platform.go
+index a8881d4cc..c49a2fd43 100644
+--- a/log/platform.go
++++ b/log/platform.go
+@@ -3,3 +3,29 @@ package log
+ type PlatformWriter interface {
+ 	WriteMessage(level Level, message string)
+ }
++
++// PlatformWriterLevel is a PlatformWriter that takes the entries of its level and below
++// only: an entry above it is not formatted for it. A writer without a level takes every
++// entry, whatever the level of the log.
++type PlatformWriterLevel interface {
++	PlatformWriter
++	Level() Level
++}
++
++// PlatformWriterColors is a PlatformWriter that may ask for its messages without the
++// colours of a terminal.
++type PlatformWriterColors interface {
++	PlatformWriter
++	DisableColors() bool
++}
++
++// platformTakes tells whether a platform writer takes an entry of the level.
++func platformTakes(writer PlatformWriter, level Level) bool {
++	leveled, hasLevel := writer.(PlatformWriterLevel)
++	return !hasLevel || level <= leveled.Level()
++}
++
++func platformPlain(writer PlatformWriter) bool {
++	colors, hasColors := writer.(PlatformWriterColors)
++	return hasColors && colors.DisableColors()
++}
+-- 
+2.53.0
+
