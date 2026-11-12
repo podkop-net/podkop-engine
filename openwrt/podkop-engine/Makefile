@@ -34,7 +34,12 @@ GO_PKG:=github.com/sagernet/sing-box
 GO_PKG_BUILD_PKG:=$(GO_PKG)/cmd/sing-box
 GO_PKG_TAGS:=with_quic,with_utls,with_clash_api,podkop_slim,badlinkname,tfogo_checklinkname0
 GO_PKG_LDFLAGS:=-checklinkname=0
-GO_PKG_LDFLAGS_X:=$(GO_PKG)/constant.Version=$(PKG_VERSION)-pdk-r$(PKG_RELEASE)
+# the GODEBUG defaults of the releases of upstream sing-box 1.14 (release/LDFLAGS): the listeners
+# take no MPTCP, TLS 1.2 takes SHA-1 signatures. runtime.godebugDefault is what the linker sets
+# from go.mod; the symbol 1.13 named (internal/godebug.defaultGODEBUG) does not exist, and -X of a
+# missing symbol does nothing
+GO_PKG_LDFLAGS_X:=$(GO_PKG)/constant.Version=$(PKG_VERSION)-pdk-r$(PKG_RELEASE) \
+	runtime.godebugDefault=multipathtcp=0,tlssha1=1
 
 # NaiveProxy links the static libcronet.a of cronet-go, whose objects carry CREL
 # relocations: GNU ld cannot link them, lld of LLVM 19+ can. Without it (PODKOP_ENGINE_LLD,
