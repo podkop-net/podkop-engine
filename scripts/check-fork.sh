@@ -24,7 +24,9 @@ if [ -z "$repo" ]; then
 else
   fetch=
 fi
-G() { git -C "$repo" "$@"; }
+# no automatic maintenance: a fetch starts it in the background, and it may rewrite the shallow file
+# while the next fetch reads it ("shallow file has changed since we read it", the fork check of r25)
+G() { git -C "$repo" -c maintenance.auto=false -c gc.auto=0 "$@"; }
 
 status=0
 for LINE in "$@"; do
