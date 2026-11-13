@@ -1,7 +1,7 @@
 From d54557f6bf276b57cd0fd6f062b2a0d556a1253b Mon Sep 17 00:00:00 2001
 From: FiyeroT <me@fiyero.xyz>
 Date: Thu, 12 Nov 2026 21:41:20 +0300
-Subject: [PATCH 27/58] rule-set: the format text
+Subject: [PATCH 27/59] rule-set: the format text
 
 A rule-set may be a plain text list of domains and IP CIDRs (format text), remote or local; its
 names are built in place into a domain set, its addresses into a cidrset.

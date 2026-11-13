@@ -1,7 +1,7 @@
 From 925d5530941cc2dbc99b502be6e65941c8953097 Mon Sep 17 00:00:00 2001
 From: FiyeroT <me@fiyero.xyz>
 Date: Thu, 12 Nov 2026 21:41:19 +0300
-Subject: [PATCH 02/58] go.mod: sing-vmess of the podkop-engine fork
+Subject: [PATCH 02/59] go.mod: sing-vmess of the podkop-engine fork
 
 sing-vmess from the podkop-engine fork (v0.2.9-pdk.2): upstream's fix of the close after a direct
 write under Vision.

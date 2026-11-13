@@ -1,7 +1,7 @@
 From 11fd2a2a14bbfb0537e3e29a8d23ab4bc8862cc0 Mon Sep 17 00:00:00 2001
 From: FiyeroT <me@fiyero.xyz>
 Date: Thu, 12 Nov 2026 21:41:19 +0300
-Subject: [PATCH 05/58] route, hooks in upstream files: the DNS of a NAT
+Subject: [PATCH 05/59] route, hooks in upstream files: the DNS of a NAT
  session answered off the reading loop
 
 The lines of upstream files that "route: the DNS of a NAT session answered off the reading loop"

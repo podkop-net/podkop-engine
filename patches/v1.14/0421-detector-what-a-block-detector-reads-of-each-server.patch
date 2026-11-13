@@ -1,7 +1,7 @@
 From 8a735c703655659aadc9b9d77b9b28a28d35b276 Mon Sep 17 00:00:00 2001
 From: FiyeroT <me@fiyero.xyz>
 Date: Thu, 12 Nov 2026 21:41:21 +0300
-Subject: [PATCH 56/58] detector: what a block detector reads of each server
+Subject: [PATCH 56/59] detector: what a block detector reads of each server
 
 What the handshakes, the flows and the download tests of each server came to, for a block detector
 of the program that runs the box.

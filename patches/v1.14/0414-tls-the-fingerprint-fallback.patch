@@ -1,7 +1,7 @@
 From 79ca7b94345291519a0ebe5e5b9288f97a57f430 Mon Sep 17 00:00:00 2001
 From: FiyeroT <me@fiyero.xyz>
 Date: Thu, 12 Nov 2026 21:41:21 +0300
-Subject: [PATCH 49/58] tls: the fingerprint fallback
+Subject: [PATCH 49/59] tls: the fingerprint fallback
 
 When a ClientHello of the configured uTLS fingerprint gets no acknowledgment, a dial goes on with
 another one: the hello without X25519MLKEM768 first, then firefox; the choice is kept in the cache

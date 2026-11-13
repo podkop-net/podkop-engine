@@ -1,0 +1,1462 @@
+From 1db41e639dbb786b1622f5b86a382111a41027d0 Mon Sep 17 00:00:00 2001
+From: FiyeroT <me@fiyero.xyz>
+Date: Fri, 13 Nov 2026 14:38:32 +0300
+Subject: [PATCH 58/59] http client: outbounds, the ways a downloader takes in
+ the order of what it knows of them
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+An HTTP client of http_clients may name outbounds instead of a detour: the ways its downloads may
+go through, the first one the default first try. The manager gives such a client a downloader
+(adapter.HTTPDownloaders): for the host of a file it orders the ways by what it knows — the way
+that brought the host's last file, the first of the list, the ways that brought another host's
+file (fastest first), those the URL tests passed (lowest delay first), the unknown ones, those
+that failed for the host — starts the next way beside those under way when they show no
+progress, at most three at once, and takes the first result its caller accepts. What the
+downloads found (DownloadMemory) is the manager's, or the one the program that runs the box keeps
+in its context. A remote rule-set whose client has outbounds downloads through the downloader; a
+body that does not parse fails its way. Users of the client that do not know the downloader go
+through the first way.
+
+Pdk-Feature: http-client-downloader
+Pdk-Zone: core
+Pdk-Layer: 04
+---
+ adapter/http.go                               |  29 +
+ common/httpclient/downloader.go               | 538 ++++++++++++++++++
+ common/httpclient/downloader_test.go          | 263 +++++++++
+ common/httpclient/manager.go                  |  18 +-
+ docs/configuration/shared/http-client.md      |  26 +
+ option/http.go                                |   6 +
+ route/rule/export_test.go                     |  35 +-
+ route/rule/rule_set_remote.go                 |  85 ++-
+ route/rule/rule_set_remote_downloader_test.go | 143 +++++
+ route/rule/rule_set_remote_fallback.go        |  39 ++
+ 10 files changed, 1159 insertions(+), 23 deletions(-)
+ create mode 100644 common/httpclient/downloader.go
+ create mode 100644 common/httpclient/downloader_test.go
+ create mode 100644 route/rule/rule_set_remote_downloader_test.go
+
+diff --git a/adapter/http.go b/adapter/http.go
+index af67ee61f..eef2fb461 100644
+--- a/adapter/http.go
++++ b/adapter/http.go
+@@ -4,6 +4,7 @@ import (
+ 	"context"
+ 	"net/http"
+ 	"sync"
++	"time"
+ 
+ 	"github.com/sagernet/sing-box/option"
+ 	"github.com/sagernet/sing/common/logger"
+@@ -29,6 +30,34 @@ type HTTPClientFallbacks interface {
+ 	ResolveFallbacks(options *option.HTTPClientOptions) ([]HTTPFallback, error)
+ }
+ 
++// HTTPDownloaders is an HTTPClientManager whose clients may download through several outbounds
++// (option.HTTPClientOptions.Outbounds).
++type HTTPDownloaders interface {
++	// ResolveDownloader is the downloader of the client the options name, or of the default
++	// client for nil; nil when that client has no outbounds.
++	ResolveDownloader(options *option.HTTPClientOptions) (HTTPDownloader, error)
++}
++
++// HTTPDownloader downloads files through the outbounds of a client: in the order of what it
++// knows of each for the host of the file, the next one started beside those under way when they
++// stall, the first accepted result taken.
++type HTTPDownloader interface {
++	// Download tries the ways for the host as their order says until accept takes a result of
++	// try. accept is called for one result at a time; an error of it fails that way. It returns
++	// the way of the accepted result.
++	Download(ctx context.Context, host string, try HTTPDownloadTry, accept func(way string, result any) error) (string, error)
++	// Ways is the order of the ways for the host, for a caller that downloads by itself, and
++	// whether the first two start together (the first failed for the host last time).
++	Ways(host string) ([]string, bool)
++	// Record takes the result of such a download through a way: err nil when it brought the
++	// file, of size bytes in took.
++	Record(host string, way string, err error, took time.Duration, bytes int64)
++}
++
++// HTTPDownloadTry downloads through one way of a downloader with its client. progress is called
++// when the headers came (0) and with the size of each part of the body that comes.
++type HTTPDownloadTry func(ctx context.Context, way string, client *http.Client, progress func(bytes int)) (any, error)
++
+ // HTTPFallback is a fallback client: its tag and its shared transport.
+ type HTTPFallback struct {
+ 	Tag       string
+diff --git a/common/httpclient/downloader.go b/common/httpclient/downloader.go
+new file mode 100644
+index 000000000..6cf50e7b5
+--- /dev/null
++++ b/common/httpclient/downloader.go
+@@ -0,0 +1,538 @@
++package httpclient
++
++import (
++	"cmp"
++	"context"
++	"net/http"
++	"slices"
++	"sync"
++	"time"
++
++	"github.com/sagernet/sing-box/adapter"
++	"github.com/sagernet/sing-box/common/urltest"
++	"github.com/sagernet/sing-box/option"
++	E "github.com/sagernet/sing/common/exceptions"
++	"github.com/sagernet/sing/common/logger"
++	N "github.com/sagernet/sing/common/network"
++	"github.com/sagernet/sing/service"
++)
++
++var (
++	_ adapter.HTTPDownloaders = (*Manager)(nil)
++	_ adapter.HTTPDownloader  = (*Downloader)(nil)
++)
++
++// DownloadPlan is when a download starts its next way beside those under way: when none of them
++// showed progress for Wait (no answer yet) or Body (a pause in a body), or the youngest is Total
++// old and none has a body coming; at most Most ways at once.
++type DownloadPlan struct {
++	Wait  time.Duration
++	Body  time.Duration
++	Total time.Duration
++	Most  int
++}
++
++// downloadPlan is the plan of every downloader. PROVISIONAL: the plan of the subscription download
++// of podkop-exp (subscription.DefaultPlan: 5 s is what a way had there before the plan, 3 s in a
++// body and 10 s a choice; 3 at once, as bursts of TLS hellos to one name are what the DPI of some
++// ISPs penalises), until the ways of real routers are measured.
++var downloadPlan = DownloadPlan{Wait: 5 * time.Second, Body: 3 * time.Second, Total: 10 * time.Second, Most: 3}
++
++// downloadWatch is how often a download looks at its ways under way.
++const downloadWatch = 100 * time.Millisecond
++
++// checkOutbounds tells a client whose outbounds come with a detour or fallbacks: which of them
++// a caller takes would depend on the caller.
++func checkOutbounds(define option.HTTPClient) error {
++	if len(define.Outbounds) == 0 {
++		return nil
++	}
++	if define.Detour != "" {
++		return E.New("http_client[", define.Tag, "]: outbounds and detour together")
++	}
++	if len(define.Fallback) > 0 {
++		return E.New("http_client[", define.Tag, "]: outbounds and fallback together")
++	}
++	return nil
++}
++
++// clientOptions are the options of the transport of a client: one with outbounds goes through
++// the first of them for a caller that does not know the downloader.
++func clientOptions(define option.HTTPClient) option.HTTPClientOptions {
++	options := define.Options()
++	if len(options.Outbounds) > 0 && options.Detour == "" {
++		options.Detour = options.Outbounds[0]
++		// a way may be a direct outbound with no options of its own: the way of no proxy
++		options.DisableEmptyDirectCheck = true
++	}
++	options.Outbounds = nil
++	return options
++}
++
++// ResolveDownloader is the downloader of the client the options name, or of the default client
++// for nil; nil when that client has no outbounds. A client has one downloader, whoever asks.
++func (m *Manager) ResolveDownloader(options *option.HTTPClientOptions) (adapter.HTTPDownloader, error) {
++	var tag string
++	switch {
++	case options == nil:
++		tag = m.defaultTag
++	case options.Tag != "":
++		tag = options.Tag
++	case len(options.Outbounds) > 0:
++		return nil, E.New("an http client with outbounds is one of http_clients, named by its tag")
++	}
++	if tag == "" {
++		return nil, nil
++	}
++	m.access.Lock()
++	defer m.access.Unlock()
++	if downloader, loaded := m.downloaders[tag]; loaded {
++		return downloader, nil
++	}
++	define, loaded := m.defines[tag]
++	if !loaded {
++		return nil, E.New("http_client not found: ", tag)
++	}
++	if len(define.Outbounds) == 0 {
++		return nil, nil
++	}
++	err := checkOutbounds(define)
++	if err != nil {
++		return nil, err
++	}
++	var ways []string
++	transports := make(map[string]adapter.HTTPTransport)
++	for _, outbound := range define.Outbounds {
++		if _, loaded := transports[outbound]; loaded {
++			continue
++		}
++		wayOptions := define.Options()
++		wayOptions.Detour = outbound
++		wayOptions.Outbounds = nil
++		wayOptions.DisableEmptyDirectCheck = true
++		transport, err := NewTransport(m.ctx, m.logger, tag, wayOptions)
++		if err != nil {
++			return nil, E.Cause(err, "http_client[", tag, "] through ", outbound)
++		}
++		m.managedTransports = append(m.managedTransports, transport)
++		ways = append(ways, outbound)
++		transports[outbound] = transport
++	}
++	downloader := NewDownloader(m.logger, ways, transports, m.memory, service.PtrFromContext[urltest.HistoryStorage](m.ctx))
++	downloader.Outbounds = service.FromContext[adapter.OutboundManager](m.ctx)
++	if m.downloaders == nil {
++		m.downloaders = make(map[string]*Downloader)
++	}
++	m.downloaders[tag] = downloader
++	return downloader, nil
++}
++
++// Downloader downloads through the outbounds of a client (adapter.HTTPDownloader).
++type Downloader struct {
++	logger     logger.ContextLogger
++	ways       []string
++	transports map[string]adapter.HTTPTransport
++	memory     *DownloadMemory
++	history    *urltest.HistoryStorage
++	// Plan is the plan of its downloads, downloadPlan when made
++	Plan DownloadPlan
++	// Outbounds, when set, tell a way that is a group: its delay is that of the outbound it
++	// uses now
++	Outbounds adapter.OutboundManager
++}
++
++// NewDownloader makes a downloader of the ways (outbound tags, the first one the default first
++// try), each with its transport; history may be nil.
++func NewDownloader(logger logger.ContextLogger, ways []string, transports map[string]adapter.HTTPTransport, memory *DownloadMemory, history *urltest.HistoryStorage) *Downloader {
++	if memory == nil {
++		memory = NewDownloadMemory()
++	}
++	return &Downloader{logger: logger, ways: ways, transports: transports, memory: memory, history: history, Plan: downloadPlan}
++}
++
++// delayHops bounds the groups of groups delay follows.
++const delayHops = 4
++
++func (d *Downloader) delay(way string) (uint16, bool) {
++	for range delayHops {
++		if d.Outbounds == nil {
++			break
++		}
++		outbound, loaded := d.Outbounds.Outbound(way)
++		if !loaded {
++			break
++		}
++		group, isGroup := outbound.(adapter.OutboundGroup)
++		if !isGroup {
++			break
++		}
++		selected := group.Selected(N.NetworkTCP)
++		if selected == nil {
++			break
++		}
++		way = selected.Tag()
++	}
++	history := d.history.LoadURLTestHistory(way)
++	if history == nil {
++		return 0, false
++	}
++	return history.Delay, true
++}
++
++func (d *Downloader) Ways(host string) ([]string, bool) {
++	ways := make([]string, 0, len(d.ways))
++	for _, way := range d.ways {
++		if d.allowed(way) {
++			ways = append(ways, way)
++		}
++	}
++	return d.memory.order(host, ways, d.delay)
++}
++
++// allowed tells a way that goes through no outbound the program excluded (SetExcluded), its
++// groups followed to the outbound they use now: a group is passed by only while it uses an
++// excluded one.
++func (d *Downloader) allowed(way string) bool {
++	for range delayHops + 1 {
++		if d.memory.isExcluded(way) {
++			return false
++		}
++		if d.Outbounds == nil {
++			return true
++		}
++		outbound, loaded := d.Outbounds.Outbound(way)
++		if !loaded {
++			return true
++		}
++		group, isGroup := outbound.(adapter.OutboundGroup)
++		if !isGroup {
++			return true
++		}
++		selected := group.Selected(N.NetworkTCP)
++		if selected == nil {
++			return true
++		}
++		way = selected.Tag()
++	}
++	return true
++}
++
++func (d *Downloader) Record(host string, way string, err error, took time.Duration, bytes int64) {
++	if err != nil {
++		d.memory.failed(host, way)
++		return
++	}
++	d.memory.brought(host, way, took, bytes)
++}
++
++// attempt is a way of a download under way or done.
++type attempt struct {
++	way     string
++	started time.Time
++	cancel  context.CancelFunc
++
++	access   sync.Mutex
++	last     time.Time
++	body     bool
++	bytes    int64
++	finished bool
++	took     time.Duration
++	result   any
++	err      error
++}
++
++func (a *attempt) progress(bytes int) {
++	a.access.Lock()
++	defer a.access.Unlock()
++	a.body = true
++	a.bytes += int64(bytes)
++	a.last = time.Now()
++}
++
++func (a *attempt) finish(result any, err error) {
++	a.access.Lock()
++	defer a.access.Unlock()
++	a.finished = true
++	a.took = time.Since(a.started)
++	a.result, a.err = result, err
++}
++
++func (d *Downloader) Download(ctx context.Context, host string, try adapter.HTTPDownloadTry, accept func(way string, result any) error) (string, error) {
++	order, together := d.Ways(host)
++	if len(order) == 0 {
++		return "", E.New("no way to download through")
++	}
++	ctx, cancel := context.WithCancel(ctx)
++	defer cancel()
++	// buffered for every way: a way that ends after the download returned does not block
++	done := make(chan *attempt, len(order))
++	var attempts []*attempt
++	next, running := 0, 0
++	start := func() {
++		way := order[next]
++		next++
++		attemptContext, attemptCancel := context.WithCancel(ctx)
++		now := time.Now()
++		item := &attempt{way: way, started: now, last: now, cancel: attemptCancel}
++		attempts = append(attempts, item)
++		running++
++		client := &http.Client{Transport: d.transports[way]}
++		d.logger.DebugContext(ctx, "download from ", host, " through ", way)
++		go func() {
++			result, err := try(attemptContext, way, client, item.progress)
++			item.finish(result, err)
++			done <- item
++		}()
++	}
++	start()
++	if together && next < len(order) {
++		start()
++	}
++	watch := time.NewTicker(downloadWatch)
++	defer watch.Stop()
++	var errs []error
++	for {
++		select {
++		case item := <-done:
++			running--
++			item.cancel()
++			err := item.err
++			if err == nil {
++				err = accept(item.way, item.result)
++				if err == nil {
++					d.memory.brought(host, item.way, item.took, item.bytes)
++					return item.way, nil
++				}
++			}
++			if ctx.Err() == nil {
++				// a way cut by the caller's deadline is not known to be bad
++				d.memory.failed(host, item.way)
++			}
++			errs = append(errs, E.Cause(err, item.way))
++			if next < len(order) || running > 0 {
++				d.logger.InfoContext(ctx, "download from ", host, " through ", item.way, " failed: ", err)
++			}
++			if next < len(order) {
++				if running < d.Plan.Most {
++					start()
++				}
++			} else if running == 0 {
++				return "", E.Errors(errs...)
++			}
++		case <-watch.C:
++			if next < len(order) && running < d.Plan.Most && d.due(attempts) {
++				start()
++			}
++		case <-ctx.Done():
++			return "", E.Errors(append(errs, ctx.Err())...)
++		}
++	}
++}
++
++// due tells whether the ways under way have earned the start of the next one (DownloadPlan).
++func (d *Downloader) due(attempts []*attempt) bool {
++	now := time.Now()
++	idle, youngest := time.Duration(-1), time.Duration(-1)
++	body := false
++	for _, item := range attempts {
++		item.access.Lock()
++		finished, last, started, inBody := item.finished, item.last, item.started, item.body
++		item.access.Unlock()
++		if finished {
++			continue
++		}
++		if inBody && now.Sub(last) < d.Plan.Body {
++			// a body is coming: a second one would hold another copy of a file of up to
++			// tens of MB on a router
++			return false
++		}
++		body = body || inBody
++		if idle < 0 || now.Sub(last) < idle {
++			idle = now.Sub(last)
++		}
++		if youngest < 0 || now.Sub(started) < youngest {
++			youngest = now.Sub(started)
++		}
++	}
++	if idle < 0 {
++		return true
++	}
++	wait := d.Plan.Wait
++	if body {
++		wait = d.Plan.Body
++	}
++	return idle >= wait || youngest >= d.Plan.Total
++}
++
++// DownloadMemory is what the downloads found of the ways: per host, the way that brought its last
++// file and the ways that failed for it since they last brought one; per way, its last download
++// that brought a file. A host process that keeps one in the context of its boxes
++// (service.ContextWithPtr) keeps it across them.
++type DownloadMemory struct {
++	access sync.Mutex
++	hosts  map[string]*hostRecord
++	ways   map[string]*wayRecord
++	// excluded are the outbounds no download goes through (SetExcluded)
++	excluded map[string]bool
++}
++
++type hostRecord struct {
++	brought string
++	failed  map[string]time.Time
++	used    time.Time
++}
++
++type wayRecord struct {
++	brought time.Time
++	// bytes a second of that download
++	rate float64
++}
++
++// memoryHosts bounds the hosts a memory keeps, the least recently used forgotten first: a box
++// downloads from a few hosts; a bound only against a caller that asks for many.
++const memoryHosts = 256
++
++func NewDownloadMemory() *DownloadMemory {
++	return &DownloadMemory{hosts: make(map[string]*hostRecord), ways: make(map[string]*wayRecord)}
++}
++
++func (m *DownloadMemory) host(name string) *hostRecord {
++	record := m.hosts[name]
++	if record == nil {
++		if len(m.hosts) >= memoryHosts {
++			var oldest string
++			for key, item := range m.hosts {
++				if oldest == "" || item.used.Before(m.hosts[oldest].used) {
++					oldest = key
++				}
++			}
++			delete(m.hosts, oldest)
++		}
++		record = &hostRecord{failed: make(map[string]time.Time)}
++		m.hosts[name] = record
++	}
++	record.used = time.Now()
++	return record
++}
++
++func (m *DownloadMemory) brought(host string, way string, took time.Duration, bytes int64) {
++	m.access.Lock()
++	defer m.access.Unlock()
++	record := m.host(host)
++	record.brought = way
++	delete(record.failed, way)
++	rate := float64(bytes)
++	if took > 0 {
++		rate = float64(bytes) / took.Seconds()
++	}
++	m.ways[way] = &wayRecord{brought: time.Now(), rate: rate}
++}
++
++func (m *DownloadMemory) failed(host string, way string) {
++	m.access.Lock()
++	defer m.access.Unlock()
++	record := m.host(host)
++	if record.brought == way {
++		record.brought = ""
++	}
++	record.failed[way] = time.Now()
++}
++
++// SetExcluded sets the outbounds no download goes through, by tag, in place of those set before:
++// the choice of the program that runs the boxes (a server of little traffic, one kept as the last
++// reserve of a rule, a tunnel to a closed network). They are not in the configuration, whose
++// http_clients would change with every new list of servers.
++func (m *DownloadMemory) SetExcluded(tags []string) {
++	excluded := make(map[string]bool, len(tags))
++	for _, tag := range tags {
++		excluded[tag] = true
++	}
++	m.access.Lock()
++	defer m.access.Unlock()
++	m.excluded = excluded
++}
++
++func (m *DownloadMemory) isExcluded(tag string) bool {
++	m.access.Lock()
++	defer m.access.Unlock()
++	return m.excluded[tag]
++}
++
++// Forget forgets what the downloads found of a way: its tag names another outbound now. A nil
++// memory has nothing to forget.
++func (m *DownloadMemory) Forget(way string) {
++	if m == nil {
++		return
++	}
++	m.access.Lock()
++	defer m.access.Unlock()
++	delete(m.ways, way)
++	for _, record := range m.hosts {
++		if record.brought == way {
++			record.brought = ""
++		}
++		delete(record.failed, way)
++	}
++}
++
++// order is the ways of a download from host in the order they are tried: the way that brought
++// its last file; the first way of the list; the ways that brought a file of another host, the
++// fastest first; those the URL tests passed, the lowest delay first (a group by the outbound it
++// uses now); those not known, in the order of the list; those that failed for the host, the oldest failure first. No way is left
++// out. together tells that the first failed for the host last time: the second starts with it.
++func (m *DownloadMemory) order(host string, ways []string, delay func(string) (uint16, bool)) ([]string, bool) {
++	if len(ways) == 0 {
++		return nil, false
++	}
++	m.access.Lock()
++	defer m.access.Unlock()
++	record := m.hosts[host]
++	if record != nil {
++		record.used = time.Now()
++	}
++	order := make([]string, 0, len(ways))
++	if record != nil && record.brought != "" && slices.Contains(ways, record.brought) {
++		order = append(order, record.brought)
++	}
++	if !slices.Contains(order, ways[0]) {
++		order = append(order, ways[0])
++	}
++	type ranked struct {
++		way   string
++		class int
++		key   float64
++	}
++	var rest []ranked
++	for _, way := range ways[1:] {
++		if slices.Contains(order, way) || slices.ContainsFunc(rest, func(item ranked) bool { return item.way == way }) {
++			continue
++		}
++		item := ranked{way: way, class: 3}
++		var failedAt time.Time
++		if record != nil {
++			failedAt = record.failed[way]
++		}
++		switch {
++		case !failedAt.IsZero():
++			item.class, item.key = 4, float64(failedAt.UnixNano())
++		case m.ways[way] != nil:
++			item.class, item.key = 1, -m.ways[way].rate
++		default:
++			if value, tested := delay(way); tested {
++				item.class, item.key = 2, float64(value)
++			}
++		}
++		rest = append(rest, item)
++	}
++	slices.SortStableFunc(rest, func(left ranked, right ranked) int {
++		if left.class != right.class {
++			return left.class - right.class
++		}
++		return cmp.Compare(left.key, right.key)
++	})
++	for _, item := range rest {
++		order = append(order, item.way)
++	}
++	together := record != nil && len(order) > 1 && !record.failed[order[0]].IsZero()
++	return order, together
++}
+diff --git a/common/httpclient/downloader_test.go b/common/httpclient/downloader_test.go
+new file mode 100644
+index 000000000..8f3cbb3ea
+--- /dev/null
++++ b/common/httpclient/downloader_test.go
+@@ -0,0 +1,263 @@
++package httpclient
++
++import (
++	"context"
++	"errors"
++	"net/http"
++	"strconv"
++	"sync"
++	"sync/atomic"
++	"testing"
++	"time"
++
++	"github.com/sagernet/sing-box/adapter"
++	"github.com/sagernet/sing-box/common/urltest"
++	"github.com/sagernet/sing-box/log"
++
++	"github.com/stretchr/testify/require"
++)
++
++// testPlan is a plan of the same shape as downloadPlan, a hundred times shorter.
++var testPlan = DownloadPlan{Wait: 50 * time.Millisecond, Body: 30 * time.Millisecond, Total: 100 * time.Millisecond, Most: 3}
++
++func testDownloader(ways ...string) *Downloader {
++	downloader := NewDownloader(log.NewNOPFactory().Logger(), ways, map[string]adapter.HTTPTransport{}, nil, nil)
++	downloader.Plan = testPlan
++	return downloader
++}
++
++func accepting(string, any) error { return nil }
++
++// The order: the way that brought the host's last file; the first of the list; the ways that
++// brought another host's file, the fastest first; those the URL tests passed, the lowest delay
++// first; the unknown ones in list order; those that failed for the host, the oldest failure first.
++func TestDownloadMemoryOrder(t *testing.T) {
++	memory := NewDownloadMemory()
++	history := urltest.NewHistoryStorage()
++	history.StoreURLTestHistory("tested-slow", &adapter.URLTestHistory{Time: time.Now(), Delay: 300})
++	history.StoreURLTestHistory("tested-fast", &adapter.URLTestHistory{Time: time.Now(), Delay: 40})
++	history.StoreURLTestHistory("failed-old", &adapter.URLTestHistory{Time: time.Now(), Delay: 10})
++	downloader := NewDownloader(log.NewNOPFactory().Logger(), []string{
++		"direct", "unknown-1", "failed-new", "tested-slow", "other-slow", "brought", "failed-old",
++		"tested-fast", "other-fast", "unknown-2",
++	}, nil, memory, history)
++	memory.failed("lists.example", "failed-old")
++	time.Sleep(time.Millisecond)
++	memory.failed("lists.example", "failed-new")
++	memory.brought("other.example", "other-slow", time.Second, 1000)
++	memory.brought("other.example", "other-fast", time.Second, 9000)
++	memory.brought("lists.example", "brought", time.Second, 1)
++	ways, together := downloader.Ways("lists.example")
++	require.Equal(t, []string{
++		"brought", "direct", "other-fast", "other-slow", "tested-fast", "tested-slow",
++		"unknown-1", "unknown-2", "failed-old", "failed-new",
++	}, ways)
++	require.False(t, together)
++}
++
++// The first way of the list stays first when it failed for the host, but the next starts with it;
++// a way that brings the host's file again is no longer a failed one.
++func TestDownloadMemoryTogether(t *testing.T) {
++	downloader := testDownloader("direct", "a", "b")
++	downloader.Record("lists.example", "direct", errors.New("reset"), 0, 0)
++	ways, together := downloader.Ways("lists.example")
++	require.Equal(t, []string{"direct", "a", "b"}, ways)
++	require.True(t, together)
++	downloader.Record("lists.example", "direct", nil, time.Second, 1)
++	_, together = downloader.Ways("lists.example")
++	require.False(t, together)
++	_, together = downloader.Ways("other.example")
++	require.False(t, together)
++}
++
++// A way that does not answer has the next one started beside it after Wait; the first result
++// accepted wins, the way under way is cancelled, and the host's next download starts with the
++// way that brought it.
++func TestDownloaderStartsNextWhenSilent(t *testing.T) {
++	downloader := testDownloader("silent", "works")
++	var silentCanceled atomic.Bool
++	started := time.Now()
++	way, err := downloader.Download(context.Background(), "lists.example", func(ctx context.Context, way string, _ *http.Client, progress func(int)) (any, error) {
++		if way == "silent" {
++			<-ctx.Done()
++			silentCanceled.Store(true)
++			return nil, ctx.Err()
++		}
++		progress(0)
++		progress(100)
++		return "list", nil
++	}, accepting)
++	require.NoError(t, err)
++	require.Equal(t, "works", way)
++	require.GreaterOrEqual(t, time.Since(started), testPlan.Wait)
++	require.Eventually(t, silentCanceled.Load, time.Second, 5*time.Millisecond)
++	ways, _ := downloader.Ways("lists.example")
++	require.Equal(t, []string{"works", "silent"}, ways)
++}
++
++// While a body comes no other way starts, however long it takes: a second copy of a big list
++// would be held at once.
++func TestDownloaderBodyHoldsTheNext(t *testing.T) {
++	downloader := testDownloader("slow-body", "other")
++	var otherStarted atomic.Bool
++	way, err := downloader.Download(context.Background(), "lists.example", func(ctx context.Context, way string, _ *http.Client, progress func(int)) (any, error) {
++		if way == "other" {
++			otherStarted.Store(true)
++			return "list", nil
++		}
++		progress(0)
++		for range 25 {
++			// steady parts, closer than Body, for 3 Totals
++			time.Sleep(testPlan.Body / 3)
++			progress(10)
++		}
++		return "list", nil
++	}, accepting)
++	require.NoError(t, err)
++	require.Equal(t, "slow-body", way)
++	require.False(t, otherStarted.Load())
++}
++
++// A result accept refuses (a page of an ISP with status 200) fails its way and the next one is
++// started at once. The refused way is the first of the list: it stays right after the way that
++// brought the file.
++func TestDownloaderAcceptRefuses(t *testing.T) {
++	downloader := testDownloader("page", "works", "spare")
++	started := time.Now()
++	way, err := downloader.Download(context.Background(), "lists.example", func(ctx context.Context, way string, _ *http.Client, progress func(int)) (any, error) {
++		progress(0)
++		return way, nil
++	}, func(way string, result any) error {
++		if result == "page" {
++			return errors.New("not a list")
++		}
++		return nil
++	})
++	require.NoError(t, err)
++	require.Equal(t, "works", way)
++	require.Less(t, time.Since(started), testPlan.Wait)
++	ways, together := downloader.Ways("lists.example")
++	require.Equal(t, []string{"works", "page", "spare"}, ways)
++	require.False(t, together)
++}
++
++// At most Most ways at once, however many are silent.
++func TestDownloaderMostAtOnce(t *testing.T) {
++	downloader := testDownloader("a", "b", "c", "d", "e")
++	var access sync.Mutex
++	running, most := 0, 0
++	ctx, cancel := context.WithTimeout(context.Background(), 8*testPlan.Wait)
++	defer cancel()
++	_, err := downloader.Download(ctx, "lists.example", func(ctx context.Context, way string, _ *http.Client, progress func(int)) (any, error) {
++		access.Lock()
++		running++
++		most = max(most, running)
++		access.Unlock()
++		<-ctx.Done()
++		access.Lock()
++		running--
++		access.Unlock()
++		return nil, ctx.Err()
++	}, accepting)
++	require.Error(t, err)
++	// a way started just before the deadline may still be counting itself in
++	time.Sleep(testPlan.Wait)
++	access.Lock()
++	defer access.Unlock()
++	require.Equal(t, testPlan.Most, most)
++}
++
++// When every way fails the error names each, and ways cut by the caller's deadline are not
++// remembered as failed.
++func TestDownloaderAllFail(t *testing.T) {
++	downloader := testDownloader("a", "b")
++	_, err := downloader.Download(context.Background(), "lists.example", func(ctx context.Context, way string, _ *http.Client, progress func(int)) (any, error) {
++		return nil, errors.New(way + " refused")
++	}, accepting)
++	require.Error(t, err)
++	for _, text := range []string{"a: a refused", "b: b refused"} {
++		require.Contains(t, err.Error(), text)
++	}
++	cut := testDownloader("silent")
++	ctx, cancel := context.WithTimeout(context.Background(), testPlan.Wait)
++	defer cancel()
++	_, err = cut.Download(ctx, "lists.example", func(ctx context.Context, way string, _ *http.Client, progress func(int)) (any, error) {
++		<-ctx.Done()
++		return nil, ctx.Err()
++	}, accepting)
++	require.Error(t, err)
++	_, together := cut.Ways("lists.example")
++	require.False(t, together)
++}
++
++// The memory keeps memoryHosts hosts, the least recently used forgotten first.
++func TestDownloadMemoryBound(t *testing.T) {
++	memory := NewDownloadMemory()
++	for index := range memoryHosts + 10 {
++		memory.failed("host-"+strconv.Itoa(index), "direct")
++	}
++	require.LessOrEqual(t, len(memory.hosts), memoryHosts)
++}
++
++// A way forgotten (its tag names another outbound now) is not known for any host any more.
++func TestDownloadMemoryForget(t *testing.T) {
++	downloader := testDownloader("direct", "a", "b")
++	downloader.Record("lists.example", "b", nil, time.Second, 10)
++	downloader.Record("lists.example", "direct", errors.New("reset"), 0, 0)
++	downloader.Record("other.example", "a", errors.New("reset"), 0, 0)
++	downloader.memory.Forget("b")
++	downloader.memory.Forget("a")
++	ways, together := downloader.Ways("lists.example")
++	require.Equal(t, []string{"direct", "a", "b"}, ways)
++	require.True(t, together)
++	ways, _ = downloader.Ways("other.example")
++	require.Equal(t, []string{"direct", "a", "b"}, ways)
++}
++
++// testOutbounds are outbounds by tag: a group selects what its entry names.
++type testOutbounds struct {
++	adapter.OutboundManager
++	selects map[string]string
++}
++
++type testOutbound struct {
++	adapter.OutboundGroup
++	tag      string
++	selected adapter.Outbound
++}
++
++func (o *testOutbound) Tag() string { return o.tag }
++
++func (o *testOutbound) Selected(string) adapter.Outbound { return o.selected }
++
++type testLeaf struct {
++	adapter.Outbound
++	tag string
++}
++
++func (o *testLeaf) Tag() string { return o.tag }
++
++func (m *testOutbounds) Outbound(tag string) (adapter.Outbound, bool) {
++	if selected, isGroup := m.selects[tag]; isGroup {
++		next, _ := m.Outbound(selected)
++		return &testOutbound{tag: tag, selected: next}, true
++	}
++	return &testLeaf{tag: tag}, true
++}
++
++// The outbounds the program excludes are no ways, nor is a group while it uses one of them (a
++// rule fallen back to its last reserve); excluding nothing again gives them back.
++func TestDownloaderExcluded(t *testing.T) {
++	downloader := testDownloader("direct", "rule-a", "rule-b", "helper")
++	outbounds := &testOutbounds{selects: map[string]string{"rule-a": "rule-a-test", "rule-a-test": "reserve", "rule-b": "nl"}}
++	downloader.Outbounds = outbounds
++	downloader.memory.SetExcluded([]string{"reserve", "helper"})
++	ways, _ := downloader.Ways("lists.example")
++	require.Equal(t, []string{"direct", "rule-b"}, ways)
++	outbounds.selects["rule-a-test"] = "fi"
++	ways, _ = downloader.Ways("lists.example")
++	require.Equal(t, []string{"direct", "rule-a", "rule-b"}, ways)
++	downloader.memory.SetExcluded(nil)
++	ways, _ = downloader.Ways("lists.example")
++	require.Equal(t, []string{"direct", "rule-a", "rule-b", "helper"}, ways)
++}
+diff --git a/common/httpclient/manager.go b/common/httpclient/manager.go
+index 820cbeabb..1dbd9ed32 100644
+--- a/common/httpclient/manager.go
++++ b/common/httpclient/manager.go
+@@ -28,6 +28,9 @@ type Manager struct {
+ 	defaultTag               string
+ 	defaultTransport         *sharedManagedTransport
+ 	defaultTransportFallback func() (*ManagedTransport, error)
++	// the downloaders of the clients with outbounds, by tag, and what their downloads found
++	downloaders map[string]*Downloader
++	memory      *DownloadMemory
+ }
+ 
+ type sharedManagedTransport struct {
+@@ -44,12 +47,17 @@ func NewManager(ctx context.Context, logger log.ContextLogger, clients []option.
+ 	if defaultTag == "" && len(clients) > 0 {
+ 		defaultTag = clients[0].Tag
+ 	}
++	memory := service.PtrFromContext[DownloadMemory](ctx)
++	if memory == nil {
++		memory = NewDownloadMemory()
++	}
+ 	return &Manager{
+ 		ctx:              ctx,
+ 		logger:           logger,
+ 		defines:          defines,
+ 		sharedTransports: make(map[string]*sharedManagedTransport),
+ 		defaultTag:       defaultTag,
++		memory:           memory,
+ 	}
+ }
+ 
+@@ -65,6 +73,12 @@ func (m *Manager) Start(stage adapter.StartStage, scope *adapter.Scope) error {
+ 	if stage != adapter.StartStateStart {
+ 		return nil
+ 	}
++	for _, define := range m.defines {
++		err := checkOutbounds(define)
++		if err != nil {
++			return err
++		}
++	}
+ 	if m.defaultTag != "" {
+ 		sharedTransport, err := m.resolveShared(m.defaultTag)
+ 		if err != nil {
+@@ -104,7 +118,7 @@ func (m *Manager) ResolveTransport(ctx context.Context, logger logger.ContextLog
+ 			if !loaded {
+ 				return nil, E.New("http_client not found: ", options.Tag)
+ 			}
+-			resolvedOptions := define.Options()
++			resolvedOptions := clientOptions(define)
+ 			resolvedOptions.ResolveOnDetour = true
+ 			transport, err := NewTransport(ctx, logger, options.Tag, resolvedOptions)
+ 			if err != nil {
+@@ -143,7 +157,7 @@ func (m *Manager) resolveShared(tag string) (*sharedManagedTransport, error) {
+ 	if !loaded {
+ 		return nil, E.New("http_client not found: ", tag)
+ 	}
+-	transport, err := NewTransport(m.ctx, m.logger, tag, define.Options())
++	transport, err := NewTransport(m.ctx, m.logger, tag, clientOptions(define))
+ 	if err != nil {
+ 		return nil, E.Cause(err, "create shared http_client[", tag, "]")
+ 	}
+diff --git a/docs/configuration/shared/http-client.md b/docs/configuration/shared/http-client.md
+index 787aaa3db..67c1dd76b 100644
+--- a/docs/configuration/shared/http-client.md
++++ b/docs/configuration/shared/http-client.md
+@@ -19,6 +19,7 @@ When object:
+   "disable_version_fallback": false,
+   "headers": {},
+   "fallback": [],
++  "outbounds": [],
+ 
+   ... // HTTP2 Fields
+ 
+@@ -103,6 +104,31 @@ no data for the stall timeout, or content that is not a rule-set) repeats it thr
+ fallback client in turn, until one brings the list. The fallbacks of a fallback client are not
+ followed. Other users of the client do not fall back.
+ 
++#### outbounds
++
++Tags of outbounds a download through this client may go through, the first one the default
++first try. Only for a client of top-level `http_clients`; not with `detour` or `fallback`. A
++user of the client that does not know the ways (any but a remote rule-set) goes through the
++first one.
++
++A remote rule-set downloads through the ways in this order, for the host of its URL:
++
++1. the way that brought the last file from this host;
++2. the first way of the list;
++3. the ways that brought a file from another host, the fastest first;
++4. the ways the URL tests passed, the lowest delay first (a group by the outbound it uses now);
++5. the ways not known yet, in the order of the list;
++6. the ways that failed for this host, the oldest failure first.
++
++No way is left out, but those the program that runs the box excludes (a group while it uses an
++excluded outbound): podkop-exp excludes the servers the user marks so. The next way starts beside those under way when none of them showed
++progress for 5 s (no answer yet) or for 3 s in a body, or the youngest is 10 s old and no body
++is coming; at most three at once. The first way that brings a list that parses wins and the
++others are stopped; a body that is not a rule-set (a page served with status 200) fails its way.
++When the first way failed for the host the last time, the second starts with it. What the
++downloads found is kept for the life of the box, and across boxes when the program that runs
++them keeps it.
++
+ ### HTTP2 Fields
+ 
+ When `version` is `2` (default).
+diff --git a/option/http.go b/option/http.go
+index 5b878421b..77844b4c5 100644
+--- a/option/http.go
++++ b/option/http.go
+@@ -44,6 +44,12 @@ type _HTTPClientOptions struct {
+ 	// repeat it through, in order (adapter.HTTPClientFallbacks). Their own fallbacks are not
+ 	// followed.
+ 	Fallback badoption.Listable[string] `json:"fallback,omitempty"`
++
++	// Outbounds are the ways a download through this client may take, the first one the
++	// default first try (adapter.HTTPDownloaders): a caller that knows the downloader tries
++	// them as it orders them; any other caller goes through the first. Not with detour or
++	// fallback.
++	Outbounds badoption.Listable[string] `json:"outbounds,omitempty" reference:"outbound"`
+ }
+ 
+ type (
+diff --git a/route/rule/export_test.go b/route/rule/export_test.go
+index 5507de93c..96295d073 100644
+--- a/route/rule/export_test.go
++++ b/route/rule/export_test.go
+@@ -1,8 +1,41 @@
+ package rule
+ 
+-import "time"
++import (
++	"context"
++	"net/http"
++	"time"
++
++	"github.com/sagernet/sing-box/adapter"
++	C "github.com/sagernet/sing-box/constant"
++	"github.com/sagernet/sing-box/log"
++)
+ 
+ // SwapTimeoutsForTest exposes the fetch bounds to the tests outside the package.
+ func SwapTimeoutsForTest(stall, startDeadline time.Duration) func() {
+ 	return swapTimeouts(stall, startDeadline)
+ }
++
++// NewRemoteRuleSetForTest is a remote rule-set of the source format at url that downloads through
++// downloader, for the tests outside the package (which may import common/httpclient).
++func NewRemoteRuleSetForTest(url string, downloader adapter.HTTPDownloader) *RemoteRuleSet {
++	set := &RemoteRuleSet{
++		ctx:        context.Background(),
++		logger:     log.NewNOPFactory().NewLogger("test"),
++		tag:        "test",
++		url:        url,
++		httpClient: &http.Client{},
++		downloader: downloader,
++	}
++	set.options.Format = C.RuleSetFormatSource
++	return set
++}
++
++// FetchForTest is fetch.
++func (s *RemoteRuleSet) FetchForTest(ctx context.Context, isStart bool) error {
++	return s.fetch(ctx, isStart)
++}
++
++// RulesForTest is the number of the rules the set has.
++func (s *RemoteRuleSet) RulesForTest() int {
++	return len(s.currentRules())
++}
+diff --git a/route/rule/rule_set_remote.go b/route/rule/rule_set_remote.go
+index c6b500b5c..0bcf0679a 100644
+--- a/route/rule/rule_set_remote.go
++++ b/route/rule/rule_set_remote.go
+@@ -53,8 +53,10 @@ type RemoteRuleSet struct {
+ 	updateInterval time.Duration
+ 	httpClient     *http.Client
+ 	// the clients a fetch that failed through httpClient is repeated through, in order
+-	// (option.HTTPClientOptions.Fallback)
++	// (option.HTTPClientOptions.Fallback); the downloader of the http client when it has
++	// outbounds (adapter.HTTPDownloaders)
+ 	fallbacks      []ruleSetFallback
++	downloader     adapter.HTTPDownloader
+ 	access         sync.RWMutex
+ 	rules          []adapter.HeadlessRule
+ 	metadata       adapter.RuleSetMetadata
+@@ -143,6 +145,10 @@ func (s *RemoteRuleSet) StartContext(ctx context.Context, startContext *adapter.
+ 		startContext.Register(fallback.Transport)
+ 		s.fallbacks = append(s.fallbacks, ruleSetFallback{tag: fallback.Tag, client: &http.Client{Transport: fallback.Transport}})
+ 	}
++	s.downloader, err = s.resolveDownloader()
++	if err != nil {
++		return E.Cause(err, "create rule-set http client")
++	}
+ 	s.loadCached()
+ 	var loadedFromInitialPath bool
+ 	if s.lastUpdated.IsZero() && s.initialPath != "" {
+@@ -450,12 +456,17 @@ var (
+ type stallResetReader struct {
+ 	reader io.Reader
+ 	reset  func()
++	// progress, when given, is told the size of every read that carries data
++	progress func(int)
+ }
+ 
+ func (r *stallResetReader) Read(p []byte) (int, error) {
+ 	n, err := r.reader.Read(p)
+ 	if n > 0 {
+ 		r.reset()
++		if r.progress != nil {
++			r.progress(n)
++		}
+ 	}
+ 	return n, err
+ }
+@@ -531,8 +542,9 @@ func describeRuleSetBody(response *http.Response, size int64, sample []byte) str
+ 	return description.String()
+ }
+ 
+-// fetch downloads the list through the http client of the rule-set and, while that fails, through
+-// each of its fallback clients in turn. Each way has the whole stall timeout of its own; the start
++// fetch downloads the list through the downloader of the http client of the rule-set when it has
++// outbounds (fetchWays); else through the client and, while that fails, through each of its
++// fallback clients in turn. Each way has the whole stall timeout of its own; the start
+ // deadline bounds them all. The error is that of every way.
+ func (s *RemoteRuleSet) fetch(ctx context.Context, isStart bool) error {
+ 	if isStart {
+@@ -540,6 +552,9 @@ func (s *RemoteRuleSet) fetch(ctx context.Context, isStart bool) error {
+ 		ctx, stop = context.WithTimeout(ctx, ruleSetStartDeadline)
+ 		defer stop()
+ 	}
++	if s.downloader != nil {
++		return s.fetchWays(ctx, isStart)
++	}
+ 	err := s.fetchThrough(ctx, s.httpClient, isStart)
+ 	if err == nil || len(s.fallbacks) == 0 {
+ 		return err
+@@ -560,8 +575,26 @@ func (s *RemoteRuleSet) fetch(ctx context.Context, isStart bool) error {
+ 	return E.Errors(errs...)
+ }
+ 
+-// fetchThrough downloads the list through client.
++// fetchThrough downloads the list through client and takes it.
+ func (s *RemoteRuleSet) fetchThrough(ctx context.Context, client *http.Client, isStart bool) error {
++	fetched, err := s.download(ctx, client, isStart, s.lastEtag, nil)
++	if err != nil {
++		return err
++	}
++	return s.apply(fetched)
++}
++
++// ruleSetFetched is what a download of the list brought: the answer that it is not modified,
++// or the body of a 200.
++type ruleSetFetched struct {
++	notModified bool
++	response    *http.Response
++	content     []byte
++}
++
++// download downloads the list through client, bounded by the stall timeout, as new if it is not
++// etag. progress, when given, is told the headers (0) and every part of the body.
++func (s *RemoteRuleSet) download(ctx context.Context, client *http.Client, isStart bool, etag string, progress func(int)) (*ruleSetFetched, error) {
+ 	s.logger.Debug("updating rule-set ", s.tag, " from URL: ", s.url)
+ 	// a group that switches members closes the connections it does not know as routed
+ 	// ones: a list half downloaded through it would wait for the next update_interval
+@@ -588,10 +621,10 @@ func (s *RemoteRuleSet) fetchThrough(ctx context.Context, client *http.Client, i
+ 	}
+ 	request, err := http.NewRequest("GET", s.url, nil)
+ 	if err != nil {
+-		return err
++		return nil, err
+ 	}
+-	if s.lastEtag != "" {
+-		request.Header.Set("If-None-Match", s.lastEtag)
++	if etag != "" {
++		request.Header.Set("If-None-Match", etag)
+ 	}
+ 	if !isStart {
+ 		defer client.CloseIdleConnections()
+@@ -603,18 +636,38 @@ func (s *RemoteRuleSet) fetchThrough(ctx context.Context, client *http.Client, i
+ 			// next batch of rule-sets into the same wait
+ 			client.Transport.(adapter.HTTPTransport).Reset()
+ 		}
+-		return describe(err)
++		return nil, describe(err)
+ 	}
+ 	defer response.Body.Close()
+ 	stall.Reset(ruleSetStallTimeout)
++	if progress != nil {
++		progress(0)
++	}
+ 	switch response.StatusCode {
+ 	case http.StatusOK:
+ 	case http.StatusNotModified:
++		return &ruleSetFetched{notModified: true, response: response}, nil
++	default:
++		return nil, E.New("unexpected status: ", response.Status)
++	}
++	body := &stallResetReader{reader: response.Body, reset: func() { stall.Reset(ruleSetStallTimeout) }, progress: progress}
++	content, err := s.readRuleSetBody(response, body)
++	// the transfer is over: parsing a large list must not look like a stalled download
++	stall.Stop()
++	if err != nil {
++		return nil, describe(err)
++	}
++	return &ruleSetFetched{response: response, content: content}, nil
++}
++
++// apply takes what a download brought.
++func (s *RemoteRuleSet) apply(fetched *ruleSetFetched) error {
++	if fetched.notModified {
+ 		s.lastUpdated = time.Now()
+ 		if checks, kept := s.cacheFile.(adapter.RuleSetCheckCache); kept {
+ 			// the time alone: a save of the set writes the whole list again, at every
+ 			// update_interval, to a cache file that may be on flash
+-			err = checks.StoreRuleSetChecked(s.tag, s.lastUpdated)
++			err := checks.StoreRuleSetChecked(s.tag, s.lastUpdated)
+ 			if err != nil {
+ 				s.logger.Error("save rule-set updated time: ", err)
+ 				return nil
+@@ -624,7 +677,7 @@ func (s *RemoteRuleSet) fetchThrough(ctx context.Context, client *http.Client, i
+ 			if savedRuleSet != nil {
+ 				savedRuleSet.LastUpdated = s.lastUpdated
+ 				savedRuleSet.URLHash = s.urlHash[:]
+-				err = s.cacheFile.SaveRuleSet(s.tag, savedRuleSet)
++				err := s.cacheFile.SaveRuleSet(s.tag, savedRuleSet)
+ 				if err != nil {
+ 					s.logger.Error("save rule-set updated time: ", err)
+ 					return nil
+@@ -633,22 +686,14 @@ func (s *RemoteRuleSet) fetchThrough(ctx context.Context, client *http.Client, i
+ 		}
+ 		s.logger.Info("update rule-set ", s.tag, ": not modified")
+ 		return nil
+-	default:
+-		return E.New("unexpected status: ", response.Status)
+-	}
+-	body := &stallResetReader{reader: response.Body, reset: func() { stall.Reset(ruleSetStallTimeout) }}
+-	content, err := s.readRuleSetBody(response, body)
+-	// the transfer is over: parsing a large list must not look like a stalled download
+-	stall.Stop()
+-	if err != nil {
+-		return describe(err)
+ 	}
++	response, content := fetched.response, fetched.content
+ 	// a rule-set closed while its list came in does not parse it: the parse of a big list
+ 	// is the most an update costs, and a box that replaces this one fetches its own
+ 	if s.ctx.Err() != nil {
+ 		return s.ctx.Err()
+ 	}
+-	err = s.commitBytes(content)
++	err := s.commitBytes(content)
+ 	if err != nil {
+ 		return E.Cause(err, "read rule-set (", describeRuleSetBody(response, int64(len(content)), content), ")")
+ 	}
+diff --git a/route/rule/rule_set_remote_downloader_test.go b/route/rule/rule_set_remote_downloader_test.go
+new file mode 100644
+index 000000000..112dc1296
+--- /dev/null
++++ b/route/rule/rule_set_remote_downloader_test.go
+@@ -0,0 +1,143 @@
++package rule_test
++
++import (
++	"context"
++	"io"
++	"net"
++	"net/http"
++	"net/http/httptest"
++	"net/url"
++	"strconv"
++	"sync/atomic"
++	"testing"
++	"time"
++
++	"github.com/sagernet/sing-box/adapter"
++	"github.com/sagernet/sing-box/common/httpclient"
++	"github.com/sagernet/sing-box/log"
++	"github.com/sagernet/sing-box/route/rule"
++
++	"github.com/stretchr/testify/require"
++)
++
++const downloaderList = `{"version":3,"rules":[{"domain_suffix":["example.com"]}]}`
++
++// testWay is an http.Transport as the transport of a way of a downloader.
++type testWay struct{ *http.Transport }
++
++func (w testWay) Reset() { w.CloseIdleConnections() }
++
++// wayTo is a way that reaches address whatever the request names: the way of an ISP that answers
++// a blocked address with its own page.
++func wayTo(address string) testWay {
++	return testWay{&http.Transport{DialContext: func(ctx context.Context, network, _ string) (net.Conn, error) {
++		return (&net.Dialer{}).DialContext(ctx, network, address)
++	}}}
++}
++
++func testRuleSetDownloader(ways []string, transports map[string]adapter.HTTPTransport) *httpclient.Downloader {
++	downloader := httpclient.NewDownloader(log.NewNOPFactory().Logger(), ways, transports, nil, nil)
++	downloader.Plan = httpclient.DownloadPlan{Wait: 50 * time.Millisecond, Body: 30 * time.Millisecond, Total: 100 * time.Millisecond, Most: 3}
++	return downloader
++}
++
++// A page served with status 200 instead of the list fails its way; the list comes through the next
++// way, is taken once, and the next download from the host starts with that way.
++func TestRemoteRuleSetDownloaderPage(t *testing.T) {
++	list := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		io.WriteString(w, downloaderList)
++	}))
++	defer list.Close()
++	page := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		io.WriteString(w, "<html><body>blocked by the provider</body></html>")
++	}))
++	defer page.Close()
++	downloader := testRuleSetDownloader([]string{"isp", "works"}, map[string]adapter.HTTPTransport{
++		"isp":   wayTo(page.Listener.Addr().String()),
++		"works": testWay{&http.Transport{}},
++	})
++	set := rule.NewRemoteRuleSetForTest(list.URL, downloader)
++	var updated int
++	set.RegisterCallback(func(adapter.RuleSet) { updated++ })
++	require.NoError(t, set.FetchForTest(context.Background(), false))
++	require.Equal(t, 1, set.RulesForTest())
++	require.Equal(t, 1, updated)
++	parsed, _ := url.Parse(list.URL)
++	ways, _ := downloader.Ways(parsed.Hostname())
++	require.Equal(t, []string{"works", "isp"}, ways)
++}
++
++// At the start a way that never answers costs one wait of the plan, not the stall timeout nor the
++// start deadline: the next way is started beside it.
++func TestRemoteRuleSetDownloaderSilentAtStart(t *testing.T) {
++	list := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		io.WriteString(w, downloaderList)
++	}))
++	defer list.Close()
++	silent := testWay{&http.Transport{DialContext: func(ctx context.Context, network, address string) (net.Conn, error) {
++		<-ctx.Done()
++		return nil, ctx.Err()
++	}}}
++	downloader := testRuleSetDownloader([]string{"silent", "works"}, map[string]adapter.HTTPTransport{
++		"silent": silent,
++		"works":  testWay{&http.Transport{}},
++	})
++	set := rule.NewRemoteRuleSetForTest(list.URL, downloader)
++	started := time.Now()
++	require.NoError(t, set.FetchForTest(context.Background(), true))
++	require.Equal(t, 1, set.RulesForTest())
++	require.Less(t, time.Since(started), 2*time.Second)
++}
++
++// A box whose list client goes first through a SOCKS server that takes the connection and never
++// answers (a local helper that hangs), then directly: the box starts with the list loaded after
++// one wait of the downloader's plan, and the silent way never reaches the server of the list.
++func TestRemoteRuleSetDownloaderInBox(t *testing.T) {
++	var requests atomic.Int32
++	list := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		requests.Add(1)
++		io.WriteString(w, downloaderList)
++	}))
++	defer list.Close()
++	silent, err := net.Listen("tcp", "127.0.0.1:0")
++	require.NoError(t, err)
++	defer silent.Close()
++	go func() {
++		var held []net.Conn
++		defer func() {
++			for _, conn := range held {
++				conn.Close()
++			}
++		}()
++		for {
++			conn, err := silent.Accept()
++			if err != nil {
++				return
++			}
++			held = append(held, conn)
++		}
++	}()
++	port := silent.Addr().(*net.TCPAddr).Port
++	config := `{
++  "log": {"level": "debug"},
++  "http_clients": [{"tag": "lists", "outbounds": ["helper", "direct"]}],
++  "route": {
++    "rule_set": [{"type": "remote", "tag": "list", "format": "source", "url": "` + list.URL + `", "update_interval": "1h", "http_client": "lists"}],
++    "rules": [{"rule_set": ["list"], "outbound": "direct"}],
++    "final": "direct"
++  },
++  "outbounds": [{"type": "direct", "tag": "direct"}, {"type": "socks", "tag": "helper", "server": "127.0.0.1", "server_port": ` + strconv.Itoa(port) + `}]
++}`
++	logs := &memLog{}
++	started := time.Now()
++	instance := startBox(t, config, logs)
++	took := time.Since(started)
++	ruleSet, loaded := instance.Router().RuleSet("list")
++	require.True(t, loaded)
++	require.Equal(t, 1, logs.count("updated rule-set list"), logs.dump())
++	require.False(t, ruleSet.Metadata().ContainsIPCIDRRule)
++	require.EqualValues(t, 1, requests.Load())
++	// one wait of the plan (5 s), not the stall (30 s) nor the start deadline (30 s)
++	require.Less(t, took, 15*time.Second, logs.dump())
++	require.Equal(t, 1, logs.count("through helper"), logs.dump())
++}
+diff --git a/route/rule/rule_set_remote_fallback.go b/route/rule/rule_set_remote_fallback.go
+index 8f865ce60..b0f745860 100644
+--- a/route/rule/rule_set_remote_fallback.go
++++ b/route/rule/rule_set_remote_fallback.go
+@@ -1,7 +1,9 @@
+ package rule
+ 
+ import (
++	"context"
+ 	"net/http"
++	"net/url"
+ 
+ 	"github.com/sagernet/sing-box/adapter"
+ 	"github.com/sagernet/sing/service"
+@@ -28,3 +30,40 @@ func (s *RemoteRuleSet) resolveFallbacks() ([]adapter.HTTPFallback, error) {
+ 	}
+ 	return resolver.ResolveFallbacks(nil)
+ }
++
++// resolveDownloader resolves the downloader of the http client the rule-set downloads with, when
++// that client has outbounds: none for the deprecated download_detour, nor with a manager that
++// has no downloaders.
++func (s *RemoteRuleSet) resolveDownloader() (adapter.HTTPDownloader, error) {
++	downloaders, loaded := service.FromContext[adapter.HTTPClientManager](s.ctx).(adapter.HTTPDownloaders)
++	if !loaded {
++		return nil, nil
++	}
++	switch {
++	case s.options.RemoteOptions.HTTPClient != nil && !s.options.RemoteOptions.HTTPClient.IsEmpty():
++		return downloaders.ResolveDownloader(s.options.RemoteOptions.HTTPClient)
++	case s.options.RemoteOptions.DownloadDetour != "": //nolint:staticcheck
++		return nil, nil
++	}
++	return downloaders.ResolveDownloader(nil)
++}
++
++// fetchWays downloads the list through the ways of the downloader. A body that does not parse
++// (a page of an ISP served with status 200) fails its way, and the other ways go on.
++func (s *RemoteRuleSet) fetchWays(ctx context.Context, isStart bool) error {
++	etag := s.lastEtag
++	var host string
++	if parsed, err := url.Parse(s.url); err == nil {
++		host = parsed.Hostname()
++	}
++	way, err := s.downloader.Download(ctx, host, func(ctx context.Context, way string, client *http.Client, progress func(int)) (any, error) {
++		return s.download(ctx, client, isStart, etag, progress)
++	}, func(way string, result any) error {
++		return s.apply(result.(*ruleSetFetched))
++	})
++	if err != nil {
++		return err
++	}
++	s.logger.Debug("rule-set ", s.tag, " came through ", way)
++	return nil
++}
+-- 
+2.53.0
+

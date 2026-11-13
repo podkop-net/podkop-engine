@@ -1,7 +1,7 @@
 From fcc52fe271d0384188101c5103571f1891373518 Mon Sep 17 00:00:00 2001
 From: FiyeroT <me@fiyero.xyz>
 Date: Thu, 12 Nov 2026 21:41:21 +0300
-Subject: [PATCH 48/58] tlsspoof: the forged ClientHello the way the connection
+Subject: [PATCH 48/59] tlsspoof: the forged ClientHello the way the connection
  goes, REALITY takes it
 
 The forged ClientHello of tls.spoof goes out the way the connection goes and nothing else does;

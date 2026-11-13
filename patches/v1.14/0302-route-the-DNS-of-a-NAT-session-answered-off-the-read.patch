@@ -1,7 +1,7 @@
 From ac79b346a9ef77d564d970afd710880db42fa891 Mon Sep 17 00:00:00 2001
 From: FiyeroT <me@fiyero.xyz>
 Date: Thu, 12 Nov 2026 21:41:20 +0300
-Subject: [PATCH 20/58] route: the DNS of a NAT session answered off the
+Subject: [PATCH 20/59] route: the DNS of a NAT session answered off the
  reading loop
 
 DNS hijacked from a NAT session is answered by a handler, off the loop that reads the session, and
