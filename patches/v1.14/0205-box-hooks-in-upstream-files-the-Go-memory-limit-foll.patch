@@ -1,7 +1,7 @@
 From 8491495f37805b2d49b2af31466f7694ada35bcd Mon Sep 17 00:00:00 2001
 From: FiyeroT <me@fiyero.xyz>
 Date: Thu, 12 Nov 2026 21:41:19 +0300
-Subject: [PATCH 08/57] box, hooks in upstream files: the Go memory limit
+Subject: [PATCH 08/58] box, hooks in upstream files: the Go memory limit
  follows the memory the system can still give
 
 The lines of upstream files that "box: the Go memory limit follows the memory the system can still

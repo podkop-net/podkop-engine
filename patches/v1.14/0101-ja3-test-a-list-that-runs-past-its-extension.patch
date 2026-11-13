@@ -1,7 +1,7 @@
 From 56d562a4a2804be1e8821d2271d2c19671dd98f2 Mon Sep 17 00:00:00 2001
 From: FiyeroT <me@fiyero.xyz>
 Date: Thu, 12 Nov 2026 21:41:19 +0300
-Subject: [PATCH 03/57] ja3: test a list that runs past its extension
+Subject: [PATCH 03/58] ja3: test a list that runs past its extension
 
 Upstream 07512b109.
 

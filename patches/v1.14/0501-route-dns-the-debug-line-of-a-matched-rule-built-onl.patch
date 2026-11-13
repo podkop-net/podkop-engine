@@ -1,0 +1,159 @@
+From 52ed10d99b3c8fa53fbe85be051a70a6dc0ab0f5 Mon Sep 17 00:00:00 2001
+From: FiyeroT <me@fiyero.xyz>
+Date: Fri, 13 Nov 2026 08:45:15 +0300
+Subject: [PATCH 58/58] route, dns: the debug line of a matched rule built only
+ when it is logged
+
+The routers built the description of every matched rule (Rule.String) on each connection and
+DNS query only to choose between two debug texts, whatever the level of the log. The line is now
+a MatchLine value the logger formats when it keeps the entry; the text is unchanged.
+
+Pdk-Feature: rule-match-log
+Pdk-Zone: core
+Pdk-Layer: 05
+---
+ dns/router.go                 | 12 ++---------
+ route/route.go                | 14 ++-----------
+ route/rule/match_line.go      | 22 ++++++++++++++++++++
+ route/rule/match_line_test.go | 38 +++++++++++++++++++++++++++++++++++
+ 4 files changed, 64 insertions(+), 22 deletions(-)
+ create mode 100644 route/rule/match_line.go
+ create mode 100644 route/rule/match_line_test.go
+
+diff --git a/dns/router.go b/dns/router.go
+index cd85090c0..10026873c 100644
+--- a/dns/router.go
++++ b/dns/router.go
+@@ -308,11 +308,7 @@ func (r *Router) matchDNS(ctx context.Context, rules []adapter.DNSRule, allowFak
+ 		metadata.ResetRuleCache()
+ 		metadata.DestinationAddressMatchFromResponse = false
+ 		if currentRule.LegacyPreMatch(metadata) {
+-			if ruleDescription := currentRule.String(); ruleDescription != "" {
+-				r.logger.DebugContext(ctx, "match[", currentRuleIndex, "] ", currentRule, " => ", currentRule.Action())
+-			} else {
+-				r.logger.DebugContext(ctx, "match[", currentRuleIndex, "] => ", currentRule.Action())
+-			}
++			r.logger.DebugContext(ctx, R.MatchLine{Prefix: "match", Index: currentRuleIndex, Rule: currentRule})
+ 			switch action := currentRule.Action().(type) {
+ 			case *R.RuleActionDNSRoute:
+ 				transport, loaded := r.transport.Transport(action.Server)
+@@ -428,11 +424,7 @@ func (r *Router) resolveDNSRoute(server string, routeOptions R.RuleActionDNSRout
+ }
+ 
+ func (r *Router) logRuleMatch(ctx context.Context, ruleIndex int, currentRule adapter.DNSRule) {
+-	if ruleDescription := currentRule.String(); ruleDescription != "" {
+-		r.logger.DebugContext(ctx, "match[", ruleIndex, "] ", currentRule, " => ", currentRule.Action())
+-	} else {
+-		r.logger.DebugContext(ctx, "match[", ruleIndex, "] => ", currentRule.Action())
+-	}
++	r.logger.DebugContext(ctx, R.MatchLine{Prefix: "match", Index: ruleIndex, Rule: currentRule})
+ }
+ 
+ type exchangeWithRulesResult struct {
+diff --git a/route/route.go b/route/route.go
+index 787c46288..9610e2763 100644
+--- a/route/route.go
++++ b/route/route.go
+@@ -386,12 +386,7 @@ func (r *Router) PreMatch(metadata adapter.InboundContext, firstPacket []byte) a
+ 		if !currentRule.Match(&metadata) {
+ 			continue
+ 		}
+-		ruleDescription := currentRule.String()
+-		if ruleDescription != "" {
+-			r.logger.DebugContext(ctx, "pre-match[", currentRuleIndex, "] ", currentRule, " => ", currentRule.Action())
+-		} else {
+-			r.logger.DebugContext(ctx, "pre-match[", currentRuleIndex, "] => ", currentRule.Action())
+-		}
++		r.logger.DebugContext(ctx, R.MatchLine{Prefix: "pre-match", Index: currentRuleIndex, Rule: currentRule})
+ 		switch action := currentRule.Action().(type) {
+ 		case *R.RuleActionSniff:
+ 			if metadata.Network == N.NetworkICMP {
+@@ -740,12 +735,7 @@ match:
+ 		if !currentRule.Match(metadata) {
+ 			continue
+ 		}
+-		ruleDescription := currentRule.String()
+-		if ruleDescription != "" {
+-			r.logger.DebugContext(ctx, "match[", currentRuleIndex, "] ", currentRule, " => ", currentRule.Action())
+-		} else {
+-			r.logger.DebugContext(ctx, "match[", currentRuleIndex, "] => ", currentRule.Action())
+-		}
++		r.logger.DebugContext(ctx, R.MatchLine{Prefix: "match", Index: currentRuleIndex, Rule: currentRule})
+ 		var routeOptions *R.RuleActionRouteOptions
+ 		switch action := currentRule.Action().(type) {
+ 		case *R.RuleActionRoute:
+diff --git a/route/rule/match_line.go b/route/rule/match_line.go
+new file mode 100644
+index 000000000..b47212e31
+--- /dev/null
++++ b/route/rule/match_line.go
+@@ -0,0 +1,22 @@
++package rule
++
++import (
++	"github.com/sagernet/sing-box/adapter"
++	F "github.com/sagernet/sing/common/format"
++)
++
++// MatchLine is the debug line of a matched rule, built only when a logger formats it: the
++// description of a rule is a long string, and the connection and query paths must not pay
++// for it at a level that drops the line.
++type MatchLine struct {
++	Prefix string
++	Index  int
++	Rule   adapter.Rule
++}
++
++func (l MatchLine) String() string {
++	if ruleDescription := l.Rule.String(); ruleDescription != "" {
++		return F.ToString(l.Prefix, "[", l.Index, "] ", ruleDescription, " => ", l.Rule.Action())
++	}
++	return F.ToString(l.Prefix, "[", l.Index, "] => ", l.Rule.Action())
++}
+diff --git a/route/rule/match_line_test.go b/route/rule/match_line_test.go
+new file mode 100644
+index 000000000..5f743bff1
+--- /dev/null
++++ b/route/rule/match_line_test.go
+@@ -0,0 +1,38 @@
++package rule
++
++import (
++	"testing"
++
++	"github.com/sagernet/sing-box/adapter"
++	F "github.com/sagernet/sing/common/format"
++)
++
++type matchLineRule struct {
++	adapter.Rule
++	description string
++	described   *int
++}
++
++func (r matchLineRule) String() string {
++	*r.described++
++	return r.description
++}
++
++func (r matchLineRule) Action() adapter.RuleAction {
++	return &RuleActionReject{Method: "default"}
++}
++
++func TestMatchLine(t *testing.T) {
++	t.Parallel()
++	var described int
++	line := MatchLine{"match", 3, matchLineRule{description: "domain_suffix=example.org", described: &described}}
++	if described != 0 {
++		t.Fatalf("the rule was described before the line was formatted")
++	}
++	if got, want := F.ToString(line), "match[3] domain_suffix=example.org => reject"; got != want {
++		t.Fatalf("line %q, want %q", got, want)
++	}
++	if got, want := F.ToString(MatchLine{"pre-match", 0, matchLineRule{described: &described}}), "pre-match[0] => reject"; got != want {
++		t.Fatalf("line %q, want %q", got, want)
++	}
++}
+-- 
+2.53.0
+
