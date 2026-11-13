@@ -1,7 +1,7 @@
 From 60fe4304980b736162bd994f0224b90fb46a35d8 Mon Sep 17 00:00:00 2001
 From: FiyeroT <me@fiyero.xyz>
 Date: Thu, 12 Nov 2026 21:41:21 +0300
-Subject: [PATCH 50/59] vless: VLESS Encryption of Xray for the outbound; a
+Subject: [PATCH 50/60] vless: VLESS Encryption of Xray for the outbound; a
  flow where it cannot work
 
 VLESS Encryption of Xray for the outbound, with Vision over it; a flow over a transport it does not

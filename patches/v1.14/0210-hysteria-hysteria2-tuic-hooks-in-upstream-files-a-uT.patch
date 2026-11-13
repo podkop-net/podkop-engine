@@ -1,7 +1,7 @@
 From e9b2774e311981635a64446ec892b335d06ffc8d Mon Sep 17 00:00:00 2001
 From: FiyeroT <me@fiyero.xyz>
 Date: Thu, 12 Nov 2026 21:41:19 +0300
-Subject: [PATCH 13/59] hysteria, hysteria2, tuic, hooks in upstream files: a
+Subject: [PATCH 13/60] hysteria, hysteria2, tuic, hooks in upstream files: a
  uTLS fingerprint is dropped with a warning
 
 The lines of upstream files that "hysteria, hysteria2, tuic: a uTLS fingerprint is dropped with a

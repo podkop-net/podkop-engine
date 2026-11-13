@@ -1,7 +1,7 @@
 From 4078a4f6ea146c682b8afb42ba3db11aab3ff0ce Mon Sep 17 00:00:00 2001
 From: FiyeroT <me@fiyero.xyz>
 Date: Thu, 12 Nov 2026 21:41:21 +0300
-Subject: [PATCH 57/59] http client: fallback clients, through which a remote
+Subject: [PATCH 57/60] http client: fallback clients, through which a remote
  rule-set repeats a failed download
 
 An HTTP client may name other shared clients as its fallbacks; a remote rule-set whose download

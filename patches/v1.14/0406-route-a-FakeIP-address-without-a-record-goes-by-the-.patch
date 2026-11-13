@@ -1,7 +1,7 @@
 From 06d046df7226c53302726422dd90f787f0ec2846 Mon Sep 17 00:00:00 2001
 From: FiyeroT <me@fiyero.xyz>
 Date: Thu, 12 Nov 2026 21:41:21 +0300
-Subject: [PATCH 41/59] route: a FakeIP address without a record goes by the
+Subject: [PATCH 41/60] route: a FakeIP address without a record goes by the
  sniffed domain
 
 A connection to a FakeIP address whose record is gone is routed by the domain sniffed from it, with
