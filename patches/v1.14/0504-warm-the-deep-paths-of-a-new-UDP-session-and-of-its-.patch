@@ -1,25 +1,28 @@
-From 6075fd82626071b8a1dae4c8f8b822e13eb6885f Mon Sep 17 00:00:00 2001
+From 0c199db14ff64ac8dcab1d6099f60f74cf614219 Mon Sep 17 00:00:00 2001
 From: FiyeroT <me@fiyero.xyz>
 Date: Sat, 14 Nov 2026 11:24:11 +0300
 Subject: [PATCH 62/63] warm: the deep paths of a new UDP session and of its
  DNS exchange on goroutines kept warm
-MIME-Version: 1.0
-Content-Type: text/plain; charset=UTF-8
-Content-Transfer-Encoding: 8bit
 
 A new goroutine starts with a small stack, and the runtime keeps no grown stack for the next one:
 a path deeper than that stack copies the stack larger every time it runs on a new goroutine. Every
-DNS query of a resolver such as dnsmasq comes from a port of its own, a new UDP session, and ran
-the route of the session on the new goroutine udpnat starts for it, then its exchange on another
-new one (dns_nat.go): at DNS saturation the copying (runtime.newstack, runtime.copystack) took a
-third of the CPU on arm64 (16 % with 1.13, whose path is shallower).
+DNS query of a resolver such as dnsmasq comes from a port of its own, a new UDP session: it ran the
+route of the session on the new goroutine udpnat starts for it, its exchange on another new one
+(dns_nat.go), the query of plain DNS from a socket of its own on a third (dns/udp), and the A
+question an AAAA one asks first under ipv6_if_no_ipv4 on yet another. At DNS saturation the
+copying (runtime.newstack, runtime.copystack) took a third of the CPU on arm64 (16 % with 1.13,
+whose path is shallower).
 
 common/warm keeps the goroutines that ran a function for a while (10 s, as long as a DNS session
 waits for its next packet) and hands the next function to one that waits, its grown stack kept;
 with none waiting a function gets a new goroutine, so no caller ever waits. The direct inbound
-routes a new session on one, and the DNS NAT handler exchanges on one. On an arm64 server at DNS
-saturation: 32 % more queries a second, 24 % less CPU a query (beyond 1.13: +10 %, −9 %), copystack
-19 % → 0.5 % of the CPU; at most 8 workers, no more memory, none left 15 s after the load.
+routes a new session on one, the DNS NAT handler exchanges on one, plain DNS over UDP sends a
+query from its own socket on one, and the DNS client asks the A question of ipv6_if_no_ipv4 on
+one. On an arm64 server, 5 rounds an arm, Mann-Whitney p <= 0.016: at DNS saturation 32 % more
+queries a second and 24 % less CPU a query (beyond 1.13: +10 %, -9 %), copystack 19 % -> 0.5 % of
+the CPU; at 500 queries a second of real names, the last two of the four 3-5 % less CPU a query
+(A and AAAA, a new port a query or 32 ports); at most 8 workers, no more memory, none left 15 s
+after the load.
 
 Pdk-Feature: warm-goroutines
 Pdk-Zone: core
@@ -27,9 +30,11 @@ Pdk-Layer: 05
 ---
  common/warm/warm.go        | 87 ++++++++++++++++++++++++++++++++++++++
  common/warm/warm_test.go   | 84 ++++++++++++++++++++++++++++++++++++
+ dns/client.go              |  8 ++--
+ dns/transport/udp_fresh.go |  7 ++-
  protocol/direct/inbound.go |  8 ++++
  route/dns_nat.go           | 22 ++++++----
- 4 files changed, 192 insertions(+), 9 deletions(-)
+ 6 files changed, 202 insertions(+), 14 deletions(-)
  create mode 100644 common/warm/warm.go
  create mode 100644 common/warm/warm_test.go
 
@@ -216,6 +221,60 @@ index 000000000..b952cba53
 +		<-done
 +	}
 +}
+diff --git a/dns/client.go b/dns/client.go
+index a56f19270..83bf4f6ff 100644
+--- a/dns/client.go
++++ b/dns/client.go
+@@ -13,6 +13,7 @@ import (
+ 	"github.com/sagernet/sing-box/adapter"
+ 	"github.com/sagernet/sing-box/common/compatible"
+ 	"github.com/sagernet/sing-box/common/interrupt"
++	"github.com/sagernet/sing-box/common/warm"
+ 	C "github.com/sagernet/sing-box/constant"
+ 	"github.com/sagernet/sing/common"
+ 	E "github.com/sagernet/sing/common/exceptions"
+@@ -432,13 +433,14 @@ func (c *Client) exchange(ctx context.Context, transport adapter.DNSTransport, m
+ 
+ func (c *Client) ExchangeAsync(ctx context.Context, transport adapter.DNSTransport, message *dns.Msg, options adapter.DNSQueryOptions, responseChecker func(response *dns.Msg) bool, callback func(response *dns.Msg, err error)) {
+ 	if c.mayAskIPv6(transport, message, options) {
+-		// the A question may have to go out: not on the caller's goroutine
+-		go func() {
++		// the A question may have to go out: not on the caller's goroutine; a warm one
++		// (common/warm), the two exchanges are deeper than the stack a new goroutine has
++		warm.Go(func() {
+ 			if c.noIPv4(ctx, transport, message, options, responseChecker) {
+ 				options.Strategy = C.DomainStrategyPreferIPv4
+ 			}
+ 			callback(c.exchange(ctx, transport, message, options, responseChecker))
+-		}()
++		})
+ 		return
+ 	}
+ 	if options.Timeout == 0 {
+diff --git a/dns/transport/udp_fresh.go b/dns/transport/udp_fresh.go
+index d8d96d0c5..7708e7979 100644
+--- a/dns/transport/udp_fresh.go
++++ b/dns/transport/udp_fresh.go
+@@ -4,6 +4,7 @@ import (
+ 	"context"
+ 	"sync"
+ 
++	"github.com/sagernet/sing-box/common/warm"
+ 	"github.com/sagernet/sing-box/dns"
+ 	"github.com/sagernet/sing-box/option"
+ 
+@@ -43,7 +44,9 @@ func (t *UDPTransport) exchangeQueryAsync(ctx context.Context, message *mDNS.Msg
+ 		t.multiplexer.ExchangeAsync(ctx, message, callback)
+ 		return
+ 	}
+-	go func() {
++	// a warm goroutine (common/warm): the exchange from a socket of its own, run for every
++	// query, is deeper than the stack a new goroutine has
++	warm.Go(func() {
+ 		callback(dns.ExchangeFresh(ctx, t.dialer, t.serverAddr, message))
+-	}()
++	})
+ }
 diff --git a/protocol/direct/inbound.go b/protocol/direct/inbound.go
 index 3c24e2cbb..8222fadef 100644
 --- a/protocol/direct/inbound.go

@@ -1,4 +1,4 @@
-From 23516f5db2270d1066e250e26ca0c60b888c1bd2 Mon Sep 17 00:00:00 2001
+From 8ec0da883e93f59be737fdafc92b89d41ee43b51 Mon Sep 17 00:00:00 2001
 From: FiyeroT <me@fiyero.xyz>
 Date: Sat, 14 Nov 2026 11:32:59 +0300
 Subject: [PATCH 63/63] go.mod: quic-go of the podkop-engine fork, Chrome's
