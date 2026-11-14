@@ -1,4 +1,4 @@
-From 90ad7ea5279ef49f66853793e7ecd0509f76c775 Mon Sep 17 00:00:00 2001
+From eb640f85ec3f258c5bac45e2b9167db61bdf9e42 Mon Sep 17 00:00:00 2001
 From: FiyeroT <me@fiyero.xyz>
 Date: Thu, 12 Nov 2026 21:41:20 +0300
 Subject: [PATCH 22/63] dns: a failed exchange logged once per server, with a

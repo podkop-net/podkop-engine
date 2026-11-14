@@ -1,4 +1,4 @@
-From 8ec0da883e93f59be737fdafc92b89d41ee43b51 Mon Sep 17 00:00:00 2001
+From 20447b2d4fb58efcc539899f1bc2ac21dd6d73c8 Mon Sep 17 00:00:00 2001
 From: FiyeroT <me@fiyero.xyz>
 Date: Sat, 14 Nov 2026 11:32:59 +0300
 Subject: [PATCH 63/63] go.mod: quic-go of the podkop-engine fork, Chrome's
@@ -19,7 +19,7 @@ Pdk-Layer: 05
  2 files changed, 6 insertions(+)
 
 diff --git a/go.mod b/go.mod
-index f4bf8c02e..df4b2b69e 100644
+index f4bf8c02e..28f0f128f 100644
 --- a/go.mod
 +++ b/go.mod
 @@ -200,3 +200,7 @@ require (
@@ -28,7 +28,7 @@ index f4bf8c02e..df4b2b69e 100644
  replace github.com/sagernet/sing-vmess => github.com/FiyeroT/sing-vmess v0.2.9-pdk.2
 +
 +// Chrome's QUIC ClientHello in the order of the CPU: ChaCha20 first without AES hardware, as Chrome
-+// does (podkop-engine, K1)
++// does
 +replace github.com/sagernet/quic-go => github.com/podkop-net/quic-go v0.61.0-sing-box-mod.12-pdk.1
 diff --git a/go.sum b/go.sum
 index 717a2152f..da8e75313 100644

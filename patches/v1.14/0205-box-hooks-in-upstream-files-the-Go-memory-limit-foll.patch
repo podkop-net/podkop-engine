@@ -1,4 +1,4 @@
-From 8491495f37805b2d49b2af31466f7694ada35bcd Mon Sep 17 00:00:00 2001
+From 6f3d30bb70cbe034016edc9c7e54e0b8b9566f90 Mon Sep 17 00:00:00 2001
 From: FiyeroT <me@fiyero.xyz>
 Date: Thu, 12 Nov 2026 21:41:19 +0300
 Subject: [PATCH 08/63] box, hooks in upstream files: the Go memory limit

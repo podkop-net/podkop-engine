@@ -1,4 +1,4 @@
-From 4dd81c868fe0b7b45de7a99a60308bca6cc69b52 Mon Sep 17 00:00:00 2001
+From d7c79fd2c7b96fd1cdeb64e2495a1a0a27789457 Mon Sep 17 00:00:00 2001
 From: FiyeroT <me@fiyero.xyz>
 Date: Thu, 12 Nov 2026 21:41:19 +0300
 Subject: [PATCH 12/63] dns, hooks in upstream files: ipv6_if_no_ipv4

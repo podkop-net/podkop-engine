@@ -1,4 +1,4 @@
-From b107697b5df28c049738a228b7bb822d22d54c5e Mon Sep 17 00:00:00 2001
+From 3165a349fad8dd8d84b19214367c4d3ed4252c62 Mon Sep 17 00:00:00 2001
 From: FiyeroT <me@fiyero.xyz>
 Date: Fri, 13 Nov 2026 21:14:28 +0300
 Subject: [PATCH 60/63] dns: the question of the exchange debug line formatted

@@ -1,4 +1,4 @@
-From b5a77480a66608ac037a8f8128e27aecdea8dd4d Mon Sep 17 00:00:00 2001
+From ba6a69f4883cc31c0c99eda6ecf3cca43b7a08f2 Mon Sep 17 00:00:00 2001
 From: FiyeroT <me@fiyero.xyz>
 Date: Fri, 13 Nov 2026 08:45:15 +0300
 Subject: [PATCH 59/63] route, dns: the debug line of a matched rule built only

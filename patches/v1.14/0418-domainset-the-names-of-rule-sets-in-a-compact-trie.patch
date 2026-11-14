@@ -1,4 +1,4 @@
-From ac55709a7e7bba5117842460b07ddbf277f7c0d6 Mon Sep 17 00:00:00 2001
+From 4abdbc66b9eea7221a0cdbe2e6d4c75c24e4c9dc Mon Sep 17 00:00:00 2001
 From: FiyeroT <me@fiyero.xyz>
 Date: Thu, 12 Nov 2026 21:41:21 +0300
 Subject: [PATCH 53/63] domainset: the names of rule-sets in a compact trie

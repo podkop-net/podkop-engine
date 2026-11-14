@@ -1,4 +1,4 @@
-From c5588bcaa24aa9d5ba4c9a3dfc7e4109a69d87b5 Mon Sep 17 00:00:00 2001
+From c6e3d8b4494c3b7eb88da8424ea861f495cf1a30 Mon Sep 17 00:00:00 2001
 From: FiyeroT <me@fiyero.xyz>
 Date: Thu, 12 Nov 2026 21:41:19 +0300
 Subject: [PATCH 07/63] dns, hooks in upstream files: a failed exchange logged

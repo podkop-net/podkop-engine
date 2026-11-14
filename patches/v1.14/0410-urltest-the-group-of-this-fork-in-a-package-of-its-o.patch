@@ -1,4 +1,4 @@
-From d01a9fabe6f31f566f7588bf07e8c7928993a5d0 Mon Sep 17 00:00:00 2001
+From 6fae67a14cae1c25a9427b260d53e8581f1e2573 Mon Sep 17 00:00:00 2001
 From: FiyeroT <me@fiyero.xyz>
 Date: Thu, 12 Nov 2026 21:41:21 +0300
 Subject: [PATCH 45/63] urltest: the group of this fork, in a package of its
@@ -9,6 +9,9 @@ in place of upstream's (protocol/group/urltest.go stays as upstream has it): one
 groups, several URLs and the median of a cycle, a member left when its connections fail, a download
 test before a switch, fallbacks, the modes loss and balance, tests out of turn, the network monitor;
 the history keeps what it needs beyond a delay in common/urltest/history_detail.go.
+
+The URL test of the daemon (the api of the command line, libbox) takes the group of this package
+for an outbound of the type urltest, as the Clash API does.
 
 Made of these commits of the earlier series (branch archive/r25-1.14-commits):
   f3ccd0af8 urltest: test each member every interval, not every other one
@@ -49,6 +52,7 @@ Pdk-Layer: 04
  common/urltest/loss.go                        | 352 +++++++
  common/urltest/loss_test.go                   |  98 ++
  common/urltest/urltest.go                     |  31 +-
+ daemon/started_service.go                     |   3 +-
  docs/configuration/outbound/urltest.md        |  34 +
  experimental/clashapi/api_meta_group.go       |   4 +-
  experimental/clashapi/proxies.go              |  56 +-
@@ -74,7 +78,7 @@ Pdk-Layer: 04
  .../urltestgroup/urltest_response_test.go     | 522 +++++++++
  .../urltestgroup/urltest_review2_test.go      | 245 +++++
  route/network.go                              |   9 +
- 31 files changed, 7861 insertions(+), 14 deletions(-)
+ 32 files changed, 7863 insertions(+), 15 deletions(-)
  create mode 100644 common/urltest/download.go
  create mode 100644 common/urltest/download_test.go
  create mode 100644 common/urltest/history_detail.go
@@ -1014,6 +1018,27 @@ index 26efe39cb..a44374c82 100644
 -	t = uint16(time.Since(start) / time.Millisecond)
 -	return
  }
+diff --git a/daemon/started_service.go b/daemon/started_service.go
+index 41c9c926a..55e76271a 100644
+--- a/daemon/started_service.go
++++ b/daemon/started_service.go
+@@ -20,6 +20,7 @@ import (
+ 	"github.com/sagernet/sing-box/experimental/locale"
+ 	"github.com/sagernet/sing-box/log"
+ 	"github.com/sagernet/sing-box/protocol/group"
++	"github.com/sagernet/sing-box/protocol/group/urltestgroup"
+ 	"github.com/sagernet/sing-box/service/oomkiller"
+ 	"github.com/sagernet/sing/common"
+ 	"github.com/sagernet/sing/common/memory"
+@@ -728,7 +729,7 @@ func (s *StartedService) URLTest(ctx context.Context, request *URLTestRequest) (
+ 		return nil, status.Error(codes.NotFound, "outbound not found: "+outboundTag)
+ 	}
+ 	historyStorage := boxService.urlTestHistoryStorage
+-	urlTest, isURLTest := outbound.(*group.URLTest)
++	urlTest, isURLTest := outbound.(*urltestgroup.URLTest)
+ 	outboundGroup, isOutboundGroup := outbound.(adapter.OutboundGroup)
+ 	if isURLTest {
+ 		go urlTest.CheckOutbounds()
 diff --git a/docs/configuration/outbound/urltest.md b/docs/configuration/outbound/urltest.md
 index f4b3b0aa8..13b107ebc 100644
 --- a/docs/configuration/outbound/urltest.md

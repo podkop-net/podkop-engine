@@ -1,4 +1,4 @@
-From 925d5530941cc2dbc99b502be6e65941c8953097 Mon Sep 17 00:00:00 2001
+From a9725732f0ce5859b4656e07f0812c2a2eb6b628 Mon Sep 17 00:00:00 2001
 From: FiyeroT <me@fiyero.xyz>
 Date: Thu, 12 Nov 2026 21:41:19 +0300
 Subject: [PATCH 02/63] go.mod: sing-vmess of the podkop-engine fork

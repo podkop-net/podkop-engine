@@ -1,4 +1,4 @@
-From a5191fd598440e58e717dcd8f79a5a9e580e43f8 Mon Sep 17 00:00:00 2001
+From 52edd9967aeb2edb5bc54efd734257f5284c2e40 Mon Sep 17 00:00:00 2001
 From: FiyeroT <me@fiyero.xyz>
 Date: Fri, 13 Nov 2026 14:38:32 +0300
 Subject: [PATCH 58/63] http client: outbounds, the ways a downloader takes in
@@ -17,29 +17,32 @@ progress, at most three at once, and takes the first result its caller accepts. 
 downloads found (DownloadMemory) is the manager's, or the one the program that runs the box keeps
 in its context. A remote rule-set whose client has outbounds downloads through the downloader; a
 body that does not parse fails its way. Users of the client that do not know the downloader go
-through the first way.
+through the first way. Each download is a user of the transport of its way, as the users of a
+shared client are: a caller that closes the idle connections of its client after a download
+closes those of the way only when no other download, nor a hold, uses it; a rule-set holds the
+ways of its downloader through the start of the box (adapter.HTTPStartContext).
 
 Pdk-Feature: http-client-downloader
 Pdk-Zone: core
 Pdk-Layer: 04
 ---
- adapter/http.go                               |  29 +
- common/httpclient/downloader.go               | 548 ++++++++++++++++++
- common/httpclient/downloader_test.go          | 297 ++++++++++
+ adapter/http.go                               |  32 +
+ common/httpclient/downloader.go               | 627 ++++++++++++++++++
+ common/httpclient/downloader_test.go          | 351 ++++++++++
  common/httpclient/manager.go                  |  18 +-
  docs/configuration/shared/http-client.md      |  26 +
  option/http.go                                |   6 +
  route/rule/export_test.go                     |  35 +-
- route/rule/rule_set_remote.go                 |  85 ++-
- route/rule/rule_set_remote_downloader_test.go | 143 +++++
+ route/rule/rule_set_remote.go                 |  89 ++-
+ route/rule/rule_set_remote_downloader_test.go | 143 ++++
  route/rule/rule_set_remote_fallback.go        |  39 ++
- 10 files changed, 1203 insertions(+), 23 deletions(-)
+ 10 files changed, 1343 insertions(+), 23 deletions(-)
  create mode 100644 common/httpclient/downloader.go
  create mode 100644 common/httpclient/downloader_test.go
  create mode 100644 route/rule/rule_set_remote_downloader_test.go
 
 diff --git a/adapter/http.go b/adapter/http.go
-index af67ee61f..eef2fb461 100644
+index af67ee61f..808a6c1c5 100644
 --- a/adapter/http.go
 +++ b/adapter/http.go
 @@ -4,6 +4,7 @@ import (
@@ -50,7 +53,7 @@ index af67ee61f..eef2fb461 100644
  
  	"github.com/sagernet/sing-box/option"
  	"github.com/sagernet/sing/common/logger"
-@@ -29,6 +30,34 @@ type HTTPClientFallbacks interface {
+@@ -29,6 +30,37 @@ type HTTPClientFallbacks interface {
  	ResolveFallbacks(options *option.HTTPClientOptions) ([]HTTPFallback, error)
  }
  
@@ -76,6 +79,9 @@ index af67ee61f..eef2fb461 100644
 +	// Record takes the result of such a download through a way: err nil when it brought the
 +	// file, of size bytes in took.
 +	Record(host string, way string, err error, took time.Duration, bytes int64)
++	// Hold keeps the pooled connections of the ways until its CloseIdleConnections: a box
++	// registers it with the start of its rule sets (HTTPStartContext).
++	Hold() HTTPTransport
 +}
 +
 +// HTTPDownloadTry downloads through one way of a downloader with its client. progress is called
@@ -87,10 +93,10 @@ index af67ee61f..eef2fb461 100644
  	Tag       string
 diff --git a/common/httpclient/downloader.go b/common/httpclient/downloader.go
 new file mode 100644
-index 000000000..204a69de1
+index 000000000..1b68bb457
 --- /dev/null
 +++ b/common/httpclient/downloader.go
-@@ -0,0 +1,548 @@
+@@ -0,0 +1,627 @@
 +package httpclient
 +
 +import (
@@ -99,6 +105,7 @@ index 000000000..204a69de1
 +	"net/http"
 +	"slices"
 +	"sync"
++	"sync/atomic"
 +	"time"
 +
 +	"github.com/sagernet/sing-box/adapter"
@@ -138,7 +145,7 @@ index 000000000..204a69de1
 +//     the next way would hold a second copy of a big list at once, for a pause the measurement
 +//     did not cover.
 +//   - Most 3: not measured — bursts of TLS hellos to one name are what the DPI of some ISPs
-+//     penalises (the plan of the subscription download of podkop-exp).
++//     penalises.
 +var downloadPlan = DownloadPlan{Wait: 4 * time.Second, Body: time.Second, LargeBody: 3 * time.Second, Large: 1 << 20, Most: 3}
 +
 +// downloadWatch is how often a download looks at its ways under way.
@@ -232,11 +239,11 @@ index 000000000..204a69de1
 +
 +// Downloader downloads through the outbounds of a client (adapter.HTTPDownloader).
 +type Downloader struct {
-+	logger     logger.ContextLogger
-+	ways       []string
-+	transports map[string]adapter.HTTPTransport
-+	memory     *DownloadMemory
-+	history    *urltest.HistoryStorage
++	logger  logger.ContextLogger
++	ways    []string
++	pools   map[string]*wayPool
++	memory  *DownloadMemory
++	history *urltest.HistoryStorage
 +	// Plan is the plan of its downloads, downloadPlan when made
 +	Plan DownloadPlan
 +	// Outbounds, when set, tell a way that is a group: its delay is that of the outbound it
@@ -250,8 +257,81 @@ index 000000000..204a69de1
 +	if memory == nil {
 +		memory = NewDownloadMemory()
 +	}
-+	return &Downloader{logger: logger, ways: ways, transports: transports, memory: memory, history: history, Plan: downloadPlan}
++	pools := make(map[string]*wayPool, len(ways))
++	for _, way := range ways {
++		pools[way] = &wayPool{transport: transports[way]}
++	}
++	return &Downloader{logger: logger, ways: ways, pools: pools, memory: memory, history: history, Plan: downloadPlan}
 +}
++
++// wayPool counts the users of the transport of a way, as sharedRef counts those of a shared
++// client: the downloads under way through it, and the holds (Hold). Its idle connections are
++// closed when the last user is done, so the downloads of several callers through one way keep
++// their pooled connections while any of them uses it.
++type wayPool struct {
++	transport adapter.HTTPTransport
++	users     atomic.Int32
++}
++
++func (p *wayPool) ref() *wayRef {
++	p.users.Add(1)
++	return &wayRef{pool: p}
++}
++
++// wayRef is one user of a way. Its CloseIdleConnections is its release, once; a round trip after
++// it takes it again (as sharedRef). Reset resets the transport of the way, for every user.
++type wayRef struct {
++	pool     *wayPool
++	released atomic.Bool
++}
++
++func (r *wayRef) RoundTrip(request *http.Request) (*http.Response, error) {
++	if r.pool.transport == nil {
++		return nil, E.New("no transport of the way")
++	}
++	if r.released.CompareAndSwap(true, false) {
++		r.pool.users.Add(1)
++	}
++	return r.pool.transport.RoundTrip(request)
++}
++
++func (r *wayRef) CloseIdleConnections() {
++	if r.released.CompareAndSwap(false, true) && r.pool.users.Add(-1) == 0 && r.pool.transport != nil {
++		r.pool.transport.CloseIdleConnections()
++	}
++}
++
++func (r *wayRef) Reset() {
++	if r.pool.transport != nil {
++		r.pool.transport.Reset()
++	}
++}
++
++// Hold keeps the pooled connections of every way until its CloseIdleConnections: a box registers
++// it with the start of its rule sets (adapter.HTTPStartContext), so the downloads of the start
++// share their connections, closed when the start is over.
++func (d *Downloader) Hold() adapter.HTTPTransport {
++	refs := make(heldWays, 0, len(d.ways))
++	for _, way := range d.ways {
++		refs = append(refs, d.pools[way].ref())
++	}
++	return refs
++}
++
++// heldWays is a hold of the ways of a downloader: no transport of its own.
++type heldWays []*wayRef
++
++func (h heldWays) RoundTrip(*http.Request) (*http.Response, error) {
++	return nil, E.New("a hold of the ways of a downloader carries no request")
++}
++
++func (h heldWays) CloseIdleConnections() {
++	for _, ref := range h {
++		ref.CloseIdleConnections()
++	}
++}
++
++func (h heldWays) Reset() {}
 +
 +// delayHops bounds the groups of groups delay follows.
 +const delayHops = 4
@@ -379,10 +459,15 @@ index 000000000..204a69de1
 +		item := &attempt{way: way, started: now, last: now, cancel: attemptCancel}
 +		attempts = append(attempts, item)
 +		running++
-+		client := &http.Client{Transport: d.transports[way]}
++		// a user of the way of its own: a caller that closes the idle connections of its client
++		// (a rule set after its update) closes those of the way only when no other download, nor
++		// a hold, uses it
++		ref := d.pools[way].ref()
++		client := &http.Client{Transport: ref}
 +		d.logger.DebugContext(ctx, "download from ", host, " through ", way)
 +		go func() {
 +			result, err := try(attemptContext, way, client, item.progress)
++			ref.CloseIdleConnections()
 +			item.finish(result, err)
 +			done <- item
 +		}()
@@ -641,10 +726,10 @@ index 000000000..204a69de1
 +}
 diff --git a/common/httpclient/downloader_test.go b/common/httpclient/downloader_test.go
 new file mode 100644
-index 000000000..67a60f1b5
+index 000000000..62e1b677c
 --- /dev/null
 +++ b/common/httpclient/downloader_test.go
-@@ -0,0 +1,297 @@
+@@ -0,0 +1,351 @@
 +package httpclient
 +
 +import (
@@ -942,6 +1027,60 @@ index 000000000..67a60f1b5
 +		})
 +	}
 +}
++
++// countingTransport counts the closes of its idle connections.
++type countingTransport struct{ closes atomic.Int32 }
++
++func (t *countingTransport) RoundTrip(*http.Request) (*http.Response, error) {
++	return nil, errors.New("no network in the test")
++}
++
++func (t *countingTransport) CloseIdleConnections() { t.closes.Add(1) }
++
++func (t *countingTransport) Reset() {}
++
++// A caller that closes the idle connections of its client after a download (a rule set after its
++// update) closes those of the way only when no other download, nor a hold, uses it: the downloads
++// through one way share its pooled connections, as the users of a shared client do.
++func TestDownloaderSharesTheConnectionsOfAWay(t *testing.T) {
++	transport := &countingTransport{}
++	downloader := NewDownloader(log.NewNOPFactory().Logger(), []string{"direct"}, map[string]adapter.HTTPTransport{"direct": transport}, nil, nil)
++	downloader.Plan = testPlan
++	closing := func(result string) adapter.HTTPDownloadTry {
++		return func(_ context.Context, _ string, client *http.Client, _ func(int)) (any, error) {
++			client.CloseIdleConnections()
++			return result, nil
++		}
++	}
++	started, release := make(chan struct{}), make(chan struct{})
++	var firstErr error
++	var wait sync.WaitGroup
++	wait.Add(1)
++	go func() {
++		defer wait.Done()
++		_, firstErr = downloader.Download(context.Background(), "a.example", func(ctx context.Context, way string, client *http.Client, progress func(int)) (any, error) {
++			close(started)
++			<-release
++			return closing("a")(ctx, way, client, progress)
++		}, accepting)
++	}()
++	<-started
++	_, err := downloader.Download(context.Background(), "b.example", closing("b"), accepting)
++	require.NoError(t, err)
++	require.Zero(t, transport.closes.Load(), "the first download still uses the way")
++	close(release)
++	wait.Wait()
++	require.NoError(t, firstErr)
++	require.Equal(t, int32(1), transport.closes.Load(), "closed when the last one is done")
++
++	hold := downloader.Hold()
++	_, err = downloader.Download(context.Background(), "a.example", closing("a"), accepting)
++	require.NoError(t, err)
++	require.Equal(t, int32(1), transport.closes.Load(), "kept while held")
++	hold.CloseIdleConnections()
++	hold.CloseIdleConnections()
++	require.Equal(t, int32(2), transport.closes.Load(), "closed once the hold is released, once")
++}
 diff --git a/common/httpclient/manager.go b/common/httpclient/manager.go
 index 820cbeabb..1dbd9ed32 100644
 --- a/common/httpclient/manager.go
@@ -1006,7 +1145,7 @@ index 820cbeabb..1dbd9ed32 100644
  		return nil, E.Cause(err, "create shared http_client[", tag, "]")
  	}
 diff --git a/docs/configuration/shared/http-client.md b/docs/configuration/shared/http-client.md
-index 787aaa3db..543b51251 100644
+index 787aaa3db..796870bce 100644
 --- a/docs/configuration/shared/http-client.md
 +++ b/docs/configuration/shared/http-client.md
 @@ -19,6 +19,7 @@ When object:
@@ -1038,7 +1177,7 @@ index 787aaa3db..543b51251 100644
 +6. the ways that failed for this host, the oldest failure first.
 +
 +No way is left out, but those the program that runs the box excludes (a group while it uses an
-+excluded outbound): podkop-exp excludes the servers the user marks so. The next way starts beside those under way when none of them showed
++excluded outbound). The next way starts beside those under way when none of them showed
 +progress for 4 s (no answer yet), or a body has paused for 1 s (3 s once 1 MiB of it came); at
 +most three at once. The first way that brings a list that parses wins and the
 +others are stopped; a body that is not a rule-set (a page served with status 200) fails its way.
@@ -1114,7 +1253,7 @@ index 5507de93c..96295d073 100644
 +	return len(s.currentRules())
 +}
 diff --git a/route/rule/rule_set_remote.go b/route/rule/rule_set_remote.go
-index c6b500b5c..0bcf0679a 100644
+index c6b500b5c..bb61387d0 100644
 --- a/route/rule/rule_set_remote.go
 +++ b/route/rule/rule_set_remote.go
 @@ -53,8 +53,10 @@ type RemoteRuleSet struct {
@@ -1129,7 +1268,7 @@ index c6b500b5c..0bcf0679a 100644
  	access         sync.RWMutex
  	rules          []adapter.HeadlessRule
  	metadata       adapter.RuleSetMetadata
-@@ -143,6 +145,10 @@ func (s *RemoteRuleSet) StartContext(ctx context.Context, startContext *adapter.
+@@ -143,6 +145,14 @@ func (s *RemoteRuleSet) StartContext(ctx context.Context, startContext *adapter.
  		startContext.Register(fallback.Transport)
  		s.fallbacks = append(s.fallbacks, ruleSetFallback{tag: fallback.Tag, client: &http.Client{Transport: fallback.Transport}})
  	}
@@ -1137,10 +1276,14 @@ index c6b500b5c..0bcf0679a 100644
 +	if err != nil {
 +		return E.Cause(err, "create rule-set http client")
 +	}
++	if s.downloader != nil {
++		// the downloads of the start share the connections of the ways, closed when it is over
++		startContext.Register(s.downloader.Hold())
++	}
  	s.loadCached()
  	var loadedFromInitialPath bool
  	if s.lastUpdated.IsZero() && s.initialPath != "" {
-@@ -450,12 +456,17 @@ var (
+@@ -450,12 +460,17 @@ var (
  type stallResetReader struct {
  	reader io.Reader
  	reset  func()
@@ -1158,7 +1301,7 @@ index c6b500b5c..0bcf0679a 100644
  	}
  	return n, err
  }
-@@ -531,8 +542,9 @@ func describeRuleSetBody(response *http.Response, size int64, sample []byte) str
+@@ -531,8 +546,9 @@ func describeRuleSetBody(response *http.Response, size int64, sample []byte) str
  	return description.String()
  }
  
@@ -1170,7 +1313,7 @@ index c6b500b5c..0bcf0679a 100644
  // deadline bounds them all. The error is that of every way.
  func (s *RemoteRuleSet) fetch(ctx context.Context, isStart bool) error {
  	if isStart {
-@@ -540,6 +552,9 @@ func (s *RemoteRuleSet) fetch(ctx context.Context, isStart bool) error {
+@@ -540,6 +556,9 @@ func (s *RemoteRuleSet) fetch(ctx context.Context, isStart bool) error {
  		ctx, stop = context.WithTimeout(ctx, ruleSetStartDeadline)
  		defer stop()
  	}
@@ -1180,7 +1323,7 @@ index c6b500b5c..0bcf0679a 100644
  	err := s.fetchThrough(ctx, s.httpClient, isStart)
  	if err == nil || len(s.fallbacks) == 0 {
  		return err
-@@ -560,8 +575,26 @@ func (s *RemoteRuleSet) fetch(ctx context.Context, isStart bool) error {
+@@ -560,8 +579,26 @@ func (s *RemoteRuleSet) fetch(ctx context.Context, isStart bool) error {
  	return E.Errors(errs...)
  }
  
@@ -1208,7 +1351,7 @@ index c6b500b5c..0bcf0679a 100644
  	s.logger.Debug("updating rule-set ", s.tag, " from URL: ", s.url)
  	// a group that switches members closes the connections it does not know as routed
  	// ones: a list half downloaded through it would wait for the next update_interval
-@@ -588,10 +621,10 @@ func (s *RemoteRuleSet) fetchThrough(ctx context.Context, client *http.Client, i
+@@ -588,10 +625,10 @@ func (s *RemoteRuleSet) fetchThrough(ctx context.Context, client *http.Client, i
  	}
  	request, err := http.NewRequest("GET", s.url, nil)
  	if err != nil {
@@ -1222,7 +1365,7 @@ index c6b500b5c..0bcf0679a 100644
  	}
  	if !isStart {
  		defer client.CloseIdleConnections()
-@@ -603,18 +636,38 @@ func (s *RemoteRuleSet) fetchThrough(ctx context.Context, client *http.Client, i
+@@ -603,18 +640,38 @@ func (s *RemoteRuleSet) fetchThrough(ctx context.Context, client *http.Client, i
  			// next batch of rule-sets into the same wait
  			client.Transport.(adapter.HTTPTransport).Reset()
  		}
@@ -1263,7 +1406,7 @@ index c6b500b5c..0bcf0679a 100644
  			if err != nil {
  				s.logger.Error("save rule-set updated time: ", err)
  				return nil
-@@ -624,7 +677,7 @@ func (s *RemoteRuleSet) fetchThrough(ctx context.Context, client *http.Client, i
+@@ -624,7 +681,7 @@ func (s *RemoteRuleSet) fetchThrough(ctx context.Context, client *http.Client, i
  			if savedRuleSet != nil {
  				savedRuleSet.LastUpdated = s.lastUpdated
  				savedRuleSet.URLHash = s.urlHash[:]
@@ -1272,7 +1415,7 @@ index c6b500b5c..0bcf0679a 100644
  				if err != nil {
  					s.logger.Error("save rule-set updated time: ", err)
  					return nil
-@@ -633,22 +686,14 @@ func (s *RemoteRuleSet) fetchThrough(ctx context.Context, client *http.Client, i
+@@ -633,22 +690,14 @@ func (s *RemoteRuleSet) fetchThrough(ctx context.Context, client *http.Client, i
  		}
  		s.logger.Info("update rule-set ", s.tag, ": not modified")
  		return nil

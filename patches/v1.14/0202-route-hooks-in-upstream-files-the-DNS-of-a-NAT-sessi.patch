@@ -1,4 +1,4 @@
-From 11fd2a2a14bbfb0537e3e29a8d23ab4bc8862cc0 Mon Sep 17 00:00:00 2001
+From 1420c31e25f6b7a2684027f7e41ab808c55e69bd Mon Sep 17 00:00:00 2001
 From: FiyeroT <me@fiyero.xyz>
 Date: Thu, 12 Nov 2026 21:41:19 +0300
 Subject: [PATCH 05/63] route, hooks in upstream files: the DNS of a NAT

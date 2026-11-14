@@ -1,4 +1,4 @@
-From 0c199db14ff64ac8dcab1d6099f60f74cf614219 Mon Sep 17 00:00:00 2001
+From b31f599f3e524968bdd0423ac88ce02b3fc0715f Mon Sep 17 00:00:00 2001
 From: FiyeroT <me@fiyero.xyz>
 Date: Sat, 14 Nov 2026 11:24:11 +0300
 Subject: [PATCH 62/63] warm: the deep paths of a new UDP session and of its
@@ -40,7 +40,7 @@ Pdk-Layer: 05
 
 diff --git a/common/warm/warm.go b/common/warm/warm.go
 new file mode 100644
-index 000000000..59063a933
+index 000000000..43100a13d
 --- /dev/null
 +++ b/common/warm/warm.go
 @@ -0,0 +1,87 @@
@@ -115,7 +115,7 @@ index 000000000..59063a933
 +// The pool of the process. At DNS saturation (16 queries at a time, one core of an arm64 server)
 +// at most 8 workers were busy or waiting, and the process held no more memory than without the
 +// pool; 64 bounds what a burst may keep. A worker waits 10 s, as a DNS session waits for its next
-+// packet (C.DNSTimeout): every worker had ended 15 s after the load (notes/2026-11-13-stage3.md, K3).
++// packet (C.DNSTimeout): every worker had ended 15 s after the load.
 +var (
 +	defaultWorkers = 64
 +	defaultIdle    = 10 * time.Second
