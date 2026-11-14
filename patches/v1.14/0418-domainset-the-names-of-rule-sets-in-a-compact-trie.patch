@@ -1,7 +1,7 @@
 From ac55709a7e7bba5117842460b07ddbf277f7c0d6 Mon Sep 17 00:00:00 2001
 From: FiyeroT <me@fiyero.xyz>
 Date: Thu, 12 Nov 2026 21:41:21 +0300
-Subject: [PATCH 53/60] domainset: the names of rule-sets in a compact trie
+Subject: [PATCH 53/63] domainset: the names of rule-sets in a compact trie
 
 The domain matcher of rule-sets built with a fraction of the memory of sing's: a trie whose levels
 are keys one after another and a bit a node, read from the source format in one pass, on 32-bit

@@ -1,0 +1,57 @@
+From 19e70d820bd90a58a42e165684a5dc5f788b326f Mon Sep 17 00:00:00 2001
+From: FiyeroT <me@fiyero.xyz>
+Date: Sat, 14 Nov 2026 11:03:34 +0300
+Subject: [PATCH 61/63] cmd: the network quality, STUN and schema tools left
+ out of the slim engine
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+The slim engine is what podkop runs on a router, and podkop runs none of them (podkop 0.7.24 calls
+sing-box version, tools decode-link, tools fetch and rule-set decompile; podkop-experimental embeds
+the engine). With them go the code of networkquality and stun: 328 KB of the arm64 binary and 459
+KB of the mipsle one (1.4–1.7 %), and as much of the memory a running sing-box keeps of its file.
+The full engine and builds without the podkop tags keep them.
+
+Pdk-Feature: slim-tools
+Pdk-Zone: build
+Pdk-Layer: 05
+---
+ cmd/sing-box/cmd_schema.go               | 2 ++
+ cmd/sing-box/cmd_tools_networkquality.go | 2 ++
+ cmd/sing-box/cmd_tools_stun.go           | 2 ++
+ 3 files changed, 6 insertions(+)
+
+diff --git a/cmd/sing-box/cmd_schema.go b/cmd/sing-box/cmd_schema.go
+index 73538125b..9994ec0b2 100644
+--- a/cmd/sing-box/cmd_schema.go
++++ b/cmd/sing-box/cmd_schema.go
+@@ -1,3 +1,5 @@
++//go:build !podkop_slim || podkop_full
++
+ package main
+ 
+ import (
+diff --git a/cmd/sing-box/cmd_tools_networkquality.go b/cmd/sing-box/cmd_tools_networkquality.go
+index 5f63571de..31ad9a4b9 100644
+--- a/cmd/sing-box/cmd_tools_networkquality.go
++++ b/cmd/sing-box/cmd_tools_networkquality.go
+@@ -1,3 +1,5 @@
++//go:build !podkop_slim || podkop_full
++
+ package main
+ 
+ import (
+diff --git a/cmd/sing-box/cmd_tools_stun.go b/cmd/sing-box/cmd_tools_stun.go
+index f13086caa..0b384c94d 100644
+--- a/cmd/sing-box/cmd_tools_stun.go
++++ b/cmd/sing-box/cmd_tools_stun.go
+@@ -1,3 +1,5 @@
++//go:build !podkop_slim || podkop_full
++
+ package main
+ 
+ import (
+-- 
+2.53.0
+

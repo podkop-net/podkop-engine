@@ -1,0 +1,48 @@
+From 23516f5db2270d1066e250e26ca0c60b888c1bd2 Mon Sep 17 00:00:00 2001
+From: FiyeroT <me@fiyero.xyz>
+Date: Sat, 14 Nov 2026 11:32:59 +0300
+Subject: [PATCH 63/63] go.mod: quic-go of the podkop-engine fork, Chrome's
+ QUIC suites in the order of the CPU
+
+The ClientHello of the Chrome QUIC parrot (hysteria2, xhttp over HTTP/3) offered AES-GCM first on
+every CPU; Chrome itself puts ChaCha20 first without AES hardware (BoringSSL), and a server takes
+the first suite it supports: on an MT7621, hysteria2 of 1.14 moved a third less and cost 40 % more
+CPU a GB than 1.13. podkop-net/quic-go v0.61.0-sing-box-mod.12-pdk.1 is upstream
+v0.61.0-sing-box-mod.12 and that one change (the order of crypto/tls's hasAESGCMHardwareSupport).
+
+Pdk-Feature: quic-chrome-suites
+Pdk-Zone: build
+Pdk-Layer: 05
+---
+ go.mod | 4 ++++
+ go.sum | 2 ++
+ 2 files changed, 6 insertions(+)
+
+diff --git a/go.mod b/go.mod
+index f4bf8c02e..df4b2b69e 100644
+--- a/go.mod
++++ b/go.mod
+@@ -200,3 +200,7 @@ require (
+ )
+ 
+ replace github.com/sagernet/sing-vmess => github.com/FiyeroT/sing-vmess v0.2.9-pdk.2
++
++// Chrome's QUIC ClientHello in the order of the CPU: ChaCha20 first without AES hardware, as Chrome
++// does (podkop-engine, K1)
++replace github.com/sagernet/quic-go => github.com/podkop-net/quic-go v0.61.0-sing-box-mod.12-pdk.1
+diff --git a/go.sum b/go.sum
+index 717a2152f..da8e75313 100644
+--- a/go.sum
++++ b/go.sum
+@@ -232,6 +232,8 @@ github.com/pires/go-proxyproto v0.8.1/go.mod h1:ZKAAyp3cgy5Y5Mo4n9AlScrkCZwUy0g3
+ github.com/pkg/sftp v1.13.10 h1:+5FbKNTe5Z9aspU88DPIKJ9z2KZoaGCu6Sr6kKR/5mU=
+ github.com/pkg/sftp v1.13.10/go.mod h1:bJ1a7uDhrX/4OII+agvy28lzRvQrmIQuaHrcI1HbeGA=
+ github.com/pmezard/go-difflib v1.0.0/go.mod h1:iKH77koFhYxTK1pcRnkKkqfTogsbg7gZNVY4sRDYZ/4=
++github.com/podkop-net/quic-go v0.61.0-sing-box-mod.12-pdk.1 h1:pRtkx26y24kDa308e1Fc8EBqzY6TlmP2Wy6pPx9VPu4=
++github.com/podkop-net/quic-go v0.61.0-sing-box-mod.12-pdk.1/go.mod h1:hmLC8GJPp+BrpBgrgJnacvI4fZGIhasuy1ROJJ8GR4E=
+ github.com/prometheus/client_model v0.0.0-20190812154241-14fe0d1b01d4/go.mod h1:xMI15A0UPsDsEKsMN9yxemIoYk6Tm2C1GtYGdfGttqA=
+ github.com/quic-go/qpack v0.6.0 h1:g7W+BMYynC1LbYLSqRt8PBg5Tgwxn214ZZR34VIOjz8=
+ github.com/quic-go/qpack v0.6.0/go.mod h1:lUpLKChi8njB4ty2bFLX2x4gzDqXwUpaO1DP9qMDZII=
+-- 
+2.53.0
+

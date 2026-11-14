@@ -1,0 +1,287 @@
+From 6075fd82626071b8a1dae4c8f8b822e13eb6885f Mon Sep 17 00:00:00 2001
+From: FiyeroT <me@fiyero.xyz>
+Date: Sat, 14 Nov 2026 11:24:11 +0300
+Subject: [PATCH 62/63] warm: the deep paths of a new UDP session and of its
+ DNS exchange on goroutines kept warm
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+A new goroutine starts with a small stack, and the runtime keeps no grown stack for the next one:
+a path deeper than that stack copies the stack larger every time it runs on a new goroutine. Every
+DNS query of a resolver such as dnsmasq comes from a port of its own, a new UDP session, and ran
+the route of the session on the new goroutine udpnat starts for it, then its exchange on another
+new one (dns_nat.go): at DNS saturation the copying (runtime.newstack, runtime.copystack) took a
+third of the CPU on arm64 (16 % with 1.13, whose path is shallower).
+
+common/warm keeps the goroutines that ran a function for a while (10 s, as long as a DNS session
+waits for its next packet) and hands the next function to one that waits, its grown stack kept;
+with none waiting a function gets a new goroutine, so no caller ever waits. The direct inbound
+routes a new session on one, and the DNS NAT handler exchanges on one. On an arm64 server at DNS
+saturation: 32 % more queries a second, 24 % less CPU a query (beyond 1.13: +10 %, −9 %), copystack
+19 % → 0.5 % of the CPU; at most 8 workers, no more memory, none left 15 s after the load.
+
+Pdk-Feature: warm-goroutines
+Pdk-Zone: core
+Pdk-Layer: 05
+---
+ common/warm/warm.go        | 87 ++++++++++++++++++++++++++++++++++++++
+ common/warm/warm_test.go   | 84 ++++++++++++++++++++++++++++++++++++
+ protocol/direct/inbound.go |  8 ++++
+ route/dns_nat.go           | 22 ++++++----
+ 4 files changed, 192 insertions(+), 9 deletions(-)
+ create mode 100644 common/warm/warm.go
+ create mode 100644 common/warm/warm_test.go
+
+diff --git a/common/warm/warm.go b/common/warm/warm.go
+new file mode 100644
+index 000000000..59063a933
+--- /dev/null
++++ b/common/warm/warm.go
+@@ -0,0 +1,87 @@
++// Package warm runs functions on goroutines that are kept for a while after they finish one.
++//
++// A new goroutine starts with a small stack, and the runtime keeps no grown stack for the next
++// goroutine when one exits: a path deeper than that stack (the route of a new UDP session, a DNS
++// exchange) copies its stack larger, often more than once, every time it runs on a new
++// goroutine. A worker of the pool keeps the stack it grew while it waits for the next function;
++// the garbage collector may still shrink the stack of a worker that waits, so the growth comes
++// back at most once a collection, not once a function.
++package warm
++
++import (
++	"sync/atomic"
++	"time"
++)
++
++// Pool hands functions to its waiting workers. It never makes a caller wait: with no worker
++// waiting, a function gets a new goroutine, which joins the pool while the pool has room.
++type Pool struct {
++	jobs chan func()
++	idle time.Duration
++	most int32
++	// workers are the goroutines of the pool, busy or waiting; started counts every one made
++	workers atomic.Int32
++	started atomic.Int64
++}
++
++// New makes a pool of at most most workers, each of which ends after waiting idle.
++func New(most int, idle time.Duration) *Pool {
++	return &Pool{jobs: make(chan func()), idle: idle, most: int32(most)}
++}
++
++// Go runs f on a waiting worker, or on a new goroutine.
++func (p *Pool) Go(f func()) {
++	select {
++	case p.jobs <- f:
++		return
++	default:
++	}
++	if p.workers.Add(1) <= p.most {
++		p.started.Add(1)
++		go p.work(f)
++		return
++	}
++	p.workers.Add(-1)
++	go f()
++}
++
++func (p *Pool) work(f func()) {
++	defer p.workers.Add(-1)
++	timer := time.NewTimer(p.idle)
++	defer timer.Stop()
++	for {
++		f()
++		f = nil
++		timer.Reset(p.idle)
++		select {
++		case f = <-p.jobs:
++		case <-timer.C:
++			return
++		}
++	}
++}
++
++// Workers is how many workers the pool has now, busy or waiting; Started how many it made.
++func (p *Pool) Workers() int { return int(p.workers.Load()) }
++
++func (p *Pool) Started() int64 { return p.started.Load() }
++
++// The pool of the process. At DNS saturation (16 queries at a time, one core of an arm64 server)
++// at most 8 workers were busy or waiting, and the process held no more memory than without the
++// pool; 64 bounds what a burst may keep. A worker waits 10 s, as a DNS session waits for its next
++// packet (C.DNSTimeout): every worker had ended 15 s after the load (notes/2026-11-13-stage3.md, K3).
++var (
++	defaultWorkers = 64
++	defaultIdle    = 10 * time.Second
++	defaultPool    = New(defaultWorkers, defaultIdle)
++)
++
++// Go runs f on a worker of the pool of the process (Pool.Go).
++func Go(f func()) {
++	defaultPool.Go(f)
++}
++
++// Default is the pool of the process.
++func Default() *Pool {
++	return defaultPool
++}
+diff --git a/common/warm/warm_test.go b/common/warm/warm_test.go
+new file mode 100644
+index 000000000..b952cba53
+--- /dev/null
++++ b/common/warm/warm_test.go
+@@ -0,0 +1,84 @@
++package warm
++
++import (
++	"sync"
++	"testing"
++	"time"
++)
++
++// Functions one after another run on one worker; a worker waits idle, then ends.
++func TestPoolReusesItsWorker(t *testing.T) {
++	pool := New(4, 200*time.Millisecond)
++	for range 10 {
++		done := make(chan struct{})
++		pool.Go(func() { close(done) })
++		<-done
++		time.Sleep(time.Millisecond)
++	}
++	if got := pool.Started(); got != 1 {
++		t.Fatalf("started %d workers for functions one after another, want 1", got)
++	}
++	deadline := time.Now().Add(2 * time.Second)
++	for pool.Workers() != 0 && time.Now().Before(deadline) {
++		time.Sleep(10 * time.Millisecond)
++	}
++	if pool.Workers() != 0 {
++		t.Fatalf("%d workers left after their wait", pool.Workers())
++	}
++}
++
++// A caller never waits: past most busy workers, a function gets a goroutine of its own.
++func TestPoolNeverWaits(t *testing.T) {
++	pool := New(2, time.Second)
++	release := make(chan struct{})
++	var running sync.WaitGroup
++	running.Add(5)
++	for range 5 {
++		pool.Go(func() {
++			running.Done()
++			<-release
++		})
++	}
++	waited := make(chan struct{})
++	go func() { running.Wait(); close(waited) }()
++	select {
++	case <-waited:
++	case <-time.After(2 * time.Second):
++		t.Fatal("not every function started while the workers were busy")
++	}
++	if got := pool.Workers(); got != 2 {
++		t.Fatalf("%d workers, want the most, 2", got)
++	}
++	close(release)
++}
++
++// deep uses a few KB of stack a call, as the route of a session does.
++//
++//go:noinline
++func deep(depth int) byte {
++	var frame [512]byte
++	frame[depth%len(frame)] = byte(depth)
++	if depth == 0 {
++		return frame[0]
++	}
++	return deep(depth-1) + frame[depth%len(frame)]
++}
++
++// A deep function on a new goroutine against on a warm worker: the stack copied larger each time,
++// or once.
++func BenchmarkDeepOnNewGoroutine(b *testing.B) {
++	for range b.N {
++		done := make(chan struct{})
++		go func() { deep(64); close(done) }()
++		<-done
++	}
++}
++
++func BenchmarkDeepOnWarmWorker(b *testing.B) {
++	pool := New(4, time.Minute)
++	for range b.N {
++		done := make(chan struct{})
++		pool.Go(func() { deep(64); close(done) })
++		<-done
++	}
++}
+diff --git a/protocol/direct/inbound.go b/protocol/direct/inbound.go
+index 3c24e2cbb..8222fadef 100644
+--- a/protocol/direct/inbound.go
++++ b/protocol/direct/inbound.go
+@@ -10,6 +10,7 @@ import (
+ 	"github.com/sagernet/sing-box/adapter"
+ 	"github.com/sagernet/sing-box/adapter/inbound"
+ 	"github.com/sagernet/sing-box/common/listener"
++	"github.com/sagernet/sing-box/common/warm"
+ 	C "github.com/sagernet/sing-box/constant"
+ 	"github.com/sagernet/sing-box/log"
+ 	"github.com/sagernet/sing-box/option"
+@@ -125,6 +126,13 @@ func (i *Inbound) NewConnection(ctx context.Context, conn net.Conn, metadata ada
+ }
+ 
+ func (i *Inbound) NewPacketConnectionEx(ctx context.Context, conn N.PacketConn, source M.Socksaddr, destination M.Socksaddr, onClose N.CloseHandlerFunc) {
++	// udpnat calls it on a new goroutine for every new session, and a resolver such as
++	// dnsmasq asks each query from a port of its own: the route of the session, deeper than
++	// the stack a new goroutine has, runs on a warm one
++	warm.Go(func() { i.newPacketConnection(ctx, conn, source, destination, onClose) })
++}
++
++func (i *Inbound) newPacketConnection(ctx context.Context, conn N.PacketConn, source M.Socksaddr, destination M.Socksaddr, onClose N.CloseHandlerFunc) {
+ 	i.logger.InfoContext(ctx, "inbound packet connection from ", source)
+ 	var metadata adapter.InboundContext
+ 	metadata.Inbound = i.Tag()
+diff --git a/route/dns_nat.go b/route/dns_nat.go
+index ea5ff1505..a14995a22 100644
+--- a/route/dns_nat.go
++++ b/route/dns_nat.go
+@@ -5,6 +5,7 @@ import (
+ 	"time"
+ 
+ 	"github.com/sagernet/sing-box/adapter"
++	"github.com/sagernet/sing-box/common/warm"
+ 	C "github.com/sagernet/sing-box/constant"
+ 	"github.com/sagernet/sing-box/dns"
+ 	R "github.com/sagernet/sing-box/route/rule"
+@@ -106,15 +107,18 @@ func (h *dnsNatHandler) NewPacketEx(buffer *buf.Buffer, destination M.Socksaddr)
+ 	metadata := h.metadata
+ 	// Not on the caller: udpnat calls NewPacketEx from the reading loop of the inbound,
+ 	// which serves every session, and an exchange can wait (a new FakeIP address is
+-	// written to the cache file, a DoT connection is being set up). The goroutine lives as
+-	// long as ExchangeAsync itself, not for the session.
+-	go h.router.dns.ExchangeAsync(adapter.WithContext(h.ctx, &metadata), &message, adapter.DNSQueryOptions{}, func(response *mDNS.Msg, exchangeErr error) {
+-		if exchangeErr == nil {
+-			exchangeErr = h.router.writeDNSPacketResponse(&message, response, h.conn, destination)
+-		}
+-		if exchangeErr != nil && !R.IsRejected(exchangeErr) && !E.IsClosedOrCanceled(exchangeErr) && !dns.IsLoggedFailure(exchangeErr) {
+-			h.router.logger.ErrorContext(h.ctx, E.Cause(exchangeErr, "process DNS packet"))
+-		}
++	// written to the cache file, a DoT connection is being set up). The goroutine is busy
++	// as long as ExchangeAsync itself, not for the session; a warm one (common/warm): the
++	// DNS rules and the exchange are deeper than the stack a new goroutine has.
++	warm.Go(func() {
++		h.router.dns.ExchangeAsync(adapter.WithContext(h.ctx, &metadata), &message, adapter.DNSQueryOptions{}, func(response *mDNS.Msg, exchangeErr error) {
++			if exchangeErr == nil {
++				exchangeErr = h.router.writeDNSPacketResponse(&message, response, h.conn, destination)
++			}
++			if exchangeErr != nil && !R.IsRejected(exchangeErr) && !E.IsClosedOrCanceled(exchangeErr) && !dns.IsLoggedFailure(exchangeErr) {
++				h.router.logger.ErrorContext(h.ctx, E.Cause(exchangeErr, "process DNS packet"))
++			}
++		})
+ 	})
+ }
+ 
+-- 
+2.53.0
+

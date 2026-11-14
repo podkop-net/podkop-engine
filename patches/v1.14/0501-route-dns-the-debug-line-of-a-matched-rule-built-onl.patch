@@ -1,7 +1,7 @@
-From bcc3b5f83a31650dfe5c5b6ab20a87997e1ef308 Mon Sep 17 00:00:00 2001
+From b5a77480a66608ac037a8f8128e27aecdea8dd4d Mon Sep 17 00:00:00 2001
 From: FiyeroT <me@fiyero.xyz>
 Date: Fri, 13 Nov 2026 08:45:15 +0300
-Subject: [PATCH 59/60] route, dns: the debug line of a matched rule built only
+Subject: [PATCH 59/63] route, dns: the debug line of a matched rule built only
  when it is logged
 
 The routers built the description of every matched rule (Rule.String) on each connection and

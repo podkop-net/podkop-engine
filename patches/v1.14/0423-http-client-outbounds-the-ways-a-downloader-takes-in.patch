@@ -1,7 +1,7 @@
-From 1db41e639dbb786b1622f5b86a382111a41027d0 Mon Sep 17 00:00:00 2001
+From a5191fd598440e58e717dcd8f79a5a9e580e43f8 Mon Sep 17 00:00:00 2001
 From: FiyeroT <me@fiyero.xyz>
 Date: Fri, 13 Nov 2026 14:38:32 +0300
-Subject: [PATCH 58/60] http client: outbounds, the ways a downloader takes in
+Subject: [PATCH 58/63] http client: outbounds, the ways a downloader takes in
  the order of what it knows of them
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8
@@ -24,8 +24,8 @@ Pdk-Zone: core
 Pdk-Layer: 04
 ---
  adapter/http.go                               |  29 +
- common/httpclient/downloader.go               | 538 ++++++++++++++++++
- common/httpclient/downloader_test.go          | 263 +++++++++
+ common/httpclient/downloader.go               | 548 ++++++++++++++++++
+ common/httpclient/downloader_test.go          | 297 ++++++++++
  common/httpclient/manager.go                  |  18 +-
  docs/configuration/shared/http-client.md      |  26 +
  option/http.go                                |   6 +
@@ -33,7 +33,7 @@ Pdk-Layer: 04
  route/rule/rule_set_remote.go                 |  85 ++-
  route/rule/rule_set_remote_downloader_test.go | 143 +++++
  route/rule/rule_set_remote_fallback.go        |  39 ++
- 10 files changed, 1159 insertions(+), 23 deletions(-)
+ 10 files changed, 1203 insertions(+), 23 deletions(-)
  create mode 100644 common/httpclient/downloader.go
  create mode 100644 common/httpclient/downloader_test.go
  create mode 100644 route/rule/rule_set_remote_downloader_test.go
@@ -87,10 +87,10 @@ index af67ee61f..eef2fb461 100644
  	Tag       string
 diff --git a/common/httpclient/downloader.go b/common/httpclient/downloader.go
 new file mode 100644
-index 000000000..6cf50e7b5
+index 000000000..204a69de1
 --- /dev/null
 +++ b/common/httpclient/downloader.go
-@@ -0,0 +1,538 @@
+@@ -0,0 +1,548 @@
 +package httpclient
 +
 +import (
@@ -116,20 +116,30 @@ index 000000000..6cf50e7b5
 +)
 +
 +// DownloadPlan is when a download starts its next way beside those under way: when none of them
-+// showed progress for Wait (no answer yet) or Body (a pause in a body), or the youngest is Total
-+// old and none has a body coming; at most Most ways at once.
++// showed progress for Wait (no answer yet), or a body has paused for Body (LargeBody once Large
++// bytes of it came); at most Most ways at once.
 +type DownloadPlan struct {
-+	Wait  time.Duration
-+	Body  time.Duration
-+	Total time.Duration
-+	Most  int
++	Wait      time.Duration
++	Body      time.Duration
++	LargeBody time.Duration
++	Large     int64
++	Most      int
 +}
 +
-+// downloadPlan is the plan of every downloader. PROVISIONAL: the plan of the subscription download
-+// of podkop-exp (subscription.DefaultPlan: 5 s is what a way had there before the plan, 3 s in a
-+// body and 10 s a choice; 3 at once, as bursts of TLS hellos to one name are what the DPI of some
-+// ISPs penalises), until the ways of real routers are measured.
-+var downloadPlan = DownloadPlan{Wait: 5 * time.Second, Body: 3 * time.Second, Total: 10 * time.Second, Most: 3}
++// downloadPlan is the plan of every downloader, from the delays of real ways (1200 tries a client
++// on a Filogic 820, an MT7621 and an x86 server: five list sources directly and through REALITY
++// with and without Vision, Trojan, Shadowsocks 2022 and hysteria2 servers near and far):
++//   - Wait 4 s: the slowest answer of a way that worked, its headers after 3.78 s (MT7621, a far
++//     REALITY server; p99 2.2–3.1 s by client), rounded up. A way that fails does it in about
++//     0.1–0.6 s (refused, reset) or hangs (a TLS handshake that never ends): the wait is what a
++//     hanging way costs.
++//   - Body 1 s: the longest pause inside a body that came, 0.94 s (p99 0.11–0.13 s), rounded up;
++//     the files were up to 260 KB. Past Large (1 MiB) received the pause may be 3 s (LargeBody):
++//     the next way would hold a second copy of a big list at once, for a pause the measurement
++//     did not cover.
++//   - Most 3: not measured — bursts of TLS hellos to one name are what the DPI of some ISPs
++//     penalises (the plan of the subscription download of podkop-exp).
++var downloadPlan = DownloadPlan{Wait: 4 * time.Second, Body: time.Second, LargeBody: 3 * time.Second, Large: 1 << 20, Most: 3}
 +
 +// downloadWatch is how often a download looks at its ways under way.
 +const downloadWatch = 100 * time.Millisecond
@@ -425,36 +435,36 @@ index 000000000..6cf50e7b5
 +// due tells whether the ways under way have earned the start of the next one (DownloadPlan).
 +func (d *Downloader) due(attempts []*attempt) bool {
 +	now := time.Now()
-+	idle, youngest := time.Duration(-1), time.Duration(-1)
-+	body := false
++	idle := time.Duration(-1)
++	stalled := false
 +	for _, item := range attempts {
 +		item.access.Lock()
-+		finished, last, started, inBody := item.finished, item.last, item.started, item.body
++		finished, last, inBody, bytes := item.finished, item.last, item.body, item.bytes
 +		item.access.Unlock()
 +		if finished {
 +			continue
 +		}
-+		if inBody && now.Sub(last) < d.Plan.Body {
-+			// a body is coming: a second one would hold another copy of a file of up to
-+			// tens of MB on a router
-+			return false
++		pause := now.Sub(last)
++		if inBody {
++			limit := d.Plan.Body
++			if bytes >= d.Plan.Large {
++				limit = d.Plan.LargeBody
++			}
++			if pause < limit {
++				// a body is coming: a second one would hold another copy of the file
++				return false
++			}
++			stalled = true
++			continue
 +		}
-+		body = body || inBody
-+		if idle < 0 || now.Sub(last) < idle {
-+			idle = now.Sub(last)
-+		}
-+		if youngest < 0 || now.Sub(started) < youngest {
-+			youngest = now.Sub(started)
++		if idle < 0 || pause < idle {
++			idle = pause
 +		}
 +	}
-+	if idle < 0 {
++	if stalled || idle < 0 {
 +		return true
 +	}
-+	wait := d.Plan.Wait
-+	if body {
-+		wait = d.Plan.Body
-+	}
-+	return idle >= wait || youngest >= d.Plan.Total
++	return idle >= d.Plan.Wait
 +}
 +
 +// DownloadMemory is what the downloads found of the ways: per host, the way that brought its last
@@ -631,10 +641,10 @@ index 000000000..6cf50e7b5
 +}
 diff --git a/common/httpclient/downloader_test.go b/common/httpclient/downloader_test.go
 new file mode 100644
-index 000000000..8f3cbb3ea
+index 000000000..67a60f1b5
 --- /dev/null
 +++ b/common/httpclient/downloader_test.go
-@@ -0,0 +1,263 @@
+@@ -0,0 +1,297 @@
 +package httpclient
 +
 +import (
@@ -655,7 +665,7 @@ index 000000000..8f3cbb3ea
 +)
 +
 +// testPlan is a plan of the same shape as downloadPlan, a hundred times shorter.
-+var testPlan = DownloadPlan{Wait: 50 * time.Millisecond, Body: 30 * time.Millisecond, Total: 100 * time.Millisecond, Most: 3}
++var testPlan = DownloadPlan{Wait: 50 * time.Millisecond, Body: 30 * time.Millisecond, LargeBody: 300 * time.Millisecond, Large: 1000, Most: 3}
 +
 +func testDownloader(ways ...string) *Downloader {
 +	downloader := NewDownloader(log.NewNOPFactory().Logger(), ways, map[string]adapter.HTTPTransport{}, nil, nil)
@@ -744,7 +754,7 @@ index 000000000..8f3cbb3ea
 +		}
 +		progress(0)
 +		for range 25 {
-+			// steady parts, closer than Body, for 3 Totals
++			// steady parts, closer than Body, for many Waits
 +			time.Sleep(testPlan.Body / 3)
 +			progress(10)
 +		}
@@ -898,6 +908,40 @@ index 000000000..8f3cbb3ea
 +	ways, _ = downloader.Ways("lists.example")
 +	require.Equal(t, []string{"direct", "rule-a", "rule-b", "helper"}, ways)
 +}
++
++// A body that pauses longer than Body has the next way started beside it while it is small; once
++// Large bytes of it came, only a pause longer than LargeBody does.
++func TestDownloaderLargeBodyWaitsLonger(t *testing.T) {
++	for _, testCase := range []struct {
++		name      string
++		before    int
++		nextStart bool
++	}{
++		{"small", 100, true},
++		{"large", 2000, false},
++	} {
++		t.Run(testCase.name, func(t *testing.T) {
++			downloader := testDownloader("pausing", "other")
++			var otherStarted atomic.Bool
++			_, err := downloader.Download(context.Background(), "lists.example", func(ctx context.Context, way string, _ *http.Client, progress func(int)) (any, error) {
++				if way == "other" {
++					otherStarted.Store(true)
++					<-ctx.Done()
++					return nil, ctx.Err()
++				}
++				progress(0)
++				progress(testCase.before)
++				// a pause of 6 Body (180 ms), shorter than LargeBody (300 ms): after its first Body
++				// there are 150 ms left, more than the 100 ms between two looks of the download
++				time.Sleep(6 * testPlan.Body)
++				progress(10)
++				return "list", nil
++			}, accepting)
++			require.NoError(t, err)
++			require.Equal(t, testCase.nextStart, otherStarted.Load())
++		})
++	}
++}
 diff --git a/common/httpclient/manager.go b/common/httpclient/manager.go
 index 820cbeabb..1dbd9ed32 100644
 --- a/common/httpclient/manager.go
@@ -962,7 +1006,7 @@ index 820cbeabb..1dbd9ed32 100644
  		return nil, E.Cause(err, "create shared http_client[", tag, "]")
  	}
 diff --git a/docs/configuration/shared/http-client.md b/docs/configuration/shared/http-client.md
-index 787aaa3db..67c1dd76b 100644
+index 787aaa3db..543b51251 100644
 --- a/docs/configuration/shared/http-client.md
 +++ b/docs/configuration/shared/http-client.md
 @@ -19,6 +19,7 @@ When object:
@@ -995,8 +1039,8 @@ index 787aaa3db..67c1dd76b 100644
 +
 +No way is left out, but those the program that runs the box excludes (a group while it uses an
 +excluded outbound): podkop-exp excludes the servers the user marks so. The next way starts beside those under way when none of them showed
-+progress for 5 s (no answer yet) or for 3 s in a body, or the youngest is 10 s old and no body
-+is coming; at most three at once. The first way that brings a list that parses wins and the
++progress for 4 s (no answer yet), or a body has paused for 1 s (3 s once 1 MiB of it came); at
++most three at once. The first way that brings a list that parses wins and the
 +others are stopped; a body that is not a rule-set (a page served with status 200) fails its way.
 +When the first way failed for the host the last time, the second starts with it. What the
 +downloads found is kept for the life of the box, and across boxes when the program that runs
@@ -1255,7 +1299,7 @@ index c6b500b5c..0bcf0679a 100644
  	}
 diff --git a/route/rule/rule_set_remote_downloader_test.go b/route/rule/rule_set_remote_downloader_test.go
 new file mode 100644
-index 000000000..112dc1296
+index 000000000..e6efa2687
 --- /dev/null
 +++ b/route/rule/rule_set_remote_downloader_test.go
 @@ -0,0 +1,143 @@
@@ -1298,7 +1342,7 @@ index 000000000..112dc1296
 +
 +func testRuleSetDownloader(ways []string, transports map[string]adapter.HTTPTransport) *httpclient.Downloader {
 +	downloader := httpclient.NewDownloader(log.NewNOPFactory().Logger(), ways, transports, nil, nil)
-+	downloader.Plan = httpclient.DownloadPlan{Wait: 50 * time.Millisecond, Body: 30 * time.Millisecond, Total: 100 * time.Millisecond, Most: 3}
++	downloader.Plan = httpclient.DownloadPlan{Wait: 50 * time.Millisecond, Body: 30 * time.Millisecond, LargeBody: 300 * time.Millisecond, Large: 1 << 20, Most: 3}
 +	return downloader
 +}
 +
@@ -1398,7 +1442,7 @@ index 000000000..112dc1296
 +	require.Equal(t, 1, logs.count("updated rule-set list"), logs.dump())
 +	require.False(t, ruleSet.Metadata().ContainsIPCIDRRule)
 +	require.EqualValues(t, 1, requests.Load())
-+	// one wait of the plan (5 s), not the stall (30 s) nor the start deadline (30 s)
++	// one wait of the plan (4 s), not the stall (30 s) nor the start deadline (30 s)
 +	require.Less(t, took, 15*time.Second, logs.dump())
 +	require.Equal(t, 1, logs.count("through helper"), logs.dump())
 +}

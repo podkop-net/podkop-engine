@@ -1,7 +1,7 @@
 From 4dd81c868fe0b7b45de7a99a60308bca6cc69b52 Mon Sep 17 00:00:00 2001
 From: FiyeroT <me@fiyero.xyz>
 Date: Thu, 12 Nov 2026 21:41:19 +0300
-Subject: [PATCH 12/60] dns, hooks in upstream files: ipv6_if_no_ipv4
+Subject: [PATCH 12/63] dns, hooks in upstream files: ipv6_if_no_ipv4
 
 The lines of upstream files that "dns: ipv6_if_no_ipv4" needs; the feature itself is its patch of
 layer 03, in files of its own.
