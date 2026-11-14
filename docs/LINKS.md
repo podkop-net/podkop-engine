@@ -88,6 +88,8 @@ outbound задаются в конфигурации.
 
 ## Линии 1.13 и 1.14
 
+(Линия 1.13 с r26 не собирается; ниже — разница, пока она была.)
+
 Разбор ссылок на обеих линиях один и тот же; различается набор опций sing-box. Только в
 1.14 есть: обфускация `gecko` у hysteria2 (`obfs.min_packet_size`, `obfs.max_packet_size`),
 `hop_interval_max`, `bbr_profile`, `disable_chrome_parrot`, `realm`, опции QUIC

@@ -12,7 +12,7 @@
 # full package.
 set -eu
 PKG=${PKG:-podkop-engine}
-PODKOP_VERSION=${PODKOP_VERSION:-0.7.22}
+PODKOP_VERSION=${PODKOP_VERSION:-0.7.24}
 fail() { echo "FAIL: $*"; exit 1; }
 # The package feed and GitHub drop a download now and then (podkop pulls a dozen packages
 # from the feed): what needs the network is tried up to four times, lists updated between.

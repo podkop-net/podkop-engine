@@ -4,7 +4,8 @@
 что пакет `sing-box` из OpenWrt, поэтому с ним он конфликтует и заменяет его.
 Файл брать из релиза нужной версии (https://github.com/podkop-net/podkop-engine/releases) под свою
 архитектуру (`opkg print-architecture` / `apk --print-arch`), например
-`podkop-engine_1.14.4-r24_openwrt_aarch64_cortex-a53.ipk`.
+`podkop-engine_1.14.4-r26_openwrt_aarch64_cortex-a53.ipk`. Линия 1.13 с r26 не
+собирается: для podkop 0.7.24 — пакет 1.14.4-r26 и новее.
 
 С r9 (1.13, 1.14) пакетов два, ставится один: `podkop-engine` — протоколы, которые использует
 podkop, TUIC, (с r15) http и (1.14, с r19) block; `podkop-engine-full` — плюс все остальные выходы для «Outbound

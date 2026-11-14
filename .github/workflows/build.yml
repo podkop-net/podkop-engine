@@ -6,7 +6,7 @@ on:
     inputs:
       lines:
         description: "Ветки sing-box (через пробел)"
-        default: "1.12 1.13 1.14"
+        default: "1.12 1.14"
       format:
         description: "Формат пакетов"
         type: choice
