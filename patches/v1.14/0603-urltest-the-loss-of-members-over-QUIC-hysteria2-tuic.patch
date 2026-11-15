@@ -1,4 +1,4 @@
-From 99eafe2980ac7faa6ebcdd567aa886ce12edab13 Mon Sep 17 00:00:00 2001
+From 337cfff5ad9d5c5d44c44250664beb63c9a0d14a Mon Sep 17 00:00:00 2001
 From: FiyeroT <me@fiyero.xyz>
 Date: Sun, 15 Nov 2026 12:55:34 +0300
 Subject: [PATCH 66/66] urltest: the loss of members over QUIC (hysteria2,
@@ -12,18 +12,27 @@ A hysteria2 or tuic outbound now tells the counts of its QUIC connection
 (adapter.QUICStatsOutbound): the server's 1-RTT packets that came and the packet numbers that did
 not, counted by the receiver in quic-go (the podkop-engine fork, ConnectionStats), and the RTTs.
 LossProbeQUIC downloads the loss URL in windows of probesock.Window, by its "bytes" parameter or
-by ranges, and counts each window by the packets the connection received meanwhile. A window
-counts only when the connection stayed the same, the packets of the window had the reorder wait
-of RFC 9002 (9/8 of the smoothed RTT) to come, and no UDP socket of the host dropped a datagram
-on receive (/proc/net/snmp, RcvbufErrors) meanwhile. A loss URL with neither ranges nor the
-parameter counts nothing (ErrLossNoWindows) and rests like a member without a connection of its
-own.
+by ranges, and counts the probe by the packets the connection received across it. It counts only
+when the connection stayed the same, the packets had the reorder wait of RFC 9002 (9/8 of the
+smoothed RTT) to come, and no UDP socket of the host dropped a datagram on receive
+(/proc/net/snmp, RcvbufErrors) meanwhile; a probe cut by its time limit counts as far as it came,
+as the TCP one does. The probe holds a stream of its own open across the download: a member
+nothing references closes its connection with its last stream, and an HTTP connection closed
+between windows, or by the cut, would close it before it was counted. The connection of the
+member in use carries its users' traffic too: its sample weighs as many packets as the probe took,
+at the share the connection lost, or one busy probe would outweigh the window of hours. A loss URL
+with neither ranges nor the parameter counts nothing (ErrLossNoWindows) and rests like a member
+without a connection of its own; one whose file ends at the end of a window (416 for the next)
+counts what came.
 
-The loss weighs a member's delay at the price of its transport. Over QUIC a lost packet costs its
-stream a round of recovery and no new connection a handshake timer: the price fitted to the
-measured slowdown of hysteria2 pages (BBR, RTT 20 to 150 ms, loss 0.5 to 10 %) makes 1 % of loss
-cost x1.06 at 20 ms and x1.24 at 100 ms, where TCP's costs x2.85 and x1.57. A slowdown below 1
-weighs nothing down.
+The loss weighs a member's delay at the price of its transport: of the outbound a member that is
+a group selects, whose tag its loss is kept by, and whose connection its probe counts. Over QUIC a
+lost packet costs its stream a round of recovery and no new connection a handshake timer: the
+price fitted to the measured slowdown of hysteria2 pages (BBR, RTT 20 to 150 ms), over the cells
+of 0.5 to 2 % of loss where a member is chosen over another, makes 1 % cost x1.03 at 20 ms and
+x1.44 at 100 ms (measured x1.05 and x1.45), where TCP's costs x2.85 and x1.57. A fit over all the
+cells, 5 and 10 % with them, priced 1 % at x1.24 at 100 ms. An RTT below the 20 ms measured is
+priced as 20 ms. A slowdown below 1 weighs nothing down.
 
 On a stand (netem on both ways, 20 probes of 1 MB a level) the count came within 0.5 points of
 the loss of 0.5 to 5 %, as close as the TCP count. On a clean path a probe on a new connection
@@ -31,24 +40,27 @@ counts about 2 packets of a megabyte (0.2 %): the server's quic-go skips packet 
 optimistic acknowledgements (RFC 9000, 21.4), one in the first 256 and one in each period that
 doubles after, and a skipped number reads as a lost one. A member nothing references closes its
 connection with its last stream (the idle connections of unreferenced outbounds are closed), so
-an unselected member is probed on a new connection and shows it; the member in use does not.
+an unselected member is probed on a new connection and shows it; the member in use does not. Not
+seen on the stand, whose path takes 1500 bytes: a server's probes of the path MTU (quic-go, up to
+1452 bytes, on a new connection) that a narrower path drops count as lost too, and so do the
+packets a router too slow for the server's rate drops before quic-go reads them.
 
 Pdk-Feature: urltest-quic-loss
 Pdk-Zone: core
 Pdk-Layer: 06
 ---
- adapter/quic_stats.go                         |  27 +++
+ adapter/quic_stats.go                         |  27 ++
  common/urltest/loss.go                        |   5 +
- common/urltest/loss_quic.go                   | 216 ++++++++++++++++++
- common/urltest/loss_quic_test.go              | 173 ++++++++++++++
- common/urltest/udpdrops_linux.go              |  41 ++++
+ common/urltest/loss_quic.go                   | 260 ++++++++++++++++
+ common/urltest/loss_quic_test.go              | 294 ++++++++++++++++++
+ common/urltest/udpdrops_linux.go              |  41 +++
  common/urltest/udpdrops_other.go              |   8 +
- protocol/group/urltestgroup/urltest_loss.go   |  49 +++-
- .../group/urltestgroup/urltest_loss_quic.go   |  15 ++
- .../group/urltestgroup/urltest_loss_test.go   |  48 +++-
- protocol/hysteria2/outbound.go                |  16 ++
- protocol/tuic/outbound.go                     |  16 ++
- 11 files changed, 605 insertions(+), 9 deletions(-)
+ protocol/group/urltestgroup/urltest_loss.go   |  70 ++++-
+ .../group/urltestgroup/urltest_loss_quic.go   |  20 ++
+ .../group/urltestgroup/urltest_loss_test.go   |  74 ++++-
+ protocol/hysteria2/outbound.go                |  16 +
+ protocol/tuic/outbound.go                     |  16 +
+ 11 files changed, 819 insertions(+), 12 deletions(-)
  create mode 100644 adapter/quic_stats.go
  create mode 100644 common/urltest/loss_quic.go
  create mode 100644 common/urltest/loss_quic_test.go
@@ -107,10 +119,10 @@ index 373a8391c..089fe9a56 100644
  // tests, as lossClientTimeout.
 diff --git a/common/urltest/loss_quic.go b/common/urltest/loss_quic.go
 new file mode 100644
-index 000000000..9baf742d7
+index 000000000..e11c2faa9
 --- /dev/null
 +++ b/common/urltest/loss_quic.go
-@@ -0,0 +1,216 @@
+@@ -0,0 +1,260 @@
 +package urltest
 +
 +import (
@@ -122,7 +134,6 @@ index 000000000..9baf742d7
 +	"net/http"
 +	"net/url"
 +	"strconv"
-+	"sync"
 +	"time"
 +
 +	"github.com/sagernet/sing-box/adapter"
@@ -143,8 +154,10 @@ index 000000000..9baf742d7
 +// no more in a round trip than the TCP probe's window lets it, whatever its
 +// congestion control (Brutal sends at a set rate and does not slow down on loss, and the stream
 +// windows of Hysteria2 are megabytes: one request for the whole body would be sent at once). The
-+// sample is the difference of the counts across the download, with whatever else the connection
-+// carried meanwhile. A window is a range of the link; a link with a "bytes" parameter (the
++// sample is the difference of the counts across the download. What else the connection carried
++// meanwhile (the member in use) is in it too: the sample then weighs as many packets as the probe
++// brought itself, at the share the connection lost, as the sample of LossProbe is the segments of
++// its own connection. A window is a range of the link; a link with a "bytes" parameter (the
 +// default loss URL, speed.cloudflare.com/__down, serves no ranges: it answers a range with the
 +// whole body) is asked for a body of that many bytes instead.
 +
@@ -164,11 +177,38 @@ index 000000000..9baf742d7
 +	return min(stats.SmoothedRTT*9/8, time.Second)
 +}
 +
++// quicPacketBytes is fewer bytes of a body than a packet of a Hysteria2 or TUIC server carries (up
++// to its datagrams of 1200 to 1452 bytes): body/quicPacketBytes is more packets than a body takes.
++const quicPacketBytes = 1000
++
++// quicProbePackets is how many packets a probe that brought received bytes in windows windows
++// takes at most: the body, and for each window a response header and an acknowledgment or two.
++func quicProbePackets(received int64, windows int) uint64 {
++	return uint64(received/quicPacketBytes) + 4*uint64(windows) + 16
++}
++
++// quicWait waits d, unless ctx is canceled (the group was closed): a probe cut by its own time
++// limit still waits, for the packets that come late.
++func quicWait(ctx context.Context, d time.Duration) error {
++	timer := time.NewTimer(d)
++	defer timer.Stop()
++	select {
++	case <-timer.C:
++		return nil
++	case <-ctx.Done():
++		if errors.Is(ctx.Err(), context.DeadlineExceeded) {
++			<-timer.C
++			return nil
++		}
++		return ctx.Err()
++	}
++}
++
 +// LossProbeQUIC downloads size bytes of link through detour, a window at a time, and returns what
 +// the QUIC connection of counter counted meanwhile. Its errors are LossProbe's, and one wrapping
-+// ErrLossNotCounted when the member had no QUIC connection, the connection was replaced during
-+// the probe, or the UDP receive buffers of the system dropped datagrams meanwhile (the count would
-+// put them on the path).
++// ErrLossNotCounted when the member had no QUIC connection, the connection was closed or replaced
++// during the probe, or the UDP receive buffers of the system dropped datagrams meanwhile (the count
++// would put them on the path).
 +func LossProbeQUIC(ctx context.Context, link string, size int64, detour N.Dialer, counter QUICCounter) (LossSample, error) {
 +	var sample LossSample
 +	linkURL, err := url.Parse(link)
@@ -187,25 +227,32 @@ index 000000000..9baf742d7
 +	destination := M.ParseSocksaddrHostPortStr(linkURL.Hostname(), port)
 +	byParameter := linkURL.Query().Has("bytes")
 +	start := time.Now()
-+	// the first stream before the first count: a member whose connection was idle dials it now
-+	first, err := detour.DialContext(ctx, "tcp", destination)
++	// a stream held open across the probe, dialed before the first count: a member whose connection
++	// was idle dials it now, and the connection stays while the HTTP connections of the probe close
++	// and come again. A member no group uses closes its connection with its last stream: a window
++	// cut by the time limit, or an HTTP connection not kept between windows, closed it before it
++	// was counted. Closed at the end, after the client's, it leaves the member to close the
++	// connection as it would have.
++	anchor, err := detour.DialContext(ctx, "tcp", destination)
 +	if err != nil {
 +		return sample, err
 +	}
++	defer anchor.Close()
 +	before, active := counter.QUICStats()
 +	if !active {
-+		first.Close()
 +		return sample, E.Cause(ErrLossNotCounted, "no QUIC connection")
 +	}
 +	dropsBefore, dropsKnown := udpReceiveDrops()
-+	client := quicProbeClient(ctx, first, detour, destination)
++	client := quicProbeClient(ctx, detour, destination)
 +	defer client.CloseIdleConnections()
 +	var received int64
 +	var probeErr error
++	windows := 0
 +	for received < size {
 +		end := min(received+probesock.Window, size) - 1
 +		got, err := quicProbeWindow(ctx, client, linkURL, byParameter, received, end)
 +		received += got
++		windows++
 +		if err != nil {
 +			probeErr = err
 +			break
@@ -223,10 +270,18 @@ index 000000000..9baf742d7
 +	default:
 +		return sample, probeErr
 +	}
-+	time.Sleep(quicReorderWait(before))
++	// the wait for what comes out of order, by the RTT the connection has now (a connection of
++	// 0-RTT may have had none before)
++	now, active := counter.QUICStats()
++	if !active || now.Connection != before.Connection {
++		return sample, E.Cause(ErrLossNotCounted, "the QUIC connection was closed or replaced during the probe")
++	}
++	if err := quicWait(ctx, quicReorderWait(now)); err != nil {
++		return sample, err
++	}
 +	after, active := counter.QUICStats()
 +	if !active || after.Connection != before.Connection {
-+		return sample, E.Cause(ErrLossNotCounted, "the QUIC connection was replaced during the probe")
++		return sample, E.Cause(ErrLossNotCounted, "the QUIC connection was closed or replaced during the probe")
 +	}
 +	if dropsKnown {
 +		if dropsAfter, known := udpReceiveDrops(); known && dropsAfter > dropsBefore {
@@ -237,6 +292,13 @@ index 000000000..9baf742d7
 +	var lost uint64
 +	if after.PeerPacketsMissing > before.PeerPacketsMissing {
 +		lost = after.PeerPacketsMissing - before.PeerPacketsMissing
++	}
++	// the connection carried more than the probe (the member in use): as many packets as the probe
++	// took, at the share the connection lost, or one busy probe would outweigh the rest of a window
++	// of hours (lossMinSegments of the group)
++	if own := quicProbePackets(received, windows); came+lost > own {
++		share := (lost*own + (came+lost)/2) / (came + lost)
++		came, lost = own-share, share
 +	}
 +	sample.At = time.Now()
 +	sample.Segments = int(came + lost)
@@ -275,6 +337,9 @@ index 000000000..9baf742d7
 +	defer resp.Body.Close()
 +	switch {
 +	case resp.StatusCode == http.StatusPartialContent && !byParameter, resp.StatusCode == http.StatusOK && byParameter:
++	case resp.StatusCode == http.StatusRequestedRangeNotSatisfiable && !byParameter && start > 0:
++		// the file ended where the window before did: the whole of it came
++		return 0, io.EOF
 +	case resp.StatusCode == http.StatusOK:
 +		// no ranges: the whole body comes at once, past the window
 +		return 0, errors.Join(ErrLossNotCounted, ErrLossNoWindows)
@@ -296,22 +361,13 @@ index 000000000..9baf742d7
 +	}
 +}
 +
-+// quicProbeClient makes the HTTP client of a QUIC probe: its first connection is first, a later one
-+// a stream dialed through detour (over the same QUIC connection). One connection at a time, no
-+// redirects, no compression asked for, as probeClient.
-+func quicProbeClient(ctx context.Context, first net.Conn, detour N.Dialer, destination M.Socksaddr) *http.Client {
-+	var access sync.Mutex
-+	pending := first
++// quicProbeClient makes the HTTP client of a QUIC probe: its connections are streams dialed through
++// detour (over the same QUIC connection). One connection at a time, no redirects, no compression
++// asked for, as probeClient.
++func quicProbeClient(ctx context.Context, detour N.Dialer, destination M.Socksaddr) *http.Client {
 +	return &http.Client{
 +		Transport: &http.Transport{
 +			DialContext: func(dialCtx context.Context, network, addr string) (net.Conn, error) {
-+				access.Lock()
-+				conn := pending
-+				pending = nil
-+				access.Unlock()
-+				if conn != nil {
-+					return conn, nil
-+				}
 +				return detour.DialContext(dialCtx, "tcp", destination)
 +			},
 +			TLSClientConfig: &tls.Config{
@@ -329,10 +385,10 @@ index 000000000..9baf742d7
 +}
 diff --git a/common/urltest/loss_quic_test.go b/common/urltest/loss_quic_test.go
 new file mode 100644
-index 000000000..b036278a0
+index 000000000..1362119c9
 --- /dev/null
 +++ b/common/urltest/loss_quic_test.go
-@@ -0,0 +1,173 @@
+@@ -0,0 +1,294 @@
 +package urltest
 +
 +import (
@@ -494,6 +550,127 @@ index 000000000..b036278a0
 +	require.Zero(t, sample.Lost)
 +}
 +
++// A connection that carried more than the probe (the member in use, busy) weighs as many packets
++// as the probe took, at the share the connection lost.
++func TestLossProbeQUICBusyConnection(t *testing.T) {
++	counter := &quicCounterStub{}
++	body := make([]byte, LossProbeSmall)
++	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		// the window, and the traffic of the users of the member meanwhile: 1000 packets, 2 % lost
++		counter.received.Add(980)
++		counter.missing.Add(20)
++		http.ServeContent(w, r, "", time.Time{}, bytes.NewReader(body))
++	}))
++	t.Cleanup(server.Close)
++	sample, err := LossProbeQUIC(context.Background(), server.URL, LossProbeSmall, plainDialer(), counter)
++	require.NoError(t, err)
++	windows := (LossProbeSmall + probesock.Window - 1) / probesock.Window
++	require.Equal(t, int(quicProbePackets(LossProbeSmall, windows)), sample.Segments)
++	require.InDelta(t, 2.0, 100*float64(sample.Lost)/float64(sample.Segments), 0.6)
++}
++
++// A file whose end is the end of a window answers the window after it with 416: the whole of it
++// came, and is counted.
++func TestLossProbeQUICRangeEnd(t *testing.T) {
++	counter := &quicCounterStub{}
++	server, _ := rangeServer(t, 2*probesock.Window, counter)
++	sample, err := LossProbeQUIC(context.Background(), server.URL, LossProbeSmall, plainDialer(), counter)
++	require.NoError(t, err)
++	require.Equal(t, int64(2*probesock.Window), sample.Received)
++	require.Positive(t, sample.Segments)
++}
++
++// idleClosingMember is a member no group uses (sing-quic with closeIdle): its QUIC connection
++// closes with its last stream, and the next stream opens another.
++type idleClosingMember struct {
++	counter quicCounterStub
++	access  sync.Mutex
++	streams int
++	open    bool
++}
++
++func (m *idleClosingMember) QUICStats() (adapter.QUICStats, bool) {
++	m.access.Lock()
++	defer m.access.Unlock()
++	if !m.open {
++		return adapter.QUICStats{}, false
++	}
++	return m.counter.QUICStats()
++}
++
++func (m *idleClosingMember) dial(ctx context.Context, network string, destination M.Socksaddr) (net.Conn, error) {
++	conn, err := plainDialer()(ctx, network, destination)
++	if err != nil {
++		return nil, err
++	}
++	m.access.Lock()
++	if !m.open {
++		m.open = true
++		m.counter.connection.Add(1)
++	}
++	m.streams++
++	m.access.Unlock()
++	return &idleClosingStream{Conn: conn, member: m}, nil
++}
++
++type idleClosingStream struct {
++	net.Conn
++	member *idleClosingMember
++	once   sync.Once
++}
++
++func (c *idleClosingStream) Close() error {
++	c.once.Do(func() {
++		c.member.access.Lock()
++		c.member.streams--
++		if c.member.streams == 0 {
++			c.member.open = false
++		}
++		c.member.access.Unlock()
++	})
++	return c.Conn.Close()
++}
++
++// A window cut by the time limit closes the HTTP connection of the probe: the connection of a member
++// no group uses stays until it was counted (the stream the probe holds), and the probe counts as
++// far as it came.
++func TestLossProbeQUICCutCounts(t *testing.T) {
++	member := &idleClosingMember{}
++	var requests atomic.Int32
++	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		member.counter.received.Add(15)
++		member.counter.missing.Add(1)
++		w.Header().Set("Content-Range", "bytes 0-"+strconv.Itoa(probesock.Window-1)+"/"+strconv.Itoa(LossProbeSmall))
++		w.Header().Set("Content-Length", strconv.Itoa(probesock.Window))
++		w.WriteHeader(http.StatusPartialContent)
++		if requests.Add(1) < 3 {
++			w.Write(make([]byte, probesock.Window))
++			return
++		}
++		// the third window comes in part, and the rest too late
++		w.Write(make([]byte, probesock.Window/2))
++		w.(http.Flusher).Flush()
++		select {
++		case <-r.Context().Done():
++		case <-time.After(5 * time.Second):
++		}
++	}))
++	t.Cleanup(server.Close)
++	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
++	defer cancel()
++	sample, err := LossProbeQUIC(ctx, server.URL, LossProbeSmall, DialerFunc(member.dial), member)
++	require.NoError(t, err)
++	require.Equal(t, int64(2*probesock.Window+probesock.Window/2), sample.Received)
++	require.Equal(t, 3*16, sample.Segments)
++	require.Equal(t, 3, sample.Lost)
++	// the HTTP connection the cut closed goes in the background of net/http
++	require.Eventually(t, func() bool {
++		member.access.Lock()
++		defer member.access.Unlock()
++		return member.streams == 0 && !member.open
++	}, 2*time.Second, 10*time.Millisecond, "the connection of a member no group uses is closed after the probe, as before it")
++}
++
 +func TestParseUDPReceiveDrops(t *testing.T) {
 +	snmp := "Ip: Forwarding DefaultTTL\nIp: 1 64\n" +
 +		"Udp: InDatagrams NoPorts InErrors OutDatagrams RcvbufErrors SndbufErrors InCsumErrors IgnoredMulti MemErrors\n" +
@@ -568,10 +745,10 @@ index 000000000..9297dd087
 +	return 0, false
 +}
 diff --git a/protocol/group/urltestgroup/urltest_loss.go b/protocol/group/urltestgroup/urltest_loss.go
-index d93dfee7a..9daf28e8f 100644
+index d93dfee7a..6d4aa7531 100644
 --- a/protocol/group/urltestgroup/urltest_loss.go
 +++ b/protocol/group/urltestgroup/urltest_loss.go
-@@ -106,8 +106,31 @@ func groupMode(mode string, link string, interval time.Duration, threshold float
+@@ -106,16 +106,57 @@ func groupMode(mode string, link string, interval time.Duration, threshold float
  	return mode, options, nil
  }
  
@@ -581,23 +758,39 @@ index d93dfee7a..9daf28e8f 100644
 +// p·(perLoss + perLossRTT·RTT) ms, the RTT in ms, p the loss in percent. A member with the loss p
 +// is then as slow as one without loss whose delay is greater by the factor
 +// 1 + p·(perLoss/RTT + perLossRTT)/perRTT, the slowdown, which a price may be fitted to directly
-+// (perRTT 1). A slowdown below 1 is none.
++// (perRTT 1). A slowdown below 1 is none. minRTT is the shortest RTT the price holds for (ms): a
++// shorter one is priced as it.
 +type lossPrice struct {
 +	perRTT, perLoss, perLossRTT float64
++	minRTT                      float64
 +}
 +
 +// tcpLossPrice is report 02's price, measured on servers with CUBIC and BBR alike: every page
 +// makes new connections to the server, and a lost handshake waits for the client's timer.
-+var tcpLossPrice = lossPrice{perRTT: 4.85, perLoss: 155, perLossRTT: 1.2}
++var tcpLossPrice = lossPrice{perRTT: 4.85, perLoss: 155, perLossRTT: 1.2, minRTT: 5}
 +
 +// lossPriceOf is the price of the loss of a member: a member over QUIC (adapter.QUICStatsOutbound)
 +// opens a stream of a connection it has for a page, and QUIC sends again what was lost within a
-+// round trip.
++// round trip. A member that is a group is priced as the member it selects (realOutbound).
 +func lossPriceOf(member adapter.Outbound) lossPrice {
-+	if _, isQUIC := member.(adapter.QUICStatsOutbound); isQUIC {
++	if _, isQUIC := realOutbound(member).(adapter.QUICStatsOutbound); isQUIC {
 +		return quicLossPrice
 +	}
 +	return tcpLossPrice
++}
++
++// realOutbound is the outbound the connections of a member go through in the end: through a group
++// (a selector, another urltest) the one it selects, as group.RealTag names it, whose tag the loss
++// of the member is kept by; nil when a group selects none.
++func realOutbound(member adapter.Outbound) adapter.Outbound {
++	for member != nil {
++		nested, isGroup := member.(adapter.OutboundGroup)
++		if !isGroup {
++			return member
++		}
++		member = nested.Selected(N.NetworkTCP)
++	}
++	return nil
 +}
 +
 +// weighDelay is delay weighed by a loss of percent over a path with the RTT rtt, at price.
@@ -605,21 +798,21 @@ index d93dfee7a..9daf28e8f 100644
  	if percent <= 0 {
  		return delay
  	}
-@@ -115,7 +138,12 @@ func weighDelay(delay uint16, percent float64, rtt time.Duration) uint16 {
- 	if milliseconds < 5 {
- 		milliseconds = 5
- 	}
--	weighed := float64(delay) * (1 + percent*(155/milliseconds+1.2)/4.85)
+-	milliseconds := float64(rtt) / float64(time.Millisecond)
+-	if milliseconds < 5 {
+-		milliseconds = 5
++	milliseconds := max(float64(rtt)/float64(time.Millisecond), price.minRTT)
 +	slowdown := 1 + percent*(price.perLoss/milliseconds+price.perLossRTT)/price.perRTT
 +	if slowdown <= 1 {
-+		// a loss makes no member faster (QUIC's below 16 ms, quicLossPrice)
++		// a loss makes no member faster
 +		return delay
-+	}
+ 	}
+-	weighed := float64(delay) * (1 + percent*(155/milliseconds+1.2)/4.85)
 +	weighed := float64(delay) * slowdown
  	if weighed > 65535 {
  		return 65535
  	}
-@@ -127,6 +155,7 @@ type memberLoss struct {
+@@ -127,6 +168,7 @@ type memberLoss struct {
  	percent float64 // over the window decided by
  	excess  float64 // less the loss of the line
  	rtt     time.Duration
@@ -627,7 +820,7 @@ index d93dfee7a..9daf28e8f 100644
  	known   bool
  }
  
-@@ -147,7 +176,7 @@ func (g *URLTestGroup) lossView() lossView {
+@@ -147,7 +189,7 @@ func (g *URLTestGroup) lossView() lossView {
  		if !known {
  			continue
  		}
@@ -636,7 +829,7 @@ index d93dfee7a..9daf28e8f 100644
  		if counted == 0 || loss.percent < floor {
  			floor = loss.percent
  		}
-@@ -175,7 +204,7 @@ func (v lossView) delay(tag string, history *adapter.URLTestHistory) uint16 {
+@@ -175,7 +217,7 @@ func (v lossView) delay(tag string, history *adapter.URLTestHistory) uint16 {
  		// no RTT of its own: a URL test takes a few round trips
  		rtt = time.Duration(history.Delay) * time.Millisecond / 3
  	}
@@ -645,14 +838,16 @@ index d93dfee7a..9daf28e8f 100644
  }
  
  // memberAlive tells whether a member may carry connections: it has a test result and has
-@@ -295,7 +324,13 @@ func (g *URLTestGroup) probeLoss(tag string, member adapter.Outbound, size int64
+@@ -295,7 +337,15 @@ func (g *URLTestGroup) probeLoss(tag string, member adapter.Outbound, size int64
  		return false
  	}
  	start := time.Now()
 -	sample, err := urltest.LossProbe(ctx, g.loss.link, size, member)
 +	var sample urltest.LossSample
 +	var err error
-+	if stats, isQUIC := member.(adapter.QUICStatsOutbound); isQUIC {
++	// a member that is a group dials through the member it selects: the QUIC connection counted is
++	// that member's, the one its loss is kept by (tag)
++	if stats, isQUIC := realOutbound(member).(adapter.QUICStatsOutbound); isQUIC {
 +		sample, err = urltest.LossProbeQUIC(ctx, g.loss.link, size, member, stats)
 +	} else {
 +		sample, err = urltest.LossProbe(ctx, g.loss.link, size, member)
@@ -660,7 +855,7 @@ index d93dfee7a..9daf28e8f 100644
  	if g.ctx.Err() != nil {
  		// the group was closed or replaced: after a swap the tag may be another outbound's
  		return false
-@@ -307,7 +342,7 @@ func (g *URLTestGroup) probeLoss(tag string, member adapter.Outbound, size int64
+@@ -307,7 +357,7 @@ func (g *URLTestGroup) probeLoss(tag string, member adapter.Outbound, size int64
  			sample.Reordered, " bytes reordered, RTT ", sample.RTT.Milliseconds(), "ms, ", sample.Received, " bytes in ",
  			sample.Elapsed.Milliseconds(), "ms")
  		return true
@@ -671,30 +866,35 @@ index d93dfee7a..9daf28e8f 100644
  	case g.networkChangedSince(start):
 diff --git a/protocol/group/urltestgroup/urltest_loss_quic.go b/protocol/group/urltestgroup/urltest_loss_quic.go
 new file mode 100644
-index 000000000..dbcc0e18e
+index 000000000..d157ee4e5
 --- /dev/null
 +++ b/protocol/group/urltestgroup/urltest_loss_quic.go
-@@ -0,0 +1,15 @@
+@@ -0,0 +1,20 @@
 +package urltestgroup
 +
 +// quicLossPrice is the price of the loss of a member over QUIC (podkop-engine), measured on the
 +// stand of report 02 (grid g16 of lab/hy2, 2026-11-15): hysteria2 of sing-box 1.14.4, its pages at
 +// RTTs of 20 to 150 ms and losses of 0.5 to 10 % on both ways, the server sending with BBR, as it
-+// does when the client declares no rate. It is fitted, by least squares over the 24 cells with
-+// loss, to the slowdown itself (a page at the loss p over a page without loss at the same RTT), so
-+// perRTT is 1. A lost packet costs its stream a round of recovery and no new connection a
-+// handshake timer: 1 % of loss costs ×1.06 at 20 ms, ×1.19 at 50 ms, ×1.24 at 100 ms and ×1.25 at
-+// 150 ms, and nothing below 16 ms (weighDelay never weighs a delay down), where over TCP the cost
-+// falls with the RTT (tcpLossPrice: ×2.85 at 20 ms, ×1.57 at 100 ms). Report 02's fit of the page
-+// time fits this grid worse (residuals of 71 ms rms, a flat ×1.14 at any RTT). With Brutal (a rate
-+// declared) a loss costs less (×1.03 to ×1.14 at 1 %), so this price weighs such a member a little
++// does when the client declares no rate. It is fitted, by least squares, to the slowdown itself (a
++// page at the loss p over a page without loss at the same RTT), so perRTT is 1, over the 12 cells
++// of 0.5 to 2 %: where a member is chosen over another. The slowdown is concave in the loss (at 50
++// ms and more, 0.5 % costs about what 1 % does), and a fit over all 24 cells, pulled by those of 5
++// and 10 %, priced 1 % at x1.24 at 100 ms where the grid measured x1.45. Measured, then priced, at
++// 1 %: x1.05 and x1.03 at 20 ms, x1.27 and x1.34 at 50 ms, x1.45 and x1.44 at 100 ms, x1.62 and
++// x1.48 at 150 ms (residuals of 0.20 rms over these cells); 5 and 10 % are priced above what they
++// cost (x5.4 for x3.3 at 100 ms and 10 %), so a member that loses that much loses its place a
++// little sooner. A lost packet costs its stream a round of recovery and no new connection a
++// handshake timer: over TCP the cost falls with the RTT (tcpLossPrice: x2.85 at 20 ms, x1.57 at
++// 100 ms), over QUIC it grows with it. No RTT below 20 ms was measured: a shorter one is priced as
++// 20 ms (minRTT), where the fitted form would price any loss at nothing below 19 ms. With Brutal
++// (a rate declared) a loss costs less (x1.03 to x1.14 at 1 %), so this price weighs such a member
 +// more than its loss costs. TUIC was not measured and is priced as hysteria2.
-+var quicLossPrice = lossPrice{perRTT: 1, perLoss: -4.43, perLossRTT: 0.282}
++var quicLossPrice = lossPrice{perRTT: 1, perLoss: -10.28, perLossRTT: 0.5438, minRTT: 20}
 diff --git a/protocol/group/urltestgroup/urltest_loss_test.go b/protocol/group/urltestgroup/urltest_loss_test.go
-index 04349b304..2d8141765 100644
+index 04349b304..a4dc07518 100644
 --- a/protocol/group/urltestgroup/urltest_loss_test.go
 +++ b/protocol/group/urltestgroup/urltest_loss_test.go
-@@ -27,12 +27,56 @@ import (
+@@ -27,12 +27,82 @@ import (
  // The weight is the crossing of the prices of report 02: a server 20 ms away with 0.8 % of
  // loss costs what a clean one 50 ms away does (delays in proportion to the RTT).
  func TestWeighDelayPrice(t *testing.T) {
@@ -708,17 +908,42 @@ index 04349b304..2d8141765 100644
 +	require.Equal(t, uint16(65535), weighDelay(60000, 50, time.Millisecond, tcpLossPrice))
 +}
 +
-+// Over QUIC a loss costs a round of recovery: more the longer the RTT, nothing on a short path
-+// (grid g16 of lab/hy2), where over TCP it costs most.
++// Over QUIC a loss costs a round of recovery: more the longer the RTT (grid g16 of lab/hy2, priced
++// over its cells of 0.5 to 2 %), where over TCP it costs most on a short path. An RTT below the
++// grid's 20 ms is priced as 20 ms: a heavy loss near weighs too.
 +func TestWeighDelayQUICPrice(t *testing.T) {
 +	quic := func(rtt time.Duration) uint16 { return weighDelay(100, 1, rtt, quicLossPrice) }
-+	require.Equal(t, uint16(100), quic(10*time.Millisecond))
-+	require.InDelta(t, 106, float64(quic(20*time.Millisecond)), 1)
-+	require.InDelta(t, 124, float64(quic(100*time.Millisecond)), 1)
-+	require.Less(t, quic(50*time.Millisecond), quic(150*time.Millisecond))
++	require.InDelta(t, 103, float64(quic(20*time.Millisecond)), 1)
++	require.Equal(t, quic(20*time.Millisecond), quic(10*time.Millisecond))
++	require.InDelta(t, 134, float64(quic(50*time.Millisecond)), 1)
++	require.InDelta(t, 144, float64(quic(100*time.Millisecond)), 1)
++	require.InDelta(t, 148, float64(quic(150*time.Millisecond)), 1)
 +	require.Greater(t, weighDelay(100, 1, 20*time.Millisecond, tcpLossPrice), quic(20*time.Millisecond))
-+	// a slowdown below 1 weighs nothing down
-+	require.Equal(t, uint16(100), weighDelay(100, 10, time.Millisecond, quicLossPrice))
++	require.Greater(t, weighDelay(100, 10, time.Millisecond, quicLossPrice), uint16(125))
++}
++
++// testSelector is a member that is a group: it selects one outbound, as a selector does.
++type testSelector struct {
++	*testMember
++	selected adapter.Outbound
++}
++
++func (s testSelector) All() []string                                     { return nil }
++func (s testSelector) Selected(network string) adapter.Outbound          { return s.selected }
++func (s testSelector) AttachConnection(closer io.Closer) (detach func()) { return func() {} }
++
++// A member that is a group is priced as the outbound it selects, whose tag its loss is kept by: a
++// selector of a member over QUIC at QUIC's price, of one over TCP, or of none, at TCP's.
++func TestLossPriceOfNestedMember(t *testing.T) {
++	hysteria2, socks := newTestMember(C.TypeHysteria2, "a", dialWorking), newTestMember(C.TypeSOCKS, "b", dialWorking)
++	selector := func(selected adapter.Outbound) adapter.Outbound {
++		return testSelector{newTestMember(C.TypeSelector, "s", dialWorking), selected}
++	}
++	require.Equal(t, quicLossPrice, lossPriceOf(quicTestMember{hysteria2}))
++	require.Equal(t, quicLossPrice, lossPriceOf(selector(quicTestMember{hysteria2})))
++	require.Equal(t, quicLossPrice, lossPriceOf(selector(selector(quicTestMember{hysteria2}))))
++	require.Equal(t, tcpLossPrice, lossPriceOf(selector(socks)))
++	require.Equal(t, tcpLossPrice, lossPriceOf(selector(nil)))
 +}
 +
 +// quicTestMember is a member over QUIC (adapter.QUICStatsOutbound).
@@ -730,8 +955,9 @@ index 04349b304..2d8141765 100644
 +	return adapter.QUICStats{}, false
 +}
 +
-+// A member is weighed at the price of its transport: one over QUIC that loses 1 % 100 ms away
-+// stays before a clean one 30 % slower; one over TCP with the same loss and delay does not.
++// A member is weighed at the price of its transport: one over QUIC that loses 1 % 20 ms away stays
++// before a clean one 50 % slower (x1.03); one over TCP with the same loss and delay does not
++// (x2.85), by more than the tolerance of a switch.
 +func TestLossModeQUICPrice(t *testing.T) {
 +	for _, overQUIC := range []bool{true, false} {
 +		a, b := newTestMember(C.TypeHysteria2, "a", dialWorking), newTestMember(C.TypeSOCKS, "b", dialWorking)
@@ -739,9 +965,9 @@ index 04349b304..2d8141765 100644
 +		if overQUIC {
 +			first = quicTestMember{a}
 +		}
-+		_, group := newModeGroup(t, modeLoss, []adapter.Outbound{first, b}, map[string]uint16{"a": 200, "b": 260}, func(group *URLTestGroup) {
-+			storeLoss(group, "a", 1000, 10, 100*time.Millisecond)
-+			storeLoss(group, "b", 1000, 0, 130*time.Millisecond)
++		_, group := newModeGroup(t, modeLoss, []adapter.Outbound{first, b}, map[string]uint16{"a": 200, "b": 300}, func(group *URLTestGroup) {
++			storeLoss(group, "a", 1000, 10, 20*time.Millisecond)
++			storeLoss(group, "b", 1000, 0, 30*time.Millisecond)
 +		})
 +		tcp, _ := selectedTags(group)
 +		if overQUIC {
