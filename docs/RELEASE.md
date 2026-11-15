@@ -38,15 +38,18 @@
    `src/tools/clang/scripts/update.py` naiveproxy той же версии cronet.
    Новая ветка (например 1.15): каталог `patches/v1.15`, строка в `LINES`.
 
-   **Форки библиотек.** sing-vmess и, с r26, quic-go берутся из форков
-   [FiyeroT/sing-vmess](https://github.com/FiyeroT/sing-vmess) и
-   [podkop-net/quic-go](https://github.com/podkop-net/quic-go): директивы `replace` в `go.mod`,
-   патчи `go.mod: …`. Исправление в библиотеке — это коммит в ветке форка (обе: `pdk-1.14.4`),
-   новый тег (sing-vmess: `v0.2.9-pdk.N`, quic-go: `v0.61.0-sing-box-mod.12-pdk.N`) и новые строки
+   **Форки библиотек.** sing-vmess, с r26 quic-go и с r27 sing-quic берутся из форков
+   [FiyeroT/sing-vmess](https://github.com/FiyeroT/sing-vmess),
+   [podkop-net/quic-go](https://github.com/podkop-net/quic-go) и
+   [podkop-net/sing-quic](https://github.com/podkop-net/sing-quic): директивы `replace` в `go.mod`,
+   патчи `go.mod: …`. Исправление в библиотеке — это коммит в ветке форка (все три: `pdk-1.14.4`),
+   новый тег (sing-vmess: `v0.2.9-pdk.N`, quic-go: `v0.61.0-sing-box-mod.12-pdk.N`, sing-quic:
+   `v0.7.2-pdk.N` — upstream 7e0a5869a5f4, которую берёт sing-box 1.14.4) и новые строки
    `go.mod` и `go.sum` в sing-box. Тег должен быть опубликован до сборки: SDK берёт модули через
    прокси Go. `replace` из go.mod зависимости не действует в модуле, который её требует:
    podkop-experimental повторяет их в своём go.mod, `sdk/check-engine.sh` там это сверяет.
-   Форк sing-quic (FiyeroT/sing-quic, `pdk-1.13`) был нужен только линии 1.13 и с r26 не используется.
+   Ветки `pdk-1.13` и `pdk-1.14` в podkop-net/sing-quic (теги `v0.6.5-pdk13.1` и `v0.7.1-pdk.1`) —
+   прежние форки; r27 их не берёт.
 
 2. **versions.env**: `SB_<ветка>_VERSION`, `SB_<ветка>_HASH`
    (`curl -sL https://codeload.github.com/SagerNet/sing-box/tar.gz/v<версия> | sha256sum`),

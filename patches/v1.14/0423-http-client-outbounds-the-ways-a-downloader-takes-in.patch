@@ -1,7 +1,7 @@
 From 52edd9967aeb2edb5bc54efd734257f5284c2e40 Mon Sep 17 00:00:00 2001
 From: FiyeroT <me@fiyero.xyz>
 Date: Fri, 13 Nov 2026 14:38:32 +0300
-Subject: [PATCH 58/63] http client: outbounds, the ways a downloader takes in
+Subject: [PATCH 58/66] http client: outbounds, the ways a downloader takes in
  the order of what it knows of them
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8

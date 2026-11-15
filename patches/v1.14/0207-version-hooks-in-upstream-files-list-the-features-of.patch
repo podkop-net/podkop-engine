@@ -1,7 +1,7 @@
 From 4894628fbe84e5e2f4f74d39f424c15c179e4f3a Mon Sep 17 00:00:00 2001
 From: FiyeroT <me@fiyero.xyz>
 Date: Thu, 12 Nov 2026 21:41:19 +0300
-Subject: [PATCH 10/63] version, hooks in upstream files: list the features of
+Subject: [PATCH 10/66] version, hooks in upstream files: list the features of
  this build
 
 The lines of upstream files that "version: list the features of this build" needs; the feature
