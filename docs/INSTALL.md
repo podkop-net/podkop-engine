@@ -1,92 +1,144 @@
-# Установка на роутер (вручную, до появления фида)
+# Install
 
-Пакет ставит `/usr/bin/sing-box`, `/etc/init.d/sing-box`, `/etc/config/sing-box` — те же пути,
-что пакет `sing-box` из OpenWrt, поэтому с ним он конфликтует и заменяет его.
-Файл брать из релиза нужной версии (https://github.com/podkop-net/podkop-engine/releases) под свою
-архитектуру (`opkg print-architecture` / `apk --print-arch`), например
-`podkop-engine_1.14.4-r27_openwrt_aarch64_cortex-a53.ipk`. Линия 1.13 с r26 не
-собирается: для podkop 0.7.24 — пакет 1.14.4-r26 и новее.
+[Русский](INSTALL.ru.md)
 
-С r9 (1.13, 1.14) пакетов два, ставится один: `podkop-engine` — протоколы, которые использует
-podkop, TUIC, (с r15) http и (1.14, с r19) block; `podkop-engine-full` — плюс все остальные выходы для «Outbound
-Config» (vmess, snell, tor, ssh, shadowtls, anytls, hysteria, NaiveProxy). Команды ниже одинаковы для
-обоих, меняется только имя файла, а в командах отката — имя пакета (`podkop-engine-full`
-вместо `podkop-engine`).
+The package installs `/usr/bin/sing-box`, `/etc/init.d/sing-box` and `/etc/config/sing-box`, the
+same paths as OpenWrt's `sing-box` package. So it conflicts with that package and replaces it.
+It also installs the failsafe service `/etc/init.d/podkop-engine`.
 
-## OpenWrt 24.10 и старше (opkg, .ipk)
+- [Choose the file](#choose-the-file)
+- [OpenWrt 24.10 and older (opkg)](#openwrt-2410-and-older-opkg)
+- [OpenWrt 25.12 and snapshot (apk)](#openwrt-2512-and-snapshot-apk)
+- [Switch between podkop-engine and podkop-engine-full](#switch-between-podkop-engine-and-podkop-engine-full)
+- [Upgrade](#upgrade)
+- [Back to OpenWrt's sing-box](#back-to-openwrts-sing-box)
+- [Failsafe service](#failsafe-service)
+- [NaiveProxy](#naiveproxy)
+
+## Choose the file
+
+Files are in the [releases](https://github.com/podkop-net/podkop-engine/releases), named
+`podkop-engine_<version>_openwrt_<pkgarch>.ipk` (or `.apk`), for example
+`podkop-engine_1.14.4-r27_openwrt_aarch64_cortex-a53.ipk`.
+
+- `<pkgarch>` is what `opkg print-architecture` or `apk --print-arch` prints on the router.
+- `podkop-engine` has what podkop uses. Take `podkop-engine-full` only if your "Outbound Config"
+  needs another protocol (vmess, snell, tor, ssh, shadowtls, anytls, hysteria, naive). Both are
+  installed the same way; only the file name differs.
+- For podkop 0.7.24, take 1.14.4-r26 or newer. The 1.13 line is no longer built.
+
+Download the file on the router through the GitHub API. OpenWrt's `wget` (uclient-fetch) hangs
+on a direct download link of github.com: the header line is 9 KB, more than it reads. The
+release notes have this command with the names filled in:
+
+```sh
+tag=v1.14.4-r27; n=podkop-engine_1.14.4-r27_openwrt_<pkgarch>.ipk
+u=$(wget -qO- https://api.github.com/repos/podkop-net/podkop-engine/releases/tags/$tag | jsonfilter -e "@.assets[@.name='$n'].url") \
+  && wget -O /tmp/pe.ipk --header='Accept: application/octet-stream' "$u"
+```
+
+For apk, put the `.apk` file name in `n` and write `/tmp/pe.apk`.
+
+## OpenWrt 24.10 and older (opkg)
 
 ```sh
 opkg update
-# если стоит sing-box из репозитория (podkop от него зависит — отсюда --force-depends):
+# when OpenWrt's sing-box is installed (podkop depends on it, hence --force-depends):
 opkg remove --force-depends sing-box sing-box-tiny 2>/dev/null
-opkg install /tmp/podkop-engine_<версия>_openwrt_<pkgarch>.ipk
+opkg install /tmp/pe.ipk
 service podkop restart
 ```
 
-Без удаления opkg откажет: `The following packages conflict with podkop-engine: sing-box`.
-После замены `opkg upgrade` фидовый sing-box обратно не предлагает.
+Without the removal opkg refuses: `The following packages conflict with podkop-engine: sing-box`.
+After the replacement, `opkg upgrade` does not offer OpenWrt's sing-box back.
 
-## OpenWrt 25.12 и snapshot (apk, .apk)
+## OpenWrt 25.12 and snapshot (apk)
 
 ```sh
 apk update
-apk add --allow-untrusted /tmp/podkop-engine_<версия>_openwrt_<pkgarch>.apk
+apk add --allow-untrusted /tmp/pe.apk
 service podkop restart
 ```
 
-apk заменяет установленный `sing-box` сам (одной транзакцией): оба пакета дают `sing-box`,
-а файлы совпадают. `--allow-untrusted` нужен, пока пакеты не подписаны.
-При установке из файла apk закрепляет в `/etc/apk/world` именно этот пакет, и `apk upgrade`
-не возвращает фидовый sing-box, даже если тот новее.
+apk replaces the installed `sing-box` in one transaction. `--allow-untrusted` is needed while the
+packages are not signed. apk pins this package in `/etc/apk/world`, so `apk upgrade` does not
+bring OpenWrt's sing-box back.
 
-Файл в `/etc`, изменённый на месте или не принадлежащий ни одному пакету, apk не
-перезаписывает: оставляет его и кладёт файл пакета рядом с суффиксом `.apk-new`. Так
-остаётся чужой `/etc/init.d/sing-box` — после движка, поставленного руками (установщик
-`bootstrap.sh` с зеркала podkop записывает такой движок виртуальным пакетом без файлов), или
-правленый скрипт фидового sing-box либо другого пакета движка. С ним sing-box работает без
-того, что задаёт только скрипт пакета: без резервного DNS, проверки загрузкой urltest и
-лимита дескрипторов 65536; перезапуск при падении и остановка — как их настроил чужой скрипт.
-С r14 пакет при установке сам ставит свой скрипт на место, прежний сохраняет в
-`/etc/sing-box/sing-box.init.before-podkop-engine` и пишет об этом строку в системный журнал.
-На r13 и старше, если есть `/etc/init.d/sing-box.apk-new`:
+apk does not overwrite a file in `/etc` that was edited or belongs to no package. It keeps such a
+file and puts the package's one beside it as `.apk-new`. A foreign `/etc/init.d/sing-box` (left
+by an engine installed by hand, or by an edited script) would run sing-box without the DNS
+fallback, the urltest download check and the limit of 65536 descriptors. Since r14 the package
+puts its own script in place by itself, keeps the old one as
+`/etc/sing-box/sing-box.init.before-podkop-engine` and logs a line about it.
+
+## Switch between podkop-engine and podkop-engine-full
+
+Download the other package as above (`n=podkop-engine-full_…`), then:
 
 ```sh
-mv /etc/init.d/sing-box /etc/sing-box/sing-box.init.before-podkop-engine
-mv /etc/init.d/sing-box.apk-new /etc/init.d/sing-box
+# opkg
+opkg remove --force-depends podkop-engine && opkg install /tmp/pe.ipk
+# apk
+apk add --allow-untrusted /tmp/pe.apk '!podkop-engine'
 service podkop restart
 ```
 
-Именно `mv`, а не `cp`: файл `.apk-new`, оставшийся рядом со скриптом, при следующем
-обновлении пакет примет за новый скрипт и поставит его на место уже обновлённого.
+Back: the same with the names swapped. `/etc/config/sing-box` is kept.
 
-## Переход между podkop-engine и podkop-engine-full
+## Upgrade
+
+Download the newer file and install it the same way (`opkg install /tmp/pe.ipk`, or
+`apk add --allow-untrusted /tmp/pe.apk`).
+`/etc/config/sing-box` is kept; options that a new release adds get their defaults.
+
+Check what runs:
 
 ```sh
-opkg remove --force-depends podkop-engine && opkg install /tmp/podkop-engine-full_<версия>_openwrt_<pkgarch>.ipk   # opkg
-apk add --allow-untrusted /tmp/podkop-engine-full_<версия>_openwrt_<pkgarch>.apk '!podkop-engine'                # apk
-service podkop restart
+sing-box version   # sing-box version 1.14.4-pdk-r27 … Tags: with_quic,with_utls,with_clash_api,podkop_slim …
 ```
 
-Обратно — то же с именами наоборот. `/etc/config/sing-box` сохраняется.
-
-## Откат на sing-box из репозитория
+## Back to OpenWrt's sing-box
 
 ```sh
-# opkg: сначала остановить podkop и скачать пакет, потом удалять
+# opkg: stop podkop and download the package first, remove after
 service podkop stop && opkg update && cd /tmp && opkg download sing-box && opkg remove --force-depends podkop-engine && opkg install /tmp/sing-box_*.ipk; service podkop start
-# apk: одной транзакцией
+# apk: one transaction
 apk add sing-box '!podkop-engine'
 ```
 
-На opkg порядок важен. Пока podkop работает, все DNS-запросы роутера идут в sing-box: если
-сначала удалить podkop-engine, роутер не сможет разрешить имя репозитория и скачать пакет, а
-сеть останется без DNS. Если это уже случилось, DNS возвращает `service podkop stop`. После
-установки podkop может подниматься до минуты.
+With opkg the order matters. While podkop runs, every DNS query of the router goes to sing-box:
+removing podkop-engine first leaves the router without DNS, so it cannot download the package.
+If that happened, `service podkop stop` gives the DNS back. `apk del podkop-engine` alone does not
+work, because podkop depends on it. With `podkop-engine-full` installed, use that name in these
+commands.
 
-`apk del podkop-engine` отдельно не сработает: от него зависит podkop.
+## Failsafe service
 
-## Проверка
+`/etc/init.d/podkop-engine` watches sing-box. procd restarts a sing-box that crashed. When
+sing-box crashes again and again, procd gives up and dnsmasq would be left sending every query to
+nothing; at that moment the service stops podkop, so the router gets its DNS back and works without
+the proxy. The service also asks sing-box a DNS question every 20 s; a sing-box that is running
+but stopped answering is ended and counts as a crash. The reason and the memory of the router are
+logged and written to `/etc/sing-box/failsafe.last`. Start podkop again with `service podkop start`
+once the cause is fixed. Details and the options: [FEATURES.md](FEATURES.md#failsafe-and-liveness-probe).
 
-```sh
-sing-box version     # sing-box version 1.14.4-pdk-r24 ... Tags: with_quic,with_utls,with_clash_api,podkop_slim,...
-```
+## NaiveProxy
+
+NaiveProxy (the `naive` outbound of `podkop-engine-full`) is built on cronet, Chromium's network
+stack, which sing-box publishes for some architectures only. It makes the binary 11 MB (x86_64) to
+17 MB (mipsel) larger.
+
+- **With NaiveProxy:** `aarch64_cortex-a53` `aarch64_cortex-a72` `aarch64_cortex-a76`
+  `aarch64_generic` `arm_cortex-a15_neon-vfpv4` `arm_cortex-a5_vfpv4` `arm_cortex-a7_neon-vfpv4`
+  `arm_cortex-a7_vfpv4` `arm_cortex-a8_vfpv3` `arm_cortex-a9_neon` `arm_cortex-a9_vfpv3-d16`
+  `i386_pentium4` `loongarch64_generic` `mipsel_24kc` `mipsel_74kc` `riscv64_generic` `x86_64`
+- **Without:** `arm_arm1176jzf-s_vfp` `arm_arm926ej-s` `arm_cortex-a7` `arm_cortex-a9`
+  `arm_fa526` `arm_xscale` `i386_pentium-mmx` `mips64_mips64r2` `mips64_octeonplus`
+  `mips64el_mips64r2` `mips_24kc` `mips_4kec` `mips_mips32` `mipsel_24kc_24kf` `mipsel_mips32`
+  `riscv64_riscv64`
+
+Why not: there is no cronet for big-endian MIPS and MIPS64; cronet is built for ARMv7 with VFP
+(not ARMv5/v6 or ARM without an FPU), with soft float (not `mipsel_24kc_24kf`), for MIPS32r2 (not
+`mipsel_mips32`), with SSE2 (not `i386_pentium-mmx`), and for `riscv64_generic` only. On these
+architectures the other protocols of `podkop-engine-full` work, and the `naive` outbound answers
+`naive outbound is not included in this build`.

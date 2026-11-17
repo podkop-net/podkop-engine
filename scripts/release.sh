@@ -27,56 +27,62 @@ for LINE in "$@"; do
   (cd "$dir" && sha256sum -- *.ipk *.apk > SHA256SUMS)
   n_ipk=$(ls "$dir"/podkop-engine_*.ipk | wc -l); n_apk=$(ls "$dir"/podkop-engine_*.apk | wc -l)
   n_full=$(ls "$dir"/podkop-engine-full_*.[ai]pk 2>/dev/null | wc -l)
-  # NaiveProxy in podkop-engine-full: the pkgarchs of naive.pkgarchs (sdk-build.sh fails a
-  # build where it is listed but missing), every other one of this release has none
-  full_arches=$(ls "$dir"/podkop-engine-full_*.[ai]pk 2>/dev/null | sed 's/.*_openwrt_\(.*\)\.[ai]pk$/\1/' | sort -u)
-  # an if, not "grep && printf": the status of a loop is that of its last command, and an
-  # arch missing from the list as the last one ended the script under "set -e" with no message
-  [ -r openwrt/podkop-engine/naive.pkgarchs ] || { echo "openwrt/podkop-engine/naive.pkgarchs is missing" >&2; exit 1; }
-  naive_yes=$(for a in $full_arches; do if grep -qx "$a" openwrt/podkop-engine/naive.pkgarchs; then printf '`%s` ' "$a"; fi; done)
-  naive_no=$(for a in $full_arches; do if ! grep -qx "$a" openwrt/podkop-engine/naive.pkgarchs; then printf '`%s` ' "$a"; fi; done)
   arches=$(ls "$dir"/podkop-engine_*.ipk "$dir"/podkop-engine_*.apk | sed 's/.*_openwrt_\(.*\)\.[ai]pk$/\1/' | sort -u | tr '\n' ' ')
-  patches=$(for pf in "patches/v$LINE"/*.patch; do printf -- '- `%s` %s\n' "$(basename "$pf" | cut -c1-4)" "$(awk '/^Subject: /{s=$0; while ((getline l) > 0 && l ~ /^ /) s = s l; sub(/^Subject: \[PATCH[^]]*\] /, "", s); print s; exit}' "$pf")"; done)
   f=podkop-engine_${v}-r${r}_openwrt
+  # what is new: the entry "## r<N> — <date>" of CHANGELOG.ru.md and CHANGELOG.md, up to the next
+  # entry; a release without both entries is not made
+  entry() { awk -v h="## r$r" '$0 == h || index($0, h " ") == 1 { on = 1; next } on && /^## / { exit } on' "$1" | sed '/./,$!d'; }
+  new_ru=$(entry CHANGELOG.ru.md); new_en=$(entry CHANGELOG.md)
+  if [ -z "$new_ru" ] || [ -z "$new_en" ]; then
+    echo "CHANGELOG.md and CHANGELOG.ru.md need the entry \"## r$r — <date>\" before the release" >&2
+    exit 1
+  fi
+  blob=https://github.com/$repo/blob/$tag
+  opkg_cmd="n=${f}_<pkgarch>.ipk; u=\$(wget -qO- https://api.github.com/repos/$repo/releases/tags/$tag | jsonfilter -e \"@.assets[@.name='\$n'].url\") && wget -O /tmp/pe.ipk --header='Accept: application/octet-stream' \"\$u\" && { opkg remove --force-depends sing-box sing-box-tiny 2>/dev/null; opkg install /tmp/pe.ipk; }"
+  apk_cmd="n=${f}_<pkgarch>.apk; u=\$(wget -qO- https://api.github.com/repos/$repo/releases/tags/$tag | jsonfilter -e \"@.assets[@.name='\$n'].url\") && wget -O /tmp/pe.apk --header='Accept: application/octet-stream' \"\$u\" && apk add --allow-untrusted /tmp/pe.apk"
+  full_ru=; full_en=
+  if [ "$n_full" -gt 0 ]; then
+    full_ru="; \`podkop-engine-full\` — плюс остальные выходы для «Outbound Config» и NaiveProxy (не на всех архитектурах: [INSTALL.ru.md](${blob}/docs/INSTALL.ru.md#naiveproxy))"
+    full_en="; \`podkop-engine-full\` adds every other outbound for \"Outbound Config\" and NaiveProxy (not on every architecture: [INSTALL.md](${blob}/docs/INSTALL.md#naiveproxy))"
+  fi
   cat > "$dir/NOTES.md" <<EOF
-sing-box **$v** для podkop на OpenWrt, ревизия пакета **r$r**. Неофициальная сборка, не связана с проектом sing-box.
+**Что нового в r$r**
 
-Патчи к \`v$v\`:
-$patches
+$new_ru
 
-Теги сборки: \`with_quic,with_utls,with_clash_api,podkop_slim\`. Go $GO_VERSION. \`sing-box version\` → \`$v-pdk-r$r\`.
-$(if [ "$n_full" -gt 0 ]; then cat <<FULL
+sing-box **$v** для podkop на OpenWrt, ревизия **r$r**: неофициальная сборка, не связана с проектом sing-box. Go $GO_VERSION, \`sing-box version\` → \`$v-pdk-r$r\`. Все изменения — [CHANGELOG.ru.md](${blob}/CHANGELOG.ru.md), патчи — [PATCHES.md](${blob}/docs/PATCHES.md).
 
-**Два пакета, ставится один из них:**
-- \`podkop-engine\` — то, что использует podkop: входы tproxy, direct, mixed; выходы direct, socks, shadowsocks, trojan, vless, hysteria2, tuic, selector, urltest, http$( [ "$LINE" = 1.14 ] && printf ', block'). Остальные типы в «Outbound Config» отвергаются с подсказкой поставить \`podkop-engine-full\`.
-- \`podkop-engine-full\` — то же плюс все остальные выходы: vmess, snell (1.14), tor (нужен пакет tor), ssh, shadowtls, anytls, hysteria и NaiveProxy (кроме архитектур ниже). Теги — те же плюс \`podkop_full\` (и \`with_naive_outbound,with_musl\`, где есть NaiveProxy).
+**Пакеты** (ставится один): \`podkop-engine\` — то, что использует podkop${full_ru}.
 
-**NaiveProxy в \`podkop-engine-full\` есть не на всех архитектурах.** Он работает на cronet (сетевом стеке Chromium), который sing-box выпускает не для всех процессоров; бинарь с NaiveProxy больше на 11 МБ (x86_64) — 17 МБ (mipsel).
-- есть: $naive_yes
-- **нет:** $naive_no
-
-Причины: mips big-endian и mips64 (cronet для них нет), armv5/armv6 и arm без FPU (cronet собран под ARMv7 с VFP), \`mipsel_24kc_24kf\` (плавающая точка в железе, cronet — soft-float), \`mipsel_mips32\` (cronet собран под MIPS32r2), \`i386_pentium-mmx\` (нет SSE2), \`riscv64_riscv64\` (sing-box выпускает cronet только для \`riscv64_generic\`). На этих архитектурах остальные протоколы \`podkop-engine-full\` работают, а выход naive отвечает \`naive outbound is not included in this build\`.
-FULL
-fi)
-
-**Установка** (\`<pkgarch>\` — \`opkg print-architecture\` / \`apk --print-arch\`; подробнее — [docs/INSTALL.md](https://github.com/$repo/blob/main/docs/INSTALL.md)):
-
-OpenWrt 24.10 и старше (opkg):
+**Установка** (\`<pkgarch>\` — \`opkg print-architecture\` / \`apk --print-arch\`; подробнее — [INSTALL.ru.md](${blob}/docs/INSTALL.ru.md)). Для \`podkop-engine-full\` замените имя файла.
 \`\`\`sh
-# podkop-engine-full: то же с именем файла podkop-engine-full_${v}-r${r}_openwrt_<pkgarch>.ipk
-n=${f}_<pkgarch>.ipk; u=\$(wget -qO- https://api.github.com/repos/$repo/releases/tags/$tag | jsonfilter -e "@.assets[@.name='\$n'].url") && wget -O /tmp/pe.ipk --header='Accept: application/octet-stream' "\$u" && { opkg remove --force-depends sing-box sing-box-tiny 2>/dev/null; opkg install /tmp/pe.ipk; }
-\`\`\`
-OpenWrt 25.12 и snapshot (apk):
-\`\`\`sh
-# podkop-engine-full: то же с именем файла podkop-engine-full_${v}-r${r}_openwrt_<pkgarch>.apk
-n=${f}_<pkgarch>.apk; u=\$(wget -qO- https://api.github.com/repos/$repo/releases/tags/$tag | jsonfilter -e "@.assets[@.name='\$n'].url") && wget -O /tmp/pe.apk --header='Accept: application/octet-stream' "\$u" && apk add --allow-untrusted /tmp/pe.apk
+# OpenWrt 24.10 и старше (opkg)
+$opkg_cmd
+# OpenWrt 25.12 и snapshot (apk)
+$apk_cmd
 \`\`\`
 
-Файл берётся через API GitHub: wget в OpenWrt (uclient-fetch) не дочитывает ответ github.com на прямую ссылку скачивания (строка заголовка 9 КБ при его пределе 4 КБ) и висит до таймаута.
+---
 
-Архитектуры ($n_ipk ipk, $n_apk apk): $arches
+**What's new in r$r**
 
-Совместимость: как Xray-клиент 26.9.9 (Xray-сервер 25.5.16+; с 24.x–25.4 — только если сайт-прикрытие не выбирает X25519MLKEM768).
+$new_en
+
+sing-box **$v** for podkop on OpenWrt, revision **r$r**: an unofficial build, not affiliated with the sing-box project. Go $GO_VERSION, \`sing-box version\` → \`$v-pdk-r$r\`. All changes: [CHANGELOG.md](${blob}/CHANGELOG.md); patches: [PATCHES.md](${blob}/docs/PATCHES.md).
+
+**Packages** (install one): \`podkop-engine\` has what podkop uses${full_en}.
+
+**Install** (\`<pkgarch>\`: \`opkg print-architecture\` / \`apk --print-arch\`; more in [INSTALL.md](${blob}/docs/INSTALL.md)). For \`podkop-engine-full\`, change the file name.
+\`\`\`sh
+# OpenWrt 24.10 and older (opkg)
+$opkg_cmd
+# OpenWrt 25.12 and snapshot (apk)
+$apk_cmd
+\`\`\`
+
+Architectures ($n_ipk ipk, $n_apk apk): $arches
+
+Compatibility: as the Xray client 26.9.9 (Xray servers 25.5.16+; 24.x–25.4.30 with the fingerprint fallback, or when the cover site does not choose X25519MLKEM768).
 EOF
   latest=--latest=false; [ "$LINE" = "$newest" ] && latest=--latest
   if [ -n "${DRY_RUN:-}" ]; then
