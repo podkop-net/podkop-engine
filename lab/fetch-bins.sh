@@ -6,8 +6,9 @@ set -eu
 PKGS=$(cd "${1:?dir with podkop-engine_*_openwrt_x86_64.ipk}" && pwd)
 mkdir -p "${2:?output dir}"; BIN=$(cd "$2" && pwd)
 # 24.11.21 и 25.4.30 — до поддержки MLKEM в REALITY (25.5.16), 26.7.28 — minClientVer по умолчанию,
-# 26.9.9 — требует MLKEM; XRAY_EXTRA — добавить свежие версии без правки скрипта.
-XRAY_VERSIONS=${XRAY_VERSIONS:-"24.11.21 25.4.30 25.5.16 25.10.15 26.7.28 26.9.9 $(printf '%s' "${XRAY_EXTRA:-}")"}
+# 26.9.9 — требует MLKEM, 26.11.9 — свежий на r28 (REALITY 4bb46b2); XRAY_EXTRA — добавить
+# свежие версии без правки скрипта.
+XRAY_VERSIONS=${XRAY_VERSIONS:-"24.11.21 25.4.30 25.5.16 25.10.15 26.7.28 26.9.9 26.11.9 $(printf '%s' "${XRAY_EXTRA:-}")"}
 tmp=$(mktemp -d)
 for v in $XRAY_VERSIONS; do
   [ -x "$BIN/xray-$v" ] && continue

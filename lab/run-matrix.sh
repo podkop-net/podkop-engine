@@ -8,6 +8,9 @@
 #   FINGERPRINTS   utls fingerprint клиента                    (по умолчанию chrome)
 #   MIN_CLIENT_VER значение realitySettings.minClientVer; пусто = не задавать (дефолт xray)
 #   KEY_SHARE      reality.key_share клиента (только sing-box-lx: hybrid|classical)
+#   FINALMASK      finalmask клиента sing-box: merged (ClientHello записями по 11–24 байта, одной
+#                  записью в сокет, как fm провайдеров) или s1 (то же двумя TCP-кусками, первый
+#                  100–200 байт); пусто = без маски. В строках результата клиент — <имя>+fm-<маска>
 #   SHOW=true      realitySettings.show (xray печатает, почему отверг клиента)
 #   VERBOSE=1      печатать хвосты логов на каждом FAIL
 set -u
@@ -54,6 +57,13 @@ xray_config() {
 EOF
 }
 
+finalmask_json() {
+  case ${FINALMASK:-} in
+    merged) echo ', "finalmask": {"tcp": [{"type": "fragment", "packets": "tlshello", "length": "11-24", "delay": "0"}]}';;
+    s1) echo ', "finalmask": {"tcp": [{"type": "fragment", "packets": "1-1", "length": "100-200", "max_split": "2"}, {"type": "fragment", "packets": "tlshello", "length": "11-24", "delay": "0"}]}';;
+  esac
+}
+
 singbox_config() {
   cat <<EOF
 {
@@ -66,7 +76,7 @@ singbox_config() {
       "enabled": true, "server_name": "$SNI",
       "utls": {"enabled": true, "fingerprint": "$1"},
       "reality": {"enabled": true, "public_key": "$PUB", "short_id": "$SID"${KEY_SHARE:+, \"key_share\": \"$KEY_SHARE\"}}
-    }
+    }$(finalmask_json)
   }]
 }
 EOF
@@ -121,7 +131,9 @@ for xv in $XRAY_VERSIONS; do
         srv=$(grep -oE 'REALITY: processed invalid connection.*' $WORK/xray.log | grep -v 'failed to read client hello' | tail -1 | sed 's/.*: //')
         [ -n "$srv" ] && detail="$detail | xray: $srv"
       fi
-      printf '%-10s %-28s %-11s %-6s %s\n' "$xv" "$sb" "$fp" "$res" "$detail"
+      label=$sb
+      case $sb in xrayc-*) ;; *) [ -n "${FINALMASK:-}" ] && label="$sb+fm-$FINALMASK";; esac
+      printf '%-10s %-28s %-11s %-6s %s\n' "$xv" "$label" "$fp" "$res" "$detail"
       if [ "$res" = FAIL ] && [ "${VERBOSE:-0}" = 1 ]; then
         echo "  --- xray.log (REALITY):"; grep -i reality $WORK/xray.log | tail -3 | sed 's/^/  /'
         echo "  --- sb.log:"; grep -iE 'error|reality' $WORK/sb.log | tail -3 | sed 's/^/  /'
