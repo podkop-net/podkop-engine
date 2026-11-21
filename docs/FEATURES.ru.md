@@ -133,8 +133,8 @@ urltest мёртв), sing-box стартует с пустым списком и
 
 Остальные поля Xray называются так же (`x_padding_*`, `session_*`, `seq_*`, `uplink_data_*`,
 `uplink_chunk_size`, `no_grpc_header`); серверные поля принимаются и не используются. VLESS `flow`
-поверх XHTTP требует [шифрования VLESS](#шифрование-vless). Нет серверной стороны, `finalmask` и
-Browser Dialer. Без аппаратного AES шифр важнее всего: MT7621 (r11, 50 МБ) — 1,9 МБ/с с `utls`
+поверх XHTTP требует [шифрования VLESS](#шифрование-vless). Нет серверной стороны и Browser
+Dialer; [finalmask](#finalmask) — опция подключения выхода. Без аппаратного AES шифр важнее всего: MT7621 (r11, 50 МБ) — 1,9 МБ/с с `utls`
 `chrome` (первым предлагает AES-GCM), 3,26 МБ/с без `utls` (ChaCha20), 3,75 МБ/с без прокси.
 
 ### Шифрование VLESS
@@ -216,6 +216,52 @@ Xray 26.6.27), из 20 одновременных запросов с одним
 собирает тот же ClientHello, и проверка REALITY проходит. podkop-experimental предлагает
 `"record_fragment": true` против заморозки по отпечатку: на таком пути без него прошло 0
 подключений из 15, с ним — 15 из 15. С r24.
+
+### finalmask
+
+Маска fragment из Xray (`finalmask` Xray-core, тип `fragment`) как опция подключения выхода: она
+режет то, что выход пишет в свои TCP-соединения, под TLS, REALITY и любым транспортом. Имя в
+строке Features — `dialer.finalmask`. С r28.
+
+```json
+"finalmask": {"tcp": [
+  {"type": "fragment", "packets": "1-1", "length": "100-200", "max_split": "2"},
+  {"type": "fragment", "packets": "tlshello", "length": "11-24", "delay": "0"}
+]}
+```
+
+| Поле | Заметки |
+|---|---|
+| `type` | только `fragment`; другой тип не проходит `sing-box check` (остальные маски Xray нужны и серверу) |
+| `packets` | `tlshello`: первая запись, если это целая запись TLS с ClientHello, режется на записи TLS; `N-M` (с 1): записи с N по M режутся на куски; пусто — каждая запись |
+| `length`, `lengths` | размер записи или куска, диапазон вида `"11-24"`, выбирается как в Xray (от 11 до 23); `lengths` — свой диапазон для каждого куска, последний — для остальных |
+| `delay`, `delays` | миллисекунды после каждого куска; с `tlshello` одна задержка `0` отправляет записи одной записью в сокет, иначе каждая запись уходит отдельно |
+| `max_split` | не больше стольких кусков, последний забирает остаток |
+
+Маски в списке сцепляются как в Xray, первая — ближе всего к сокету: выше записи ClientHello
+уходят двумя TCP-кусками, первый — 100–200 байт. У двух провайдеров, которые отбрасывают ClientHello
+к части серверов, так прошло 165 подключений из 168; один `tlshello` одной записью отбрасывался,
+когда hello помещается в один пакет (508 байт у `edge` и `ios`), а запись на каждую запись TLS не
+прошла ни разу. Пауза кончается, когда соединение закрывают или наступает срок записи. С `detour`
+выход своих соединений не открывает, и маска ничего не делает; UDP и QUIC она не трогает.
+
+### Закрепление сертификата и другие имена
+
+`tls.certificate_sha256` (из sing-box 1.15; с r28) закрепляет SHA-256 сертификата сервера, base64,
+список. Закреплённый конечный сертификат принимается без корней, самоподписанный тоже.
+Закреплённый сертификат CA из цепочки выше конечного, как его принимает `pinnedPeerCertSha256` Xray,
+становится единственным корнем, и цепочка проверяется до него по имени. Не вместе с `certificate`
+или `certificate_path`.
+
+`tls.certificate_server_name` (с r28) — имена, по которым проверяется сертификат вместо
+`server_name`, который по-прежнему отправляется (`verifyPeerCertByName` Xray): сервер, к которому
+обращаются по одному имени, с сертификатом на другое. С закреплённым CA имена проверяют цепочку до
+него. С `insecure` отвергается; не работает с REALITY, naive и движками apple и windows. Имена в
+строке Features — `tls.certificate_sha256` и `tls.certificate_server_name`.
+
+```json
+"tls": { "enabled": true, "server_name": "cdn.example.com", "certificate_server_name": ["origin.example.com"] }
+```
 
 ### Выход block
 
@@ -479,14 +525,15 @@ stderr; 2 и одна строка `error: …`, если ссылку испо�
 
 ```
 $ sing-box version
-sing-box version 1.14.4-pdk-r27
+sing-box version 1.14.4-pdk-r28
 …
-Features: urltest.fallbacks,urltest.download_url,transport.xhttp,tools.decode-link,tls.utls-fallback
+Features: urltest.fallbacks,urltest.download_url,transport.xhttp,tools.decode-link,tls.utls-fallback,dialer.finalmask,tls.certificate_sha256,tls.certificate_server_name
 ```
 
 Последняя строка `sing-box version` (с r11) называет то, что сборка добавляет и от чего может
 зависеть конфиг или скрипт: `urltest.fallbacks` и `urltest.download_url` (сами опции — с r10),
-`transport.xhttp`, `tools.decode-link`, а с r13 — `tls.utls-fallback`. Имя не удаляется и не меняет
+`transport.xhttp`, `tools.decode-link`, с r13 — `tls.utls-fallback`, а с r28 — `dialer.finalmask`,
+`tls.certificate_sha256` и `tls.certificate_server_name`. Имя не удаляется и не меняет
 смысла; без нужного имени podkop опцию не пишет. Опции без имени узнаются по версии (`-pdk-rN`).
 
 Службы API нет ни в одном пакете. В `podkop-engine` нет ещё `sing-box tools networkquality`,

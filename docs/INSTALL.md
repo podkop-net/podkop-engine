@@ -19,7 +19,7 @@ It also installs the failsafe service `/etc/init.d/podkop-engine`.
 
 Files are in the [releases](https://github.com/podkop-net/podkop-engine/releases), named
 `podkop-engine_<version>_openwrt_<pkgarch>.ipk` (or `.apk`), for example
-`podkop-engine_1.14.4-r27_openwrt_aarch64_cortex-a53.ipk`.
+`podkop-engine_1.14.4-r28_openwrt_aarch64_cortex-a53.ipk`.
 
 - `<pkgarch>` is what `opkg print-architecture` or `apk --print-arch` prints on the router.
 - `podkop-engine` has what podkop uses. Take `podkop-engine-full` only if your "Outbound Config"
@@ -32,7 +32,7 @@ on a direct download link of github.com: the header line is 9 KB, more than it r
 release notes have this command with the names filled in:
 
 ```sh
-tag=v1.14.4-r27; n=podkop-engine_1.14.4-r27_openwrt_<pkgarch>.ipk
+tag=v1.14.4-r28; n=podkop-engine_1.14.4-r28_openwrt_<pkgarch>.ipk
 u=$(wget -qO- https://api.github.com/repos/podkop-net/podkop-engine/releases/tags/$tag | jsonfilter -e "@.assets[@.name='$n'].url") \
   && wget -O /tmp/pe.ipk --header='Accept: application/octet-stream' "$u"
 ```
@@ -94,7 +94,7 @@ Download the newer file and install it the same way (`opkg install /tmp/pe.ipk`,
 Check what runs:
 
 ```sh
-sing-box version   # sing-box version 1.14.4-pdk-r27 … Tags: with_quic,with_utls,with_clash_api,podkop_slim …
+sing-box version   # sing-box version 1.14.4-pdk-r28 … Tags: with_quic,with_utls,with_clash_api,podkop_slim …
 ```
 
 ## Back to OpenWrt's sing-box

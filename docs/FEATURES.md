@@ -132,7 +132,7 @@ outbound with a V2Ray transport: vless and trojan, and vmess in `podkop-engine-f
 
 Other Xray fields keep their names (`x_padding_*`, `session_*`, `seq_*`, `uplink_data_*`,
 `uplink_chunk_size`, `no_grpc_header`); server-side fields are accepted and not used. VLESS `flow`
-over XHTTP needs [VLESS Encryption](#vless-encryption). No server side, `finalmask` or Browser Dialer. Without
+over XHTTP needs [VLESS Encryption](#vless-encryption). No server side or Browser Dialer; [finalmask](#finalmask) is a dial option of the outbound. Without
 hardware AES the cipher matters most: MT7621 (r11, 50 MB) gave 1.9 MB/s with `utls` `chrome`
 (AES-GCM first), 3.26 MB/s without `utls` (ChaCha20), 3.75 MB/s without a proxy.
 
@@ -216,6 +216,53 @@ several TLS records) act on a REALITY client too; upstream accepts them there an
 server reassembles the same ClientHello, and REALITY verifies it. podkop-experimental offers
 `"record_fragment": true` against a freeze by fingerprint: on such a path 0 of 15 connections passed
 without it, 15 of 15 with it. Since r24.
+
+### finalmask
+
+Xray's fragment mask (`finalmask` of Xray-core, type `fragment`) as a dial option of an outbound:
+it cuts what the outbound writes to the TCP connections it opens itself, beneath TLS, REALITY and
+every transport. Feature name `dialer.finalmask`. Since r28.
+
+```json
+"finalmask": {"tcp": [
+  {"type": "fragment", "packets": "1-1", "length": "100-200", "max_split": "2"},
+  {"type": "fragment", "packets": "tlshello", "length": "11-24", "delay": "0"}
+]}
+```
+
+| Field | Notes |
+|---|---|
+| `type` | only `fragment`; another type fails `sing-box check` (Xray's other masks need the server) |
+| `packets` | `tlshello`: the first write, when it is a whole ClientHello record, cut into TLS records; `N-M` (from 1): writes N to M cut into pieces; empty: every write |
+| `length`, `lengths` | the size of a record or piece, a range such as `"11-24"`, drawn as Xray draws it (11 to 23); `lengths`: a range for each piece, the last for the rest |
+| `delay`, `delays` | milliseconds after each piece; with `tlshello` a single delay of `0` sends the records in one write, anything else a write per record |
+| `max_split` | at most this many pieces, the last one taking the rest |
+
+Masks in a list are chained as in Xray, the first next to the socket: above, the records of the
+ClientHello go out in two TCP pieces, the first of 100–200 bytes. On two ISPs that drop the
+ClientHello of some servers this form passed 165 of 168 times; `tlshello` alone in one write was
+dropped whenever the hello fits one packet (the 508 bytes of `edge` and `ios`), and a write per
+record never passed. A pause ends when the connection closes or at its write deadline. With a
+`detour` the outbound opens no connection of its own and the mask does nothing; UDP and QUIC are
+not touched.
+
+### Certificate pin and other names
+
+`tls.certificate_sha256` (from sing-box 1.15; since r28) pins the SHA-256 of the server's
+certificate, base64, a list. A pinned leaf is taken without the roots, a self-signed one too. A
+pinned CA of the chain above the leaf, as Xray's `pinnedPeerCertSha256` takes it, becomes the only
+root, and the chain is verified to it by name. Not together with `certificate` or
+`certificate_path`.
+
+`tls.certificate_server_name` (since r28): the names the certificate is verified by, in place of
+`server_name`, which is still sent (Xray's `verifyPeerCertByName`): a server reached by one name
+with a certificate for another. With a pinned CA the names verify the chain to it. Refused with
+`insecure`; not with REALITY, naive, or the apple and windows engines. Feature names
+`tls.certificate_sha256` and `tls.certificate_server_name`.
+
+```json
+"tls": { "enabled": true, "server_name": "cdn.example.com", "certificate_server_name": ["origin.example.com"] }
+```
 
 ### block outbound
 
@@ -469,14 +516,15 @@ r11, all protocols since r13. Every parameter: [LINKS.md](LINKS.md) (in Russian)
 
 ```
 $ sing-box version
-sing-box version 1.14.4-pdk-r27
+sing-box version 1.14.4-pdk-r28
 …
-Features: urltest.fallbacks,urltest.download_url,transport.xhttp,tools.decode-link,tls.utls-fallback
+Features: urltest.fallbacks,urltest.download_url,transport.xhttp,tools.decode-link,tls.utls-fallback,dialer.finalmask,tls.certificate_sha256,tls.certificate_server_name
 ```
 
 The last line of `sing-box version` (since r11) names what this build adds that a configuration or a
 script may depend on: `urltest.fallbacks` and `urltest.download_url` (the options since r10),
-`transport.xhttp`, `tools.decode-link`, and since r13 `tls.utls-fallback`. A name is never removed
+`transport.xhttp`, `tools.decode-link`, since r13 `tls.utls-fallback`, and since r28
+`dialer.finalmask`, `tls.certificate_sha256` and `tls.certificate_server_name`. A name is never removed
 and never changes its meaning; podkop does not write an option whose name is missing. Options
 without a name are told by the version (`-pdk-rN`).
 

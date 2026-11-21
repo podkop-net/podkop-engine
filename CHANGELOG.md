@@ -8,6 +8,16 @@ previous release and what it means for a user; a line is named only where a chan
 line. What each patch does: [docs/PATCHES.md](docs/PATCHES.md); the options: [docs/FEATURES.md](docs/FEATURES.md);
 full notes and packages: [GitHub releases](https://github.com/podkop-net/podkop-engine/releases).
 
+## r28 — 2026-11-21
+
+sing-box 1.14.4
+
+- **outbounds:** `finalmask`, Xray's fragment mask in the dialer: the ClientHello cut into small TLS records beneath TLS, REALITY and every transport. On two Russian ISPs that drop the ClientHello of some servers, records of 11–24 bytes in two TCP pieces got through 165 of 168 times, a whole hello never.
+- **tls:** `certificate_sha256` of sing-box 1.15 pins the server's certificate (a self-signed one too) or, as Xray does, a CA of its chain; `certificate_server_name` verifies the certificate by other names than the one sent (Xray's `vcn`).
+- **decode-link:** links give `fm` (`finalmask`; in Hysteria 2 links salamander, gecko and port hopping), `pcs` and `pinSHA256` (`certificate_sha256`), `vcn` (`certificate_server_name`): servers with self-signed certificates connect now. Hysteria's `realm` stays refused.
+- **urltest, probesock, detector:** a balance holds 4096 devices at most; a test reads 64 KB of response headers at most; the prober no longer keeps replaced outbounds; a far end cannot hold a loss probe; a server's handshake outcome is written to the cache file at a bounded rate.
+- **version:** the Features line adds `dialer.finalmask`, `tls.certificate_sha256` and `tls.certificate_server_name`.
+
 ## r27 — 2026-11-15
 
 sing-box 1.14.4 · podkop-exp 0.8.16, 0.8.17

@@ -8,6 +8,16 @@
 изменение касалось одной линии. Что делает каждый патч — [docs/PATCHES.md](docs/PATCHES.md); опции — [docs/FEATURES.ru.md](docs/FEATURES.ru.md);
 полные заметки и пакеты — [выпуски на GitHub](https://github.com/podkop-net/podkop-engine/releases).
 
+## r28 — 2026-11-21
+
+sing-box 1.14.4
+
+- **выходы:** `finalmask`, маска fragment из Xray в дайлере: ClientHello режется на мелкие записи TLS под TLS, REALITY и любым транспортом. У двух российских провайдеров, которые отбрасывают ClientHello к части серверов, записи по 11–24 байта двумя TCP-кусками прошли 165 раз из 168, целый hello — ни разу.
+- **tls:** `certificate_sha256` из sing-box 1.15 закрепляет сертификат сервера (и самоподписанный) или, как в Xray, сертификат CA из его цепочки; `certificate_server_name` проверяет сертификат по другим именам, чем отправленное (`vcn` Xray).
+- **decode-link:** ссылки дают `fm` (`finalmask`; в ссылках Hysteria 2 — salamander, gecko и смену портов), `pcs` и `pinSHA256` (`certificate_sha256`), `vcn` (`certificate_server_name`): серверы с самоподписанными сертификатами теперь подключаются. `realm` Hysteria по-прежнему отвергается.
+- **urltest, probesock, детектор:** balance держит не больше 4096 устройств; тест читает не больше 64 КБ заголовков ответа; тесты больше не удерживают заменённые выходы в памяти; дальняя сторона не может удержать пробу потерь; итог рукопожатий сервера пишется в файл кэша с ограниченной частотой.
+- **version:** в строке Features добавлены `dialer.finalmask`, `tls.certificate_sha256` и `tls.certificate_server_name`.
+
 ## r27 — 2026-11-15
 
 sing-box 1.14.4 · podkop-exp 0.8.16, 0.8.17

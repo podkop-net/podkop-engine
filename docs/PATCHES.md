@@ -1,9 +1,9 @@
 # podkop-engine patches
 
 podkop-engine is upstream sing-box at a release tag plus the patches in `patches/v<line>/`, and
-nothing else. The 1.14 line is `v1.14.4` plus the 66 patches of `patches/v1.14`: the branch
-`podkop-engine-1.14` of podkop-net/sing-box at `337cfff5ad9d5c5d44c44250664beb63c9a0d14a`
-(`SB_1_14_FORK_COMMIT` in `versions.env`, release r27), the commit podkop-experimental pins in its
+nothing else. The 1.14 line is `v1.14.4` plus the 69 patches of `patches/v1.14`: the branch
+`podkop-engine-1.14` of podkop-net/sing-box at `209086dbd08a50faf48f13c80febbb30f1caf942`
+(`SB_1_14_FORK_COMMIT` in `versions.env`, release r28), the commit podkop-experimental pins in its
 `go.mod`. `scripts/check-fork.sh [-C <sing-box clone>]` applies the patches to the tag in a
 scratch index and compares the tree with that commit (CI runs it before every build). The 1.12
 line is `v1.12.25` plus 2 patches, with no fork commit. By hand, in a clone of SagerNet/sing-box:
@@ -21,12 +21,13 @@ layer × 100 + place in the layer.
 | Layer | Patches | What it holds |
 |---|---|---|
 | 00 | 0001–0002 | build: what a build registers (tags `podkop_slim`, `podkop_full`), forks of libraries in `go.mod` |
-| 01 | 0101 | upstream fixes carried back to the tag |
+| 01 | 0101–0102 | upstream changes carried back to the tag (0102: sing-box 1.15's certificate pin, since r28) |
 | 02 | 0201–0215 | hooks: the few lines of upstream files that a module of layer 03 needs, one patch per module |
 | 03 | 0301–0317 | own modules: new files only |
 | 04 | 0401–0423 | behaviour changes in upstream files, with new files beside them |
 | 05 | 0501–0505 | added in r26: CPU and size (log lines, goroutine stacks, QUIC suites, CLI tools); upstream lines and new files in one patch |
 | 06 | 0601–0603 | added in r27: the BitTorrent sniffers and the loss of members over QUIC; same form as 05 |
+| 07 | 0701–0702 | added in r28: Xray's finalmask fragment and Xray's verification of the certificate; same form as 05 |
 
 Every patch ends with three trailers: `Pdk-Feature:` (the feature; a module of layer 03 and its
 hooks in layer 02 share it), `Pdk-Zone:` (`core`, `protocols`, `groups`, `tools`, `build`,
@@ -39,9 +40,10 @@ Rules (`docs/RELEASE.md`): a fix of a feature goes into its patch (`git commit -
 `git rebase --onto <tag> v1.14.4`, checked with `git range-diff`; layer 03 adds only new files, so
 conflicts come from the patches that edit upstream files. Only the whole series is checked: a few
 lines of one feature sit in the patch of another (noted below), so not every intermediate tree
-builds.
+builds. Since r28, 0701 and 0702 also hold the lines of the link decoder (0307) and of the
+Features line (0308) for what they add.
 
-## 1.14.4 — 66 patches
+## 1.14.4 — 69 patches
 
 ### Layer 00: build
 
@@ -70,6 +72,14 @@ builds.
 `backport-ja3` · since r10 · [patch](../patches/v1.14/0101-ja3-test-a-list-that-runs-past-its-extension.patch)
 - The test of upstream 07512b109 for `common/ja3`. The fix was a backport from r10; sing-box 1.14.3
   (r15) has it, and only the test is left.
+
+#### 0102 tls: certificate_sha256, a pin of the whole server certificate
+`backport-certificate-sha256` · since r28 · [patch](../patches/v1.14/0102-tls-certificate_sha256-a-pin-of-the-whole-server-cer.patch)
+- Upstream e7ad8a875 of sing-box 1.15.0-alpha.13, carried back as it is: the outbound TLS option
+  `certificate_sha256`, the SHA-256 of the server's whole certificate (base64, a list), and the
+  inbound `client_certificate_sha256`. A pinned server is taken without the roots, a self-signed
+  one too; with `certificate` or `certificate_path` it is refused.
+- Upstream pins the leaf; 0702 takes a pinned CA of the chain as well, as Xray does.
 
 ### Layer 02: hooks in upstream files
 
@@ -160,6 +170,8 @@ Each patch holds the call sites of one layer-03 module; the module's entry says 
   repeat the link.
 - `sb.<option path>` sets an option a link has no parameter for (`sb.tls.fragment=1`); the `extra`
   of XHTTP links and the `encryption` of VLESS links are read. Link keys: `docs/LINKS.md`.
+- Since r28 links also give `finalmask` (`fm`), `certificate_sha256` (`pcs`, `pinSHA256`) and
+  `certificate_server_name` (`vcn`); those lines are in 0701 and 0702.
 
 #### 0308 version: list the features of this build
 `version` · since r11 · hooks: 0207 · [patch](../patches/v1.14/0308-version-list-the-features-of-this-build.patch)
@@ -210,6 +222,8 @@ Each patch holds the call sites of one layer-03 module; the module's entry says 
 - A `detour` finds the outbound of its tag at every dial. An update that leaves an outbound
   depending on one replaced or removed, or over the limit of kept outbounds (`ErrTooManyKept`), is
   refused; a refused or failed update changes nothing.
+- Since r28 a `balance` group gets its balancer back when the update that replaced it is undone
+  (a later start stage failed); before, it balanced no more.
 
 #### 0315 route: a connection a block outbound refused is logged at debug
 `route-block-log` · since r19 · [patch](../patches/v1.14/0315-route-a-connection-a-block-outbound-refused-is-logge.patch)
@@ -235,6 +249,9 @@ Each patch holds the call sites of one layer-03 module; the module's entry says 
   retransmissions and reordering (told by the least RTT). Linux only.
 - Its receive window is held small during the probe, then let grow to the system maximum; DNS
   lookups of a probe dial do not inherit the probe.
+- Since r28 the far end cannot hold the probe or grow its memory: the counter keeps a bounded
+  number of holes and fills (past either the probe is not counted), and the drain after the stop
+  ends at the first packet stamped after it, at a limit at the latest.
 
 ### Layer 04: behaviour changes in upstream files
 
@@ -340,6 +357,10 @@ Each patch holds the call sites of one layer-03 module; the module's entry says 
   `loss_url` every `loss_interval` (30m; 256 KiB, 1 MiB before a switch); `balance`, connections
   spread by source over at most `balance_size` (3, max 16) best members under `loss_threshold`
   (1 %); a device may move after `balance_idle` (5m) without connections.
+- Since r28: a balance holds 4096 devices at most (past that the idle ones go, and a new device
+  goes by the member its address falls on); a test, a download check or a loss probe reads 64 KB
+  of response headers at most (net/http: 10 MB); the prober drops the times of first servers
+  that have passed, so replaced outbounds are not kept.
 
 #### 0411 log: entries for the Clash API formatted only while read; a platform writer's level
 `log` · since r10 · [patch](../patches/v1.14/0411-log-entries-for-the-Clash-API-formatted-only-while-r.patch)
@@ -420,6 +441,9 @@ Each patch holds the call sites of one layer-03 module; the module's entry says 
 - Routed connections count bytes both ways and learn whether the remote side ended the stream
   (`adapter.RemoteEOFMarker`). The download results come from the URL test history of 0410.
 - `adapter/experimental.go` here also declares cache methods of 0402 and 0414.
+- Since r28 the outcome of one server is written four times at once, then once in ten seconds
+  (the latest state): a path that let some handshakes through and not others wrote the cache
+  file, on flash, for every connection.
 
 #### 0422 http client: fallback clients, through which a remote rule-set repeats a failed download
 `http-client-fallback` · since r25 · [patch](../patches/v1.14/0422-http-client-fallback-clients-through-which-a-remote-.patch)
@@ -495,6 +519,37 @@ Each patch holds the call sites of one layer-03 module; the module's entry says 
   stand the count was within 0.5 points for 0.5–5 % loss, a new connection on a clean path reads
   about 0.2 %.
 
+### Layer 07: Xray's finalmask and certificate verification (r28)
+
+#### 0701 finalmask: Xray's fragment mask on the TCP connections of an outbound; fm and pcs in links
+`finalmask` · since r28 · [patch](../patches/v1.14/0701-finalmask-Xray-s-fragment-mask-on-the-TCP-connection.patch)
+- The dial option `finalmask` `{"tcp": [{"type": "fragment", …}]}`: Xray's fragment mask on every
+  TCP connection the outbound opens itself, beneath TLS, REALITY and every transport. `packets`
+  `tlshello` (the ClientHello cut into TLS records), `N-M` or empty, `length`/`lengths`,
+  `delay`/`delays`, `max_split`; masks in a list are chained as in Xray. Ranges are drawn as Xray
+  draws them. A pause ends at close and at the write deadline; through `detour` it does nothing.
+  Feature name `dialer.finalmask`.
+- Measured on routers of three ISPs (podkop-exp `lab/runs/2026-11-21-fmcheck*`): where the
+  ClientHello of the servers is dropped, records of 11–24 bytes written in two TCP pieces (the
+  first of 100–200 bytes) passed 165 of 168 times over edge, ios, qq, chrome, firefox and safari;
+  in one write a 508-byte hello (edge, ios) fits one packet and was dropped (0 of 28). REALITY
+  servers (the engine's own, Xray 26.3.27) take the cut hello.
+- The link decoder: `fm` fragment masks become `finalmask` (delays dropped; a `tlshello` with
+  delays still goes a record a write); in Hysteria 2 links salamander becomes `obfs` (gecko with a
+  `packetSize`), `udphop` and `quicParams.udpHop` the port hopping; `realm` is refused
+  (`hysteria-realm`). `pcs` and `pinSHA256` become `certificate_sha256`.
+
+#### 0702 tls: the server's certificate verified as Xray verifies it: other names, a pinned CA
+`certificate-server-name` · since r28 · [patch](../patches/v1.14/0702-tls-the-server-s-certificate-verified-as-Xray-verifi.patch)
+- `tls.certificate_server_name` (a list): the certificate is verified for any of these names in
+  place of `server_name`, which is still sent (Xray's `verifyPeerCertByName`, `vcn` of links).
+  Refused with `insecure`; not with REALITY, naive, or the apple and windows engines.
+- `certificate_sha256` (0102) also takes a pinned CA of the chain above the leaf, the chain then
+  verified to it by the names (Xray's `pinnedPeerCertSha256`); a pinned leaf is taken by itself.
+  With a pin or names `disable_sni` no longer also verifies the server name against the roots.
+- The decoder keeps a pin with `insecure`, maps `vcn`, reads both in the XHTTP download, and gives
+  naive neither. Feature names `tls.certificate_sha256`, `tls.certificate_server_name`.
+
 ## 1.12.25 — 2 patches
 
 The first two patches of the original series, without trailers; on 1.14 both are in 0401.
@@ -517,6 +572,7 @@ since r1 · [patch](../patches/v1.12/0002-utls-firefox-Firefox-148-safari-Safari
 | `build-slim` | 0001 | `podkop_slim` and `podkop_full` sets of protocols |
 | `gomod-vmess` | 0002 | sing-vmess from the fork |
 | `backport-ja3` | 0101 | the ja3 test of upstream 07512b109 |
+| `backport-certificate-sha256` | 0102 | `certificate_sha256` of sing-box 1.15 |
 | `dns-udp` | 0201, 0301 | a UDP socket per DNS query, resent at 1 s and 3 s |
 | `dns-nat` | 0202, 0302 | DNS of NAT sessions answered by a handler |
 | `listener-udp` | 0203, 0303 | UDP output queue of 1024 packets |
@@ -565,3 +621,5 @@ since r1 · [patch](../patches/v1.12/0002-utls-firefox-Firefox-148-safari-Safari
 | `sniff-bittorrent` | 0601 | uTP by SYN only, DHT sniffer |
 | `quic-stats` | 0602 | quic-go and sing-quic forks: QUIC connection statistics |
 | `urltest-quic-loss` | 0603 | loss of hysteria2 and tuic members |
+| `finalmask` | 0701 | Xray's fragment mask in the dialer; `fm`, `pcs` in links |
+| `certificate-server-name` | 0702 | `certificate_server_name`, a pinned CA; `vcn` in links |
