@@ -1,7 +1,7 @@
-From 2c2fbe5afc318bf5068b77d77b54890545094338 Mon Sep 17 00:00:00 2001
+From 2da72ba85361368f74449a0f5d07250094c4c2db Mon Sep 17 00:00:00 2001
 From: FiyeroT <me@fiyero.xyz>
 Date: Thu, 12 Nov 2026 21:41:19 +0300
-Subject: [PATCH 09/66] xhttp, hooks in upstream files: the client of Xray's
+Subject: [PATCH 10/69] xhttp, hooks in upstream files: the client of Xray's
  XHTTP transport
 
 The lines of upstream files that "xhttp: the client of Xray's XHTTP transport" needs; the feature

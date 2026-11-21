@@ -1,7 +1,7 @@
-From 81566e6190b23683fa097a2ef70fcd9bc540ac89 Mon Sep 17 00:00:00 2001
+From a41d43b86fb89622c3f96554e87d942bd67000b2 Mon Sep 17 00:00:00 2001
 From: FiyeroT <me@fiyero.xyz>
 Date: Thu, 12 Nov 2026 21:41:21 +0300
-Subject: [PATCH 56/66] detector: what a block detector reads of each server
+Subject: [PATCH 57/69] detector: what a block detector reads of each server
 
 What the handshakes, the flows and the download tests of each server came to, for a block detector
 of the program that runs the box.
@@ -16,20 +16,20 @@ Pdk-Layer: 04
  adapter/experimental.go                       |  30 +
  adapter/router.go                             |   8 +
  common/tls/client.go                          |   7 +
- common/tls/detect_outcome.go                  | 101 ++++
- common/tls/detect_outcome_test.go             | 523 ++++++++++++++++++
+ common/tls/detect_outcome.go                  | 158 +++++
+ common/tls/detect_outcome_test.go             | 578 ++++++++++++++++++
  common/tls/reality_client.go                  |  69 +++
- common/trafficcontrol/detect_flows_test.go    | 309 +++++++++++
+ common/trafficcontrol/detect_flows_test.go    | 309 ++++++++++
  common/trafficcontrol/manager.go              | 123 ++++
  common/trafficcontrol/tracker.go              |  86 ++-
- common/urltest/history_test.go                |  63 +++
+ common/urltest/history_test.go                |  63 ++
  experimental/cachefile/detect_outcome.go      |  48 ++
- experimental/cachefile/detect_outcome_test.go |  31 ++
+ experimental/cachefile/detect_outcome_test.go |  31 +
  experimental/clashapi/proxies_delay_test.go   |  58 ++
- .../group/urltestgroup/urltest_detect_test.go | 188 +++++++
+ .../group/urltestgroup/urltest_detect_test.go | 188 ++++++
  route/conn.go                                 |   5 +
- route/conn_podkop_test.go                     | 128 +++++
- 16 files changed, 1775 insertions(+), 2 deletions(-)
+ route/conn_podkop_test.go                     | 128 ++++
+ 16 files changed, 1887 insertions(+), 2 deletions(-)
  create mode 100644 common/tls/detect_outcome.go
  create mode 100644 common/tls/detect_outcome_test.go
  create mode 100644 common/trafficcontrol/detect_flows_test.go
@@ -120,10 +120,10 @@ index c9116634d..933d1e750 100644
  	// no ClientHello of this client to watch on it, and a forged one would be sent to the
 diff --git a/common/tls/detect_outcome.go b/common/tls/detect_outcome.go
 new file mode 100644
-index 000000000..81251af90
+index 000000000..034e01dcc
 --- /dev/null
 +++ b/common/tls/detect_outcome.go
-@@ -0,0 +1,101 @@
+@@ -0,0 +1,158 @@
 +//go:build with_utls
 +
 +package tls
@@ -141,6 +141,13 @@ index 000000000..81251af90
 +// flash by default, so a handshake that changes nothing writes nothing: there is no write by
 +// time, and a restart begins with what the file holds. The writes are made in the order of the
 +// changes by one goroutine at most, which takes the latest state when several came meanwhile.
++//
++// A state that changes with every connection (a path that lets some handshakes through and not
++// the others, a server that answers by turns as itself and as a stranger) would be a commit of
++// the cache file for every connection. So the changes of one server are written
++// detectOutcomeWriteBurst at once, then one in detectOutcomeWriteEvery, the latest state: what
++// the file tells of the server is behind by that time at most, and only while its state changes
++// that often.
 +type detectOutcomeWriter struct {
 +	access sync.Mutex
 +	// set once, by open: the box registers the cache file after it has made the outbounds
@@ -155,9 +162,26 @@ index 000000000..81251af90
 +	// a change is waiting for the goroutine; the goroutine runs
 +	dirty   bool
 +	writing bool
++	// the writes that may go at once, and the time the last of them was counted back
++	allowance int
++	allowedAt time.Time
 +	// handshakes in a row that met their deadline, with the fallback off
 +	deadlines atomic.Int32
 +}
++
++// The bound of the writes of one server's state (variables for the tests).
++var (
++	// detectOutcomeWriteBurst is how many changes are written at once. What happens to a server
++	// is two changes (it stops answering, then a fingerprint gets through) or three (it refuses
++	// as well); two paths that settle on candidates of their own make four
++	// (TestDetectOutcomeWritesOnChange).
++	detectOutcomeWriteBurst = 4
++	// detectOutcomeWriteEvery is the time that gives one write back: as long as a line of the
++	// fallback's log takes to be written again (utlsFallbackLogInterval), for the same reason, a
++	// path that gives the same on every connection. 8640 commits a day at most, where every
++	// connection made one.
++	detectOutcomeWriteEvery = 10 * time.Second
++)
 +
 +// open gives the writer its place in the cache file, once.
 +func (w *detectOutcomeWriter) open(cache adapter.CacheFile, key string) {
@@ -167,6 +191,7 @@ index 000000000..81251af90
 +		return
 +	}
 +	w.cache, w.key = cache, key
++	w.allowance, w.allowedAt = detectOutcomeWriteBurst, time.Now()
 +	flags, fingerprint, at, loaded := cache.LoadDetectOutcome(key)
 +	if loaded {
 +		w.flags, w.fingerprint, w.at, w.seeded = flags, fingerprint, at, true
@@ -219,18 +244,50 @@ index 000000000..81251af90
 +			w.access.Unlock()
 +			return
 +		}
++		if wait := w.allow(time.Now()); wait > 0 {
++			// the state may change again meanwhile: the one of that moment is written
++			w.access.Unlock()
++			time.Sleep(wait)
++			continue
++		}
 +		w.dirty = false
 +		flags, fingerprint, at := w.flags, w.fingerprint, w.at
 +		w.access.Unlock()
 +		_ = w.cache.StoreDetectOutcome(w.key, flags, fingerprint, at)
 +	}
 +}
++
++// allow takes one write of the allowance at now and returns 0, or tells how long until there is
++// one. The caller holds the lock.
++func (w *detectOutcomeWriter) allow(now time.Time) time.Duration {
++	every, burst := detectOutcomeWriteEvery, detectOutcomeWriteBurst
++	if every <= 0 || burst <= 0 {
++		return 0
++	}
++	if back := now.Sub(w.allowedAt) / every; back > 0 {
++		if w.allowance+int(min(back, time.Duration(burst))) >= burst {
++			w.allowance, w.allowedAt = burst, now
++		} else {
++			w.allowance += int(back)
++			w.allowedAt = w.allowedAt.Add(back * every)
++		}
++	}
++	if w.allowance > 0 {
++		if w.allowance == burst {
++			// the time that gives a write back runs from the first one taken
++			w.allowedAt = now
++		}
++		w.allowance--
++		return 0
++	}
++	return w.allowedAt.Add(every).Sub(now)
++}
 diff --git a/common/tls/detect_outcome_test.go b/common/tls/detect_outcome_test.go
 new file mode 100644
-index 000000000..8a79b7148
+index 000000000..d1355111d
 --- /dev/null
 +++ b/common/tls/detect_outcome_test.go
-@@ -0,0 +1,523 @@
+@@ -0,0 +1,578 @@
 +//go:build with_utls
 +
 +package tls
@@ -619,6 +676,57 @@ index 000000000..8a79b7148
 +	require.Equal(t, 2, cache.outcomeWriteCount())
 +}
 +
++// A state that changes with every handshake is written detectOutcomeWriteBurst times at once, then
++// once in detectOutcomeWriteEvery, the latest state; after a quiet time the changes are written
++// at once again.
++func TestDetectOutcomeWriteRate(t *testing.T) {
++	every := detectOutcomeWriteEvery
++	detectOutcomeWriteEvery = 100 * time.Millisecond
++	t.Cleanup(func() { detectOutcomeWriteEvery = every })
++	cache := &choiceCache{choices: make(map[string]choiceEntry)}
++	writer := new(detectOutcomeWriter)
++	writer.open(cache, "key")
++	answer := func(fingerprint string) {
++		writer.answered(time.Now(), func(byte, string) (byte, string) { return 0, fingerprint })
++	}
++	start := time.Now()
++	changes := 0
++	for time.Since(start) < 450*time.Millisecond {
++		if changes%2 == 0 {
++			writer.failed(time.Now(), adapter.DetectFailed)
++		} else {
++			answer("chrome")
++		}
++		changes++
++		time.Sleep(time.Millisecond)
++	}
++	answer("firefox")
++	entry := outcomeOf(t, cache, writer)
++	require.Zero(t, entry.flags)
++	require.Equal(t, "firefox", entry.fingerprint)
++	writes := cache.outcomeWriteCount()
++	require.GreaterOrEqual(t, changes, 100)
++	// the burst at once, one for each 100 ms of the 450, and the last state
++	require.GreaterOrEqual(t, writes, detectOutcomeWriteBurst+1)
++	require.LessOrEqual(t, writes, detectOutcomeWriteBurst+6)
++
++	time.Sleep(time.Duration(detectOutcomeWriteBurst)*detectOutcomeWriteEvery + 50*time.Millisecond)
++	for index := 1; index <= detectOutcomeWriteBurst; index++ {
++		if index%2 == 1 {
++			writer.failed(time.Now(), adapter.DetectNoAnswer)
++		} else {
++			answer("firefox")
++		}
++		require.Eventually(t, func() bool { return cache.outcomeWriteCount() == writes+index }, 50*time.Millisecond, time.Millisecond)
++	}
++	// the next change waits for its turn, and is written
++	writer.failed(time.Now(), adapter.DetectFailed)
++	time.Sleep(20 * time.Millisecond)
++	require.Equal(t, writes+detectOutcomeWriteBurst, cache.outcomeWriteCount())
++	require.Equal(t, adapter.DetectFailed, outcomeOf(t, cache, writer).flags)
++	require.Equal(t, writes+detectOutcomeWriteBurst+1, cache.outcomeWriteCount())
++}
++
 +// blockingCache holds the writes until told to go on, and watches how many run at once.
 +type blockingCache struct {
 +	choiceCache
@@ -667,6 +775,10 @@ index 000000000..8a79b7148
 +// verification is a failure at once, and nothing is written when nothing changes.
 +func TestDetectOutcomeFallbackOff(t *testing.T) {
 +	setFallback(t, false)
++	// nine changes in a row, to see each recorded: the bound of the writes has its own test
++	every := detectOutcomeWriteEvery
++	detectOutcomeWriteEvery = 0
++	t.Cleanup(func() { detectOutcomeWriteEvery = every })
 +	cache := &choiceCache{choices: make(map[string]choiceEntry)}
 +	ctx := service.ContextWith[adapter.CacheFile](context.Background(), adapter.CacheFile(cache))
 +	config, _ := fallbackClientIn(t, ctx, "chrome", true)

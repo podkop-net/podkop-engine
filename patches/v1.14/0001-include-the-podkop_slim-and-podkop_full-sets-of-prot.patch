@@ -1,7 +1,7 @@
 From 4421fe03dfee622e4e34b4b659b85f369907a67e Mon Sep 17 00:00:00 2001
 From: FiyeroT <me@fiyero.xyz>
 Date: Thu, 12 Nov 2026 21:41:19 +0300
-Subject: [PATCH 01/66] include: the podkop_slim and podkop_full sets of
+Subject: [PATCH 01/69] include: the podkop_slim and podkop_full sets of
  protocols and services
 
 What a podkop-engine build registers: podkop_slim keeps the protocols podkop writes and drops the

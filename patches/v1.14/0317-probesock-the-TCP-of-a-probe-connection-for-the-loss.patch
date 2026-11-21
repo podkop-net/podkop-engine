@@ -1,7 +1,7 @@
-From 560cdefdb03c8b4fe0fc4e876c74e5e3648d456a Mon Sep 17 00:00:00 2001
+From 51ed870484cfa04377ae0a3454ff541a328d6041 Mon Sep 17 00:00:00 2001
 From: FiyeroT <me@fiyero.xyz>
 Date: Thu, 12 Nov 2026 21:41:20 +0300
-Subject: [PATCH 35/66] probesock: the TCP of a probe connection, for the loss
+Subject: [PATCH 36/69] probesock: the TCP of a probe connection, for the loss
  of a member
 
 The probe sockets of the loss mode: the retransmissions and reordering of a probe connection told
@@ -19,14 +19,14 @@ Pdk-Feature: probesock
 Pdk-Zone: groups
 Pdk-Layer: 03
 ---
- common/probesock/capture_linux.go      | 369 +++++++++++++++++++++++++
- common/probesock/capture_linux_test.go | 145 ++++++++++
+ common/probesock/capture_linux.go      | 398 +++++++++++++++++++++++++
+ common/probesock/capture_linux_test.go | 298 ++++++++++++++++++
  common/probesock/capture_other.go      |  35 +++
- common/probesock/count.go              | 154 +++++++++++
- common/probesock/count_test.go         | 140 ++++++++++
- common/probesock/probesock.go          | 189 +++++++++++++
+ common/probesock/count.go              | 209 +++++++++++++
+ common/probesock/count_test.go         | 383 ++++++++++++++++++++++++
+ common/probesock/probesock.go          | 189 ++++++++++++
  common/probesock/window_linux_test.go  |  57 ++++
- 7 files changed, 1089 insertions(+)
+ 7 files changed, 1569 insertions(+)
  create mode 100644 common/probesock/capture_linux.go
  create mode 100644 common/probesock/capture_linux_test.go
  create mode 100644 common/probesock/capture_other.go
@@ -37,10 +37,10 @@ Pdk-Layer: 03
 
 diff --git a/common/probesock/capture_linux.go b/common/probesock/capture_linux.go
 new file mode 100644
-index 000000000..0f44a1772
+index 000000000..39a575caa
 --- /dev/null
 +++ b/common/probesock/capture_linux.go
-@@ -0,0 +1,369 @@
+@@ -0,0 +1,398 @@
 +//go:build linux
 +
 +package probesock
@@ -171,7 +171,10 @@ index 000000000..0f44a1772
 +	local   netip.AddrPort
 +	remote  netip.AddrPort
 +	stopped atomic.Bool
-+	done    chan struct{}
++	// stoppedAt is the time of the stop by the clock the kernel stamps the packets with, in
++	// nanoseconds: set before stopped
++	stoppedAt atomic.Int64
++	done      chan struct{}
 +
 +	access  sync.Mutex
 +	counter counter
@@ -300,15 +303,30 @@ index 000000000..0f44a1772
 +	return filter, nil
 +}
 +
++// drainLimit bounds the reading of what the socket still holds once the capture is stopped. Its
++// buffer (a megabyte, doubled by the kernel) holds some thousands of packets: on an x86 host the
++// capture read 480 thousand a second under a flood, and a stop under that flood took 12 ms
++// (TestCaptureStopUnderFlood). A far end that goes on sending, to a connection closed or not,
++// must not keep the capture, and the probe that waits for it, for good.
++const drainLimit = time.Second
++
 +func (c *capture) run() {
 +	defer close(c.done)
 +	buffer := make([]byte, snapLength)
 +	oob := make([]byte, unix.CmsgSpace(int(unsafe.Sizeof(unix.Timespec{}))))
++	var drainUntil time.Time
 +	for {
 +		flags := 0
 +		if c.stopped.Load() {
-+			// what came before the stop is read without waiting, then the capture ends
++			// what came before the stop is read without waiting, then the capture ends: when the
++			// socket is empty, at the first packet that came after the stop, or at drainLimit
 +			flags = unix.MSG_DONTWAIT
++			now := time.Now()
++			if drainUntil.IsZero() {
++				drainUntil = now.Add(drainLimit)
++			} else if now.After(drainUntil) {
++				return
++			}
 +		}
 +		n, oobn, _, from, err := unix.Recvmsg(c.fd, buffer, oob, flags)
 +		if err != nil {
@@ -320,15 +338,22 @@ index 000000000..0f44a1772
 +			}
 +			return
 +		}
++		at, hasTime := packetTime(oob[:oobn])
++		if flags != 0 && hasTime && at.UnixNano() > c.stoppedAt.Load() {
++			return
++		}
 +		link, isLink := from.(*unix.SockaddrLinklayer)
 +		if !isLink || link.Pkttype == unix.PACKET_OUTGOING {
 +			continue
 +		}
-+		at, hasTime := packetTime(oob[:oobn])
 +		if !hasTime {
 +			at = time.Now()
 +		}
-+		c.take(buffer[:n], link.Ifindex, at)
++		if !c.take(buffer[:n], link.Ifindex, at) {
++			// no stream of a probe (the counter is broken): nothing more is read, and the kernel
++			// drops what the socket has no room for
++			return
++		}
 +	}
 +}
 +
@@ -350,10 +375,11 @@ index 000000000..0f44a1772
 +
 +// take counts an incoming packet of the connection: the addresses are checked here, and
 +// only the first interface that brought one is believed (a packet may be seen on a device
-+// and on the device under it).
-+func (c *capture) take(packet []byte, index int, at time.Time) {
++// and on the device under it). It returns false when the counter is broken: the capture has
++// nothing more to read.
++func (c *capture) take(packet []byte, index int, at time.Time) bool {
 +	if len(packet) < 20 {
-+		return
++		return true
 +	}
 +	var (
 +		source  netip.Addr
@@ -364,39 +390,42 @@ index 000000000..0f44a1772
 +	case 4:
 +		headerLength := int(packet[0]&0x0f) * 4
 +		if len(packet) < headerLength+20 {
-+			return
++			return true
 +		}
 +		source = netip.AddrFrom4([4]byte(packet[12:16]))
 +		tcp = packet[headerLength:]
 +		payload = int(binary.BigEndian.Uint16(packet[2:4])) - headerLength - int(tcp[12]>>4)*4
 +	case 6:
 +		if len(packet) < 60 {
-+			return
++			return true
 +		}
 +		source = netip.AddrFrom16([16]byte(packet[8:24]))
 +		tcp = packet[40:]
 +		payload = int(binary.BigEndian.Uint16(packet[4:6])) - int(tcp[12]>>4)*4
 +	default:
-+		return
++		return true
 +	}
 +	// the local address is not matched: a source NAT on the way rewrites it (incomingFilter)
 +	if source != c.remote.Addr() ||
 +		binary.BigEndian.Uint16(tcp[0:2]) != c.remote.Port() || binary.BigEndian.Uint16(tcp[2:4]) != c.local.Port() {
-+		return
++		return true
 +	}
 +	c.access.Lock()
 +	defer c.access.Unlock()
 +	if c.inIndex == 0 {
 +		c.inIndex = index
 +	} else if index != c.inIndex {
-+		return
++		return true
 +	}
 +	c.counter.add(at, binary.BigEndian.Uint32(tcp[4:8]), payload)
++	return !c.counter.Broken
 +}
 +
-+// stop ends the capture once the packets already taken are read, and returns what it
-+// counted and how many packets the socket dropped.
++// stop ends the capture once the packets that came before it are read (run: within drainLimit,
++// whatever the far end sends meanwhile), and returns what it counted and how many packets the
++// socket dropped.
 +func (c *capture) stop() (*counter, int) {
++	c.stoppedAt.CompareAndSwap(0, time.Now().UnixNano())
 +	if c.stopped.Swap(true) {
 +		return &counter{}, 0
 +	}
@@ -412,20 +441,25 @@ index 000000000..0f44a1772
 +}
 diff --git a/common/probesock/capture_linux_test.go b/common/probesock/capture_linux_test.go
 new file mode 100644
-index 000000000..f4bb53135
+index 000000000..b9f32135d
 --- /dev/null
 +++ b/common/probesock/capture_linux_test.go
-@@ -0,0 +1,145 @@
+@@ -0,0 +1,298 @@
 +//go:build linux
 +
 +package probesock
 +
 +import (
 +	"context"
++	"encoding/binary"
 +	"io"
 +	"net"
++	"net/netip"
 +	"strings"
++	"sync"
++	"sync/atomic"
 +	"testing"
++	"time"
 +
 +	"github.com/sagernet/sing/common/control"
 +
@@ -561,6 +595,154 @@ index 000000000..f4bb53135
 +	_, err = socket.Finish()
 +	require.ErrorIs(t, err, ErrNoOwnConnection)
 +}
++
++// flood sends TCP segments with the addresses of a connection, as its far end would, from raw
++// sockets (workers at once), until the returned function is called: each of a byte of data, with
++// the sequence number sequence gives for its count. Their checksums are wrong: the kernel's TCP
++// drops them, the capture, which sees every packet before that, takes them.
++func flood(t *testing.T, local net.Addr, remote net.Addr, workers int, sequence func(count uint32) uint32) (stop func() int64) {
++	t.Helper()
++	localPort, remotePort := netip.MustParseAddrPort(local.String()), netip.MustParseAddrPort(remote.String())
++	var (
++		sent    atomic.Int64
++		count   atomic.Uint32
++		stopped atomic.Bool
++		group   sync.WaitGroup
++	)
++	for worker := 0; worker < workers; worker++ {
++		fd, err := unix.Socket(unix.AF_INET, unix.SOCK_RAW|unix.SOCK_CLOEXEC, unix.IPPROTO_RAW)
++		if err != nil {
++			t.Skip("no raw socket: ", err)
++		}
++		group.Add(1)
++		go func() {
++			defer group.Done()
++			defer unix.Close(fd)
++			packet := make([]byte, 41)
++			packet[0], packet[8], packet[9] = 0x45, 64, unix.IPPROTO_TCP
++			binary.BigEndian.PutUint16(packet[2:], uint16(len(packet)))
++			source, destination := remotePort.Addr().As4(), localPort.Addr().As4()
++			copy(packet[12:], source[:])
++			copy(packet[16:], destination[:])
++			binary.BigEndian.PutUint16(packet[20:], remotePort.Port())
++			binary.BigEndian.PutUint16(packet[22:], localPort.Port())
++			packet[32], packet[33] = 5<<4, 0x10
++			to := &unix.SockaddrInet4{Addr: destination}
++			for !stopped.Load() {
++				binary.BigEndian.PutUint32(packet[24:], sequence(count.Add(1)))
++				if unix.Sendto(fd, packet, 0, to) == nil {
++					sent.Add(1)
++				}
++			}
++		}()
++	}
++	return func() int64 {
++		stopped.Store(true)
++		group.Wait()
++		return sent.Load()
++	}
++}
++
++// probed opens a probe connection, downloads size bytes over it and returns the socket with the
++// capture still on, and the sequence number of the first byte the capture counted.
++func probed(t *testing.T, size int) (*Socket, net.Conn, uint32) {
++	t.Helper()
++	address := serve(t, size)
++	ctx, socket := With(context.Background(), Window)
++	conn, err := socket.Dial(ctx, net.Dialer{}, "tcp", address)
++	require.NoError(t, err)
++	t.Cleanup(func() { conn.Close() })
++	socket.access.Lock()
++	capture, captureErr := socket.capture, socket.err
++	socket.access.Unlock()
++	skipWithoutCapture(t, captureErr)
++	require.NoError(t, captureErr)
++	_, err = conn.Write([]byte{1})
++	require.NoError(t, err)
++	received, err := io.Copy(io.Discard, conn)
++	require.NoError(t, err)
++	require.Equal(t, int64(size), received)
++	var base uint32
++	require.Eventually(t, func() bool {
++		capture.access.Lock()
++		defer capture.access.Unlock()
++		base = capture.counter.base
++		return capture.counter.highest >= int64(size)
++	}, 5*time.Second, time.Millisecond)
++	return socket, conn, base
++}
++
++// finishWithin ends the probe and fails the test when that takes longer than limit.
++func finishWithin(t *testing.T, socket *Socket, limit time.Duration) (Result, time.Duration) {
++	t.Helper()
++	type finished struct {
++		result Result
++		err    error
++	}
++	done := make(chan finished, 1)
++	start := time.Now()
++	go func() {
++		result, err := socket.Finish()
++		done <- finished{result, err}
++	}()
++	select {
++	case end := <-done:
++		require.NoError(t, end.err)
++		return end.result, time.Since(start)
++	case <-time.After(limit):
++		t.Fatalf("the probe did not end within %v: the capture goes on reading", limit)
++		return Result{}, 0
++	}
++}
++
++// A far end that never stops sending (packets of data the connection has already, as fast as
++// four senders make them) does not keep the probe: the capture ends at the first packet that
++// came after the stop.
++func TestCaptureStopUnderFlood(t *testing.T) {
++	socket, _, base := probed(t, 64<<10)
++	stop := flood(t, socket.conn.LocalAddr(), socket.conn.RemoteAddr(), 4, func(uint32) uint32 { return base })
++	time.Sleep(time.Second)
++	socket.access.Lock()
++	capture := socket.capture
++	socket.access.Unlock()
++	capture.access.Lock()
++	before := capture.counter.Packets
++	capture.access.Unlock()
++	time.Sleep(time.Second)
++	capture.access.Lock()
++	rate := capture.counter.Packets - before
++	capture.access.Unlock()
++	result, took := finishWithin(t, socket, drainLimit+2*time.Second)
++	sent := stop()
++	t.Logf("the flood: %d packets sent, the capture read %d a second, dropped %d; the stop took %v", sent, rate, result.Dropped, took)
++	require.False(t, result.Broken)
++	require.Less(t, took, drainLimit+500*time.Millisecond)
++	require.Equal(t, int64(64<<10), result.Bytes)
++}
++
++// A far end that sends holes without end (every packet three bytes past the one before) is told
++// as no stream of a probe: the capture stops reading at maxHoles holes, keeps none of them, and
++// the probe ends at once.
++func TestCaptureHolesWithoutEnd(t *testing.T) {
++	socket, _, base := probed(t, 64<<10)
++	stop := flood(t, socket.conn.LocalAddr(), socket.conn.RemoteAddr(), 1, func(count uint32) uint32 { return base + 1<<20 + 3*count })
++	socket.access.Lock()
++	capture := socket.capture
++	socket.access.Unlock()
++	select {
++	case <-capture.done:
++	case <-time.After(10 * time.Second):
++		t.Fatal("the capture goes on reading holes without end")
++	}
++	capture.access.Lock()
++	require.True(t, capture.counter.Broken)
++	require.Nil(t, capture.counter.holes)
++	capture.access.Unlock()
++	result, took := finishWithin(t, socket, 2*time.Second)
++	sent := stop()
++	t.Logf("the flood: %d packets sent; the stop took %v", sent, took)
++	require.True(t, result.Broken)
++}
 diff --git a/common/probesock/capture_other.go b/common/probesock/capture_other.go
 new file mode 100644
 index 000000000..c0fae7418
@@ -604,10 +786,10 @@ index 000000000..c0fae7418
 +func restoreWindow(conn *net.TCPConn) {}
 diff --git a/common/probesock/count.go b/common/probesock/count.go
 new file mode 100644
-index 000000000..f29264e0b
+index 000000000..17796427d
 --- /dev/null
 +++ b/common/probesock/count.go
-@@ -0,0 +1,154 @@
+@@ -0,0 +1,209 @@
 +// Package probesock counts what a probe connection lost on its way to this host
 +// (podkop-engine).
 +//
@@ -636,6 +818,9 @@ index 000000000..f29264e0b
 +	ReorderBytes int64 // bytes of holes filled soon: reordered
 +	DupBytes     int64 // bytes that came twice
 +	Unfilled     int64 // bytes of holes still open at the end
++	// Broken: the sequence was no stream of a probe (more holes open at once than maxHoles, or
++	// more fills than maxFills); the counter stopped there and the counts say nothing
++	Broken bool
 +}
 +
 +// minReorderWindow is the least time a hole may take to fill and still be reordering: a
@@ -663,7 +848,9 @@ index 000000000..f29264e0b
 +	bytes  int64
 +}
 +
-+// counter follows the incoming sequence of one connection, packet by packet.
++// counter follows the incoming sequence of one connection, packet by packet. Its holes are in the
++// order of the sequence and apart from each other: a hole opens past the highest byte, and a
++// packet only takes from the holes there are.
 +type counter struct {
 +	started bool
 +	base    uint32
@@ -673,13 +860,30 @@ index 000000000..f29264e0b
 +	Counts
 +}
 +
++// The most a counter keeps. The capture takes every packet with the addresses of the connection,
++// whatever its sequence number: what the far end sends is not held to the window (the kernel drops
++// what is outside it, after the capture has seen it), and a far end that sends holes without end
++// must cost neither memory nor time.
++const (
++	// maxHoles is the most holes open at once. A sender that keeps to the window the probe offers
++	// has all its data that is not acknowledged within Window bytes after the first hole, and a
++	// hole takes a missing segment and one that came after it: seven holes with segments of 1448
++	// bytes, 19 with segments of 536 (the least MSS of IPv4, RFC 879). 256 holes are open only
++	// with segments of 40 bytes, which no download comes in.
++	maxHoles = Window / (2 * 40)
++	// maxFills is the most pieces of holes filled, in all: one for a segment that came late or
++	// out of order. The megabyte of the largest probe (urltest.LossProbeLarge) is 1957 segments
++	// of 536 bytes; were every one of them a fill, the count is still under this.
++	maxFills = 4096
++)
++
 +// maxAhead bounds how far past the highest byte a packet may start: a sequence number
 +// further away is not of this stream (an older packet, wrapped around).
 +const maxAhead = 1 << 30
 +
 +// add takes an incoming packet with payload bytes of data starting at seq, captured at at.
 +func (c *counter) add(at time.Time, seq uint32, payload int) {
-+	if payload <= 0 {
++	if payload <= 0 || c.Broken {
 +		return
 +	}
 +	if !c.started {
@@ -692,6 +896,10 @@ index 000000000..f29264e0b
 +	end := start + int64(payload)
 +	c.Packets++
 +	if start > c.highest {
++		if len(c.holes) >= maxHoles {
++			c.broken()
++			return
++		}
 +		c.holes = append(c.holes, hole{c.highest, start, at})
 +		c.Holes++
 +		c.highest = end
@@ -699,33 +907,62 @@ index 000000000..f29264e0b
 +	}
 +	limit := min(end, c.highest)
 +	covered := int64(0)
-+	// a new list: a packet inside a hole splits it in two, and a list filtered in place would
-+	// write the second piece over the next hole before it is read
-+	kept := make([]hole, 0, len(c.holes)+1)
-+	for _, h := range c.holes {
++	// the holes are filtered in place: a packet leaves at most one piece of each hole it reaches,
++	// but for one that lies inside a single hole and splits it in two (it reaches no other hole)
++	kept := 0
++	for index := 0; index < len(c.holes); index++ {
++		h := c.holes[index]
 +		from, to := max(start, h.start), min(limit, h.end)
 +		if from >= to {
-+			kept = append(kept, h)
++			c.holes[kept] = h
++			kept++
 +			continue
++		}
++		if len(c.fills) >= maxFills {
++			c.broken()
++			return
 +		}
 +		covered += to - from
 +		c.fills = append(c.fills, fill{packet: c.Packets, age: at.Sub(h.at), bytes: to - from})
-+		if h.start < from {
-+			kept = append(kept, hole{h.start, from, h.at})
-+		}
-+		if to < h.end {
-+			kept = append(kept, hole{to, h.end, h.at})
++		switch {
++		case h.start < from && to < h.end:
++			// inside the hole: every hole before it was kept as it is (kept == index), and the
++			// holes after it move up by one
++			if len(c.holes) >= maxHoles {
++				c.broken()
++				return
++			}
++			c.holes = append(c.holes, hole{})
++			copy(c.holes[index+2:], c.holes[index+1:])
++			c.holes[index] = hole{h.start, from, h.at}
++			c.holes[index+1] = hole{to, h.end, h.at}
++			kept = len(c.holes)
++			index = len(c.holes)
++		case h.start < from:
++			c.holes[kept] = hole{h.start, from, h.at}
++			kept++
++		case to < h.end:
++			c.holes[kept] = hole{to, h.end, h.at}
++			kept++
 +		}
 +	}
-+	c.holes = kept
++	c.holes = c.holes[:kept]
 +	c.DupBytes += (limit - start) - covered
 +	if end > c.highest {
 +		c.highest = end
 +	}
 +}
 +
++// broken ends the counting: the sequence is no stream of a probe (maxHoles, maxFills). What was
++// kept is let go, and every later packet is passed over.
++func (c *counter) broken() {
++	c.Broken = true
++	c.holes, c.fills = nil, nil
++}
++
 +// finish returns the counts of the connection so far, the holes filled within window
-+// counted as reordering, the others as loss.
++// counted as reordering, the others as loss. Of a broken counter, only Broken and Packets tell
++// anything.
 +func (c *counter) finish(window time.Duration) Counts {
 +	counts := c.Counts
 +	counts.Bytes = c.highest
@@ -764,13 +1001,14 @@ index 000000000..f29264e0b
 +const defaultMSS = 1448
 diff --git a/common/probesock/count_test.go b/common/probesock/count_test.go
 new file mode 100644
-index 000000000..321d6b793
+index 000000000..4780f9584
 --- /dev/null
 +++ b/common/probesock/count_test.go
-@@ -0,0 +1,140 @@
+@@ -0,0 +1,383 @@
 +package probesock
 +
 +import (
++	"math/rand"
 +	"testing"
 +	"time"
 +
@@ -907,6 +1145,248 @@ index 000000000..321d6b793
 +	require.Zero(t, counts.DupBytes)
 +	require.Zero(t, counts.Unfilled)
 +	require.Equal(t, int64(7000), counts.Bytes)
++}
++
++// reference is the counter as it was before its holes were kept in place and bounded: a new list
++// of holes for every packet at or below the highest byte, nothing bounded.
++type reference struct {
++	started bool
++	base    uint32
++	highest int64
++	holes   []hole
++	fills   []fill
++	Counts
++}
++
++func (c *reference) add(at time.Time, seq uint32, payload int) {
++	if payload <= 0 {
++		return
++	}
++	if !c.started {
++		c.base, c.started = seq, true
++	}
++	start := int64(seq - c.base)
++	if start > c.highest+maxAhead {
++		return
++	}
++	end := start + int64(payload)
++	c.Packets++
++	if start > c.highest {
++		c.holes = append(c.holes, hole{c.highest, start, at})
++		c.Holes++
++		c.highest = end
++		return
++	}
++	limit := min(end, c.highest)
++	covered := int64(0)
++	kept := make([]hole, 0, len(c.holes)+1)
++	for _, h := range c.holes {
++		from, to := max(start, h.start), min(limit, h.end)
++		if from >= to {
++			kept = append(kept, h)
++			continue
++		}
++		covered += to - from
++		c.fills = append(c.fills, fill{packet: c.Packets, age: at.Sub(h.at), bytes: to - from})
++		if h.start < from {
++			kept = append(kept, hole{h.start, from, h.at})
++		}
++		if to < h.end {
++			kept = append(kept, hole{to, h.end, h.at})
++		}
++	}
++	c.holes = kept
++	c.DupBytes += (limit - start) - covered
++	if end > c.highest {
++		c.highest = end
++	}
++}
++
++// The holes kept in place count what the list made anew for every packet counted: streams of
++// segments lost and sent again (whole, in parts, with their neighbours), out of order and twice.
++func TestCounterAsReference(t *testing.T) {
++	for seed := int64(1); seed <= 200; seed++ {
++		random := rand.New(rand.NewSource(seed))
++		type packet struct {
++			seq     uint32
++			payload int
++			at      int
++		}
++		var packets []packet
++		base := uint32(random.Int63())
++		offset, clock := 0, 0
++		var late []packet
++		for segment := 0; segment < 300; segment++ {
++			size := 1 + random.Intn(1448)
++			p := packet{base + uint32(offset), size, 0}
++			offset += size
++			switch choice := random.Intn(20); {
++			case choice == 0:
++				// lost: sent again later, whole, in two parts, or with bytes of its neighbours
++				switch random.Intn(3) {
++				case 0:
++					late = append(late, p)
++				case 1:
++					half := 1 + random.Intn(size)
++					late = append(late, packet{p.seq, half, 0}, packet{p.seq + uint32(half), size - half, 0})
++				default:
++					before := min(random.Intn(700), int(p.seq-base))
++					late = append(late, packet{p.seq - uint32(before), size + before + random.Intn(700), 0})
++				}
++			case choice == 1:
++				// twice
++				packets = append(packets, p, p)
++			case choice == 2 && len(packets) > 0:
++				// out of order: before the packet that came before it
++				last := packets[len(packets)-1]
++				packets[len(packets)-1] = p
++				packets = append(packets, last)
++			default:
++				packets = append(packets, p)
++			}
++			if len(late) > 0 && random.Intn(4) == 0 {
++				index := random.Intn(len(late))
++				packets = append(packets, late[index])
++				late = append(late[:index], late[index+1:]...)
++			}
++		}
++		// some of the lost are never sent again: holes open at the end
++		for len(late) > 2 {
++			packets = append(packets, late[0])
++			late = late[1:]
++		}
++		counted, expected := newCounter(), &reference{}
++		for _, p := range packets {
++			clock += random.Intn(12)
++			counted.add(at(clock), p.seq, p.payload)
++			expected.add(at(clock), p.seq, p.payload)
++		}
++		require.False(t, counted.Broken, "seed %d", seed)
++		require.Equal(t, len(expected.holes), len(counted.holes), "seed %d", seed)
++		for index := range expected.holes {
++			require.Equal(t, expected.holes[index], counted.holes[index], "seed %d, hole %d", seed, index)
++		}
++		require.Equal(t, len(expected.fills), len(counted.fills), "seed %d", seed)
++		for index := range expected.fills {
++			require.Equal(t, expected.fills[index], counted.fills[index], "seed %d, fill %d", seed, index)
++		}
++		for _, window := range []time.Duration{0, testWindow, time.Second} {
++			want := (&counter{highest: expected.highest, holes: expected.holes, fills: expected.fills, Counts: expected.Counts}).finish(window)
++			require.Equal(t, want, counted.finish(window), "seed %d", seed)
++		}
++	}
++}
++
++// A far end that opens holes without end (every packet past the highest byte) is no stream of a
++// probe: the counter keeps maxHoles of them and stops.
++func TestCounterHolesBounded(t *testing.T) {
++	c := newCounter()
++	c.add(at(0), 0, 1)
++	for i := 1; i <= maxHoles; i++ {
++		c.add(at(i), uint32(2*i), 1)
++	}
++	require.False(t, c.Broken)
++	require.Len(t, c.holes, maxHoles)
++	c.add(at(1000), uint32(2*maxHoles+2), 1)
++	require.True(t, c.Broken)
++	require.Nil(t, c.holes)
++	require.Nil(t, c.fills)
++	packets := c.Packets
++	for i := 0; i < 100000; i++ {
++		c.add(at(2000+i), uint32(3*maxHoles+2*i), 1)
++		c.add(at(2000+i), uint32(i), 1)
++	}
++	require.Equal(t, packets, c.Packets)
++	require.Nil(t, c.holes)
++	require.True(t, c.finish(testWindow).Broken)
++}
++
++// Nor do packets that split the holes there are: a hole of maxHoles*4 bytes cut by a byte at
++// every fourth breaks the counter at maxHoles holes.
++func TestCounterSplitsBounded(t *testing.T) {
++	c := newCounter()
++	c.add(at(0), 0, 1)
++	c.add(at(1), uint32(8*maxHoles), 1)
++	require.Len(t, c.holes, 1)
++	for i := 1; i < 2*maxHoles && !c.Broken; i++ {
++		c.add(at(1+i), uint32(4*i), 1)
++		require.LessOrEqual(t, len(c.holes), maxHoles)
++	}
++	require.True(t, c.Broken)
++}
++
++// A hole filled a byte at a time is fills without end: the counter keeps maxFills and stops.
++func TestCounterFillsBounded(t *testing.T) {
++	c := newCounter()
++	c.add(at(0), 0, 1)
++	c.add(at(1), uint32(2*maxFills), 1)
++	for i := 1; i <= maxFills; i++ {
++		c.add(at(1+i), uint32(i), 1)
++	}
++	require.False(t, c.Broken)
++	require.Len(t, c.fills, maxFills)
++	require.Len(t, c.holes, 1)
++	c.add(at(100000), uint32(maxFills+1), 1)
++	require.True(t, c.Broken)
++	require.Nil(t, c.fills)
++}
++
++// The largest probe at the least segments, every other one lost and sent again, is within the
++// bounds: the bounds leave out no stream of a probe.
++func TestCounterBoundsHoldAProbe(t *testing.T) {
++	const segment, size = 536, 1 << 20
++	const total, perWindow = (size + segment - 1) / segment, Window / segment
++	c := newCounter()
++	clock, shown := 0, 0
++	length := func(index int) int { return min(segment, size-index*segment) }
++	// the sender keeps to the window: what it sent and is not acknowledged is within Window
++	// bytes after the first hole, so the lost segments of a window are sent again before the next
++	for first := 0; first < total; first += perWindow {
++		last := min(first+perWindow, total) - 1
++		var lost []int
++		for index := first; index <= last; index++ {
++			if index%2 == 1 {
++				lost = append(lost, index)
++				if index < last {
++					// a segment came after it: a hole
++					shown++
++				}
++				continue
++			}
++			clock++
++			c.add(at(clock), uint32(index*segment), length(index))
++		}
++		require.LessOrEqual(t, len(c.holes), Window/(2*segment)+1)
++		for _, index := range lost {
++			clock += 50
++			c.add(at(clock), uint32(index*segment), length(index))
++		}
++		require.False(t, c.Broken)
++		require.Empty(t, c.holes)
++	}
++	counts := c.finish(testWindow)
++	require.False(t, counts.Broken)
++	require.Zero(t, counts.Unfilled)
++	require.Equal(t, int64(size), counts.Bytes)
++	require.Equal(t, shown, len(c.fills))
++	require.Less(t, len(c.fills), maxFills)
++	segments, lostSegments := counts.segments(segment)
++	require.Equal(t, total, segments)
++	require.Equal(t, shown, lostSegments)
++}
++
++// A packet at or below the highest byte allocates nothing while it splits no hole.
++func TestCounterAddAllocatesNothing(t *testing.T) {
++	c := newCounter()
++	c.add(at(0), 0, 1)
++	for i := 1; i <= maxHoles; i++ {
++		c.add(at(i), uint32(2*i), 1)
++	}
++	allocations := testing.AllocsPerRun(1000, func() {
++		// twice the first byte: every hole is looked at, none is changed
++		c.add(at(5000), 0, 1)
++	})
++	require.Zero(t, allocations)
 +}
 diff --git a/common/probesock/probesock.go b/common/probesock/probesock.go
 new file mode 100644

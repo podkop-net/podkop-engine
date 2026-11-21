@@ -1,7 +1,7 @@
-From a4257213b60bca188d6f47dc26bd7a6f08ff03d0 Mon Sep 17 00:00:00 2001
+From 384881c1854a21f9bd221ddb76f3bf705fb38980 Mon Sep 17 00:00:00 2001
 From: FiyeroT <me@fiyero.xyz>
 Date: Thu, 12 Nov 2026 21:41:20 +0300
-Subject: [PATCH 34/66] dns: the transports group and provider
+Subject: [PATCH 35/69] dns: the transports group and provider
 
 A server of the type group asks its servers in order and, after one gave no answer in time, the rest
 together; provider is the DNS of the provider netifd knows.

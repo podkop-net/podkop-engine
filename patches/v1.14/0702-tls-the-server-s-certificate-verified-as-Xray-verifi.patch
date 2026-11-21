@@ -1,0 +1,980 @@
+From 209086dbd08a50faf48f13c80febbb30f1caf942 Mon Sep 17 00:00:00 2001
+From: FiyeroT <me@fiyero.xyz>
+Date: Sat, 21 Nov 2026 18:34:03 +0300
+Subject: [PATCH 69/69] tls: the server's certificate verified as Xray verifies
+ it: other names, a pinned CA
+
+certificate_server_name is a list of names: the server's certificate is verified against the
+roots (the system's, or those of certificate) for any of them, in place of server_name, which the
+handshake still sends; with disable_sni nothing is sent and the names verify. It is Xray's
+verifyPeerCertByName ("vcn" of a link): a server reached by one name (a front, an address) with
+a certificate for another.
+
+certificate_sha256 (0102) pins a whole certificate: upstream takes the leaf only. Here it also
+takes a CA of the chain above the leaf, as Xray takes pinnedPeerCertSha256 (verifyChain,
+foundCA): the chain is then verified to that CA alone, by certificate_server_name or the server
+name. A pinned leaf is taken by itself, whatever its names and issuer. Both together work as in
+Xray.
+
+Feature names: tls.certificate_sha256 (with the pinned CA), tls.certificate_server_name.
+
+- The std and uTLS clients verify in VerifyPeerCertificate (InsecureSkipVerify, as upstream's
+  pins do), set per server name in SetServerName and kept by Clone; ECH, kTLS, shadowtls and the
+  QUIC clients that take the std configuration go through it. With a pin or names, disable_sni no
+  longer verifies the server name against the roots as well (upstream refused a pinned
+  self-signed server without SNI on the std client).
+- certificate_server_name is refused with insecure and with an empty name; unavailable with
+  REALITY, which checks its own key (the REALITY client installs its own verification per
+  connection), and in the apple and windows engines. naive refuses it and both pins: Cronet
+  verifies by the server name only.
+- The link decoder: pcs and pinSHA256 are kept with insecure (Hysteria checks its pin then, and
+  Xray has no insecure any more), which is dropped; dashes are taken out of a hash too; vcn becomes
+  certificate_server_name unless every name is the server name; the XHTTP download reads its own
+  pinnedPeerCertSha256 and verifyPeerCertByName; naive gets neither, with a warning.
+
+Pdk-Feature: certificate-server-name
+Pdk-Zone: core
+Pdk-Layer: 07
+---
+ cmd/sing-box/version_features.go              |   4 +
+ common/sharelink/link_test.go                 |  23 +++
+ common/sharelink/policy.go                    |   2 +-
+ common/sharelink/policy_test.go               |  45 ++++-
+ common/sharelink/testdata/options-1.14.txt    |  12 ++
+ common/sharelink/tls.go                       |  57 ++++--
+ common/sharelink/tlsproxy.go                  |   6 +
+ common/sharelink/xhttp.go                     |  12 +-
+ common/tls/certificate_server_name.go         | 132 +++++++++++++
+ common/tls/certificate_server_name_test.go    | 187 ++++++++++++++++++
+ .../tls/certificate_server_name_utls_test.go  |  36 ++++
+ common/tls/reality_client.go                  |   4 +
+ common/tls/std_client.go                      |  20 +-
+ common/tls/system_client.go                   |   3 +
+ common/tls/utls_client.go                     |  20 +-
+ option/tls.go                                 |   1 +
+ protocol/naive/outbound.go                    |   8 +
+ 17 files changed, 539 insertions(+), 33 deletions(-)
+ create mode 100644 common/tls/certificate_server_name.go
+ create mode 100644 common/tls/certificate_server_name_test.go
+ create mode 100644 common/tls/certificate_server_name_utls_test.go
+
+diff --git a/cmd/sing-box/version_features.go b/cmd/sing-box/version_features.go
+index 50cf01695..d1cb62da3 100644
+--- a/cmd/sing-box/version_features.go
++++ b/cmd/sing-box/version_features.go
+@@ -24,4 +24,8 @@ var versionFeatures = []string{
+ 	"tls.utls-fallback",
+ 	// the dialer option "finalmask": Xray's fragment mask on the TCP connections of an outbound
+ 	"dialer.finalmask",
++	// tls "certificate_sha256" (of sing-box 1.15) taking a pinned CA of the chain as Xray does
++	"tls.certificate_sha256",
++	// tls "certificate_server_name": the certificate verified by other names (Xray's vcn)
++	"tls.certificate_server_name",
+ }
+diff --git a/common/sharelink/link_test.go b/common/sharelink/link_test.go
+index 55fb35396..287b71cb7 100644
+--- a/common/sharelink/link_test.go
++++ b/common/sharelink/link_test.go
+@@ -425,3 +425,26 @@ func TestFoundInTheWild(t *testing.T) {
+ 		require.Error(t, err, name)
+ 	}
+ }
++
++// The download of XHTTP, a server of its own, verifies its certificate as the link's TLS does:
++// its pinnedPeerCertSha256 and verifyPeerCertByName.
++func TestXHTTPDownloadVerification(t *testing.T) {
++	t.Parallel()
++	extra := `{"downloadSettings":{"address":"d.example.org","port":443,"network":"xhttp","security":"tls",` +
++		`"tlsSettings":{"serverName":"d.example.org","pinnedPeerCertSha256":"abababababababababababababababababababababababababababababababab","verifyPeerCertByName":"real.example.org"}}}`
++	content, warnings := decodeJSON(t, xhttpLink(extra, uriComponent, ""))
++	require.Empty(t, warnings)
++	var outbound struct {
++		Transport struct {
++			Download struct {
++				TLS struct {
++					CertificateSHA256     string `json:"certificate_sha256"`
++					CertificateServerName string `json:"certificate_server_name"`
++				} `json:"tls"`
++			} `json:"download"`
++		} `json:"transport"`
++	}
++	require.NoError(t, json.Unmarshal([]byte(content), &outbound))
++	require.Equal(t, "q6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6s=", outbound.Transport.Download.TLS.CertificateSHA256)
++	require.Equal(t, "real.example.org", outbound.Transport.Download.TLS.CertificateServerName)
++}
+diff --git a/common/sharelink/policy.go b/common/sharelink/policy.go
+index 85c2988ab..248be0cdf 100644
+--- a/common/sharelink/policy.go
++++ b/common/sharelink/policy.go
+@@ -6,7 +6,7 @@ package sharelink
+ // the outbound made of it would not work: an error means that the link, as it is, does
+ // not work in sing-box. What the client alone decides (a fingerprint, a fragmenting of
+ // its own packets, a multiplexing mode the server serves either way) and what only adds
+-// a check (a pinned certificate, the ML-DSA check of REALITY) is a warning: the outbound
++// a check this engine does not have (the ML-DSA check of REALITY) is a warning: the outbound
+ // is made and connects.
+ //
+ // refusals lists every refusal by its ID with what it rests on. "lab" is the interop
+diff --git a/common/sharelink/policy_test.go b/common/sharelink/policy_test.go
+index 45269acb2..ea3acc680 100644
+--- a/common/sharelink/policy_test.go
++++ b/common/sharelink/policy_test.go
+@@ -213,14 +213,34 @@ func TestLeniencies(t *testing.T) {
+ 		},
+ 		"a pinned certificate": {
+ 			policyBase + "security=tls&pcs=0123abcd&vcn=example.org",
+-			`{"type":"vless","server":"example.org","server_port":443,"uuid":"` + testUUID + `","tls":{"enabled":true,"utls":{"enabled":true,"fingerprint":"chrome"}}}`,
+-			[]string{"the pinned certificate (pcs, pinSHA256) cannot be read", "vcn (the names the certificate is verified by) is not supported"},
++			`{"type":"vless","server":"example.org","server_port":443,"uuid":"` + testUUID + `","tls":{"enabled":true,"certificate_server_name":"example.org","utls":{"enabled":true,"fingerprint":"chrome"}}}`,
++			[]string{"the pinned certificate (pcs, pinSHA256) cannot be read"},
+ 		},
+-		"the certificate verified by the name that is sent": {
++		"the certificate verified by the names of vcn": {
+ 			policyBase + "security=tls&sni=s.example.org&vcn=other.example.org,S.example.org&cs=TLS_AES_128_GCM_SHA256",
+-			`{"type":"vless","server":"example.org","server_port":443,"uuid":"` + testUUID + `","tls":{"enabled":true,"server_name":"s.example.org","utls":{"enabled":true,"fingerprint":"chrome"}}}`,
++			`{"type":"vless","server":"example.org","server_port":443,"uuid":"` + testUUID + `","tls":{"enabled":true,"server_name":"s.example.org","certificate_server_name":["other.example.org","S.example.org"],"utls":{"enabled":true,"fingerprint":"chrome"}}}`,
+ 			[]string{"cs (the cipher suites of TLS) is not supported and is ignored"},
+ 		},
++		"vcn that is the name sent": {
++			policyBase + "security=tls&sni=s.example.org&vcn=S.example.org",
++			`{"type":"vless","server":"example.org","server_port":443,"uuid":"` + testUUID + `","tls":{"enabled":true,"server_name":"s.example.org","utls":{"enabled":true,"fingerprint":"chrome"}}}`,
++			nil,
++		},
++		"vcn with a pinned certificate": {
++			policyBase + "security=tls&vcn=b.example.org&pcs=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
++			`{"type":"vless","server":"example.org","server_port":443,"uuid":"` + testUUID + `","tls":{"enabled":true,"certificate_sha256":"qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqo=","certificate_server_name":"b.example.org","utls":{"enabled":true,"fingerprint":"chrome"}}}`,
++			nil,
++		},
++		"vcn with REALITY": {
++			policyBase + "security=reality&pbk=K&sid=ab&vcn=b.example.org",
++			`{"type":"vless","server":"example.org","server_port":443,"uuid":"` + testUUID + `","tls":{"enabled":true,"utls":{"enabled":true,"fingerprint":"chrome"},"reality":{"enabled":true,"public_key":"K","short_id":"ab"}}}`,
++			nil,
++		},
++		"vcn of an insecure link": {
++			policyBase + "security=tls&vcn=b.example.org&allowInsecure=1",
++			`{"type":"vless","server":"example.org","server_port":443,"uuid":"` + testUUID + `","tls":{"enabled":true,"insecure":true,"utls":{"enabled":true,"fingerprint":"chrome"}}}`,
++			nil,
++		},
+ 		"udphop over TCP: no UDP of its own to hop": {
+ 			policyBase + "fm=%7B%22udp%22%3A%5B%7B%22type%22%3A%22udphop%22%2C%22settings%22%3A%7B%22mode%22%3A%22intervalRemote%22%2C%22remotePorts%22%3A%221000-2000%22%7D%7D%2C%7B%22type%22%3A%22noise%22%7D%5D%7D",
+ 			`{"type":"vless","server":"example.org","server_port":443,"uuid":"` + testUUID + `"}`,
+@@ -257,11 +277,26 @@ func TestLeniencies(t *testing.T) {
+ 			[]string{"the delays of the fragment mask are not applied"},
+ 		},
+ 
+-		"a pinned certificate, not verified anyway": {
++		"a pin that cannot be read, of a link not verified anyway": {
+ 			policyBase + "security=tls&pcs=0123abcd&allowInsecure=1",
+ 			`{"type":"vless","server":"example.org","server_port":443,"uuid":"` + testUUID + `","tls":{"enabled":true,"insecure":true,"utls":{"enabled":true,"fingerprint":"chrome"}}}`,
++			[]string{"the pinned certificate (pcs, pinSHA256) cannot be read and is ignored (a hash is not 32 bytes long): the server is not verified"},
++		},
++		"a pin of an insecure link: the pin is the check": {
++			policyBase + "security=tls&pcs=abababababababababababababababababababababababababababababababab&allowInsecure=1",
++			`{"type":"vless","server":"example.org","server_port":443,"uuid":"` + testUUID + `","tls":{"enabled":true,"certificate_sha256":"q6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6s=","utls":{"enabled":true,"fingerprint":"chrome"}}}`,
++			nil,
++		},
++		"the pin of Hysteria with dashes and insecure=1": {
++			"hysteria2://p@example.com:443/?insecure=1&pinSHA256=ab-ab-ab-ab-ab-ab-ab-ab-ab-ab-ab-ab-ab-ab-ab-ab-ab-ab-ab-ab-ab-ab-ab-ab-ab-ab-ab-ab-ab-ab-ab-ab",
++			`{"type":"hysteria2","server":"example.com","server_port":443,"password":"p","tls":{"enabled":true,"certificate_sha256":"q6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6s="}}`,
+ 			nil,
+ 		},
++		"naive: a pin and vcn are not for Cronet": {
++			"naive+https://u:p@example.org?pcs=abababababababababababababababababababababababababababababababab&vcn=b.example.org",
++			`{"type":"naive","server":"example.org","server_port":443,"username":"u","password":"p","tls":{"enabled":true}}`,
++			[]string{"naive verifies the certificate by the server name only"},
++		},
+ 		"ECH configuration": {
+ 			policyBase + "security=tls&ech=AEX+DQBBFQAgACDcTtW6VmPQkAvAnqIbGkSmKuOO+GbBdXvKkcOIAfS0PAAEAAEAAQASY2xvdWRmbGFyZS1lY2guY29tAAA=",
+ 			`{"type":"vless","server":"example.org","server_port":443,"uuid":"` + testUUID + `","tls":{"enabled":true,"utls":{"enabled":true,"fingerprint":"chrome"},
+diff --git a/common/sharelink/testdata/options-1.14.txt b/common/sharelink/testdata/options-1.14.txt
+index 2e13c281f..7328e1a81 100644
+--- a/common/sharelink/testdata/options-1.14.txt
++++ b/common/sharelink/testdata/options-1.14.txt
+@@ -31,6 +31,7 @@ anytls tls.alpn sb
+ anytls tls.certificate sb
+ anytls tls.certificate_path denied: a local file
+ anytls tls.certificate_public_key_sha256 sb
++anytls tls.certificate_server_name sb
+ anytls tls.certificate_sha256 sb
+ anytls tls.cipher_suites sb
+ anytls tls.client_certificate sb
+@@ -96,6 +97,7 @@ http tls.alpn sb
+ http tls.certificate sb
+ http tls.certificate_path denied: a local file
+ http tls.certificate_public_key_sha256 sb
++http tls.certificate_server_name sb
+ http tls.certificate_sha256 sb
+ http tls.cipher_suites sb
+ http tls.client_certificate sb
+@@ -177,6 +179,7 @@ hysteria tls.alpn sb
+ hysteria tls.certificate sb
+ hysteria tls.certificate_path denied: a local file
+ hysteria tls.certificate_public_key_sha256 sb
++hysteria tls.certificate_server_name sb
+ hysteria tls.certificate_sha256 sb
+ hysteria tls.cipher_suites sb
+ hysteria tls.client_certificate sb
+@@ -262,6 +265,7 @@ hysteria2 tls.alpn sb
+ hysteria2 tls.certificate sb
+ hysteria2 tls.certificate_path denied: a local file
+ hysteria2 tls.certificate_public_key_sha256 sb
++hysteria2 tls.certificate_server_name sb
+ hysteria2 tls.certificate_sha256 sb
+ hysteria2 tls.cipher_suites sb
+ hysteria2 tls.client_certificate sb
+@@ -332,6 +336,7 @@ naive tls.alpn sb
+ naive tls.certificate sb
+ naive tls.certificate_path denied: a local file
+ naive tls.certificate_public_key_sha256 sb
++naive tls.certificate_server_name sb
+ naive tls.certificate_sha256 sb
+ naive tls.cipher_suites sb
+ naive tls.client_certificate sb
+@@ -480,6 +485,7 @@ trojan tls.alpn sb
+ trojan tls.certificate sb
+ trojan tls.certificate_path denied: a local file
+ trojan tls.certificate_public_key_sha256 sb
++trojan tls.certificate_server_name sb
+ trojan tls.certificate_sha256 sb
+ trojan tls.cipher_suites sb
+ trojan tls.client_certificate sb
+@@ -536,6 +542,7 @@ trojan transport.download.tls.alpn sb
+ trojan transport.download.tls.certificate sb
+ trojan transport.download.tls.certificate_path denied: a local file
+ trojan transport.download.tls.certificate_public_key_sha256 sb
++trojan transport.download.tls.certificate_server_name sb
+ trojan transport.download.tls.certificate_sha256 sb
+ trojan transport.download.tls.cipher_suites sb
+ trojan transport.download.tls.client_certificate sb
+@@ -666,6 +673,7 @@ tuic tls.alpn sb
+ tuic tls.certificate sb
+ tuic tls.certificate_path denied: a local file
+ tuic tls.certificate_public_key_sha256 sb
++tuic tls.certificate_server_name sb
+ tuic tls.certificate_sha256 sb
+ tuic tls.cipher_suites sb
+ tuic tls.client_certificate sb
+@@ -745,6 +753,7 @@ vless tls.alpn sb
+ vless tls.certificate sb
+ vless tls.certificate_path denied: a local file
+ vless tls.certificate_public_key_sha256 sb
++vless tls.certificate_server_name sb
+ vless tls.certificate_sha256 sb
+ vless tls.cipher_suites sb
+ vless tls.client_certificate sb
+@@ -801,6 +810,7 @@ vless transport.download.tls.alpn sb
+ vless transport.download.tls.certificate sb
+ vless transport.download.tls.certificate_path denied: a local file
+ vless transport.download.tls.certificate_public_key_sha256 sb
++vless transport.download.tls.certificate_server_name sb
+ vless transport.download.tls.certificate_sha256 sb
+ vless transport.download.tls.cipher_suites sb
+ vless transport.download.tls.client_certificate sb
+@@ -936,6 +946,7 @@ vmess tls.alpn sb
+ vmess tls.certificate sb
+ vmess tls.certificate_path denied: a local file
+ vmess tls.certificate_public_key_sha256 sb
++vmess tls.certificate_server_name sb
+ vmess tls.certificate_sha256 sb
+ vmess tls.cipher_suites sb
+ vmess tls.client_certificate sb
+@@ -992,6 +1003,7 @@ vmess transport.download.tls.alpn sb
+ vmess transport.download.tls.certificate sb
+ vmess transport.download.tls.certificate_path denied: a local file
+ vmess transport.download.tls.certificate_public_key_sha256 sb
++vmess transport.download.tls.certificate_server_name sb
+ vmess transport.download.tls.certificate_sha256 sb
+ vmess transport.download.tls.cipher_suites sb
+ vmess transport.download.tls.client_certificate sb
+diff --git a/common/sharelink/tls.go b/common/sharelink/tls.go
+index c20238128..bce563942 100644
+--- a/common/sharelink/tls.go
++++ b/common/sharelink/tls.go
+@@ -90,26 +90,8 @@ func (d *decoder) tlsCommon(tlsOptions *option.OutboundTLSOptions, reality bool)
+ 		tlsOptions.Certificate = strings.Split(strings.ReplaceAll(certificate, "\r\n", "\n"), "\n")
+ 	}
+ 	tlsOptions.ECH = d.ech()
+-	if pins := d.first("pcs", "pinsha256"); pins != "" && !reality && !tlsOptions.Insecure && len(tlsOptions.Certificate) == 0 {
+-		// Xray (pinnedPeerCertSha256) and Hysteria pin the SHA-256 of the whole certificate,
+-		// as certificate_sha256 does: a server whose certificate has one of them is taken
+-		// without the system roots, a self-signed one too
+-		hashes, err := certificateHashes(pins)
+-		if err != nil {
+-			d.warn("the pinned certificate (pcs, pinSHA256) cannot be read and is ignored (", err.Error(), "): the server is verified against the system roots")
+-		} else {
+-			tlsOptions.CertificateSHA256 = hashes
+-		}
+-	}
+-	if names := splitList(d.query["vcn"]); len(names) > 0 && !tlsOptions.Insecure {
+-		// Xray verifies the certificate by these names instead of the one it sends
+-		same := false
+-		for _, name := range names {
+-			same = same || strings.EqualFold(name, tlsOptions.ServerName)
+-		}
+-		if !same {
+-			d.warn("vcn (the names the certificate is verified by) is not supported: the certificate is verified by the server name of TLS, and a server with a certificate for another name is refused")
+-		}
++	if !reality {
++		d.verification(tlsOptions, d.first("pcs", "pinsha256"), d.query["vcn"])
+ 	}
+ 	if d.query["cs"] != "" {
+ 		d.warn("cs (the cipher suites of TLS) is not supported and is ignored")
+@@ -210,10 +192,43 @@ func (d *decoder) tlsAlways() *option.OutboundTLSOptions {
+ // certificateHashes reads the pins of Xray's pcs and Hysteria's pinSHA256: SHA-256 hashes in
+ // hexadecimal, with or without colons, separated by commas (infra/conf of Xray-core). The
+ // message names no hash: a pin is part of the link.
++// verification reads how Xray and Hysteria verify the server's certificate, as this engine
++// verifies it too (podkop-engine, 0702): pins (pcs, pinnedPeerCertSha256 of Xray; pinSHA256 of
++// Hysteria) are the SHA-256 of a whole certificate, the leaf or a CA of the chain, as
++// certificate_sha256 takes them; the pin is the check, with insecure as well (Hysteria checks it
++// then, and Xray no longer has insecure). vcn (verifyPeerCertByName) names what the certificate
++// is verified by instead of the name sent, as certificate_server_name does. With a certificate of
++// the link a pin is not taken: that certificate is the root.
++func (d *decoder) verification(tlsOptions *option.OutboundTLSOptions, pins string, names string) {
++	if pins != "" && len(tlsOptions.Certificate) == 0 {
++		hashes, err := certificateHashes(pins)
++		if err != nil {
++			if tlsOptions.Insecure {
++				d.warn("the pinned certificate (pcs, pinSHA256) cannot be read and is ignored (", err.Error(), "): the server is not verified")
++			} else {
++				d.warn("the pinned certificate (pcs, pinSHA256) cannot be read and is ignored (", err.Error(), "): the server is verified against the system roots")
++			}
++		} else {
++			tlsOptions.CertificateSHA256 = hashes
++			tlsOptions.Insecure = false
++		}
++	}
++	if list := splitList(names); len(list) > 0 && !tlsOptions.Insecure {
++		same := true
++		for _, name := range list {
++			same = same && strings.EqualFold(name, tlsOptions.ServerName)
++		}
++		if !same {
++			tlsOptions.CertificateServerName = list
++		}
++	}
++}
++
+ func certificateHashes(text string) (badoption.Listable[[]byte], error) {
+ 	var hashes badoption.Listable[[]byte]
+ 	for _, entry := range strings.Split(text, ",") {
+-		entry = strings.ReplaceAll(strings.TrimSpace(entry), ":", "")
++		// OpenSSL's colons; Hysteria takes dashes too
++		entry = strings.NewReplacer(":", "", "-", "").Replace(strings.TrimSpace(entry))
+ 		if entry == "" {
+ 			continue
+ 		}
+diff --git a/common/sharelink/tlsproxy.go b/common/sharelink/tlsproxy.go
+index ad69de09f..c4cea4560 100644
+--- a/common/sharelink/tlsproxy.go
++++ b/common/sharelink/tlsproxy.go
+@@ -59,5 +59,11 @@ func (d *decoder) naive() (any, error) {
+ 		}
+ 	}
+ 	options.TLS = d.tlsAlways()
++	if len(options.TLS.CertificateSHA256) > 0 || len(options.TLS.CertificateServerName) > 0 {
++		// Cronet verifies by the server name against its roots: the naive outbound refuses both
++		d.warn("naive verifies the certificate by the server name only: the pinned certificate (pcs, pinSHA256) and vcn are not used")
++		options.TLS.CertificateSHA256 = nil
++		options.TLS.CertificateServerName = nil
++	}
+ 	return options, nil
+ }
+diff --git a/common/sharelink/xhttp.go b/common/sharelink/xhttp.go
+index ebdb330c0..a9ff1d23d 100644
+--- a/common/sharelink/xhttp.go
++++ b/common/sharelink/xhttp.go
+@@ -77,10 +77,13 @@ type xrayStream struct {
+ }
+ 
+ type xrayTLS struct {
+-	AllowInsecure bool           `json:"allowInsecure"`
+-	ServerName    string         `json:"serverName"`
+-	ALPN          xrayStringList `json:"alpn"`
+-	Fingerprint   string         `json:"fingerprint"`
++	AllowInsecure bool `json:"allowInsecure"`
++	// pcs and vcn of the download's own TLS
++	PinnedPeerCertSha256 string         `json:"pinnedPeerCertSha256"`
++	VerifyPeerCertByName string         `json:"verifyPeerCertByName"`
++	ServerName           string         `json:"serverName"`
++	ALPN                 xrayStringList `json:"alpn"`
++	Fingerprint          string         `json:"fingerprint"`
+ }
+ 
+ type xrayREALITY struct {
+@@ -432,6 +435,7 @@ func (d *decoder) xhttpDownload(content []byte) (*option.V2RayXHTTPDownloadOptio
+ 			Insecure:   tlsSettings.AllowInsecure,
+ 			ALPN:       badoption.Listable[string](tlsSettings.ALPN),
+ 		}
++		d.verification(options.TLS, tlsSettings.PinnedPeerCertSha256, tlsSettings.VerifyPeerCertByName)
+ 		options.TLS.UTLS, err = d.utlsOf(tlsSettings.Fingerprint, false)
+ 		if err != nil {
+ 			return nil, E.Cause(err, name)
+diff --git a/common/tls/certificate_server_name.go b/common/tls/certificate_server_name.go
+new file mode 100644
+index 000000000..af0a1e90b
+--- /dev/null
++++ b/common/tls/certificate_server_name.go
+@@ -0,0 +1,132 @@
++package tls
++
++import (
++	"bytes"
++	"crypto/sha256"
++	"crypto/x509"
++	"slices"
++	"strings"
++	"time"
++
++	"github.com/sagernet/sing-box/option"
++	E "github.com/sagernet/sing/common/exceptions"
++)
++
++// checkCertificateServerName refuses certificate_server_name with insecure, which skips the
++// verification it is for, and an empty name (podkop-engine).
++func checkCertificateServerName(options option.OutboundTLSOptions) error {
++	if len(options.CertificateServerName) == 0 {
++		return nil
++	}
++	if options.Insecure {
++		return E.New("certificate_server_name is conflict with insecure")
++	}
++	for _, name := range options.CertificateServerName {
++		if strings.TrimSpace(name) == "" {
++			return E.New("certificate_server_name has an empty name")
++		}
++	}
++	return nil
++}
++
++// peerVerifier verifies the server's certificate the way Xray's client does (podkop-engine;
++// transport/internet/tls/config.go, verifyPeerCert and verifyChain), when a pin or
++// certificate_server_name is set:
++//   - a pinned leaf (certificate_sha256 or certificate_public_key_sha256) is taken by itself,
++//     whatever its names and its issuer are, as upstream's VerifyPinnedCertificate takes it;
++//   - a pinned certificate above the leaf that is a CA becomes the only root: the chain is
++//     verified to it (a pin that lives through the renewals of the leaf);
++//   - the names verified are those of certificate_server_name, or the server name; the
++//     handshake still sends the server name.
++//
++// Without a pin, the roots are the configured ones (the system's, or those of certificate).
++type peerVerifier struct {
++	roots             *x509.CertPool
++	timeFunc          func() time.Time
++	certificateHashes [][]byte
++	publicKeyHashes   [][]byte
++	names             []string
++}
++
++// newPeerVerifier returns nil when the default verification stands: neither a pin nor
++// certificate_server_name.
++func newPeerVerifier(options option.OutboundTLSOptions, roots *x509.CertPool, timeFunc func() time.Time) *peerVerifier {
++	if len(options.CertificateSHA256) == 0 && len(options.CertificatePublicKeySHA256) == 0 && len(options.CertificateServerName) == 0 {
++		return nil
++	}
++	return &peerVerifier{
++		roots:             roots,
++		timeFunc:          timeFunc,
++		certificateHashes: options.CertificateSHA256,
++		publicKeyHashes:   options.CertificatePublicKeySHA256,
++		names:             options.CertificateServerName,
++	}
++}
++
++// forName is the VerifyPeerCertificate of a connection to serverName.
++func (v *peerVerifier) forName(serverName string) func(rawCerts [][]byte, verifiedChains [][]*x509.Certificate) error {
++	return func(rawCerts [][]byte, verifiedChains [][]*x509.Certificate) error {
++		return v.verify(rawCerts, serverName)
++	}
++}
++
++func (v *peerVerifier) verify(rawCerts [][]byte, serverName string) error {
++	if len(rawCerts) == 0 {
++		return E.New("missing peer certificate")
++	}
++	roots := v.roots
++	if len(v.certificateHashes) > 0 || len(v.publicKeyHashes) > 0 {
++		pinErr := VerifyPinnedCertificate(v.certificateHashes, v.publicKeyHashes, rawCerts)
++		if pinErr == nil {
++			return nil
++		}
++		authority := v.pinnedAuthority(rawCerts[1:])
++		if authority == nil {
++			return pinErr
++		}
++		roots = x509.NewCertPool()
++		roots.AddCert(authority)
++	}
++	names := v.names
++	if len(names) == 0 {
++		if serverName == "" {
++			return E.New("a pinned certificate authority needs a server name to verify by")
++		}
++		names = []string{serverName}
++	}
++	certificates := make([]*x509.Certificate, 0, len(rawCerts))
++	for _, rawCert := range rawCerts {
++		certificate, err := x509.ParseCertificate(rawCert)
++		if err != nil {
++			return E.Cause(err, "parse peer certificate")
++		}
++		certificates = append(certificates, certificate)
++	}
++	var lastErr error
++	for _, name := range names {
++		lastErr = verifySystemTLSPeer(roots, name, v.timeFunc, certificates)
++		if lastErr == nil {
++			return nil
++		}
++	}
++	if len(v.names) > 0 {
++		return E.Cause(lastErr, "verify the certificate for certificate_server_name")
++	}
++	return E.Cause(lastErr, "verify the certificate against the pinned certificate authority")
++}
++
++// pinnedAuthority finds the certificate of the chain above the leaf whose certificate_sha256 is
++// pinned and that is a CA (Xray's foundCA).
++func (v *peerVerifier) pinnedAuthority(rawCerts [][]byte) *x509.Certificate {
++	for _, rawCert := range rawCerts {
++		hash := sha256.Sum256(rawCert)
++		if !slices.ContainsFunc(v.certificateHashes, func(value []byte) bool { return bytes.Equal(value, hash[:]) }) {
++			continue
++		}
++		certificate, err := x509.ParseCertificate(rawCert)
++		if err == nil && certificate.IsCA {
++			return certificate
++		}
++	}
++	return nil
++}
+diff --git a/common/tls/certificate_server_name_test.go b/common/tls/certificate_server_name_test.go
+new file mode 100644
+index 000000000..47f7c5c96
+--- /dev/null
++++ b/common/tls/certificate_server_name_test.go
+@@ -0,0 +1,187 @@
++package tls
++
++import (
++	"context"
++	"crypto/ecdsa"
++	"crypto/elliptic"
++	"crypto/rand"
++	"crypto/sha256"
++	stdtls "crypto/tls"
++	"crypto/x509"
++	"crypto/x509/pkix"
++	"encoding/pem"
++	"math/big"
++	"sync"
++	"testing"
++	"time"
++
++	"github.com/sagernet/sing-box/option"
++	"github.com/sagernet/sing/common/json/badoption"
++	"github.com/sagernet/sing/common/logger"
++
++	"github.com/stretchr/testify/require"
++)
++
++// sniRecorder keeps the server names the test server was asked for.
++type sniRecorder struct {
++	access sync.Mutex
++	names  []string
++}
++
++func (r *sniRecorder) config(certificate stdtls.Certificate) *stdtls.Config {
++	return &stdtls.Config{
++		Certificates: []stdtls.Certificate{certificate},
++		GetConfigForClient: func(hello *stdtls.ClientHelloInfo) (*stdtls.Config, error) {
++			r.access.Lock()
++			r.names = append(r.names, hello.ServerName)
++			r.access.Unlock()
++			return nil, nil
++		},
++	}
++}
++
++func (r *sniRecorder) last() string {
++	r.access.Lock()
++	defer r.access.Unlock()
++	if len(r.names) == 0 {
++		return "<none>"
++	}
++	return r.names[len(r.names)-1]
++}
++
++// testAuthority is a CA and a leaf for real.example it signed: the chain a server sends.
++type testAuthority struct {
++	certificate *x509.Certificate
++	leaf        stdtls.Certificate
++	pem         string
++}
++
++func newTestAuthority(t *testing.T) testAuthority {
++	t.Helper()
++	caKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
++	require.NoError(t, err)
++	caTemplate := &x509.Certificate{
++		SerialNumber: big.NewInt(1), Subject: pkix.Name{CommonName: "test CA"},
++		NotBefore: time.Now().Add(-time.Hour), NotAfter: time.Now().Add(time.Hour),
++		IsCA: true, BasicConstraintsValid: true, KeyUsage: x509.KeyUsageCertSign | x509.KeyUsageDigitalSignature,
++	}
++	caDER, err := x509.CreateCertificate(rand.Reader, caTemplate, caTemplate, &caKey.PublicKey, caKey)
++	require.NoError(t, err)
++	ca, err := x509.ParseCertificate(caDER)
++	require.NoError(t, err)
++	leafKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
++	require.NoError(t, err)
++	leafTemplate := &x509.Certificate{
++		SerialNumber: big.NewInt(2), Subject: pkix.Name{CommonName: "real.example"}, DNSNames: []string{"real.example"},
++		NotBefore: time.Now().Add(-time.Hour), NotAfter: time.Now().Add(time.Hour),
++		KeyUsage: x509.KeyUsageDigitalSignature, ExtKeyUsage: []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
++	}
++	leafDER, err := x509.CreateCertificate(rand.Reader, leafTemplate, ca, &leafKey.PublicKey, caKey)
++	require.NoError(t, err)
++	return testAuthority{
++		certificate: ca,
++		leaf:        stdtls.Certificate{Certificate: [][]byte{leafDER, caDER}, PrivateKey: leafKey},
++		pem:         string(pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: caDER})),
++	}
++}
++
++// testCertificateServerName dials a server whose certificate is for real.example by the name
++// front.example: verified by the server name it is refused, by certificate_server_name it is
++// taken when one of the names is that of the certificate, and the handshake still sends
++// front.example.
++func testCertificateServerName(t *testing.T, utls *option.OutboundUTLSOptions) {
++	serverCertificate := newPinnedTestCertificate(t, "real.example")
++	recorder := &sniRecorder{}
++	serverConfig := recorder.config(serverCertificate.Certificate)
++	base := func() option.OutboundTLSOptions {
++		return option.OutboundTLSOptions{
++			Enabled:     true,
++			ServerName:  "front.example",
++			Certificate: badoption.Listable[string]{serverCertificate.certificatePEM},
++			UTLS:        utls,
++		}
++	}
++
++	require.Error(t, dialPinnedTestServer(t, serverConfig, base()), "verified by the server name")
++	require.Equal(t, "front.example", recorder.last())
++
++	options := base()
++	options.CertificateServerName = badoption.Listable[string]{"other.example", "real.example"}
++	require.NoError(t, dialPinnedTestServer(t, serverConfig, options), "one of the names is the certificate's")
++	require.Equal(t, "front.example", recorder.last(), "the server name is still sent")
++
++	options = base()
++	options.CertificateServerName = badoption.Listable[string]{"wrong.example"}
++	require.ErrorContains(t, dialPinnedTestServer(t, serverConfig, options), "certificate_server_name", "none of the names is the certificate's")
++
++	options = base()
++	options.CertificateServerName = badoption.Listable[string]{"real.example"}
++	options.Certificate = nil
++	require.ErrorContains(t, dialPinnedTestServer(t, serverConfig, options), "certificate_server_name", "the chain is still verified: the system roots do not have it")
++
++	options = base()
++	options.DisableSNI = true
++	options.CertificateServerName = badoption.Listable[string]{"real.example"}
++	require.NoError(t, dialPinnedTestServer(t, serverConfig, options), "without SNI, verified by the names")
++	require.Equal(t, "", recorder.last())
++
++	options = base()
++	options.DisableSNI = true
++	options.CertificateServerName = badoption.Listable[string]{"wrong.example"}
++	require.ErrorContains(t, dialPinnedTestServer(t, serverConfig, options), "certificate_server_name", "without SNI, a wrong name is refused")
++}
++
++// testPinnedAuthority: a pin of the CA in the chain, as Xray takes pinnedPeerCertSha256, and
++// a pinned self-signed leaf without SNI.
++func testPinnedAuthority(t *testing.T, utls *option.OutboundUTLSOptions) {
++	authority := newTestAuthority(t)
++	serverConfig := &stdtls.Config{Certificates: []stdtls.Certificate{authority.leaf}}
++	caHash := sha256.Sum256(authority.certificate.Raw)
++	otherHash := sha256.Sum256([]byte("another certificate"))
++	pinned := func(serverName string, names ...string) option.OutboundTLSOptions {
++		return option.OutboundTLSOptions{
++			Enabled: true, ServerName: serverName, UTLS: utls,
++			CertificateSHA256:     badoption.Listable[[]byte]{otherHash[:], caHash[:]},
++			CertificateServerName: names,
++		}
++	}
++	require.NoError(t, dialPinnedTestServer(t, serverConfig, pinned("real.example")), "the chain verified to the pinned CA by the server name")
++	require.ErrorContains(t, dialPinnedTestServer(t, serverConfig, pinned("front.example")), "pinned certificate authority", "the pinned CA, but not the name")
++	require.NoError(t, dialPinnedTestServer(t, serverConfig, pinned("front.example", "real.example")), "the pinned CA and certificate_server_name")
++
++	options := pinned("real.example")
++	options.CertificateSHA256 = badoption.Listable[[]byte]{otherHash[:]}
++	require.ErrorContains(t, dialPinnedTestServer(t, serverConfig, options), "unrecognized peer certificate", "no certificate of the chain is pinned")
++
++	// a pinned self-signed leaf is taken whatever its name, with or without SNI
++	selfSigned := newPinnedTestCertificate(t, "localhost")
++	leafHash := sha256.Sum256(selfSigned.Leaf.Raw)
++	selfConfig := &stdtls.Config{Certificates: []stdtls.Certificate{selfSigned.Certificate}}
++	for _, disableSNI := range []bool{false, true} {
++		require.NoError(t, dialPinnedTestServer(t, selfConfig, option.OutboundTLSOptions{
++			Enabled: true, ServerName: "front.example", DisableSNI: disableSNI, UTLS: utls,
++			CertificateSHA256: badoption.Listable[[]byte]{leafHash[:]},
++		}), "a pinned leaf, disable_sni %v", disableSNI)
++	}
++}
++
++func TestClientCertificateServerName(t *testing.T) {
++	t.Parallel()
++	testCertificateServerName(t, nil)
++}
++
++func TestClientPinnedAuthority(t *testing.T) {
++	t.Parallel()
++	testPinnedAuthority(t, nil)
++}
++
++func TestCertificateServerNameConflicts(t *testing.T) {
++	t.Parallel()
++	for name, options := range map[string]option.OutboundTLSOptions{
++		"insecure":      {Enabled: true, ServerName: "a.example", Insecure: true, CertificateServerName: badoption.Listable[string]{"b.example"}},
++		"an empty name": {Enabled: true, ServerName: "a.example", CertificateServerName: badoption.Listable[string]{" "}},
++	} {
++		_, err := NewClientWithOptions(ClientOptions{Context: context.Background(), Logger: logger.NOP(), Options: options})
++		require.ErrorContains(t, err, "certificate_server_name", name)
++	}
++}
+diff --git a/common/tls/certificate_server_name_utls_test.go b/common/tls/certificate_server_name_utls_test.go
+new file mode 100644
+index 000000000..f76cc1b4a
+--- /dev/null
++++ b/common/tls/certificate_server_name_utls_test.go
+@@ -0,0 +1,36 @@
++//go:build with_utls
++
++package tls
++
++import (
++	"context"
++	"testing"
++
++	"github.com/sagernet/sing-box/option"
++	"github.com/sagernet/sing/common/json/badoption"
++	"github.com/sagernet/sing/common/logger"
++
++	"github.com/stretchr/testify/require"
++)
++
++func TestUTLSClientCertificateServerName(t *testing.T) {
++	t.Parallel()
++	testCertificateServerName(t, &option.OutboundUTLSOptions{Enabled: true, Fingerprint: "chrome"})
++}
++
++func TestUTLSClientPinnedAuthority(t *testing.T) {
++	t.Parallel()
++	testPinnedAuthority(t, &option.OutboundUTLSOptions{Enabled: true, Fingerprint: "chrome"})
++}
++
++func TestRealityRefusesCertificateServerName(t *testing.T) {
++	t.Parallel()
++	_, err := NewClientWithOptions(ClientOptions{Context: context.Background(), Logger: logger.NOP(), Options: option.OutboundTLSOptions{
++		Enabled:               true,
++		ServerName:            "a.example",
++		UTLS:                  &option.OutboundUTLSOptions{Enabled: true, Fingerprint: "chrome"},
++		Reality:               &option.OutboundRealityOptions{Enabled: true, PublicKey: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"},
++		CertificateServerName: badoption.Listable[string]{"b.example"},
++	}})
++	require.ErrorContains(t, err, "certificate_server_name is unavailable in reality")
++}
+diff --git a/common/tls/reality_client.go b/common/tls/reality_client.go
+index 82d390c57..5536ea150 100644
+--- a/common/tls/reality_client.go
++++ b/common/tls/reality_client.go
+@@ -134,6 +134,10 @@ func newRealityClient(ctx context.Context, logger logger.ContextLogger, serverAd
+ 	if options.UTLS == nil || !options.UTLS.Enabled {
+ 		return nil, E.New("uTLS is required by reality client")
+ 	}
++	// REALITY checks the server by its own key, not by a certificate's names (podkop-engine)
++	if len(options.CertificateServerName) > 0 {
++		return nil, E.New("certificate_server_name is unavailable in reality")
++	}
+ 
+ 	classicFingerprint, err := checkRealityFingerprint(options.UTLS.Fingerprint)
+ 	if err != nil {
+diff --git a/common/tls/std_client.go b/common/tls/std_client.go
+index 2897d9688..3b1398ce9 100644
+--- a/common/tls/std_client.go
++++ b/common/tls/std_client.go
+@@ -35,6 +35,9 @@ type STDClientConfig struct {
+ 	recordFragment        bool
+ 	spoof                 string
+ 	spoofMethod           tlsspoof.Method
++	// how the server's certificate is verified with a pin or certificate_server_name (nil: as
++	// crypto/tls does)
++	verifier *peerVerifier
+ }
+ 
+ func (c *STDClientConfig) ServerName() string {
+@@ -43,6 +46,9 @@ func (c *STDClientConfig) ServerName() string {
+ 
+ func (c *STDClientConfig) SetServerName(serverName string) {
+ 	c.serverName = serverName
++	if c.verifier != nil {
++		c.config.VerifyPeerCertificate = c.verifier.forName(serverName)
++	}
+ 	if c.disableSNI {
+ 		c.config.ServerName = ""
+ 		if c.verifyServerName {
+@@ -99,6 +105,7 @@ func (c *STDClientConfig) Clone() Config {
+ 		recordFragment:        c.recordFragment,
+ 		spoof:                 c.spoof,
+ 		spoofMethod:           c.spoofMethod,
++		verifier:              c.verifier,
+ 	}
+ 	cloned.SetServerName(cloned.serverName)
+ 	return cloned
+@@ -126,6 +133,10 @@ func newSTDClient(ctx context.Context, logger logger.ContextLogger, serverAddres
+ 	if serverName == "" && !options.Insecure && !allowEmptyServerName {
+ 		return nil, errMissingServerName
+ 	}
++	err := checkCertificateServerName(options)
++	if err != nil {
++		return nil, err
++	}
+ 
+ 	var tlsConfig tls.Config
+ 	tlsConfig.Time = ntp.TimeFuncFromContext(ctx)
+@@ -193,6 +204,12 @@ func newSTDClient(ctx context.Context, logger logger.ContextLogger, serverAddres
+ 		}
+ 		tlsConfig.RootCAs = certPool
+ 	}
++	// a pin or certificate_server_name: the verification of Xray's client, set per server name
++	// in SetServerName (podkop-engine)
++	verifier := newPeerVerifier(options, tlsConfig.RootCAs, tlsConfig.Time)
++	if verifier != nil {
++		tlsConfig.InsecureSkipVerify = true
++	}
+ 	var clientCertificate []byte
+ 	if len(options.ClientCertificate) > 0 {
+ 		clientCertificate = []byte(strings.Join(options.ClientCertificate, "\n"))
+@@ -237,7 +254,8 @@ func newSTDClient(ctx context.Context, logger logger.ContextLogger, serverAddres
+ 		config:                &tlsConfig,
+ 		serverName:            serverName,
+ 		disableSNI:            options.DisableSNI,
+-		verifyServerName:      options.DisableSNI && !options.Insecure,
++		verifyServerName:      options.DisableSNI && !options.Insecure && verifier == nil,
++		verifier:              verifier,
+ 		handshakeTimeout:      handshakeTimeout,
+ 		fragment:              options.Fragment,
+ 		fragmentFallbackDelay: time.Duration(options.FragmentFallbackDelay),
+diff --git a/common/tls/system_client.go b/common/tls/system_client.go
+index 559df943c..000841363 100644
+--- a/common/tls/system_client.go
++++ b/common/tls/system_client.go
+@@ -52,6 +52,9 @@ func ValidateSystemTLSOptions(ctx context.Context, options option.OutboundTLSOpt
+ 	if options.Spoof != "" || options.SpoofMethod != "" {
+ 		return SystemTLSValidated{}, E.New("spoof is unsupported in ", engineName)
+ 	}
++	if len(options.CertificateServerName) > 0 {
++		return SystemTLSValidated{}, E.New("certificate_server_name is unsupported in ", engineName)
++	}
+ 	if (len(options.CertificateSHA256) > 0 || len(options.CertificatePublicKeySHA256) > 0) && (len(options.Certificate) > 0 || options.CertificatePath != "") {
+ 		return SystemTLSValidated{}, E.New("certificate_sha256 or certificate_public_key_sha256 is conflict with certificate or certificate_path")
+ 	}
+diff --git a/common/tls/utls_client.go b/common/tls/utls_client.go
+index 154df09a7..39144be68 100644
+--- a/common/tls/utls_client.go
++++ b/common/tls/utls_client.go
+@@ -43,6 +43,9 @@ type UTLSClientConfig struct {
+ 	fallback *utlsFallback
+ 	// the ClientHello without the X25519MLKEM768 key share: a candidate of the fallback
+ 	noMLKEM bool
++	// how the server's certificate is verified with a pin or certificate_server_name (nil: as
++	// uTLS does)
++	verifier *peerVerifier
+ }
+ 
+ func (c *UTLSClientConfig) ServerName() string {
+@@ -51,6 +54,9 @@ func (c *UTLSClientConfig) ServerName() string {
+ 
+ func (c *UTLSClientConfig) SetServerName(serverName string) {
+ 	c.serverName = serverName
++	if c.verifier != nil {
++		c.config.VerifyPeerCertificate = c.verifier.forName(serverName)
++	}
+ 	if c.disableSNI {
+ 		c.config.ServerName = ""
+ 		if c.verifyServerName {
+@@ -121,6 +127,7 @@ func (c *UTLSClientConfig) Clone() Config {
+ 		spoofMethod:           c.spoofMethod,
+ 		fallback:              c.fallback,
+ 		noMLKEM:               c.noMLKEM,
++		verifier:              c.verifier,
+ 	}
+ 	cloned.SetServerName(cloned.serverName)
+ 	return cloned
+@@ -242,6 +249,10 @@ func newUTLSClient(ctx context.Context, logger logger.ContextLogger, serverAddre
+ 	if serverName == "" && !options.Insecure && !allowEmptyServerName {
+ 		return nil, errMissingServerName
+ 	}
++	err := checkCertificateServerName(options)
++	if err != nil {
++		return nil, err
++	}
+ 
+ 	var tlsConfig utls.Config
+ 	tlsConfig.Time = ntp.TimeFuncFromContext(ctx)
+@@ -308,6 +319,12 @@ func newUTLSClient(ctx context.Context, logger logger.ContextLogger, serverAddre
+ 		}
+ 		tlsConfig.RootCAs = certPool
+ 	}
++	// a pin or certificate_server_name: the verification of Xray's client, set per server name
++	// in SetServerName (podkop-engine)
++	verifier := newPeerVerifier(options, tlsConfig.RootCAs, tlsConfig.Time)
++	if verifier != nil {
++		tlsConfig.InsecureSkipVerify = true
++	}
+ 	var clientCertificate []byte
+ 	if len(options.ClientCertificate) > 0 {
+ 		clientCertificate = []byte(strings.Join(options.ClientCertificate, "\n"))
+@@ -356,7 +373,8 @@ func newUTLSClient(ctx context.Context, logger logger.ContextLogger, serverAddre
+ 		config:                &tlsConfig,
+ 		serverName:            serverName,
+ 		disableSNI:            options.DisableSNI,
+-		verifyServerName:      options.DisableSNI && !options.Insecure,
++		verifyServerName:      options.DisableSNI && !options.Insecure && verifier == nil,
++		verifier:              verifier,
+ 		handshakeTimeout:      handshakeTimeout,
+ 		id:                    id,
+ 		fragment:              options.Fragment,
+diff --git a/option/tls.go b/option/tls.go
+index 414253361..7ad978502 100644
+--- a/option/tls.go
++++ b/option/tls.go
+@@ -120,6 +120,7 @@ type OutboundTLSOptions struct {
+ 	CertificatePath            string                              `json:"certificate_path,omitempty"`
+ 	CertificateSHA256          badoption.Listable[[]byte]          `json:"certificate_sha256,omitempty"`
+ 	CertificatePublicKeySHA256 badoption.Listable[[]byte]          `json:"certificate_public_key_sha256,omitempty"`
++	CertificateServerName      badoption.Listable[string]          `json:"certificate_server_name,omitempty"`
+ 	ClientCertificate          badoption.Listable[string]          `json:"client_certificate,omitempty"`
+ 	ClientCertificatePath      string                              `json:"client_certificate_path,omitempty"`
+ 	ClientKey                  badoption.Listable[string]          `json:"client_key,omitempty"`
+diff --git a/protocol/naive/outbound.go b/protocol/naive/outbound.go
+index c89d4bc48..fb4ee0460 100644
+--- a/protocol/naive/outbound.go
++++ b/protocol/naive/outbound.go
+@@ -86,6 +86,14 @@ func NewOutbound(ctx context.Context, router adapter.Router, logger log.ContextL
+ 	if options.TLS.Reality != nil && options.TLS.Reality.Enabled {
+ 		return nil, E.New("reality is not supported on naive outbound")
+ 	}
++	// Cronet verifies by the server name against its roots: a pin or other names would be left
++	// unused (podkop-engine)
++	if len(options.TLS.CertificateSHA256) > 0 || len(options.TLS.CertificatePublicKeySHA256) > 0 {
++		return nil, E.New("certificate_sha256 and certificate_public_key_sha256 are not supported on naive outbound")
++	}
++	if len(options.TLS.CertificateServerName) > 0 {
++		return nil, E.New("certificate_server_name is not supported on naive outbound")
++	}
+ 
+ 	serverAddress := options.ServerOptions.Build()
+ 
+-- 
+2.53.0
+

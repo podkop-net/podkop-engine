@@ -1,7 +1,7 @@
-From 6fae67a14cae1c25a9427b260d53e8581f1e2573 Mon Sep 17 00:00:00 2001
+From 25505840afead52f572cef0560c95903f8926067 Mon Sep 17 00:00:00 2001
 From: FiyeroT <me@fiyero.xyz>
 Date: Thu, 12 Nov 2026 21:41:21 +0300
-Subject: [PATCH 45/66] urltest: the group of this fork, in a package of its
+Subject: [PATCH 46/69] urltest: the group of this fork, in a package of its
  own
 
 The urltest group of podkop-engine in protocol/group/urltestgroup, registered for the type urltest
@@ -49,9 +49,9 @@ Pdk-Layer: 04
  common/urltest/download.go                    |  85 ++
  common/urltest/download_test.go               |  75 ++
  common/urltest/history_detail.go              | 195 ++++
- common/urltest/loss.go                        | 352 +++++++
- common/urltest/loss_test.go                   |  98 ++
- common/urltest/urltest.go                     |  31 +-
+ common/urltest/loss.go                        | 356 +++++++
+ common/urltest/loss_test.go                   | 143 +++
+ common/urltest/urltest.go                     |  39 +-
  daemon/started_service.go                     |   3 +-
  docs/configuration/outbound/urltest.md        |  34 +
  experimental/clashapi/api_meta_group.go       |   4 +-
@@ -61,7 +61,7 @@ Pdk-Layer: 04
  protocol/group/selector_release.go            |   9 +
  protocol/group/selector_release_test.go       |  34 +
  protocol/group/urltestgroup/urltest.go        | 992 ++++++++++++++++++
- .../group/urltestgroup/urltest_balance.go     | 331 ++++++
+ .../group/urltestgroup/urltest_balance.go     | 373 +++++++
  .../group/urltestgroup/urltest_download.go    | 211 ++++
  .../urltestgroup/urltest_download_test.go     | 488 +++++++++
  .../group/urltestgroup/urltest_failure.go     | 470 +++++++++
@@ -69,16 +69,16 @@ Pdk-Layer: 04
  .../urltestgroup/urltest_fallback_test.go     | 386 +++++++
  .../urltestgroup/urltest_interval_test.go     |  91 ++
  protocol/group/urltestgroup/urltest_loss.go   | 394 +++++++
- .../group/urltestgroup/urltest_loss_test.go   | 486 +++++++++
+ .../group/urltestgroup/urltest_loss_test.go   | 571 ++++++++++
  .../urltestgroup/urltest_network_test.go      | 427 ++++++++
- protocol/group/urltestgroup/urltest_probe.go  | 293 ++++++
- .../group/urltestgroup/urltest_probe_test.go  | 372 +++++++
+ protocol/group/urltestgroup/urltest_probe.go  | 297 ++++++
+ .../group/urltestgroup/urltest_probe_test.go  | 390 +++++++
  .../group/urltestgroup/urltest_r20_test.go    | 231 ++++
  .../group/urltestgroup/urltest_response.go    | 443 ++++++++
  .../urltestgroup/urltest_response_test.go     | 522 +++++++++
  .../urltestgroup/urltest_review2_test.go      | 245 +++++
  route/network.go                              |   9 +
- 32 files changed, 7863 insertions(+), 15 deletions(-)
+ 32 files changed, 8069 insertions(+), 15 deletions(-)
  create mode 100644 common/urltest/download.go
  create mode 100644 common/urltest/download_test.go
  create mode 100644 common/urltest/history_detail.go
@@ -479,10 +479,10 @@ index 000000000..b84522a9e
 +}
 diff --git a/common/urltest/loss.go b/common/urltest/loss.go
 new file mode 100644
-index 000000000..373a8391c
+index 000000000..143c413c3
 --- /dev/null
 +++ b/common/urltest/loss.go
-@@ -0,0 +1,352 @@
+@@ -0,0 +1,356 @@
 +package urltest
 +
 +import (
@@ -635,6 +635,10 @@ index 000000000..373a8391c
 +		return sample, E.Cause(ErrLossNotCounted, err)
 +	}
 +	switch {
++	case result.Broken:
++		// more holes in the sequence than a download at the window of the probe can have: packets
++		// that are not of its stream came with its addresses
++		return sample, E.Cause(ErrLossNotCounted, "the packets of the connection were no stream of a download")
 +	case result.Dropped > 0:
 +		return sample, E.Cause(ErrLossNotCounted, "the capture dropped ", result.Dropped, " packets")
 +	case result.Bytes < received:
@@ -837,10 +841,10 @@ index 000000000..373a8391c
 +}
 diff --git a/common/urltest/loss_test.go b/common/urltest/loss_test.go
 new file mode 100644
-index 000000000..29db69af7
+index 000000000..8b17c4ad7
 --- /dev/null
 +++ b/common/urltest/loss_test.go
-@@ -0,0 +1,98 @@
+@@ -0,0 +1,143 @@
 +package urltest
 +
 +import (
@@ -851,6 +855,7 @@ index 000000000..29db69af7
 +	"net/http"
 +	"net/http/httptest"
 +	"strings"
++	"sync/atomic"
 +	"testing"
 +	"time"
 +
@@ -939,8 +944,52 @@ index 000000000..29db69af7
 +func (f DialerFunc) ListenPacket(ctx context.Context, destination M.Socksaddr) (net.PacketConn, error) {
 +	return nil, errors.New("no UDP")
 +}
++
++// A test reads probeHeaderLimit of response headers at most: an answer whose headers go on
++// (they come through the member tested) fails the test, and is not kept in memory.
++func TestProbeHeadersBounded(t *testing.T) {
++	listener, err := net.Listen("tcp", "127.0.0.1:0")
++	require.NoError(t, err)
++	t.Cleanup(func() { listener.Close() })
++	var sent atomic.Int64
++	go func() {
++		for {
++			conn, err := listener.Accept()
++			if err != nil {
++				return
++			}
++			go func() {
++				defer conn.Close()
++				conn.Read(make([]byte, 4096))
++				conn.Write([]byte("HTTP/1.1 204 No Content\r\nX-Filler: "))
++				filler := make([]byte, 16<<10)
++				for i := range filler {
++					filler[i] = 'a'
++				}
++				for {
++					n, err := conn.Write(filler)
++					sent.Add(int64(n))
++					if err != nil {
++						return
++					}
++				}
++			}()
++		}
++	}()
++	plain := DialerFunc(func(ctx context.Context, network string, destination M.Socksaddr) (net.Conn, error) {
++		return (&net.Dialer{}).DialContext(ctx, network, destination.String())
++	})
++	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
++	defer cancel()
++	start := time.Now()
++	_, err = URLTest(ctx, "http://"+listener.Addr().String()+"/", plain)
++	require.ErrorContains(t, err, "response headers exceeded")
++	require.Less(t, time.Since(start), 4*time.Second, "the test read the headers until its time was up")
++	// what the client took before it gave up: the limit and what was on the way, not megabytes
++	require.Less(t, sent.Load(), int64(probeHeaderLimit+(4<<20)))
++}
 diff --git a/common/urltest/urltest.go b/common/urltest/urltest.go
-index 26efe39cb..a44374c82 100644
+index 26efe39cb..5e31ddee3 100644
 --- a/common/urltest/urltest.go
 +++ b/common/urltest/urltest.go
 @@ -24,11 +24,13 @@ type HistoryStorage struct {
@@ -973,7 +1022,7 @@ index 26efe39cb..a44374c82 100644
  	s.notifyUpdated()
  	s.access.Unlock()
  }
-@@ -127,7 +131,23 @@ func urlTest(ctx context.Context, link string, detour N.Dialer) (t uint16, err e
+@@ -127,8 +131,32 @@ func urlTest(ctx context.Context, link string, detour N.Dialer) (t uint16, err e
  	if err != nil {
  		return
  	}
@@ -989,16 +1038,25 @@ index 26efe39cb..a44374c82 100644
 +	return
 +}
 +
++// probeHeaderLimit bounds the response headers a test reads (podkop-engine). The answer comes
++// through the member tested, and net/http keeps up to 10 MB of headers by default: a member (or
++// what it reaches) that sends headers without end would cost that for each test of a round, on
++// a router. The headers of a test URL are some hundreds of bytes; web servers bound a header at
++// 8 KB (nginx, Apache), all of them at 64 KB to 1 MB.
++const probeHeaderLimit = 64 << 10
++
 +// probeClient makes an HTTP client that speaks over instance only, the connection the test
 +// dialed through the member: no redirects, no compression asked for (a download test counts
 +// the bytes that cross the link, and a body of zeros would compress to nothing), the TCP
-+// timeout.
++// timeout, and response headers of probeHeaderLimit at most.
 +func probeClient(ctx context.Context, instance net.Conn) *http.Client {
 +	return &http.Client{
  		Transport: &http.Transport{
++			MaxResponseHeaderBytes: probeHeaderLimit,
  			DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
  				return instance, nil
-@@ -136,18 +156,11 @@ func urlTest(ctx context.Context, link string, detour N.Dialer) (t uint16, err e
+ 			},
+@@ -136,18 +164,11 @@ func urlTest(ctx context.Context, link string, detour N.Dialer) (t uint16, err e
  				Time:    ntp.TimeFuncFromContext(ctx),
  				RootCAs: adapter.RootPoolFromContext(ctx),
  			},
@@ -2303,10 +2361,10 @@ index 000000000..54d7f6814
 +}
 diff --git a/protocol/group/urltestgroup/urltest_balance.go b/protocol/group/urltestgroup/urltest_balance.go
 new file mode 100644
-index 000000000..b7398a353
+index 000000000..7876b2b5d
 --- /dev/null
 +++ b/protocol/group/urltestgroup/urltest_balance.go
-@@ -0,0 +1,331 @@
+@@ -0,0 +1,373 @@
 +package urltestgroup
 +
 +import (
@@ -2350,6 +2408,13 @@ index 000000000..b7398a353
 +	defaultBalanceIdle = 5 * time.Minute
 +	// balanceForget is how long a device that opens no connection is remembered.
 +	balanceForget = time.Hour
++	// balanceDevices is the most devices a balance remembers: a device is a source address, and
++	// what sends from addresses without end (the temporary addresses of IPv6, forged sources)
++	// must not grow the list for balanceForget. 4096 is a LAN of a thousand devices with four
++	// addresses each. Past it, the devices idle for balance_idle go (they are hashed again at
++	// their next connection anyway), and a device there is no room for goes by the member its
++	// address falls on, at every connection: the same member while the members stay.
++	balanceDevices = 4096
 +)
 +
 +type balancer struct {
@@ -2358,6 +2423,11 @@ index 000000000..b7398a353
 +	udp       []adapter.Outbound
 +	devices   map[string]*balanceDevice
 +	lastSweep time.Time
++	// lastFull: when the devices idle for balance_idle were last dropped for room (balanceDevices)
++	lastFull time.Time
++	// takenFrom: the group this balancer was taken from in a hot swap (takeBalance), to give it
++	// back to when the swap is undone
++	takenFrom *URLTestGroup
 +}
 +
 +type balanceDevice struct {
@@ -2474,8 +2544,28 @@ index 000000000..b7398a353
 +	}
 +	b.access.Lock()
 +	b.tcp, b.udp = keep(b.tcp), keep(b.udp)
++	b.takenFrom = from
 +	b.access.Unlock()
 +	g.balance.Store(b)
++}
++
++// returnBalance undoes takeBalance when the swap is undone (GiveBack): the group of before, which
++// runs on, has its balancer and its devices again, with the members the two groups share until
++// its next selection chooses them anew; this group, about to be closed, is left an empty one.
++func (g *URLTestGroup) returnBalance(to *URLTestGroup) {
++	b := g.balance.Load()
++	if b == nil {
++		return
++	}
++	b.access.Lock()
++	taken := b.takenFrom == to
++	if taken {
++		b.takenFrom = nil
++	}
++	b.access.Unlock()
++	if taken && g.balance.CompareAndSwap(b, newBalancer()) {
++		to.balance.CompareAndSwap(nil, b)
++	}
 +}
 +
 +// balanceKey is the device a connection comes from: its source address, the same for its TCP
@@ -2542,7 +2632,17 @@ index 000000000..b7398a353
 +	device := b.devices[key]
 +	if device == nil {
 +		device = &balanceDevice{}
-+		b.devices[key] = device
++		if len(b.devices) >= balanceDevices && now.Sub(b.lastFull) >= time.Second {
++			b.lastFull = now
++			for oldKey, old := range b.devices {
++				if old.active == 0 && now.Sub(old.last) >= g.loss.balanceIdle {
++					delete(b.devices, oldKey)
++				}
++			}
++		}
++		if len(b.devices) < balanceDevices {
++			b.devices[key] = device
++		}
 +	}
 +	// a device busy or idle for less than balance_idle keeps its member while it is up, in the
 +	// balance or not; one idle longer is given the member its address falls on now, which
@@ -5216,10 +5316,10 @@ index 000000000..d93dfee7a
 +}
 diff --git a/protocol/group/urltestgroup/urltest_loss_test.go b/protocol/group/urltestgroup/urltest_loss_test.go
 new file mode 100644
-index 000000000..04349b304
+index 000000000..a1e4a6cd6
 --- /dev/null
 +++ b/protocol/group/urltestgroup/urltest_loss_test.go
-@@ -0,0 +1,486 @@
+@@ -0,0 +1,571 @@
 +package urltestgroup
 +
 +import (
@@ -5662,6 +5762,91 @@ index 000000000..04349b304
 +	}
 +	newGroup.performUpdateCheck()
 +	require.NotEqual(t, "c", memberOf(newTest, newGroup, onC))
++}
++
++// A hot swap undone gives the balancer back: the group of before, which runs on, balances its
++// devices as before, and the group that had taken it is left an empty one.
++func TestBalanceGiveBack(t *testing.T) {
++	a, b, c := newTestMember(C.TypeSOCKS, "a", dialWorking), newTestMember(C.TypeSOCKS, "b", dialWorking), newTestMember(C.TypeSOCKS, "c", dialWorking)
++	oldTest, oldGroup := newModeGroup(t, modeBalance, members(a, b, c), map[string]uint16{"a": 100, "b": 110, "c": 120}, nil)
++	target := balanceTarget(t)
++	memberOf := func(source string) string {
++		conn, err := oldTest.DialContext(sourceContext(source), N.NetworkTCP, target)
++		require.NoError(t, err)
++		conn.Close()
++		return oldGroup.balance.Load().devices[source].member.Tag()
++	}
++	onB := deviceOn(t, memberOf, "10.6.0.", "b")
++	newTest, newGroup := newModeGroup(t, modeBalance, members(a, b), nil, nil)
++	newGroup.history = oldGroup.history
++	newTest.TakeOver(oldTest)
++	require.Nil(t, oldGroup.balance.Load())
++	taken := newGroup.balance.Load()
++	newTest.GiveBack(oldTest)
++	require.Same(t, taken, oldGroup.balance.Load())
++	require.Contains(t, oldGroup.balance.Load().devices, onB, "the devices are back")
++	require.Equal(t, "b", memberOf(onB))
++	require.NotNil(t, newGroup.balance.Load())
++	require.NotSame(t, taken, newGroup.balance.Load())
++	require.Empty(t, newGroup.balance.Load().devices)
++	// given back once: a second call, or one for another group, changes nothing
++	newTest.GiveBack(oldTest)
++	require.Same(t, taken, oldGroup.balance.Load())
++	// a group that took nothing gives nothing
++	otherTest, otherGroup := newModeGroup(t, modeBalance, members(a, b), nil, nil)
++	own := otherGroup.balance.Load()
++	otherTest.GiveBack(oldTest)
++	require.Same(t, own, otherGroup.balance.Load())
++	require.Same(t, taken, oldGroup.balance.Load())
++}
++
++// A balance remembers balanceDevices devices at most: past it the devices idle for balance_idle
++// go, and a device there is no room for still gets a member, the one its address falls on.
++func TestBalanceDevicesBounded(t *testing.T) {
++	a, b := newTestMember(C.TypeSOCKS, "a", dialWorking), newTestMember(C.TypeSOCKS, "b", dialWorking)
++	_, group := newModeGroup(t, modeBalance, members(a, b), map[string]uint16{"a": 100, "b": 110}, nil)
++	balance := group.balance.Load()
++	connect := func(source string) (string, func()) {
++		member, closed := group.balanced(sourceContext(source), N.NetworkTCP)
++		require.NotNil(t, member, source)
++		return member.Tag(), closed
++	}
++	// devices with a connection open fill the list: none of them may go
++	var open []func()
++	for i := 0; i < balanceDevices; i++ {
++		_, closed := connect(fmt.Sprint("10.", 16+i>>16, ".", i>>8&255, ".", i&255))
++		open = append(open, closed)
++	}
++	require.Len(t, balance.devices, balanceDevices)
++	for i := 0; i < 100; i++ {
++		source := fmt.Sprint("10.200.0.", i)
++		first, closed := connect(source)
++		closed()
++		again, closed := connect(source)
++		closed()
++		require.Equal(t, first, again, "the member its address falls on, each time")
++	}
++	require.Len(t, balance.devices, balanceDevices)
++	require.NotContains(t, balance.devices, "10.200.0.7")
++	// idle for balance_idle, they give their room
++	for _, closed := range open[:1000] {
++		closed()
++	}
++	balance.access.Lock()
++	for _, device := range balance.devices {
++		if device.active == 0 {
++			device.last = device.last.Add(-group.loss.balanceIdle)
++		}
++	}
++	balance.lastFull = time.Time{}
++	balance.access.Unlock()
++	_, closed := connect("10.200.0.7")
++	closed()
++	require.Contains(t, balance.devices, "10.200.0.7")
++	require.Len(t, balance.devices, balanceDevices-1000+1)
++	for _, closed := range open[1000:] {
++		closed()
++	}
 +}
 +
 +// The members of a balance are referenced, not only the choice of the group: their idle
@@ -6141,10 +6326,10 @@ index 000000000..74bd83b04
 +}
 diff --git a/protocol/group/urltestgroup/urltest_probe.go b/protocol/group/urltestgroup/urltest_probe.go
 new file mode 100644
-index 000000000..9f1697bec
+index 000000000..dc185bbda
 --- /dev/null
 +++ b/protocol/group/urltestgroup/urltest_probe.go
-@@ -0,0 +1,293 @@
+@@ -0,0 +1,297 @@
 +package urltestgroup
 +
 +import (
@@ -6179,8 +6364,11 @@ index 000000000..9f1697bec
 +	spacing time.Duration
 +	access  sync.Mutex
 +	calls   map[probeKey]*probeCall
-+	// when the next test through a first server may begin
-+	hops map[any]time.Time
++	// when the next test through a first server may begin; a time that has passed says nothing,
++	// and is dropped once in spacing (pruned: when last), so that the outbound it is kept by is
++	// let go when the configuration replaces it
++	hops   map[any]time.Time
++	pruned time.Time
 +}
 +
 +type probeKey struct {
@@ -6284,7 +6472,8 @@ index 000000000..9f1697bec
 +	if next, reserved := p.hops[hop]; reserved && now.Before(next) {
 +		return next.Sub(now)
 +	}
-+	if len(p.hops) > 1024 {
++	if now.Sub(p.pruned) >= p.spacing || now.Before(p.pruned) {
++		p.pruned = now
 +		for key, next := range p.hops {
 +			if !now.Before(next) {
 +				delete(p.hops, key)
@@ -6440,10 +6629,10 @@ index 000000000..9f1697bec
 +}
 diff --git a/protocol/group/urltestgroup/urltest_probe_test.go b/protocol/group/urltestgroup/urltest_probe_test.go
 new file mode 100644
-index 000000000..c7dafb8b1
+index 000000000..aec3c1a64
 --- /dev/null
 +++ b/protocol/group/urltestgroup/urltest_probe_test.go
-@@ -0,0 +1,372 @@
+@@ -0,0 +1,390 @@
 +package urltestgroup
 +
 +import (
@@ -6815,6 +7004,24 @@ index 000000000..c7dafb8b1
 +	URLTestOutbounds(context.Background(), nil, single, log.NewNOPFactory().Logger(), []adapter.Outbound{member}, slow, time.Minute, true, true)
 +	require.GreaterOrEqual(t, single.LoadURLTestHistory("a").Delay, uint16(150))
 +	_ = link
++}
++
++// A first server whose time has passed is forgotten within spacing, however few there are: the
++// prober is the process's, and must not keep the outbounds of a configuration that was replaced.
++func TestProberForgetsHops(t *testing.T) {
++	p := newProber(2 * time.Second)
++	start := time.Unix(1000, 0)
++	for hop := 0; hop < 100; hop++ {
++		require.Zero(t, p.reserve(hop, start))
++	}
++	require.Len(t, p.hops, 100)
++	// a hop whose time has not passed is kept: the next test through it waits
++	require.Equal(t, time.Second, p.reserve(5, start.Add(time.Second)))
++	require.Zero(t, p.reserve("new", start.Add(time.Second)))
++	require.Len(t, p.hops, 101)
++	require.Zero(t, p.reserve("other", start.Add(3*time.Second)))
++	require.Len(t, p.hops, 1)
++	require.Contains(t, p.hops, any("other"))
 +}
 diff --git a/protocol/group/urltestgroup/urltest_r20_test.go b/protocol/group/urltestgroup/urltest_r20_test.go
 new file mode 100644

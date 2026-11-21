@@ -1,7 +1,7 @@
-From 631b090340900e4cf72600b6b8a88b71728ac4ce Mon Sep 17 00:00:00 2001
+From db7e7456f670d5b2b173ae1f0c101d8c24df55aa Mon Sep 17 00:00:00 2001
 From: FiyeroT <me@fiyero.xyz>
 Date: Thu, 12 Nov 2026 21:41:21 +0300
-Subject: [PATCH 52/66] tlsfragment: fragment and record_fragment, also on the
+Subject: [PATCH 53/69] tlsfragment: fragment and record_fragment, also on the
  ClientHello of REALITY
 
 The fragmenting of a ClientHello does not hold the socket while it waits for an acknowledgment and

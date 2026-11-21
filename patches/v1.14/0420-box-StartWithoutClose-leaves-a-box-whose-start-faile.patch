@@ -1,7 +1,7 @@
-From 68acd89ab851681c55b4800d3a19ce5303e733aa Mon Sep 17 00:00:00 2001
+From 2274ac9de790841326f63b4af56ce043cc86b24f Mon Sep 17 00:00:00 2001
 From: FiyeroT <me@fiyero.xyz>
 Date: Thu, 12 Nov 2026 21:41:21 +0300
-Subject: [PATCH 55/66] box: StartWithoutClose leaves a box whose start failed
+Subject: [PATCH 56/69] box: StartWithoutClose leaves a box whose start failed
  to its caller
 
 StartWithoutClose leaves a box whose start failed to its caller.

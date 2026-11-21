@@ -1,7 +1,7 @@
-From 4804e46e755c2fd8b0fda27aa6aaa9eacae9bf5d Mon Sep 17 00:00:00 2001
+From 9ae41896f06dcd192fc89e46915b879443a5076a Mon Sep 17 00:00:00 2001
 From: FiyeroT <me@fiyero.xyz>
 Date: Thu, 12 Nov 2026 21:41:21 +0300
-Subject: [PATCH 54/66] cidrset: the CIDR lists of rule-sets as ranges
+Subject: [PATCH 55/69] cidrset: the CIDR lists of rule-sets as ranges
 
 The CIDR lists of rule-sets kept as sorted ranges of their own.
 

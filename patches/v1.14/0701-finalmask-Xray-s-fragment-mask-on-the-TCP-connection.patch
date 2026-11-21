@@ -1,0 +1,1827 @@
+From 1422cd2fb8e0c01dfdec8cc80f5ea52311e98816 Mon Sep 17 00:00:00 2001
+From: FiyeroT <me@fiyero.xyz>
+Date: Sat, 21 Nov 2026 14:16:35 +0300
+Subject: [PATCH 68/69] finalmask: Xray's fragment mask on the TCP connections
+ of an outbound; fm and pcs in links
+
+The dialer option finalmask {"tcp": [{"type": "fragment", ...}]} puts Xray's fragment mask
+(transport/internet/finalmask/fragment of Xray-core 26.x) on every TCP connection the default
+dialer opens for the outbound, beneath TLS, REALITY and every transport:
+
+- packets "tlshello": the first write, when it is a whole TLS handshake record, is cut into TLS
+  records of length/lengths bytes; with one delay of 0 they go out in one write, otherwise each
+  in a write of its own with its delay;
+- packets "N-M" (from 1): writes N to M are cut into pieces, each a write; "": every write;
+- max_split bounds the pieces, the last one taking the rest;
+- masks in a list are chained as in Xray, the first next to the socket: a "1-1" mask under a
+  "tlshello" one writes the cut ClientHello in two TCP pieces.
+
+The cutting is Xray's, piece for piece, its ranges drawn as Xray draws them (from included, to
+left out: "11-24" gives 11 to 23). A ClientHello is cut only when the first write is a whole
+record of one (Xray takes any handshake record), and a record of no byte goes as it is. A pause
+ends when the connection is closed or at its write deadline. Through a detour the outbound opens
+no connection of its own and the mask does nothing. Only "fragment": the other masks of Xray
+change what goes over the wire and need the server. The feature name is dialer.finalmask.
+
+Measured on routers of three ISPs (podkop-exp lab/runs/2026-11-21-fmcheck*), against servers
+whose ClientHello two of them drop (TCP connects, the hello is never acknowledged):
+- a whole ClientHello: 0 of 28 per variant; records of 11-24 bytes in one write: 81 of 84 with
+  the 1.5-1.9 KB hellos of chrome, firefox and safari, 0 of 28 with the 508-byte hello of edge
+  and ios, which then fits in one TCP packet; a write per record: 0 of 28;
+- records of 11-24 bytes in two TCP pieces (the first of 100-200 bytes): 165 of 168 over edge,
+  ios, qq, chrome, firefox and safari; the time to the first byte as on the ISP without the block;
+- REALITY takes the cut hello (the engine's own server and Xray 26.3.27: every try).
+tls.fragment and tls.record_fragment, which cut only inside the server name, never passed.
+
+The link decoder (tools decode-link) reads what links carry of it:
+- fm: its fragment masks of TCP become finalmask, without their delays (a pause of this host is
+  not a link's to set; with none the records go out in one write, as Xray sends them with a
+  delay of 0); noise and udphop are the client's own and are left out with a warning; any other
+  mask is refused (the server expects it);
+- fm of a Hysteria 2 link: salamander becomes obfs, with a packetSize Xray's gecko (the same
+  framing as sing-quic's gecko, and it replaces obfs=salamander that Remnawave writes into such a
+  link too); udphop and quicParams.udpHop become server_ports, hop_interval and
+  hop_interval_max; realm is refused by a rule of its own (hysteria-realm: other servers asked,
+  ports of the gateway opened, as with sb.realm);
+- pcs and pinSHA256 become certificate_sha256 (0102): the hash of the whole certificate, hex,
+  colons allowed, comma separated; ignored with REALITY, insecure or a certificate of the link.
+  Xray also takes the hash of a CA in the chain; certificate_sha256 pins the leaf only.
+
+Pdk-Feature: finalmask
+Pdk-Zone: core
+Pdk-Layer: 07
+---
+ cmd/sing-box/version_features.go           |   2 +
+ common/dialer/default.go                   |  10 +
+ common/dialer/default_finalmask_test.go    |  71 +++++
+ common/finalmask/conn.go                   | 199 ++++++++++++++
+ common/finalmask/finalmask.go              | 149 +++++++++++
+ common/finalmask/finalmask_test.go         | 292 +++++++++++++++++++++
+ common/sharelink/link.go                   |  14 +
+ common/sharelink/link_test.go              |  57 ++--
+ common/sharelink/policy.go                 |   3 +-
+ common/sharelink/policy_test.go            |  62 ++++-
+ common/sharelink/quic.go                   | 161 ++++++++++--
+ common/sharelink/schemes_test.go           |  29 +-
+ common/sharelink/testdata/options-1.14.txt |  23 ++
+ common/sharelink/tls.go                    |  51 +++-
+ common/sharelink/transport.go              |  93 ++++++-
+ option/finalmask.go                        |  32 +++
+ option/outbound.go                         |   2 +
+ 17 files changed, 1182 insertions(+), 68 deletions(-)
+ create mode 100644 common/dialer/default_finalmask_test.go
+ create mode 100644 common/finalmask/conn.go
+ create mode 100644 common/finalmask/finalmask.go
+ create mode 100644 common/finalmask/finalmask_test.go
+ create mode 100644 option/finalmask.go
+
+diff --git a/cmd/sing-box/version_features.go b/cmd/sing-box/version_features.go
+index c5b410ff5..50cf01695 100644
+--- a/cmd/sing-box/version_features.go
++++ b/cmd/sing-box/version_features.go
+@@ -22,4 +22,6 @@ var versionFeatures = []string{
+ 	"tools.decode-link",
+ 	// the uTLS fingerprint fallback (SING_BOX_UTLS_FALLBACK)
+ 	"tls.utls-fallback",
++	// the dialer option "finalmask": Xray's fragment mask on the TCP connections of an outbound
++	"dialer.finalmask",
+ }
+diff --git a/common/dialer/default.go b/common/dialer/default.go
+index 88d6566fa..f38be80af 100644
+--- a/common/dialer/default.go
++++ b/common/dialer/default.go
+@@ -10,6 +10,7 @@ import (
+ 	"time"
+ 
+ 	"github.com/sagernet/sing-box/adapter"
++	"github.com/sagernet/sing-box/common/finalmask"
+ 	"github.com/sagernet/sing-box/common/listener"
+ 	"github.com/sagernet/sing-box/common/probesock"
+ 	C "github.com/sagernet/sing-box/constant"
+@@ -52,6 +53,8 @@ type DefaultDialer struct {
+ 	fallbackNetworkType    []C.InterfaceType
+ 	networkFallbackDelay   time.Duration
+ 	networkLastFallback    common.TypedValue[time.Time]
++	// the masks of Xray's finalmask on the TCP connections (podkop-engine)
++	finalMask *finalmask.Masks
+ }
+ 
+ func NewDefault(ctx context.Context, options option.DialerOptions) (*DefaultDialer, error) {
+@@ -229,7 +232,12 @@ func NewDefault(ctx context.Context, options option.DialerOptions) (*DefaultDial
+ 	}
+ 	tcpDialer4 := tfo.Dialer{Dialer: dialer4, DisableTFO: !options.TCPFastOpen}
+ 	tcpDialer6 := tfo.Dialer{Dialer: dialer6, DisableTFO: !options.TCPFastOpen}
++	finalMask, err := finalmask.New(options.FinalMask)
++	if err != nil {
++		return nil, err
++	}
+ 	return &DefaultDialer{
++		finalMask:              finalMask,
+ 		dialer4:                tcpDialer4,
+ 		dialer6:                tcpDialer6,
+ 		udpDialer4:             udpDialer4,
+@@ -450,6 +458,8 @@ func (d *DefaultDialer) trackConn(ctx context.Context, destination M.Socksaddr,
+ 			return nil, err
+ 		}
+ 		conn = &udpConn{Conn: conn, rawConn: rawConn}
++	} else if d.finalMask != nil {
++		conn = d.finalMask.Client(conn)
+ 	}
+ 	if d.connectionManager != nil {
+ 		conn = d.connectionManager.TrackConn(conn)
+diff --git a/common/dialer/default_finalmask_test.go b/common/dialer/default_finalmask_test.go
+new file mode 100644
+index 000000000..683552146
+--- /dev/null
++++ b/common/dialer/default_finalmask_test.go
+@@ -0,0 +1,71 @@
++package dialer
++
++import (
++	"context"
++	"crypto/rand"
++	"io"
++	"net"
++	"testing"
++	"time"
++
++	"github.com/sagernet/sing-box/option"
++	M "github.com/sagernet/sing/common/metadata"
++
++	"github.com/stretchr/testify/require"
++)
++
++// The finalmask of the dialer options reaches the TCP connections of the default dialer: a
++// ClientHello written to one arrives cut into records of the lengths asked for.
++func TestDefaultDialerFinalMask(t *testing.T) {
++	t.Parallel()
++	listener, err := net.Listen("tcp", "127.0.0.1:0")
++	require.NoError(t, err)
++	defer listener.Close()
++	received := make(chan []byte, 1)
++	go func() {
++		conn, err := listener.Accept()
++		if err != nil {
++			received <- nil
++			return
++		}
++		defer conn.Close()
++		_ = conn.SetReadDeadline(time.Now().Add(5 * time.Second))
++		content, _ := io.ReadAll(conn)
++		received <- content
++	}()
++	length := option.V2RayXHTTPRange{From: 11, To: 24}
++	dialer, err := NewDefault(context.Background(), option.DialerOptions{FinalMask: &option.FinalMaskOptions{
++		TCP: []option.FinalMaskTCPOptions{{Type: "fragment", Packets: "tlshello", Length: &length}},
++	}})
++	require.NoError(t, err)
++	conn, err := dialer.DialContext(context.Background(), "tcp", M.ParseSocksaddr(listener.Addr().String()))
++	require.NoError(t, err)
++	payload := make([]byte, 600)
++	_, _ = rand.Read(payload)
++	payload[0] = 1
++	message := append([]byte{22, 3, 1, byte(len(payload) >> 8), byte(len(payload))}, payload...)
++	_, err = conn.Write(message)
++	require.NoError(t, err)
++	require.NoError(t, conn.Close())
++	stream := <-received
++	var joined []byte
++	count := 0
++	for len(stream) >= 5 {
++		size := int(stream[3])<<8 | int(stream[4])
++		require.LessOrEqual(t, size, 24)
++		joined = append(joined, stream[5:5+size]...)
++		stream = stream[5+size:]
++		count++
++	}
++	require.Empty(t, stream)
++	require.Equal(t, payload, joined)
++	require.Greater(t, count, 600/24)
++}
++
++// Without a finalmask the bytes go as they are written.
++func TestDefaultDialerWithoutFinalMask(t *testing.T) {
++	t.Parallel()
++	dialer, err := NewDefault(context.Background(), option.DialerOptions{})
++	require.NoError(t, err)
++	require.Nil(t, dialer.finalMask)
++}
+diff --git a/common/finalmask/conn.go b/common/finalmask/conn.go
+new file mode 100644
+index 000000000..83691caec
+--- /dev/null
++++ b/common/finalmask/conn.go
+@@ -0,0 +1,199 @@
++package finalmask
++
++import (
++	"net"
++	"os"
++	"sync"
++	"sync/atomic"
++	"time"
++)
++
++// fragmentConn cuts the writes of a connection as Xray's fragment mask does
++// (fragment/conn.go of Xray-core). Reading is not touched. A pause between pieces ends when
++// the connection is closed or its write deadline passes.
++type fragmentConn struct {
++	net.Conn
++	mask *fragment
++	// writes begun, and writes done: the mask steps aside only after the last one it cuts
++	count     atomic.Int64
++	done      atomic.Int64
++	deadline  atomic.Int64
++	closeOnce sync.Once
++	closed    chan struct{}
++}
++
++func newFragmentConn(conn net.Conn, mask *fragment) *fragmentConn {
++	return &fragmentConn{Conn: conn, mask: mask, closed: make(chan struct{})}
++}
++
++func (c *fragmentConn) Close() error {
++	c.closeOnce.Do(func() { close(c.closed) })
++	return c.Conn.Close()
++}
++
++func (c *fragmentConn) setDeadline(t time.Time) {
++	if t.IsZero() {
++		c.deadline.Store(0)
++	} else {
++		c.deadline.Store(t.UnixNano())
++	}
++}
++
++func (c *fragmentConn) SetDeadline(t time.Time) error {
++	c.setDeadline(t)
++	return c.Conn.SetDeadline(t)
++}
++
++func (c *fragmentConn) SetWriteDeadline(t time.Time) error {
++	c.setDeadline(t)
++	return c.Conn.SetWriteDeadline(t)
++}
++
++func (c *fragmentConn) pause(delay span) error {
++	if delay.to <= 0 {
++		return nil
++	}
++	wait := time.Duration(delay.draw()) * time.Millisecond
++	expired := false
++	if deadline := c.deadline.Load(); deadline != 0 {
++		left := time.Until(time.Unix(0, deadline))
++		if left <= 0 {
++			return os.ErrDeadlineExceeded
++		}
++		if left < wait {
++			wait, expired = left, true
++		}
++	}
++	timer := time.NewTimer(wait)
++	defer timer.Stop()
++	select {
++	case <-timer.C:
++		if expired {
++			return os.ErrDeadlineExceeded
++		}
++		return nil
++	case <-c.closed:
++		return net.ErrClosed
++	}
++}
++
++// pieceEnd is where a piece that starts at from ends: its drawn length, bounded by the bytes
++// left (a length near the largest int does not wrap on 32 bits), and the rest for the last
++// piece max_split allows.
++func (c *fragmentConn) pieceEnd(from, size int, piece, maxSplit int64) int {
++	length := c.mask.lengthOf(piece).draw()
++	if length > int64(size-from) || maxSplit > 0 && piece+1 >= maxSplit {
++		return size
++	}
++	return from + int(length)
++}
++
++func (c *fragmentConn) Write(p []byte) (int, error) {
++	count := c.count.Add(1)
++	defer c.done.Add(1)
++	mask := c.mask
++	if mask.packetsFrom == 0 && mask.packetsTo == 1 {
++		return c.writeHello(p, count)
++	}
++	if mask.packetsFrom != 0 && (count < mask.packetsFrom || count > mask.packetsTo) {
++		return c.Conn.Write(p)
++	}
++	maxSplit := mask.maxSplit.draw()
++	var piece int64
++	for from := 0; ; {
++		to := c.pieceEnd(from, len(p), piece, maxSplit)
++		n, err := c.Conn.Write(p[from:to])
++		from += n
++		if err != nil {
++			return from, err
++		}
++		// as in Xray, the pause follows every piece, the last one too
++		err = c.pause(mask.delayOf(piece))
++		if err != nil {
++			return from, err
++		}
++		piece++
++		if from >= len(p) {
++			return from, nil
++		}
++	}
++}
++
++// writeHello cuts the first write, when it is a whole TLS record of a ClientHello, into
++// records ("tlshello"). Anything else goes as it is: Xray takes any first record of the
++// handshake, which a client's first write that only looks like one (the random salt of
++// Shadowsocks, one time in 256) would lose its bytes to; a record of no byte is no hello.
++func (c *fragmentConn) writeHello(p []byte, count int64) (int, error) {
++	if count != 1 || len(p) <= 5 || p[0] != 22 || p[1] != 3 || p[5] != 1 {
++		return c.Conn.Write(p)
++	}
++	recordLength := 5 + (int(p[3])<<8 | int(p[4]))
++	if len(p) < recordLength || recordLength == 5 {
++		return c.Conn.Write(p)
++	}
++	mask := c.mask
++	data := p[5:recordLength]
++	merged := mask.merged()
++	var out []byte
++	if merged {
++		// each piece of n bytes gets a header of 5
++		out = make([]byte, 0, len(data)+5*(len(data)/max(int(mask.lengths[0].from), 1)+2))
++	}
++	maxSplit := mask.maxSplit.draw()
++	var piece int64
++	for from := 0; from < len(data); piece++ {
++		to := c.pieceEnd(from, len(data), piece, maxSplit)
++		length := to - from
++		record := append(append([]byte(nil), p[0], p[1], p[2], byte(length>>8), byte(length)), data[from:to]...)
++		from = to
++		if merged {
++			out = append(out, record...)
++			continue
++		}
++		_, err := c.Conn.Write(record)
++		if err != nil {
++			return 0, err
++		}
++		err = c.pause(mask.delayOf(piece))
++		if err != nil {
++			return 0, err
++		}
++	}
++	if len(out) > 0 {
++		_, err := c.Conn.Write(out)
++		if err != nil {
++			return 0, err
++		}
++	}
++	if len(p) > recordLength {
++		n, err := c.Conn.Write(p[recordLength:])
++		if err != nil {
++			return recordLength + n, err
++		}
++	}
++	return len(p), nil
++}
++
++// ReaderReplaceable: reads are not touched.
++func (c *fragmentConn) ReaderReplaceable() bool {
++	return true
++}
++
++// WriterReplaceable: the writes past the ones the mask cuts may go to the connection under
++// it directly, once the last of those is done. Cutting every write ("" packets), it never
++// steps aside.
++func (c *fragmentConn) WriterReplaceable() bool {
++	done := c.done.Load()
++	switch {
++	case c.mask.packetsFrom == 0 && c.mask.packetsTo == 1:
++		return done >= 1
++	case c.mask.packetsFrom == 0:
++		return false
++	default:
++		return done >= c.mask.packetsTo
++	}
++}
++
++func (c *fragmentConn) Upstream() any {
++	return c.Conn
++}
+diff --git a/common/finalmask/finalmask.go b/common/finalmask/finalmask.go
+new file mode 100644
+index 000000000..e235a951d
+--- /dev/null
++++ b/common/finalmask/finalmask.go
+@@ -0,0 +1,149 @@
++// Package finalmask puts Xray's finalmask masks on the TCP connections of an outbound: what
++// goes over the wire is reshaped, what it carries is not. Only "fragment" is here, the one
++// mask a server does not see (transport/internet/finalmask/fragment of Xray-core, 26.x): it
++// cuts the ClientHello into small TLS records, or the first writes of a connection into
++// small pieces, so that a DPI box that reads the handshake in one piece does not find it.
++package finalmask
++
++import (
++	"math/rand/v2"
++	"net"
++	"strings"
++
++	"github.com/sagernet/sing-box/option"
++	E "github.com/sagernet/sing/common/exceptions"
++)
++
++// Masks are the masks of one outbound, in the order of its options.
++type Masks struct {
++	fragments []*fragment
++}
++
++// New reads the masks; nil when there are none.
++func New(options *option.FinalMaskOptions) (*Masks, error) {
++	if options == nil || len(options.TCP) == 0 {
++		return nil, nil
++	}
++	masks := &Masks{}
++	for index, mask := range options.TCP {
++		switch strings.ToLower(mask.Type) {
++		case "fragment":
++			built, err := newFragment(mask)
++			if err != nil {
++				return nil, E.Cause(err, "finalmask.tcp[", index, "]")
++			}
++			masks.fragments = append(masks.fragments, built)
++		default:
++			return nil, E.New("finalmask.tcp[", index, "]: the mask ", mask.Type, " is not supported (only fragment)")
++		}
++	}
++	return masks, nil
++}
++
++// Client puts the masks on a TCP connection the outbound opened: the first mask of the list
++// is the one nearest to the socket, as in Xray.
++func (m *Masks) Client(conn net.Conn) net.Conn {
++	if m == nil {
++		return conn
++	}
++	for _, mask := range m.fragments {
++		conn = newFragmentConn(conn, mask)
++	}
++	return conn
++}
++
++// a range of whole numbers, drawn as Xray's crypto.RandBetween draws it: from included, to
++// left out, and from alone when they are 1 apart or less ("11-24" gives 11 to 23)
++type span struct{ from, to int64 }
++
++func (s span) draw() int64 {
++	from, to := s.from, s.to
++	if from > to {
++		from, to = to, from
++	}
++	if to-from <= 1 {
++		return from
++	}
++	return from + rand.Int64N(to-from)
++}
++
++func spanOf(value *option.V2RayXHTTPRange) span {
++	if value == nil {
++		return span{}
++	}
++	return span{int64(value.From), int64(value.To)}
++}
++
++// fragment is a fragment mask as Xray builds it (infra/conf FragmentMask.Build).
++type fragment struct {
++	// the writes cut, counted from 1: 0-1 is the ClientHello ("tlshello"), 0-0 every write
++	packetsFrom, packetsTo int64
++	lengths, delays        []span
++	maxSplit               span
++}
++
++func newFragment(options option.FinalMaskTCPOptions) (*fragment, error) {
++	f := &fragment{}
++	switch packets := strings.ToLower(strings.TrimSpace(options.Packets)); packets {
++	case "tlshello":
++		f.packetsFrom, f.packetsTo = 0, 1
++	case "":
++	default:
++		var bounds option.V2RayXHTTPRange
++		err := bounds.UnmarshalJSON([]byte(`"` + packets + `"`))
++		if err != nil {
++			return nil, E.Cause(err, "packets")
++		}
++		if bounds.From <= 0 {
++			return nil, E.New("packets: the first write is 1")
++		}
++		f.packetsFrom, f.packetsTo = int64(bounds.From), int64(bounds.To)
++	}
++	if len(options.Lengths) > 0 {
++		for index := range options.Lengths {
++			f.lengths = append(f.lengths, spanOf(&options.Lengths[index]))
++		}
++	} else {
++		f.lengths = append(f.lengths, spanOf(options.Length))
++	}
++	for _, length := range f.lengths {
++		if length.from < 0 {
++			return nil, E.New("length: a negative length")
++		}
++	}
++	// a piece of no byte is no piece: Xray refuses a last range that may draw 0
++	if f.lengths[len(f.lengths)-1].from <= 0 {
++		return nil, E.New("length: the last range must start above 0")
++	}
++	if len(options.Delays) > 0 {
++		for index := range options.Delays {
++			f.delays = append(f.delays, spanOf(&options.Delays[index]))
++		}
++	} else {
++		f.delays = append(f.delays, spanOf(options.Delay))
++	}
++	for _, delay := range f.delays {
++		if delay.from < 0 {
++			return nil, E.New("delay: a negative delay")
++		}
++	}
++	f.maxSplit = spanOf(options.MaxSplit)
++	if f.maxSplit.from < 0 {
++		return nil, E.New("max_split: a negative number")
++	}
++	return f, nil
++}
++
++func (f *fragment) lengthOf(piece int64) span {
++	return f.lengths[min(piece, int64(len(f.lengths)-1))]
++}
++
++func (f *fragment) delayOf(piece int64) span {
++	return f.delays[min(piece, int64(len(f.delays)-1))]
++}
++
++// merged: with one delay of 0 the records of a ClientHello go out in one write (Xray's
++// mergeTlsHelloSegments)
++func (f *fragment) merged() bool {
++	return len(f.delays) == 1 && f.delays[0].to == 0
++}
+diff --git a/common/finalmask/finalmask_test.go b/common/finalmask/finalmask_test.go
+new file mode 100644
+index 000000000..099235cd9
+--- /dev/null
++++ b/common/finalmask/finalmask_test.go
+@@ -0,0 +1,292 @@
++package finalmask
++
++import (
++	"bytes"
++	"crypto/rand"
++	"net"
++	"os"
++	"sync"
++	"testing"
++	"time"
++
++	"github.com/sagernet/sing-box/option"
++	"github.com/sagernet/sing/common/json"
++
++	"github.com/stretchr/testify/require"
++)
++
++// writesConn keeps each write of the mask apart.
++type writesConn struct {
++	net.Conn
++	access sync.Mutex
++	writes [][]byte
++}
++
++func (c *writesConn) Write(p []byte) (int, error) {
++	c.access.Lock()
++	defer c.access.Unlock()
++	c.writes = append(c.writes, append([]byte(nil), p...))
++	return len(p), nil
++}
++
++func (c *writesConn) Close() error { return nil }
++
++func (c *writesConn) SetDeadline(time.Time) error      { return nil }
++func (c *writesConn) SetWriteDeadline(time.Time) error { return nil }
++
++func hello(size int) []byte {
++	payload := make([]byte, size)
++	_, _ = rand.Read(payload)
++	payload[0] = 1 // ClientHello
++	return append([]byte{22, 3, 1, byte(size >> 8), byte(size)}, payload...)
++}
++
++// records reads TLS records back: their payload joined and their sizes.
++func records(t *testing.T, stream []byte) ([]byte, []int) {
++	t.Helper()
++	var payload []byte
++	var sizes []int
++	for len(stream) > 0 {
++		require.GreaterOrEqual(t, len(stream), 5)
++		require.Equal(t, []byte{22, 3, 1}, stream[:3])
++		size := int(stream[3])<<8 | int(stream[4])
++		require.GreaterOrEqual(t, len(stream), 5+size)
++		payload = append(payload, stream[5:5+size]...)
++		sizes = append(sizes, size)
++		stream = stream[5+size:]
++	}
++	return payload, sizes
++}
++
++func masked(t *testing.T, content string) (*fragmentConn, *writesConn) {
++	t.Helper()
++	var options option.FinalMaskOptions
++	require.NoError(t, json.Unmarshal([]byte(content), &options))
++	masks, err := New(&options)
++	require.NoError(t, err)
++	under := &writesConn{}
++	conn := masks.Client(under).(*fragmentConn)
++	return conn, under
++}
++
++func TestHelloInRecordsOneWrite(t *testing.T) {
++	t.Parallel()
++	for range 20 {
++		conn, under := masked(t, `{"tcp":[{"type":"fragment","packets":"tlshello","length":"11-24","delay":0}]}`)
++		message := hello(1521)
++		n, err := conn.Write(message)
++		require.NoError(t, err)
++		require.Equal(t, len(message), n)
++		require.Len(t, under.writes, 1, "a single delay of 0: one write")
++		payload, sizes := records(t, under.writes[0])
++		require.Equal(t, message[5:], payload)
++		for _, size := range sizes[:len(sizes)-1] {
++			require.True(t, size >= 11 && size <= 23, "a record of %d bytes", size)
++		}
++		require.True(t, sizes[len(sizes)-1] >= 1 && sizes[len(sizes)-1] <= 23)
++		require.Greater(t, len(sizes), 1521/24)
++	}
++}
++
++func TestHelloRecordsEachAWriteWithDelay(t *testing.T) {
++	t.Parallel()
++	conn, under := masked(t, `{"tcp":[{"type":"fragment","packets":"tlshello","length":"200","delay":"1-2"}]}`)
++	message := hello(1000)
++	_, err := conn.Write(message)
++	require.NoError(t, err)
++	require.Len(t, under.writes, 5)
++	payload, sizes := records(t, bytes.Join(under.writes, nil))
++	require.Equal(t, message[5:], payload)
++	require.Equal(t, []int{200, 200, 200, 200, 200}, sizes)
++}
++
++func TestHelloLengthsAndMaxSplit(t *testing.T) {
++	t.Parallel()
++	conn, under := masked(t, `{"tcp":[{"type":"fragment","packets":"tlshello","lengths":["1","5",{"from":100,"to":100}],"max_split":"4"}]}`)
++	message := hello(600)
++	_, err := conn.Write(message)
++	require.NoError(t, err)
++	payload, sizes := records(t, under.writes[0])
++	require.Equal(t, message[5:], payload)
++	require.Equal(t, []int{1, 5, 100, 494}, sizes, "the last of max_split pieces takes the rest")
++}
++
++func TestHelloOnlyTheFirstWrite(t *testing.T) {
++	t.Parallel()
++	conn, under := masked(t, `{"tcp":[{"type":"fragment","packets":"tlshello","length":"11-24"}]}`)
++	plain := []byte("GET / HTTP/1.1\r\n\r\n")
++	_, err := conn.Write(plain)
++	require.NoError(t, err)
++	require.True(t, conn.WriterReplaceable())
++	message := hello(300)
++	_, err = conn.Write(message)
++	require.NoError(t, err)
++	require.Equal(t, [][]byte{plain, message}, under.writes, "not a hello first: nothing is cut, and later writes are not looked at")
++}
++
++func TestHelloWithMoreAfterTheRecord(t *testing.T) {
++	t.Parallel()
++	conn, under := masked(t, `{"tcp":[{"type":"fragment","packets":"tlshello","length":"50"}]}`)
++	message := hello(120)
++	extra := []byte{23, 3, 3, 0, 1, 9}
++	n, err := conn.Write(append(append([]byte(nil), message...), extra...))
++	require.NoError(t, err)
++	require.Equal(t, len(message)+len(extra), n)
++	require.Len(t, under.writes, 2)
++	payload, sizes := records(t, under.writes[0])
++	require.Equal(t, message[5:], payload)
++	require.Equal(t, []int{50, 50, 20}, sizes)
++	require.Equal(t, extra, under.writes[1])
++}
++
++func TestPacketsRange(t *testing.T) {
++	t.Parallel()
++	conn, under := masked(t, `{"tcp":[{"type":"fragment","packets":"2-3","length":"3"}]}`)
++	for _, text := range []string{"first", "second", "third!", "fourth"} {
++		_, err := conn.Write([]byte(text))
++		require.NoError(t, err)
++	}
++	require.Equal(t, []string{"first", "sec", "ond", "thi", "rd!", "fourth"}, texts(under.writes))
++	require.True(t, conn.WriterReplaceable())
++}
++
++func TestPacketsEvery(t *testing.T) {
++	t.Parallel()
++	conn, under := masked(t, `{"tcp":[{"type":"fragment","length":"4"}]}`)
++	for _, text := range []string{"abcdefgh", "ijkl"} {
++		_, err := conn.Write([]byte(text))
++		require.NoError(t, err)
++	}
++	require.Equal(t, []string{"abcd", "efgh", "ijkl"}, texts(under.writes))
++	require.False(t, conn.WriterReplaceable(), "every write is cut: the mask never steps aside")
++}
++
++func TestCloseEndsThePause(t *testing.T) {
++	t.Parallel()
++	conn, _ := masked(t, `{"tcp":[{"type":"fragment","packets":"1-1","length":"1","delay":"60000"}]}`)
++	done := make(chan error, 1)
++	go func() {
++		_, err := conn.Write([]byte("abc"))
++		done <- err
++	}()
++	time.Sleep(50 * time.Millisecond)
++	require.NoError(t, conn.Close())
++	select {
++	case err := <-done:
++		require.ErrorIs(t, err, net.ErrClosed)
++	case <-time.After(5 * time.Second):
++		t.Fatal("the pause did not end with the connection")
++	}
++}
++
++func TestOptionErrors(t *testing.T) {
++	t.Parallel()
++	for name, content := range map[string]string{
++		"another mask":        `{"tcp":[{"type":"header-custom"}]}`,
++		"no length":           `{"tcp":[{"type":"fragment","packets":"tlshello"}]}`,
++		"a last length of 0":  `{"tcp":[{"type":"fragment","lengths":["5","0-3"]}]}`,
++		"packets from 0":      `{"tcp":[{"type":"fragment","packets":"0-2","length":"5"}]}`,
++		"packets not a range": `{"tcp":[{"type":"fragment","packets":"hello","length":"5"}]}`,
++	} {
++		var options option.FinalMaskOptions
++		err := json.Unmarshal([]byte(content), &options)
++		if err == nil {
++			_, err = New(&options)
++		}
++		require.Error(t, err, name)
++	}
++	masks, err := New(nil)
++	require.NoError(t, err)
++	require.Nil(t, masks)
++}
++
++func texts(writes [][]byte) []string {
++	var result []string
++	for _, write := range writes {
++		result = append(result, string(write))
++	}
++	return result
++}
++
++func TestNotReplaceableBeforeTheFirstWrite(t *testing.T) {
++	t.Parallel()
++	for _, content := range []string{
++		`{"tcp":[{"type":"fragment","packets":"tlshello","length":"11-24"}]}`,
++		`{"tcp":[{"type":"fragment","packets":"1-2","length":"3"}]}`,
++		`{"tcp":[{"type":"fragment","length":"3"}]}`,
++	} {
++		conn, _ := masked(t, content)
++		require.False(t, conn.WriterReplaceable(), "a copy loop must not reach the socket before the mask has cut: %s", content)
++		require.True(t, conn.ReaderReplaceable())
++	}
++}
++
++func TestHelloNotCut(t *testing.T) {
++	t.Parallel()
++	for name, first := range map[string][]byte{
++		// a record of no byte, and a record after it: Xray would lose the header
++		"an empty record": {22, 3, 1, 0, 0, 22, 3, 1, 0, 1, 1},
++		// a handshake record that is not a ClientHello (type 2): not a client's first write
++		"not a ClientHello": append([]byte{22, 3, 3, 0, 40, 2}, make([]byte, 39)...),
++		// what only looks like a record: the salt of Shadowsocks starting with 0x16
++		"not TLS": append([]byte{22, 9, 9, 0, 20, 1}, make([]byte, 30)...),
++	} {
++		conn, under := masked(t, `{"tcp":[{"type":"fragment","packets":"tlshello","length":"2"}]}`)
++		n, err := conn.Write(first)
++		require.NoError(t, err)
++		require.Equal(t, len(first), n)
++		require.Equal(t, [][]byte{first}, under.writes, name)
++	}
++}
++
++func TestRangesAsXrayDrawsThem(t *testing.T) {
++	t.Parallel()
++	// crypto.RandBetween of Xray: "11-12" is always 11, "11-14" never 14
++	for range 20 {
++		conn, under := masked(t, `{"tcp":[{"type":"fragment","packets":"tlshello","length":"11-12","delay":0}]}`)
++		_, err := conn.Write(hello(110))
++		require.NoError(t, err)
++		_, sizes := records(t, under.writes[0])
++		require.Equal(t, []int{11, 11, 11, 11, 11, 11, 11, 11, 11, 11}, sizes)
++	}
++	seen := map[int]bool{}
++	for range 50 {
++		conn, under := masked(t, `{"tcp":[{"type":"fragment","packets":"tlshello","length":"11-14","delay":0}]}`)
++		_, err := conn.Write(hello(600))
++		require.NoError(t, err)
++		_, sizes := records(t, under.writes[0])
++		for _, size := range sizes[:len(sizes)-1] {
++			seen[size] = true
++		}
++	}
++	require.Equal(t, map[int]bool{11: true, 12: true, 13: true}, seen)
++}
++
++func TestHugeLength(t *testing.T) {
++	t.Parallel()
++	conn, under := masked(t, `{"tcp":[{"type":"fragment","packets":"1-1","lengths":["5","2147483647"]}]}`)
++	_, err := conn.Write(bytes.Repeat([]byte{7}, 40))
++	require.NoError(t, err)
++	require.Equal(t, []int{5, 35}, sizesOf(under.writes))
++}
++
++func TestDeadlineEndsThePause(t *testing.T) {
++	t.Parallel()
++	conn, under := masked(t, `{"tcp":[{"type":"fragment","packets":"1-1","length":"1","delay":"60000"}]}`)
++	require.NoError(t, conn.SetWriteDeadline(time.Now().Add(100*time.Millisecond)))
++	started := time.Now()
++	n, err := conn.Write([]byte("abc"))
++	require.ErrorIs(t, err, os.ErrDeadlineExceeded)
++	require.Equal(t, 1, n, "the piece before the pause is written")
++	require.Less(t, time.Since(started), 5*time.Second)
++	require.Equal(t, []string{"a"}, texts(under.writes))
++	require.NoError(t, conn.SetWriteDeadline(time.Time{}))
++}
++
++func sizesOf(writes [][]byte) []int {
++	var sizes []int
++	for _, write := range writes {
++		sizes = append(sizes, len(write))
++	}
++	return sizes
++}
+diff --git a/common/sharelink/link.go b/common/sharelink/link.go
+index 45f49b6b5..7de128683 100644
+--- a/common/sharelink/link.go
++++ b/common/sharelink/link.go
+@@ -151,6 +151,18 @@ func Decode(link string) (*Outbound, []string, error) {
+ 		}
+ 		return nil, nil, err
+ 	}
++	if d.mask != nil {
++		// the masks of fm, for the dialer of the outbound
++		content, err := json.Marshal(d.mask)
++		if err != nil {
++			return nil, nil, err
++		}
++		masks, err := parseObject(content)
++		if err != nil {
++			return nil, nil, err
++		}
++		options.put("finalmask", masks)
++	}
+ 	err = d.fallback(linkScheme.outbound, options)
+ 	if err != nil {
+ 		return nil, nil, err
+@@ -424,6 +436,8 @@ type decoder struct {
+ 	// the parameters the scheme reads
+ 	known    map[string]bool
+ 	warnings []string
++	// the masks of "fm" for the dialer of the outbound (finalmask)
++	mask *option.FinalMaskOptions
+ }
+ 
+ // reads marks the parameters the scheme reads: any other gets a warning.
+diff --git a/common/sharelink/link_test.go b/common/sharelink/link_test.go
+index 8f6fe8828..55fb35396 100644
+--- a/common/sharelink/link_test.go
++++ b/common/sharelink/link_test.go
+@@ -211,38 +211,43 @@ func TestOtherTransports(t *testing.T) {
+ 
+ func TestWarnings(t *testing.T) {
+ 	t.Parallel()
++	// pcs says nothing to REALITY, which verifies no certificate: no warning of its own
+ 	_, warnings := decodeJSON(t, "vless://"+testUUID+"@example.org:443?security=reality&pbk=K&pqv=V&ech=E&pcs=P&fm=F&type=grpc&authority=a")
+-	require.Len(t, warnings, 5)
++	require.Len(t, warnings, 4)
+ }
+ 
+ func TestErrors(t *testing.T) {
+ 	t.Parallel()
+ 	for name, link := range map[string]string{
+-		"empty":             "",
+-		"not a link":        "hello",
+-		"scheme":            "gopher://example.org:70",
+-		"no user":           "vless://example.org:443",
+-		"empty user":        "vless://@example.org:443",
+-		"no port":           "vless://" + testUUID + "@example.org",
+-		"bad port":          "vless://" + testUUID + "@example.org:70000",
+-		"zero port":         "vless://" + testUUID + "@example.org:0",
+-		"no host":           "vless://" + testUUID + "@:443",
+-		"bad ipv6":          "vless://" + testUUID + "@[::1:443",
+-		"encryption":        "vless://" + testUUID + "@example.org:443?encryption=mlkem768x25519plus.native.0rtt.KEY",
+-		"security":          "vless://" + testUUID + "@example.org:443?security=xtls",
+-		"reality no key":    "vless://" + testUUID + "@example.org:443?security=reality",
+-		"kcp":               "vless://" + testUUID + "@example.org:443?type=kcp",
+-		"tcp http header":   "vless://" + testUUID + "@example.org:443?security=tls&type=tcp&headerType=http",
+-		"tcp other header":  "vless://" + testUUID + "@example.org:443?type=tcp&headerType=srtp",
+-		"grpc mode":         "vless://" + testUUID + "@example.org:443?type=grpc&mode=other",
+-		"bad escape":        "vless://" + testUUID + "@example.org:443?type=ws&path=%zz",
+-		"extra not json":    xhttpLink(`{"xPaddingBytes":`, url.QueryEscape, ""),
+-		"extra not object":  xhttpLink(`"text"`, url.QueryEscape, ""),
+-		"extra bad range":   xhttpLink(`{"xPaddingBytes":"a-b"}`, url.QueryEscape, ""),
+-		"extra huge range":  xhttpLink(`{"xPaddingBytes":99999999999}`, url.QueryEscape, ""),
+-		"extra bad type":    xhttpLink(`{"noGRPCHeader":"yes"}`, url.QueryEscape, ""),
+-		"flat padding":      xhttpLink(`{}`, url.QueryEscape, "&x_padding_bytes=a%22b"),
+-		"extra bad headers": xhttpLink(`{"headers":{"a":1}}`, url.QueryEscape, ""),
++		"empty":                 "",
++		"not a link":            "hello",
++		"scheme":                "gopher://example.org:70",
++		"no user":               "vless://example.org:443",
++		"empty user":            "vless://@example.org:443",
++		"no port":               "vless://" + testUUID + "@example.org",
++		"bad port":              "vless://" + testUUID + "@example.org:70000",
++		"zero port":             "vless://" + testUUID + "@example.org:0",
++		"no host":               "vless://" + testUUID + "@:443",
++		"bad ipv6":              "vless://" + testUUID + "@[::1:443",
++		"encryption":            "vless://" + testUUID + "@example.org:443?encryption=mlkem768x25519plus.native.0rtt.KEY",
++		"security":              "vless://" + testUUID + "@example.org:443?security=xtls",
++		"reality no key":        "vless://" + testUUID + "@example.org:443?security=reality",
++		"kcp":                   "vless://" + testUUID + "@example.org:443?type=kcp",
++		"gecko of 3000":         "hysteria2://p@example.org?fm=" + uriComponent(`{"udp":[{"type":"salamander","settings":{"password":"x","packetSize":"0-3000"}}]}`),
++		"udphop of 3 s":         "hysteria2://p@example.org?fm=" + uriComponent(`{"udp":[{"type":"udphop","settings":{"mode":"intervalRemote","interval":3,"remotePorts":"1-2"}}]}`),
++		"udpHop of 3 s":         "hysteria2://p@example.org?fm=" + uriComponent(`{"quicParams":{"udpHop":{"ports":"1-2","interval":"3"}}}`),
++		"salamander unreadable": "hysteria2://p@example.org?fm=" + uriComponent(`{"udp":[{"type":"salamander","settings":"x"}]}`),
++		"tcp http header":       "vless://" + testUUID + "@example.org:443?security=tls&type=tcp&headerType=http",
++		"tcp other header":      "vless://" + testUUID + "@example.org:443?type=tcp&headerType=srtp",
++		"grpc mode":             "vless://" + testUUID + "@example.org:443?type=grpc&mode=other",
++		"bad escape":            "vless://" + testUUID + "@example.org:443?type=ws&path=%zz",
++		"extra not json":        xhttpLink(`{"xPaddingBytes":`, url.QueryEscape, ""),
++		"extra not object":      xhttpLink(`"text"`, url.QueryEscape, ""),
++		"extra bad range":       xhttpLink(`{"xPaddingBytes":"a-b"}`, url.QueryEscape, ""),
++		"extra huge range":      xhttpLink(`{"xPaddingBytes":99999999999}`, url.QueryEscape, ""),
++		"extra bad type":        xhttpLink(`{"noGRPCHeader":"yes"}`, url.QueryEscape, ""),
++		"flat padding":          xhttpLink(`{}`, url.QueryEscape, "&x_padding_bytes=a%22b"),
++		"extra bad headers":     xhttpLink(`{"headers":{"a":1}}`, url.QueryEscape, ""),
+ 	} {
+ 		outbound, _, err := Decode(link)
+ 		require.Error(t, err, name)
+diff --git a/common/sharelink/policy.go b/common/sharelink/policy.go
+index fef25936a..85c2988ab 100644
+--- a/common/sharelink/policy.go
++++ b/common/sharelink/policy.go
+@@ -20,7 +20,8 @@ var refusals = map[string]string{
+ 	"flow":                  "a flow other than xtls-rprx-vision is not in sing-box; Xray has removed the older ones",
+ 	"flow-transport":        "lab: with the flow over ws and grpc sing-box fails every connection itself, over httpupgrade Xray answers \"XTLS only supports TLS and REALITY directly\"; over xhttp Xray takes a flow only with VLESS Encryption, and with it the flow is taken over every transport; the http transport fails as ws does",
+ 	"flow-no-tls":           "Vision works on a TLS connection: without TLS, REALITY or VLESS Encryption there is none",
+-	"finalmask":             "a mask of finalmask other than fragment and noise changes what goes over the wire, and the server expects it",
++	"finalmask":             "a mask of finalmask other than fragment, noise and udphop (and salamander for Hysteria 2, which sing-box has) changes what goes over the wire, and the server expects it",
++	"hysteria-realm":        "the realm of Hysteria (Xray's realm mask, sing-box's hysteria2.realm: the same API) reaches a server behind a NAT through a realm server and STUN servers the link names, and may open ports of the gateway (port_mapping): as with sb.realm (deniedNames), a link does not set it",
+ 	"tcp-http-header-tls":   "lab: the HTTP header of the TCP transport works as the http transport of sing-box without TLS; with TLS that transport speaks HTTP/2",
+ 	"tcp-header":            "a header type of the TCP transport other than none and http does not exist in Xray either",
+ 	"grpc-mode":             "a gRPC mode other than gun and multi does not exist in Xray either",
+diff --git a/common/sharelink/policy_test.go b/common/sharelink/policy_test.go
+index edc3a3eb0..45269acb2 100644
+--- a/common/sharelink/policy_test.go
++++ b/common/sharelink/policy_test.go
+@@ -179,28 +179,84 @@ func TestLeniencies(t *testing.T) {
+ 		"finalmask of the client's own": {
+ 			policyBase + "fm=%7B%22tcp%22%3A%5B%7B%22type%22%3A%22fragment%22%7D%5D%2C%22udp%22%3A%5B%7B%22type%22%3A%22noise%22%7D%5D%2C%22quicParams%22%3A%7B%7D%7D",
+ 			`{"type":"vless","server":"example.org","server_port":443,"uuid":"` + testUUID + `"}`,
+-			[]string{"fm (finalmask) is not supported and is ignored"},
++			[]string{"fm (finalmask): a fragment mask is ignored", "fm (finalmask): the mask noise is not applied"},
+ 		},
+ 		"finalmask that cannot be read": {
+ 			policyBase + "fm=x",
+ 			`{"type":"vless","server":"example.org","server_port":443,"uuid":"` + testUUID + `"}`,
+-			[]string{"fm (finalmask) is not supported and cannot be read"},
++			[]string{"fm (finalmask) cannot be read and is ignored"},
+ 		},
+ 		"packet as packetaddr": {
+ 			policyBase + "packetEncoding=packet",
+ 			`{"type":"vless","server":"example.org","server_port":443,"uuid":"` + testUUID + `","packet_encoding":"packetaddr"}`,
+ 			nil,
+ 		},
++		"finalmask: the ClientHello in small records": {
++			policyBase + "security=tls&fm=%7B%22tcp%22%3A%5B%7B%22type%22%3A%22fragment%22%2C%22settings%22%3A%7B%22packets%22%3A%22tlshello%22%2C%22length%22%3A%2211-24%22%2C%22delay%22%3A%220%22%7D%7D%5D%7D",
++			`{"type":"vless","server":"example.org","server_port":443,"uuid":"` + testUUID + `","finalmask":{"tcp":[{"type":"fragment","packets":"tlshello","length":"11-24"}]},"tls":{"enabled":true,"utls":{"enabled":true,"fingerprint":"chrome"}}}`,
++			nil,
++		},
++		"finalmask: the first writes in pieces, the delays left out": {
++			policyBase + "fm=%7B%22tcp%22%3A%5B%7B%22type%22%3A%22fragment%22%2C%22settings%22%3A%7B%22packets%22%3A%221-3%22%2C%22lengths%22%3A%5B%221%22%2C%225-10%22%5D%2C%22delays%22%3A%5B%2210-20%22%5D%2C%22maxSplit%22%3A%224%22%7D%7D%5D%2C%22udp%22%3A%5B%7B%22type%22%3A%22noise%22%7D%5D%7D",
++			`{"type":"vless","server":"example.org","server_port":443,"uuid":"` + testUUID + `","finalmask":{"tcp":[{"type":"fragment","packets":"1-3","lengths":["1","5-10"],"max_split":"4"}]}}`,
++			[]string{"the delays of the fragment mask are not applied", "the mask noise is not applied"},
++		},
++		"a pinned certificate of Xray": {
++			policyBase + "security=tls&pcs=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa,0B%3A0B%3A0B%3A0B%3A0B%3A0B%3A0B%3A0B%3A0B%3A0B%3A0B%3A0B%3A0B%3A0B%3A0B%3A0B%3A0B%3A0B%3A0B%3A0B%3A0B%3A0B%3A0B%3A0B%3A0B%3A0B%3A0B%3A0B%3A0B%3A0B%3A0B%3A0B",
++			`{"type":"vless","server":"example.org","server_port":443,"uuid":"` + testUUID + `","tls":{"enabled":true,"certificate_sha256":["qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqo=","CwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCws="],"utls":{"enabled":true,"fingerprint":"chrome"}}}`,
++			nil,
++		},
++		"a pinned certificate with REALITY": {
++			policyBase + "security=reality&pbk=K&sid=ab&pcs=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
++			`{"type":"vless","server":"example.org","server_port":443,"uuid":"` + testUUID + `","tls":{"enabled":true,"utls":{"enabled":true,"fingerprint":"chrome"},"reality":{"enabled":true,"public_key":"K","short_id":"ab"}}}`,
++			nil,
++		},
+ 		"a pinned certificate": {
+ 			policyBase + "security=tls&pcs=0123abcd&vcn=example.org",
+ 			`{"type":"vless","server":"example.org","server_port":443,"uuid":"` + testUUID + `","tls":{"enabled":true,"utls":{"enabled":true,"fingerprint":"chrome"}}}`,
+-			[]string{"the pinned certificate (pcs, pinSHA256) is not supported", "vcn (the names the certificate is verified by) is not supported"},
++			[]string{"the pinned certificate (pcs, pinSHA256) cannot be read", "vcn (the names the certificate is verified by) is not supported"},
+ 		},
+ 		"the certificate verified by the name that is sent": {
+ 			policyBase + "security=tls&sni=s.example.org&vcn=other.example.org,S.example.org&cs=TLS_AES_128_GCM_SHA256",
+ 			`{"type":"vless","server":"example.org","server_port":443,"uuid":"` + testUUID + `","tls":{"enabled":true,"server_name":"s.example.org","utls":{"enabled":true,"fingerprint":"chrome"}}}`,
+ 			[]string{"cs (the cipher suites of TLS) is not supported and is ignored"},
+ 		},
++		"udphop over TCP: no UDP of its own to hop": {
++			policyBase + "fm=%7B%22udp%22%3A%5B%7B%22type%22%3A%22udphop%22%2C%22settings%22%3A%7B%22mode%22%3A%22intervalRemote%22%2C%22remotePorts%22%3A%221000-2000%22%7D%7D%2C%7B%22type%22%3A%22noise%22%7D%5D%7D",
++			`{"type":"vless","server":"example.org","server_port":443,"uuid":"` + testUUID + `"}`,
++			[]string{"fm (finalmask): the masks noise, udphop are not applied"},
++		},
++		"udphop between addresses": {
++			"hysteria2://p@example.com:443/?fm=%7B%22udp%22%3A%5B%7B%22type%22%3A%22udphop%22%2C%22settings%22%3A%7B%22mode%22%3A%22intervalRemote%22%2C%22remoteIPs%22%3A%5B%22192.0.2.0%2F24%22%5D%2C%22remotePorts%22%3A%2220000-30000%22%7D%7D%5D%7D",
++			`{"type":"hysteria2","server":"example.com","server_port":443,"server_ports":"20000:30000","password":"p","tls":{"enabled":true}}`,
++			[]string{"fm (finalmask): udphop between addresses (remoteIPs) is not supported"},
++		},
++		"udphop of the local port only": {
++			"hysteria2://p@example.com:443/?fm=%7B%22udp%22%3A%5B%7B%22type%22%3A%22udphop%22%2C%22settings%22%3A%7B%22mode%22%3A%22intervalLocal%22%7D%7D%5D%7D",
++			`{"type":"hysteria2","server":"example.com","server_port":443,"password":"p","tls":{"enabled":true}}`,
++			[]string{"fm (finalmask): udphop of the local port only is not supported"},
++		},
++		"udphop of the local port with ports: Xray stays on the port of the link": {
++			"hysteria2://p@example.com:443/?fm=%7B%22udp%22%3A%5B%7B%22type%22%3A%22udphop%22%2C%22settings%22%3A%7B%22mode%22%3A%22intervalLocal%22%2C%22remotePorts%22%3A%2220000-30000%22%7D%7D%5D%7D",
++			`{"type":"hysteria2","server":"example.com","server_port":443,"password":"p","tls":{"enabled":true}}`,
++			[]string{"fm (finalmask): udphop of the local port only is not supported"},
++		},
++		"udphop without a mode": {
++			"hysteria2://p@example.com:443/?fm=%7B%22udp%22%3A%5B%7B%22type%22%3A%22udphop%22%2C%22settings%22%3A%7B%22remotePorts%22%3A%2220000-30000%22%7D%7D%5D%7D",
++			`{"type":"hysteria2","server":"example.com","server_port":443,"password":"p","tls":{"enabled":true}}`,
++			[]string{"fm (finalmask): udphop of an unknown mode is ignored"},
++		},
++		"noise in a Hysteria 2 link": {
++			"hysteria2://p@example.com:443/?fm=%7B%22udp%22%3A%5B%7B%22type%22%3A%22noise%22%7D%5D%7D",
++			`{"type":"hysteria2","server":"example.com","server_port":443,"password":"p","tls":{"enabled":true}}`,
++			[]string{"fm (finalmask): the mask noise is not applied"},
++		},
++		"finalmask: the ClientHello in records with delays, a write each without the pause": {
++			policyBase + "security=tls&fm=%7B%22tcp%22%3A%5B%7B%22type%22%3A%22fragment%22%2C%22settings%22%3A%7B%22packets%22%3A%22tlshello%22%2C%22length%22%3A%2210-20%22%2C%22delay%22%3A%2210-20%22%7D%7D%5D%7D",
++			`{"type":"vless","server":"example.org","server_port":443,"uuid":"` + testUUID + `","finalmask":{"tcp":[{"type":"fragment","packets":"tlshello","length":"10-20","delays":["0","0"]}]},"tls":{"enabled":true,"utls":{"enabled":true,"fingerprint":"chrome"}}}`,
++			[]string{"the delays of the fragment mask are not applied"},
++		},
++
+ 		"a pinned certificate, not verified anyway": {
+ 			policyBase + "security=tls&pcs=0123abcd&allowInsecure=1",
+ 			`{"type":"vless","server":"example.org","server_port":443,"uuid":"` + testUUID + `","tls":{"enabled":true,"insecure":true,"utls":{"enabled":true,"fingerprint":"chrome"}}}`,
+diff --git a/common/sharelink/quic.go b/common/sharelink/quic.go
+index c2dd22e45..3c1892361 100644
+--- a/common/sharelink/quic.go
++++ b/common/sharelink/quic.go
+@@ -3,7 +3,9 @@ package sharelink
+ import (
+ 	"strconv"
+ 	"strings"
++	"time"
+ 
++	C "github.com/sagernet/sing-box/constant"
+ 	"github.com/sagernet/sing-box/option"
+ 	E "github.com/sagernet/sing/common/exceptions"
+ 	"github.com/sagernet/sing/common/json"
+@@ -124,7 +126,9 @@ func (d *decoder) hysteria2() (any, error) {
+ }
+ 
+ // hysteria2Mask reads "fm", the finalmask of Xray, in a Hysteria 2 link: Remnawave writes
+-// the obfuscation, the port hopping and the speeds of its Hysteria inbounds there.
++// the obfuscation, the port hopping and the speeds of its Hysteria inbounds there. What the
++// link says itself (obfs, a list of ports) stands, apart from the packet size of salamander:
++// that makes Xray's gecko, which Remnawave writes into the link as obfs=salamander too.
+ func (d *decoder) hysteria2Mask(options *option.Hysteria2OutboundOptions) error {
+ 	content := strings.TrimSpace(d.query["fm"])
+ 	if content == "" {
+@@ -132,10 +136,8 @@ func (d *decoder) hysteria2Mask(options *option.Hysteria2OutboundOptions) error
+ 	}
+ 	var mask struct {
+ 		UDP []struct {
+-			Type     string `json:"type"`
+-			Settings struct {
+-				Password string `json:"password"`
+-			} `json:"settings"`
++			Type     string          `json:"type"`
++			Settings json.RawMessage `json:"settings"`
+ 		} `json:"udp"`
+ 		QUIC struct {
+ 			BrutalUp   vmessText `json:"brutalUp"`
+@@ -152,16 +154,29 @@ func (d *decoder) hysteria2Mask(options *option.Hysteria2OutboundOptions) error
+ 		return nil
+ 	}
+ 	for _, entry := range mask.UDP {
+-		switch strings.ToLower(entry.Type) {
+-		case "salamander":
+-			if options.Obfs == nil {
+-				options.Obfs = &option.Hysteria2Obfs{Type: "salamander", Password: entry.Settings.Password}
+-			}
++		kind := strings.ToLower(entry.Type)
++		switch kind {
+ 		case "noise":
++			d.warn("fm (finalmask): the mask noise is not applied: it is the client's own")
++		case "salamander", "udphop":
++		case "realm":
++			return refuse("hysteria-realm", "fm (finalmask) asks for the realm of Hysteria, which a link does not set: it has other servers asked, and may open ports of the gateway")
+ 		default:
+ 			return refuse("finalmask", "fm (finalmask) asks for the mask", shown(entry.Type), ", which is not supported: the server expects it")
+ 		}
+ 	}
++	for _, entry := range mask.UDP {
++		var err error
++		switch strings.ToLower(entry.Type) {
++		case "salamander":
++			err = d.salamanderMask(options, entry.Settings)
++		case "udphop":
++			err = d.udpHopMask(options, entry.Settings)
++		}
++		if err != nil {
++			return err
++		}
++	}
+ 	if ports := string(mask.QUIC.UDPHop.Ports); ports != "" && len(options.ServerPorts) == 0 {
+ 		ranges, err := portRanges(ports)
+ 		if err != nil {
+@@ -169,12 +184,10 @@ func (d *decoder) hysteria2Mask(options *option.Hysteria2OutboundOptions) error
+ 		}
+ 		options.ServerPorts = badoption.Listable[string](ranges)
+ 		// seconds; a range of them is how often Xray hops, between the two
+-		interval, _, _ := strings.Cut(string(mask.QUIC.UDPHop.Interval), "-")
+-		if seconds, err := strconv.Atoi(strings.TrimSpace(interval)); err == nil && seconds > 0 {
+-			err = options.HopInterval.UnmarshalJSON([]byte(strconv.Quote(strconv.Itoa(seconds) + "s")))
+-			if err != nil {
+-				return E.New("invalid hop interval in fm")
+-			}
++		from, to, _ := strings.Cut(string(mask.QUIC.UDPHop.Interval), "-")
++		err = hopInterval(options, from, to)
++		if err != nil {
++			return err
+ 		}
+ 	}
+ 	if options.UpMbps == 0 {
+@@ -186,6 +199,122 @@ func (d *decoder) hysteria2Mask(options *option.Hysteria2OutboundOptions) error
+ 	return nil
+ }
+ 
++// hopInterval sets how often the ports hop from a range of seconds: hop_interval, and
++// hop_interval_max when the range has two ends. Under 5 s Xray refuses it, and sing-quic
++// refuses every connection (hysteria/hop.go).
++func hopInterval(options *option.Hysteria2OutboundOptions, from, to string) error {
++	least, err := strconv.Atoi(strings.TrimSpace(from))
++	if err != nil || least <= 0 {
++		return nil
++	}
++	if least < 5 {
++		return E.New("fm (finalmask): the interval of the port hopping is under 5 s")
++	}
++	most, err := strconv.Atoi(strings.TrimSpace(to))
++	if err != nil {
++		most = least
++	}
++	options.HopInterval = badoption.Duration(time.Duration(least) * time.Second)
++	if most > least {
++		options.HopIntervalMax = badoption.Duration(time.Duration(most) * time.Second)
++	}
++	return nil
++}
++
++// salamanderMask reads the salamander mask. With a packet size Xray makes it gecko
++// (infra/conf Salamander.Build): the same framing as the gecko of sing-box (a flag 0x80,
++// a header of 5 bytes, 2 to 8 chunks, under salamander), which then replaces what obfs of
++// the link says.
++func (d *decoder) salamanderMask(options *option.Hysteria2OutboundOptions, content json.RawMessage) error {
++	var settings struct {
++		Password   string                  `json:"password"`
++		PacketSize *option.V2RayXHTTPRange `json:"packetSize"`
++	}
++	if len(content) > 0 && string(content) != "null" {
++		if err := json.Unmarshal(content, &settings); err != nil {
++			// the server expects the obfuscation: without it nothing connects (Xray refuses it too)
++			return E.New("fm (finalmask): the salamander mask cannot be read")
++		}
++	}
++	if settings.PacketSize != nil && settings.PacketSize.To > 0 {
++		least, most := int(settings.PacketSize.From), int(settings.PacketSize.To)
++		if least <= 0 || most > 2048 || least > most {
++			return E.New("fm (finalmask): the packet size of gecko is not between 1 and 2048 bytes")
++		}
++		options.Obfs = &option.Hysteria2Obfs{
++			Type:         C.Hysteria2ObfsTypeGecko,
++			Password:     settings.Password,
++			GeckoOptions: option.Hysteria2ObfsGecko{MinPacketSize: least, MaxPacketSize: most},
++		}
++		return nil
++	}
++	if options.Obfs == nil {
++		options.Obfs = &option.Hysteria2Obfs{Type: C.Hysteria2ObfsTypeSalamander, Password: settings.Password}
++	}
++	return nil
++}
++
++// udpHopMask reads the udphop mask, the hopping of Xray's client between ports (and
++// addresses): the ports become the server ports of sing-box's hopping, unless the link
++// names its own. The server listens on all of them either way.
++func (d *decoder) udpHopMask(options *option.Hysteria2OutboundOptions, content json.RawMessage) error {
++	var settings struct {
++		Mode        string                  `json:"mode"`
++		Interval    *option.V2RayXHTTPRange `json:"interval"`
++		RemoteIPs   []string                `json:"remoteIPs"`
++		RemotePorts json.RawMessage         `json:"remotePorts"`
++	}
++	if len(content) > 0 && string(content) != "null" {
++		if err := json.Unmarshal(content, &settings); err != nil {
++			d.warn("fm (finalmask): the udphop mask cannot be read and is ignored")
++			return nil
++		}
++	}
++	// Xray moves to the ports of remotePorts only in the modes intervalRemote and
++	// perConnRemote (udphop/conn.go); intervalLocal alone keeps the port of the link
++	remote := false
++	for _, mode := range strings.Split(settings.Mode, ",") {
++		switch strings.ToLower(strings.TrimSpace(mode)) {
++		case "intervalremote", "perconnremote":
++			remote = true
++		case "intervallocal":
++		default:
++			d.warn("fm (finalmask): udphop of an unknown mode is ignored")
++			return nil
++		}
++	}
++	if !remote {
++		d.warn("fm (finalmask): udphop of the local port only is not supported and is ignored")
++		return nil
++	}
++	if len(settings.RemoteIPs) > 0 {
++		d.warn("fm (finalmask): udphop between addresses (remoteIPs) is not supported, the address of the link is used")
++	}
++	var ports string
++	if len(settings.RemotePorts) > 0 && string(settings.RemotePorts) != "null" {
++		var text vmessText
++		if err := json.Unmarshal(settings.RemotePorts, &text); err != nil {
++			return E.New("fm (finalmask): the ports of udphop cannot be read")
++		}
++		ports = string(text)
++	}
++	if strings.TrimSpace(ports) == "" {
++		return nil
++	}
++	if len(options.ServerPorts) == 0 {
++		ranges, err := portRanges(ports)
++		if err != nil {
++			return err
++		}
++		options.ServerPorts = badoption.Listable[string](ranges)
++	}
++	// Xray's default is 30 s, sing-box's too
++	if options.HopInterval == 0 && settings.Interval != nil && settings.Interval.From > 0 {
++		return hopInterval(options, strconv.Itoa(int(settings.Interval.From)), strconv.Itoa(int(settings.Interval.To)))
++	}
++	return nil
++}
++
+ // hysteria reads a link of the first Hysteria:
+ // "hysteria://host:port?protocol=udp&auth=...&peer=...&upmbps=...&downmbps=...#name".
+ func (d *decoder) hysteria() (any, error) {
+diff --git a/common/sharelink/schemes_test.go b/common/sharelink/schemes_test.go
+index f052a7205..40e28574c 100644
+--- a/common/sharelink/schemes_test.go
++++ b/common/sharelink/schemes_test.go
+@@ -80,21 +80,37 @@ func TestSchemes(t *testing.T) {
+ 		"hysteria2 with a list of ports and speeds": {
+ 			"hysteria2://p@example.com:443,5000-6000/?upmbps=50&down=200%20Mbps&pinSHA256=AB%3ACD",
+ 			`{"type":"hysteria2","server":"example.com","server_port":443,"server_ports":["443:443","5000:6000"],"up_mbps":50,"down_mbps":200,"password":"p","tls":{"enabled":true}}`,
+-			[]string{"the pinned certificate (pcs, pinSHA256) is not supported"},
++			[]string{"the pinned certificate (pcs, pinSHA256) cannot be read"},
++		},
++		"hysteria2 with the pinned certificate of Hysteria": {
++			"hysteria2://p@example.com:443/?pinSHA256=0B%3A0B%3A0B%3A0B%3A0B%3A0B%3A0B%3A0B%3A0B%3A0B%3A0B%3A0B%3A0B%3A0B%3A0B%3A0B%3A0B%3A0B%3A0B%3A0B%3A0B%3A0B%3A0B%3A0B%3A0B%3A0B%3A0B%3A0B%3A0B%3A0B%3A0B%3A0B",
++			`{"type":"hysteria2","server":"example.com","server_port":443,"password":"p","tls":{"enabled":true,"certificate_sha256":"CwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCws="}}`, nil,
+ 		},
+ 		"hysteria2 with mport": {
+ 			"hysteria2://p@[2001:db8::1]:443?mport=20000-30000",
+ 			`{"type":"hysteria2","server":"2001:db8::1","server_port":443,"server_ports":"20000:30000","password":"p","tls":{"enabled":true}}`, nil,
+ 		},
+ 		"hysteria2 of Remnawave: obfuscation, port hopping and speeds in fm": {
+-			"hysteria2://p@example.com:443/?sni=s.example.com&fm=" + uriComponent(`{"udp":[{"type":"salamander","settings":{"password":"obfs pass"}},{"type":"noise"}],"quicParams":{"brutalUp":"50 mbps","brutalDown":200,"udpHop":{"ports":"20000-30000,40000","interval":"10-30"}}}`),
+-			`{"type":"hysteria2","server":"example.com","server_port":443,"server_ports":["20000:30000","40000:40000"],"hop_interval":"10s","up_mbps":50,"down_mbps":200,
++			"hysteria2://p@example.com:443/?sni=s.example.com&fm=" + uriComponent(`{"udp":[{"type":"salamander","settings":{"password":"obfs pass"}}],"quicParams":{"brutalUp":"50 mbps","brutalDown":200,"udpHop":{"ports":"20000-30000,40000","interval":"10-30"}}}`),
++			`{"type":"hysteria2","server":"example.com","server_port":443,"server_ports":["20000:30000","40000:40000"],"hop_interval":"10s","hop_interval_max":"30s","up_mbps":50,"down_mbps":200,
+ 			"obfs":{"type":"salamander","password":"obfs pass"},"password":"p","tls":{"enabled":true,"server_name":"s.example.com"}}`, nil,
+ 		},
+ 		"hysteria2 with fm that says what the link says already": {
+ 			"hysteria2://p@example.com:443/?obfs=salamander&obfs-password=link&mport=5000-6000&fm=" + uriComponent(`{"udp":[{"type":"salamander","settings":{"password":"mask"}}],"quicParams":{"udpHop":{"ports":"1-2"}}}`),
+ 			`{"type":"hysteria2","server":"example.com","server_port":443,"server_ports":"5000:6000","obfs":{"type":"salamander","password":"link"},"password":"p","tls":{"enabled":true}}`, nil,
+ 		},
++		"hysteria2 of Remnawave with gecko: salamander with a packet size, obfs=salamander in the link too": {
++			"hysteria2://p@example.com:443/?obfs=salamander&obfs-password=pw&fm=" + uriComponent(`{"udp":[{"type":"salamander","settings":{"password":"pw","packetSize":"600-1200"}}]}`),
++			`{"type":"hysteria2","server":"example.com","server_port":443,"obfs":{"type":"gecko","password":"pw","min_packet_size":600,"max_packet_size":1200},"password":"p","tls":{"enabled":true}}`, nil,
++		},
++		"hysteria2 with udphop": {
++			"hysteria2://p@example.com:443/?fm=" + uriComponent(`{"udp":[{"type":"udphop","settings":{"mode":"intervalRemote","interval":"10-30","remotePorts":"20000-30000,40000"}}]}`),
++			`{"type":"hysteria2","server":"example.com","server_port":443,"server_ports":["20000:30000","40000:40000"],"hop_interval":"10s","hop_interval_max":"30s","password":"p","tls":{"enabled":true}}`, nil,
++		},
++		"hysteria2 with udphop and ports of its own: the interval of the mask": {
++			"hysteria2://p@example.com:443,5000-6000/?fm=" + uriComponent(`{"udp":[{"type":"udphop","settings":{"mode":"perConnRemote","interval":20,"remotePorts":7000}}]}`),
++			`{"type":"hysteria2","server":"example.com","server_port":443,"server_ports":["443:443","5000:6000"],"hop_interval":"20s","password":"p","tls":{"enabled":true}}`, nil,
++		},
+ 		"vmess of Marzban: gRPC with type none, an IPv6 address in brackets": {
+ 			"vmess://" + b64(`{"add": "[2001:db8::10]", "aid": "0", "host": "", "id": "`+testUUID+`", "net": "grpc", "path": "svc", "port": 443, "ps": "m", "scy": "auto", "tls": "tls", "type": "none", "v": "2"}`),
+ 			`{"type":"vmess","tag":"m","server":"2001:db8::10","server_port":443,"uuid":"` + testUUID + `","security":"auto","tls":{"enabled":true,"utls":{"enabled":true,"fingerprint":"chrome"}},"transport":{"type":"grpc","service_name":"svc"}}`, nil,
+@@ -176,9 +192,10 @@ func TestSchemeRefusals(t *testing.T) {
+ 		"hysteria://example.org:1?protocol=faketcp": "hysteria-protocol",
+ 		"hysteria://example.org:1?obfs=salamander":  "hysteria-obfs",
+ 		"tuic://token@example.org:443":              "tuic-v4",
+-		"vmess://" + b64(`{"add":"h","port":1,"id":"`+testUUID+`","net":"kcp","type":"none","path":"seed"}`):        "kcp",
+-		"vmess://" + b64(`{"add":"h","port":1,"id":"`+testUUID+`","net":"quic","host":"aes-128-gcm","path":"key"}`): "quic-security",
+-		"hysteria2://p@example.org?fm=" + uriComponent(`{"udp":[{"type":"xdns"}]}`):                                 "finalmask",
++		"vmess://" + b64(`{"add":"h","port":1,"id":"`+testUUID+`","net":"kcp","type":"none","path":"seed"}`):                                              "kcp",
++		"vmess://" + b64(`{"add":"h","port":1,"id":"`+testUUID+`","net":"quic","host":"aes-128-gcm","path":"key"}`):                                       "quic-security",
++		"hysteria2://p@example.org?fm=" + uriComponent(`{"udp":[{"type":"xdns"}]}`):                                                                       "finalmask",
++		"hysteria2://p@example.org?fm=" + uriComponent(`{"udp":[{"type":"realm","settings":{"url":"realm://t@r.example.org/x","stunServers":["s:1"]}}]}`): "hysteria-realm",
+ 	} {
+ 		require.Equal(t, id, refusalID(t, link), link)
+ 	}
+diff --git a/common/sharelink/testdata/options-1.14.txt b/common/sharelink/testdata/options-1.14.txt
+index 521a98581..2e13c281f 100644
+--- a/common/sharelink/testdata/options-1.14.txt
++++ b/common/sharelink/testdata/options-1.14.txt
+@@ -8,6 +8,7 @@ anytls domain_resolver denied: another object
+ anytls domain_strategy denied: deprecated
+ anytls fallback_delay denied: the local route
+ anytls fallback_network_type denied: the local route
++anytls finalmask.tcp sb
+ anytls idle_session_check_interval sb
+ anytls idle_session_timeout sb
+ anytls inet4_bind_address denied: the local route
+@@ -30,6 +31,7 @@ anytls tls.alpn sb
+ anytls tls.certificate sb
+ anytls tls.certificate_path denied: a local file
+ anytls tls.certificate_public_key_sha256 sb
++anytls tls.certificate_sha256 sb
+ anytls tls.cipher_suites sb
+ anytls tls.client_certificate sb
+ anytls tls.client_certificate_path denied: a local file
+@@ -72,6 +74,7 @@ http domain_resolver denied: another object
+ http domain_strategy denied: deprecated
+ http fallback_delay denied: the local route
+ http fallback_network_type denied: the local route
++http finalmask.tcp sb
+ http headers sb
+ http inet4_bind_address denied: the local route
+ http inet6_bind_address denied: the local route
+@@ -93,6 +96,7 @@ http tls.alpn sb
+ http tls.certificate sb
+ http tls.certificate_path denied: a local file
+ http tls.certificate_public_key_sha256 sb
++http tls.certificate_sha256 sb
+ http tls.cipher_suites sb
+ http tls.client_certificate sb
+ http tls.client_certificate_path denied: a local file
+@@ -143,6 +147,7 @@ hysteria down sb
+ hysteria down_mbps sb
+ hysteria fallback_delay denied: the local route
+ hysteria fallback_network_type denied: the local route
++hysteria finalmask.tcp sb
+ hysteria hop_interval sb
+ hysteria idle_timeout sb
+ hysteria inet4_bind_address denied: the local route
+@@ -172,6 +177,7 @@ hysteria tls.alpn sb
+ hysteria tls.certificate sb
+ hysteria tls.certificate_path denied: a local file
+ hysteria tls.certificate_public_key_sha256 sb
++hysteria tls.certificate_sha256 sb
+ hysteria tls.cipher_suites sb
+ hysteria tls.client_certificate sb
+ hysteria tls.client_certificate_path denied: a local file
+@@ -222,6 +228,7 @@ hysteria2 domain_strategy denied: deprecated
+ hysteria2 down_mbps sb
+ hysteria2 fallback_delay denied: the local route
+ hysteria2 fallback_network_type denied: the local route
++hysteria2 finalmask.tcp sb
+ hysteria2 hop_interval sb
+ hysteria2 hop_interval_max sb
+ hysteria2 idle_timeout sb
+@@ -255,6 +262,7 @@ hysteria2 tls.alpn sb
+ hysteria2 tls.certificate sb
+ hysteria2 tls.certificate_path denied: a local file
+ hysteria2 tls.certificate_public_key_sha256 sb
++hysteria2 tls.certificate_sha256 sb
+ hysteria2 tls.cipher_suites sb
+ hysteria2 tls.client_certificate sb
+ hysteria2 tls.client_certificate_path denied: a local file
+@@ -299,6 +307,7 @@ naive domain_strategy denied: deprecated
+ naive extra_headers sb
+ naive fallback_delay denied: the local route
+ naive fallback_network_type denied: the local route
++naive finalmask.tcp sb
+ naive inet4_bind_address denied: the local route
+ naive inet6_bind_address denied: the local route
+ naive insecure_concurrency sb
+@@ -323,6 +332,7 @@ naive tls.alpn sb
+ naive tls.certificate sb
+ naive tls.certificate_path denied: a local file
+ naive tls.certificate_public_key_sha256 sb
++naive tls.certificate_sha256 sb
+ naive tls.cipher_suites sb
+ naive tls.client_certificate sb
+ naive tls.client_certificate_path denied: a local file
+@@ -368,6 +378,7 @@ shadowsocks domain_resolver denied: another object
+ shadowsocks domain_strategy denied: deprecated
+ shadowsocks fallback_delay denied: the local route
+ shadowsocks fallback_network_type denied: the local route
++shadowsocks finalmask.tcp sb
+ shadowsocks inet4_bind_address denied: the local route
+ shadowsocks inet6_bind_address denied: the local route
+ shadowsocks method sb
+@@ -408,6 +419,7 @@ socks domain_resolver denied: another object
+ socks domain_strategy denied: deprecated
+ socks fallback_delay denied: the local route
+ socks fallback_network_type denied: the local route
++socks finalmask.tcp sb
+ socks inet4_bind_address denied: the local route
+ socks inet6_bind_address denied: the local route
+ socks netns denied: another object
+@@ -438,6 +450,7 @@ trojan domain_resolver denied: another object
+ trojan domain_strategy denied: deprecated
+ trojan fallback_delay denied: the local route
+ trojan fallback_network_type denied: the local route
++trojan finalmask.tcp sb
+ trojan inet4_bind_address denied: the local route
+ trojan inet6_bind_address denied: the local route
+ trojan multiplex.brutal.down_mbps sb
+@@ -467,6 +480,7 @@ trojan tls.alpn sb
+ trojan tls.certificate sb
+ trojan tls.certificate_path denied: a local file
+ trojan tls.certificate_public_key_sha256 sb
++trojan tls.certificate_sha256 sb
+ trojan tls.cipher_suites sb
+ trojan tls.client_certificate sb
+ trojan tls.client_certificate_path denied: a local file
+@@ -522,6 +536,7 @@ trojan transport.download.tls.alpn sb
+ trojan transport.download.tls.certificate sb
+ trojan transport.download.tls.certificate_path denied: a local file
+ trojan transport.download.tls.certificate_public_key_sha256 sb
++trojan transport.download.tls.certificate_sha256 sb
+ trojan transport.download.tls.cipher_suites sb
+ trojan transport.download.tls.client_certificate sb
+ trojan transport.download.tls.client_certificate_path denied: a local file
+@@ -624,6 +639,7 @@ tuic domain_resolver denied: another object
+ tuic domain_strategy denied: deprecated
+ tuic fallback_delay denied: the local route
+ tuic fallback_network_type denied: the local route
++tuic finalmask.tcp sb
+ tuic heartbeat sb
+ tuic idle_timeout sb
+ tuic inet4_bind_address denied: the local route
+@@ -650,6 +666,7 @@ tuic tls.alpn sb
+ tuic tls.certificate sb
+ tuic tls.certificate_path denied: a local file
+ tuic tls.certificate_public_key_sha256 sb
++tuic tls.certificate_sha256 sb
+ tuic tls.cipher_suites sb
+ tuic tls.client_certificate sb
+ tuic tls.client_certificate_path denied: a local file
+@@ -697,6 +714,7 @@ vless domain_strategy denied: deprecated
+ vless encryption sb
+ vless fallback_delay denied: the local route
+ vless fallback_network_type denied: the local route
++vless finalmask.tcp sb
+ vless flow sb
+ vless inet4_bind_address denied: the local route
+ vless inet6_bind_address denied: the local route
+@@ -727,6 +745,7 @@ vless tls.alpn sb
+ vless tls.certificate sb
+ vless tls.certificate_path denied: a local file
+ vless tls.certificate_public_key_sha256 sb
++vless tls.certificate_sha256 sb
+ vless tls.cipher_suites sb
+ vless tls.client_certificate sb
+ vless tls.client_certificate_path denied: a local file
+@@ -782,6 +801,7 @@ vless transport.download.tls.alpn sb
+ vless transport.download.tls.certificate sb
+ vless transport.download.tls.certificate_path denied: a local file
+ vless transport.download.tls.certificate_public_key_sha256 sb
++vless transport.download.tls.certificate_sha256 sb
+ vless transport.download.tls.cipher_suites sb
+ vless transport.download.tls.client_certificate sb
+ vless transport.download.tls.client_certificate_path denied: a local file
+@@ -884,6 +904,7 @@ vmess domain_resolver denied: another object
+ vmess domain_strategy denied: deprecated
+ vmess fallback_delay denied: the local route
+ vmess fallback_network_type denied: the local route
++vmess finalmask.tcp sb
+ vmess global_padding sb
+ vmess inet4_bind_address denied: the local route
+ vmess inet6_bind_address denied: the local route
+@@ -915,6 +936,7 @@ vmess tls.alpn sb
+ vmess tls.certificate sb
+ vmess tls.certificate_path denied: a local file
+ vmess tls.certificate_public_key_sha256 sb
++vmess tls.certificate_sha256 sb
+ vmess tls.cipher_suites sb
+ vmess tls.client_certificate sb
+ vmess tls.client_certificate_path denied: a local file
+@@ -970,6 +992,7 @@ vmess transport.download.tls.alpn sb
+ vmess transport.download.tls.certificate sb
+ vmess transport.download.tls.certificate_path denied: a local file
+ vmess transport.download.tls.certificate_public_key_sha256 sb
++vmess transport.download.tls.certificate_sha256 sb
+ vmess transport.download.tls.cipher_suites sb
+ vmess transport.download.tls.client_certificate sb
+ vmess transport.download.tls.client_certificate_path denied: a local file
+diff --git a/common/sharelink/tls.go b/common/sharelink/tls.go
+index b8e722ce7..c20238128 100644
+--- a/common/sharelink/tls.go
++++ b/common/sharelink/tls.go
+@@ -1,11 +1,14 @@
+ package sharelink
+ 
+ import (
++	"crypto/sha256"
+ 	"encoding/base64"
++	"encoding/hex"
+ 	"strings"
+ 
+ 	"github.com/sagernet/sing-box/option"
+ 	E "github.com/sagernet/sing/common/exceptions"
++	"github.com/sagernet/sing/common/json/badoption"
+ )
+ 
+ // The fingerprints sing-box knows by these names (common/tls/utls_client.go).
+@@ -68,8 +71,9 @@ func (d *decoder) utlsOf(fingerprint string, reality bool) (*option.OutboundUTLS
+ 	return &option.OutboundUTLSOptions{Enabled: true, Fingerprint: fingerprint}, nil
+ }
+ 
+-// The parameters of TLS every scheme reads the same way.
+-func (d *decoder) tlsCommon(tlsOptions *option.OutboundTLSOptions) {
++// The parameters of TLS every scheme reads the same way. With REALITY no certificate is
++// verified, and a pin the link carries along is left out without a word.
++func (d *decoder) tlsCommon(tlsOptions *option.OutboundTLSOptions, reality bool) {
+ 	d.reads("sni", "servername", "peer", "allowinsecure", "allow_insecure", "insecure", "skip-cert-verify",
+ 		"alpn", "disable_sni", "nosni", "cert", "ech", "pcs", "pinsha256", "vcn", "cs")
+ 	tlsOptions.Enabled = true
+@@ -86,10 +90,16 @@ func (d *decoder) tlsCommon(tlsOptions *option.OutboundTLSOptions) {
+ 		tlsOptions.Certificate = strings.Split(strings.ReplaceAll(certificate, "\r\n", "\n"), "\n")
+ 	}
+ 	tlsOptions.ECH = d.ech()
+-	if d.first("pcs", "pinsha256") != "" && !tlsOptions.Insecure && len(tlsOptions.Certificate) == 0 {
+-		// Xray and Hysteria pin the hash of a certificate, sing-box that of a public key:
+-		// one cannot be made from the other
+-		d.warn("the pinned certificate (pcs, pinSHA256) is not supported: the server is verified against the system roots, and one with a self-signed certificate is refused")
++	if pins := d.first("pcs", "pinsha256"); pins != "" && !reality && !tlsOptions.Insecure && len(tlsOptions.Certificate) == 0 {
++		// Xray (pinnedPeerCertSha256) and Hysteria pin the SHA-256 of the whole certificate,
++		// as certificate_sha256 does: a server whose certificate has one of them is taken
++		// without the system roots, a self-signed one too
++		hashes, err := certificateHashes(pins)
++		if err != nil {
++			d.warn("the pinned certificate (pcs, pinSHA256) cannot be read and is ignored (", err.Error(), "): the server is verified against the system roots")
++		} else {
++			tlsOptions.CertificateSHA256 = hashes
++		}
+ 	}
+ 	if names := splitList(d.query["vcn"]); len(names) > 0 && !tlsOptions.Insecure {
+ 		// Xray verifies the certificate by these names instead of the one it sends
+@@ -163,7 +173,7 @@ func (d *decoder) security(defaultSecurity string) (*option.OutboundTLSOptions,
+ 		return nil, refuse("security", "unsupported security", shown(security))
+ 	}
+ 	tlsOptions := new(option.OutboundTLSOptions)
+-	d.tlsCommon(tlsOptions)
++	d.tlsCommon(tlsOptions, security == "reality")
+ 	var err error
+ 	tlsOptions.UTLS, err = d.utls(security == "reality")
+ 	if err != nil {
+@@ -193,6 +203,31 @@ func (d *decoder) security(defaultSecurity string) (*option.OutboundTLSOptions,
+ // "fp" read it themselves.
+ func (d *decoder) tlsAlways() *option.OutboundTLSOptions {
+ 	tlsOptions := new(option.OutboundTLSOptions)
+-	d.tlsCommon(tlsOptions)
++	d.tlsCommon(tlsOptions, false)
+ 	return tlsOptions
+ }
++
++// certificateHashes reads the pins of Xray's pcs and Hysteria's pinSHA256: SHA-256 hashes in
++// hexadecimal, with or without colons, separated by commas (infra/conf of Xray-core). The
++// message names no hash: a pin is part of the link.
++func certificateHashes(text string) (badoption.Listable[[]byte], error) {
++	var hashes badoption.Listable[[]byte]
++	for _, entry := range strings.Split(text, ",") {
++		entry = strings.ReplaceAll(strings.TrimSpace(entry), ":", "")
++		if entry == "" {
++			continue
++		}
++		hash, err := hex.DecodeString(entry)
++		if err != nil {
++			return nil, E.New("a hash is not hexadecimal")
++		}
++		if len(hash) != sha256.Size {
++			return nil, E.New("a hash is not 32 bytes long")
++		}
++		hashes = append(hashes, hash)
++	}
++	if len(hashes) == 0 {
++		return nil, E.New("no hash")
++	}
++	return hashes, nil
++}
+diff --git a/common/sharelink/transport.go b/common/sharelink/transport.go
+index a59c307ba..2bf7dbe4c 100644
+--- a/common/sharelink/transport.go
++++ b/common/sharelink/transport.go
+@@ -2,9 +2,11 @@ package sharelink
+ 
+ import (
+ 	"net/url"
++	"slices"
+ 	"strconv"
+ 	"strings"
+ 
++	"github.com/sagernet/sing-box/common/finalmask"
+ 	C "github.com/sagernet/sing-box/constant"
+ 	"github.com/sagernet/sing-box/option"
+ 	E "github.com/sagernet/sing/common/exceptions"
+@@ -18,9 +20,10 @@ import (
+ var knownKeys = make(map[string]bool)
+ 
+ // The masks of Xray's finalmask ("fm") that are the client's own business: the server
+-// is reached without them. Every other one changes what goes over the wire, and the
+-// server expects it.
+-var localMasks = map[string]bool{"fragment": true, "noise": true}
++// is reached without them (udphop, the hopping of the ports, is refused by Xray's server
++// side: transport/internet/finalmask/udphop/config.go). Every other one changes what goes
++// over the wire, and the server expects it.
++var localMasks = map[string]bool{"fragment": true, "noise": true, "udphop": true}
+ 
+ // clientSide warns of the settings of Xray's client that a panel writes into a link: how
+ // it fragments and pads its own packets. The server is reached without them.
+@@ -34,7 +37,13 @@ func (d *decoder) clientSide() {
+ 	}
+ }
+ 
+-// finalMask reads "fm", the finalmask object of Xray.
++// finalMask reads "fm", the finalmask object of Xray. Its fragment masks of TCP become the
++// outbound's finalmask (the dialer cuts the ClientHello or the first writes as Xray does),
++// without their delays: a pause of this host is not a link's to set, and with none the
++// records of a ClientHello go out in one write, as Xray sends them with a delay of 0. A
++// noise mask and udphop are the client's own and are left out (a link of a transport over
++// TCP has no UDP of its own to hop); any other mask changes what goes over the wire, the
++// server expects it, and the link is refused.
+ func (d *decoder) finalMask() error {
+ 	d.reads("fm")
+ 	content := strings.TrimSpace(d.query["fm"])
+@@ -43,7 +52,8 @@ func (d *decoder) finalMask() error {
+ 	}
+ 	var mask struct {
+ 		TCP []struct {
+-			Type string `json:"type"`
++			Type     string          `json:"type"`
++			Settings json.RawMessage `json:"settings"`
+ 		} `json:"tcp"`
+ 		UDP []struct {
+ 			Type string `json:"type"`
+@@ -51,15 +61,82 @@ func (d *decoder) finalMask() error {
+ 	}
+ 	err := json.Unmarshal([]byte(content), &mask)
+ 	if err != nil {
+-		d.warn("fm (finalmask) is not supported and cannot be read, the connection may not work")
++		d.warn("fm (finalmask) cannot be read and is ignored, the connection may not work")
+ 		return nil
+ 	}
+-	for _, entry := range append(mask.TCP, mask.UDP...) {
++	for _, entry := range mask.TCP {
++		if !localMasks[strings.ToLower(entry.Type)] {
++			return refuse("finalmask", "fm (finalmask) asks for the mask", shown(entry.Type), ", which is not supported: the server expects it")
++		}
++	}
++	for _, entry := range mask.UDP {
+ 		if !localMasks[strings.ToLower(entry.Type)] {
+ 			return refuse("finalmask", "fm (finalmask) asks for the mask", shown(entry.Type), ", which is not supported: the server expects it")
+ 		}
+ 	}
+-	d.warn("fm (finalmask) is not supported and is ignored: what it sets is the client's own")
++	var masks option.FinalMaskOptions
++	var ignored []string
++	for _, entry := range mask.TCP {
++		if !strings.EqualFold(entry.Type, "fragment") {
++			ignored = append(ignored, strings.ToLower(entry.Type))
++			continue
++		}
++		var settings struct {
++			Packets  string                   `json:"packets"`
++			Length   *option.V2RayXHTTPRange  `json:"length"`
++			Lengths  []option.V2RayXHTTPRange `json:"lengths"`
++			Delay    *option.V2RayXHTTPRange  `json:"delay"`
++			Delays   []option.V2RayXHTTPRange `json:"delays"`
++			MaxSplit *option.V2RayXHTTPRange  `json:"maxSplit"`
++		}
++		if len(entry.Settings) > 0 && string(entry.Settings) != "null" {
++			_, err = d.readObject("fm fragment", entry.Settings, &settings)
++			if err != nil {
++				d.warn("fm (finalmask): a fragment mask cannot be read and is ignored")
++				continue
++			}
++		}
++		fragment := option.FinalMaskTCPOptions{
++			Type:     "fragment",
++			Packets:  settings.Packets,
++			Length:   settings.Length,
++			Lengths:  settings.Lengths,
++			MaxSplit: settings.MaxSplit,
++		}
++		paused := settings.Delay != nil && settings.Delay.To > 0
++		for _, delay := range settings.Delays {
++			paused = paused || delay.To > 0
++		}
++		if paused {
++			if strings.EqualFold(strings.TrimSpace(settings.Packets), "tlshello") {
++				// Xray writes each record with its pause; without a pause the records still go in
++				// writes of their own (two delays of 0: not the one write of a single delay 0)
++				fragment.Delays = []option.V2RayXHTTPRange{{}, {}}
++			}
++			d.warn("fm (finalmask): the delays of the fragment mask are not applied, a pause of this host is not a link's to set")
++		}
++		_, err = finalmask.New(&option.FinalMaskOptions{TCP: []option.FinalMaskTCPOptions{fragment}})
++		if err != nil {
++			d.warn("fm (finalmask): a fragment mask is ignored: ", err.Error())
++			continue
++		}
++		masks.TCP = append(masks.TCP, fragment)
++	}
++	for _, entry := range mask.UDP {
++		ignored = append(ignored, strings.ToLower(entry.Type))
++	}
++	if len(ignored) > 0 {
++		slices.Sort(ignored)
++		ignored = slices.Compact(ignored)
++		if len(ignored) == 1 {
++			d.warn("fm (finalmask): the mask ", ignored[0], " is not applied: it is the client's own")
++		} else {
++			d.warn("fm (finalmask): the masks ", strings.Join(ignored, ", "), " are not applied: they are the client's own")
++		}
++	}
++	if len(masks.TCP) > 0 {
++		d.mask = &masks
++	}
+ 	return nil
+ }
+ 
+diff --git a/option/finalmask.go b/option/finalmask.go
+new file mode 100644
+index 000000000..9bab76d98
+--- /dev/null
++++ b/option/finalmask.go
+@@ -0,0 +1,32 @@
++package option
++
++// FinalMaskOptions are the masks put on the TCP connections an outbound opens itself, as
++// Xray's finalmask (streamSettings.finalmask) puts them: they change how the bytes go over
++// the wire, not the bytes. Only the masks the server does not see are taken: "fragment".
++// Through a detour an outbound opens no connection of its own, and the masks do nothing.
++type FinalMaskOptions struct {
++	TCP []FinalMaskTCPOptions `json:"tcp,omitempty"`
++}
++
++// FinalMaskTCPOptions is one mask of the TCP list. "fragment" is Xray's fragment mask
++// (transport/internet/finalmask/fragment of Xray-core):
++//
++//   - packets "tlshello": the first write, when it is a whole TLS record of the handshake
++//     (the ClientHello), is cut into TLS records of the lengths below; with a single delay
++//     of 0 the records go out in one write, otherwise each in a write of its own, the delay
++//     after it.
++//   - packets "N-M": the writes N to M of the connection (from 1) are cut into pieces of the
++//     lengths below, each a write of its own; "" cuts every write.
++//
++// length or lengths (a range per piece, the last one for the rest) are required; delay or
++// delays are milliseconds (none: 0); max_split bounds the number of pieces (0: none), the
++// last piece takes what remains. A range is "from-to", a number, or {"from", "to"}.
++type FinalMaskTCPOptions struct {
++	Type     string            `json:"type"`
++	Packets  string            `json:"packets,omitempty"`
++	Length   *V2RayXHTTPRange  `json:"length,omitempty"`
++	Lengths  []V2RayXHTTPRange `json:"lengths,omitempty"`
++	Delay    *V2RayXHTTPRange  `json:"delay,omitempty"`
++	Delays   []V2RayXHTTPRange `json:"delays,omitempty"`
++	MaxSplit *V2RayXHTTPRange  `json:"max_split,omitempty"`
++}
+diff --git a/option/outbound.go b/option/outbound.go
+index 5780929aa..69fd91a1e 100644
+--- a/option/outbound.go
++++ b/option/outbound.go
+@@ -79,6 +79,8 @@ type DialerOptionsWrapper interface {
+ 
+ type DialerOptions struct {
+ 	Detour string `json:"detour,omitempty" reference:"outbound"`
++	// FinalMask: the masks of the TCP connections the outbound opens itself (podkop-engine)
++	FinalMask *FinalMaskOptions `json:"finalmask,omitempty"`
+ 	AbstractDialerOptions
+ }
+ 
+-- 
+2.53.0
+

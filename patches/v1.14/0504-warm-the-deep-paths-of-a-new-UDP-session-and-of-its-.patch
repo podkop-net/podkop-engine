@@ -1,7 +1,7 @@
-From b31f599f3e524968bdd0423ac88ce02b3fc0715f Mon Sep 17 00:00:00 2001
+From f1a69b05d341a765e92aa1f6f27c2e06551419db Mon Sep 17 00:00:00 2001
 From: FiyeroT <me@fiyero.xyz>
 Date: Sat, 14 Nov 2026 11:24:11 +0300
-Subject: [PATCH 62/66] warm: the deep paths of a new UDP session and of its
+Subject: [PATCH 63/69] warm: the deep paths of a new UDP session and of its
  DNS exchange on goroutines kept warm
 
 A new goroutine starts with a small stack, and the runtime keeps no grown stack for the next one:

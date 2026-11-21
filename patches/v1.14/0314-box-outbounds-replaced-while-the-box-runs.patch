@@ -1,7 +1,7 @@
-From f27b119be0b6513c075ca50f252959deebb91cfa Mon Sep 17 00:00:00 2001
+From 4cc06354c7696cf380e678d70db7abca484086f8 Mon Sep 17 00:00:00 2001
 From: FiyeroT <me@fiyero.xyz>
 Date: Thu, 12 Nov 2026 21:41:20 +0300
-Subject: [PATCH 32/66] box: outbounds replaced while the box runs
+Subject: [PATCH 33/69] box: outbounds replaced while the box runs
 
 Outbounds are replaced while the box runs: a group that takes the tag of another starts from what it
 knew, the replaced one lets go of its members a while later, a detour finds the outbound of its tag
@@ -19,14 +19,14 @@ Pdk-Layer: 03
  adapter/lifecycle_podkop_test.go         |  65 +++
  adapter/outbound/manager_podkop.go       |  90 ++++
  adapter/outbound/manager_podkop_test.go  | 112 +++++
- box_podkop.go                            | 570 +++++++++++++++++++++++
- box_podkop_test.go                       | 381 +++++++++++++++
+ box_podkop.go                            | 583 +++++++++++++++++++++++
+ box_podkop_test.go                       | 415 ++++++++++++++++
  common/dialer/detour_podkop.go           |  20 +
  common/dialer/detour_podkop_test.go      |  65 +++
  export_podkop_test.go                    |  33 ++
- protocol/group/urltestgroup/swap.go      | 213 +++++++++
+ protocol/group/urltestgroup/swap.go      | 224 +++++++++
  protocol/group/urltestgroup/swap_test.go | 214 +++++++++
- 11 files changed, 1803 insertions(+)
+ 11 files changed, 1861 insertions(+)
  create mode 100644 adapter/lifecycle_podkop.go
  create mode 100644 adapter/lifecycle_podkop_test.go
  create mode 100644 adapter/outbound/manager_podkop.go
@@ -372,10 +372,10 @@ index 000000000..4964ff1d3
 +}
 diff --git a/box_podkop.go b/box_podkop.go
 new file mode 100644
-index 000000000..2c5faa6fa
+index 000000000..a5570b2ea
 --- /dev/null
 +++ b/box_podkop.go
-@@ -0,0 +1,570 @@
+@@ -0,0 +1,583 @@
 +package box
 +
 +import (
@@ -455,6 +455,11 @@ index 000000000..2c5faa6fa
 +	// start stage, before it is started
 +	outboundSuccessor interface {
 +		TakeOver(previous adapter.Outbound)
++	}
++	// outboundReturner gives back to the outbound it replaced what TakeOver took from it and
++	// that outbound cannot do without: the update is undone, and the outbound of before runs on
++	outboundReturner interface {
++		GiveBack(previous adapter.Outbound)
 +	}
 +	// retiringOutbound stops what it does on its own once it is replaced or taken out
 +	retiringOutbound interface {
@@ -605,10 +610,17 @@ index 000000000..2c5faa6fa
 +		added    []string
 +		removed  []adapter.Outbound
 +	)
++	// tookOver: the new outbounds that took over from the one they replace (after TakeOver)
++	var tookOver []*hotEntry
 +	rollback := func(cause error) error {
 +		_, swapErr := s.outbound.SwapOutbounds(append(previous, removed...), added)
 +		if swapErr != nil {
 +			s.logger.Error("put back the outbounds of before: ", swapErr)
++		}
++		for _, entry := range slices.Backward(tookOver) {
++			if returner, isReturner := entry.outbound.(outboundReturner); isReturner {
++				returner.GiveBack(entry.previous)
++			}
 +		}
 +		closeEntries()
 +		return cause
@@ -654,6 +666,7 @@ index 000000000..2c5faa6fa
 +	for _, entry := range entries {
 +		if successor, isSuccessor := entry.outbound.(outboundSuccessor); isSuccessor && entry.previous != nil {
 +			successor.TakeOver(entry.previous)
++			tookOver = append(tookOver, entry)
 +		}
 +	}
 +	for _, layer := range layers {
@@ -948,10 +961,10 @@ index 000000000..2c5faa6fa
 +}
 diff --git a/box_podkop_test.go b/box_podkop_test.go
 new file mode 100644
-index 000000000..8ef800831
+index 000000000..3fe09cb2e
 --- /dev/null
 +++ b/box_podkop_test.go
-@@ -0,0 +1,381 @@
+@@ -0,0 +1,415 @@
 +package box_test
 +
 +import (
@@ -973,6 +986,7 @@ index 000000000..8ef800831
 +	"github.com/sagernet/sing-box/include"
 +	"github.com/sagernet/sing-box/log"
 +	"github.com/sagernet/sing-box/option"
++	"github.com/sagernet/sing-box/protocol/group/urltestgroup"
 +	E "github.com/sagernet/sing/common/exceptions"
 +	"github.com/sagernet/sing/common/json"
 +	M "github.com/sagernet/sing/common/metadata"
@@ -986,17 +1000,20 @@ index 000000000..8ef800831
 +// start, and records its close.
 +type testServer struct {
 +	outbound.Adapter
-+	fail   bool
-+	closed atomic.Bool
++	fail     bool
++	failLate bool
++	closed   atomic.Bool
 +}
 +
 +type testServerOptions struct {
-+	Fail    bool `json:"fail,omitempty"`
-+	Version int  `json:"version,omitempty"`
++	Fail bool `json:"fail,omitempty"`
++	// FailLate fails the stage after the start, once the groups of the update have taken over
++	FailLate bool `json:"fail_late,omitempty"`
++	Version  int  `json:"version,omitempty"`
 +}
 +
 +func newTestServer(ctx context.Context, router adapter.Router, logger log.ContextLogger, tag string, options testServerOptions) (adapter.Outbound, error) {
-+	return &testServer{Adapter: outbound.NewAdapter("testserver", tag, []string{N.NetworkTCP, N.NetworkUDP}, nil), fail: options.Fail}, nil
++	return &testServer{Adapter: outbound.NewAdapter("testserver", tag, []string{N.NetworkTCP, N.NetworkUDP}, nil), fail: options.Fail, failLate: options.FailLate}, nil
 +}
 +
 +func (s *testServer) Start(stage adapter.StartStage, scope *adapter.Scope) error {
@@ -1009,6 +1026,10 @@ index 000000000..8ef800831
 +	case adapter.StartStateStart:
 +		if s.fail {
 +			return E.New("this server does not start")
++		}
++	case adapter.StartStatePostStart:
++		if s.failLate {
++			return E.New("this server fails after its start")
 +		}
 +	}
 +	return nil
@@ -1245,6 +1266,32 @@ index 000000000..8ef800831
 +	require.NoError(t, err)
 +}
 +
++// An update undone after the new group took over from the one it replaces gives that one its
++// balancer back: put back in its place, it balances on.
++func TestUpdateOutboundsGivesTheBalanceBack(t *testing.T) {
++	h := newHotTest(t)
++	balance := func(members ...string) string {
++		return `{"type": "urltest", "tag": "b", "outbounds": ["` + strings.Join(members, `", "`) + `"], "url": "` + h.link +
++			`", "interval": "1m", "mode": "balance", "loss_url": "` + h.link + `"}`
++	}
++	_, err := h.update(balance("s1", "s2"), nil, 0)
++	require.NoError(t, err)
++	group := h.outbound("b")
++	balancing := func() bool {
++		return group.(interface {
++			Balance() []urltestgroup.BalanceMember
++		}).Balance() != nil
++	}
++	require.True(t, balancing())
++
++	_, err = h.update(`{"type": "testserver", "tag": "s4", "fail_late": true}, `+balance("s1", "s2", "s4"), nil, 0)
++	require.ErrorContains(t, err, "fails after its start")
++	require.Same(t, group, h.outbound("b"))
++	_, loaded := h.box.Outbound().Outbound("s4")
++	require.False(t, loaded)
++	require.True(t, balancing(), "the group of before lost its balancer to the one that was undone")
++}
++
 +// An outbound replaced is kept while a connection in the list goes through it, and not
 +// before drainMin is over; then closed, the groups too.
 +func TestDrainKeepsWhatCarriesConnections(t *testing.T) {
@@ -1471,10 +1518,10 @@ index 000000000..5e1e7a413
 +var DrainMin, DrainMax = drainMin, drainMax
 diff --git a/protocol/group/urltestgroup/swap.go b/protocol/group/urltestgroup/swap.go
 new file mode 100644
-index 000000000..3ffff558e
+index 000000000..8c237c779
 --- /dev/null
 +++ b/protocol/group/urltestgroup/swap.go
-@@ -0,0 +1,213 @@
+@@ -0,0 +1,224 @@
 +package urltestgroup
 +
 +import (
@@ -1540,6 +1587,17 @@ index 000000000..3ffff558e
 +	// a balance goes on with its devices: their connections end on the balancer they began on
 +	g.takeBalance(from)
 +	g.hotStart = true
++}
++
++// GiveBack returns to the group this one replaced what TakeOver took from it, when the update
++// that put this group in its place is undone: its balancer, with the devices. The rest TakeOver
++// only read.
++func (s *URLTest) GiveBack(previous adapter.Outbound) {
++	old, isURLTest := previous.(*URLTest)
++	if !isURLTest || old.group == nil || s.group == nil {
++		return
++	}
++	s.group.returnBalance(old.group)
 +}
 +
 +// Retire stops the group for good: no round, no selection, no judgement of a member from a

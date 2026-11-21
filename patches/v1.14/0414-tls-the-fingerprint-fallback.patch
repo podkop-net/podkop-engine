@@ -1,7 +1,7 @@
-From 9ac4093f3f666c23e9ade3a165209739f793342a Mon Sep 17 00:00:00 2001
+From 8aa1f78625e2bf610627d9366a261a15eb15774d Mon Sep 17 00:00:00 2001
 From: FiyeroT <me@fiyero.xyz>
 Date: Thu, 12 Nov 2026 21:41:21 +0300
-Subject: [PATCH 49/66] tls: the fingerprint fallback
+Subject: [PATCH 50/69] tls: the fingerprint fallback
 
 When a ClientHello of the configured uTLS fingerprint gets no acknowledgment, a dial goes on with
 another one: the hello without X25519MLKEM768 first, then firefox; the choice is kept in the cache
@@ -1045,7 +1045,7 @@ index 20597bda7..8ad21f88f 100644
 +	return e.uClient.spoof != ""
 +}
 diff --git a/common/tls/utls_client.go b/common/tls/utls_client.go
-index 18e135747..fd0e7e227 100644
+index ce7493a8c..154df09a7 100644
 --- a/common/tls/utls_client.go
 +++ b/common/tls/utls_client.go
 @@ -39,6 +39,10 @@ type UTLSClientConfig struct {

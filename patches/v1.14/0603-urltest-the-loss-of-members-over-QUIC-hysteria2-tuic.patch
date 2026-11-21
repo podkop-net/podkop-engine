@@ -1,7 +1,7 @@
-From 337cfff5ad9d5c5d44c44250664beb63c9a0d14a Mon Sep 17 00:00:00 2001
+From 9239052f50ee79041cd360f14ed51632234f3f04 Mon Sep 17 00:00:00 2001
 From: FiyeroT <me@fiyero.xyz>
 Date: Sun, 15 Nov 2026 12:55:34 +0300
-Subject: [PATCH 66/66] urltest: the loss of members over QUIC (hysteria2,
+Subject: [PATCH 67/69] urltest: the loss of members over QUIC (hysteria2,
  tuic)
 
 The loss mode counted a member's loss by the retransmissions of a TCP connection of its own to
@@ -102,7 +102,7 @@ index 000000000..0de94c244
 +	MinRTT              time.Duration
 +}
 diff --git a/common/urltest/loss.go b/common/urltest/loss.go
-index 373a8391c..089fe9a56 100644
+index 143c413c3..1c3d499bc 100644
 --- a/common/urltest/loss.go
 +++ b/common/urltest/loss.go
 @@ -44,6 +44,11 @@ var ErrLossNotCounted = E.New("loss not counted")
@@ -891,7 +891,7 @@ index 000000000..d157ee4e5
 +// more than its loss costs. TUIC was not measured and is priced as hysteria2.
 +var quicLossPrice = lossPrice{perRTT: 1, perLoss: -10.28, perLossRTT: 0.5438, minRTT: 20}
 diff --git a/protocol/group/urltestgroup/urltest_loss_test.go b/protocol/group/urltestgroup/urltest_loss_test.go
-index 04349b304..a4dc07518 100644
+index a1e4a6cd6..3de571fa8 100644
 --- a/protocol/group/urltestgroup/urltest_loss_test.go
 +++ b/protocol/group/urltestgroup/urltest_loss_test.go
 @@ -27,12 +27,82 @@ import (

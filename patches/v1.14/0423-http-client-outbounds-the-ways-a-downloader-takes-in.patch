@@ -1,7 +1,7 @@
-From 52edd9967aeb2edb5bc54efd734257f5284c2e40 Mon Sep 17 00:00:00 2001
+From b83527d172d4a4dac1e003b4dc2dd52e4eb41a42 Mon Sep 17 00:00:00 2001
 From: FiyeroT <me@fiyero.xyz>
 Date: Fri, 13 Nov 2026 14:38:32 +0300
-Subject: [PATCH 58/66] http client: outbounds, the ways a downloader takes in
+Subject: [PATCH 59/69] http client: outbounds, the ways a downloader takes in
  the order of what it knows of them
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8
@@ -1145,7 +1145,7 @@ index 820cbeabb..1dbd9ed32 100644
  		return nil, E.Cause(err, "create shared http_client[", tag, "]")
  	}
 diff --git a/docs/configuration/shared/http-client.md b/docs/configuration/shared/http-client.md
-index 787aaa3db..796870bce 100644
+index c3c77bb42..092ccc617 100644
 --- a/docs/configuration/shared/http-client.md
 +++ b/docs/configuration/shared/http-client.md
 @@ -19,6 +19,7 @@ When object:
@@ -1156,7 +1156,7 @@ index 787aaa3db..796870bce 100644
  
    ... // HTTP2 Fields
  
-@@ -103,6 +104,31 @@ no data for the stall timeout, or content that is not a rule-set) repeats it thr
+@@ -104,6 +105,31 @@ no data for the stall timeout, or content that is not a rule-set) repeats it thr
  fallback client in turn, until one brings the list. The fallbacks of a fallback client are not
  followed. Other users of the client do not fall back.
  

@@ -1,0 +1,1193 @@
+From f7d16bb107f2ef8e51af99e4f795f8e1d2000698 Mon Sep 17 00:00:00 2001
+From: FiyeroT <me@fiyero.xyz>
+Date: Sat, 21 Nov 2026 14:00:56 +0300
+Subject: [PATCH 04/69] tls: certificate_sha256, a pin of the whole server
+ certificate
+
+Upstream e7ad8a875 (sing-box 1.15.0-alpha.13), carried back as it is: certificate_sha256 for
+the outbound, client_certificate_sha256 for the inbound, both in base64, checked in
+VerifyPinnedCertificate next to the public-key pins. A pin of the whole certificate is what
+Xray (pinnedPeerCertSha256, "pcs" in links) and Hysteria ("pinSHA256") take; a public-key pin
+cannot be made from it.
+
+Pdk-Feature: backport-certificate-sha256
+Pdk-Zone: core
+Pdk-Layer: 01
+---
+ common/httpclient/apple_transport_darwin.go   | 113 +++++++----
+ common/httpclient/apple_transport_darwin.h    |  10 +-
+ common/httpclient/apple_transport_darwin.m    |  12 +-
+ .../httpclient/apple_transport_darwin_test.go |  98 +++++++---
+ common/tls/apple_client_platform.go           |   4 +-
+ common/tls/pinned_certificate_test.go         | 175 ++++++++++++++++++
+ common/tls/std_client.go                      |  34 ++--
+ common/tls/std_server.go                      |  11 +-
+ common/tls/system_client.go                   |   4 +-
+ common/tls/system_client_engine.go            |   5 +-
+ common/tls/utls_client.go                     |   6 +-
+ common/tls/windows_client.go                  |   4 +-
+ common/tls/windows_client_test.go             |  38 ++++
+ docs/configuration/shared/http-client.md      |   1 +
+ docs/configuration/shared/http-client.zh.md   |   1 +
+ docs/configuration/shared/tls.md              |  40 +++-
+ docs/configuration/shared/tls.zh.md           |  40 +++-
+ docs/schema.json                              |  74 ++++++++
+ option/tls.go                                 |   2 +
+ 19 files changed, 576 insertions(+), 96 deletions(-)
+ create mode 100644 common/tls/pinned_certificate_test.go
+
+diff --git a/common/httpclient/apple_transport_darwin.go b/common/httpclient/apple_transport_darwin.go
+index 36584f9cf..56b958698 100644
+--- a/common/httpclient/apple_transport_darwin.go
++++ b/common/httpclient/apple_transport_darwin.go
+@@ -48,22 +48,35 @@ var (
+ 	}
+ )
+ 
+-func verifyApplePinnedPublicKeySHA256(flatHashes []byte, leafCertificate []byte) error {
++func splitApplePinnedHashes(flatHashes []byte) ([][]byte, error) {
+ 	if len(flatHashes)%applePinnedHashSize != 0 {
+-		return E.New("invalid pinned public key list")
++		return nil, E.New("invalid pinned hash list")
+ 	}
+ 	knownHashes := make([][]byte, 0, len(flatHashes)/applePinnedHashSize)
+ 	for offset := 0; offset < len(flatHashes); offset += applePinnedHashSize {
+ 		knownHashes = append(knownHashes, append([]byte(nil), flatHashes[offset:offset+applePinnedHashSize]...))
+ 	}
+-	return boxTLS.VerifyPublicKeySHA256(knownHashes, [][]byte{leafCertificate})
++	return knownHashes, nil
+ }
+ 
+-//export box_apple_http_verify_public_key_sha256
+-func box_apple_http_verify_public_key_sha256(knownHashValues *C.uint8_t, knownHashValuesLen C.size_t, leafCert *C.uint8_t, leafCertLen C.size_t) *C.char {
+-	flatHashes := C.GoBytes(unsafe.Pointer(knownHashValues), C.int(knownHashValuesLen))
++func verifyApplePinnedCertificate(flatCertificateHashes []byte, flatPublicKeyHashes []byte, leafCertificate []byte) error {
++	certificateHashes, err := splitApplePinnedHashes(flatCertificateHashes)
++	if err != nil {
++		return err
++	}
++	publicKeyHashes, err := splitApplePinnedHashes(flatPublicKeyHashes)
++	if err != nil {
++		return err
++	}
++	return boxTLS.VerifyPinnedCertificate(certificateHashes, publicKeyHashes, [][]byte{leafCertificate})
++}
++
++//export box_apple_http_verify_pinned_certificate
++func box_apple_http_verify_pinned_certificate(certificateHashValues *C.uint8_t, certificateHashValuesLen C.size_t, publicKeyHashValues *C.uint8_t, publicKeyHashValuesLen C.size_t, leafCert *C.uint8_t, leafCertLen C.size_t) *C.char {
++	flatCertificateHashes := C.GoBytes(unsafe.Pointer(certificateHashValues), C.int(certificateHashValuesLen))
++	flatPublicKeyHashes := C.GoBytes(unsafe.Pointer(publicKeyHashValues), C.int(publicKeyHashValuesLen))
+ 	leafCertificate := C.GoBytes(unsafe.Pointer(leafCert), C.int(leafCertLen))
+-	err := verifyApplePinnedPublicKeySHA256(flatHashes, leafCertificate)
++	err := verifyApplePinnedCertificate(flatCertificateHashes, flatPublicKeyHashes, leafCertificate)
+ 	if err == nil {
+ 		return nil
+ 	}
+@@ -71,14 +84,15 @@ func box_apple_http_verify_public_key_sha256(knownHashValues *C.uint8_t, knownHa
+ }
+ 
+ type appleSessionConfig struct {
+-	serverName             string
+-	minVersion             uint16
+-	maxVersion             uint16
+-	insecure               bool
+-	anchorOnly             bool
+-	userAnchors            adapter.AppleAnchors
+-	store                  adapter.CertificateStore
+-	pinnedPublicKeySHA256s []byte
++	serverName               string
++	minVersion               uint16
++	maxVersion               uint16
++	insecure                 bool
++	anchorOnly               bool
++	userAnchors              adapter.AppleAnchors
++	store                    adapter.CertificateStore
++	pinnedCertificateSHA256s []byte
++	pinnedPublicKeySHA256s   []byte
+ }
+ 
+ type appleTransportShared struct {
+@@ -184,7 +198,7 @@ func newAppleSessionConfig(ctx context.Context, options option.HTTPClientOptions
+ 		serverName: tlsOptions.ServerName,
+ 		minVersion: validated.MinVersion,
+ 		maxVersion: validated.MaxVersion,
+-		insecure:   tlsOptions.Insecure || len(tlsOptions.CertificatePublicKeySHA256) > 0,
++		insecure:   tlsOptions.Insecure || len(tlsOptions.CertificateSHA256) > 0 || len(tlsOptions.CertificatePublicKeySHA256) > 0,
+ 		anchorOnly: validated.Exclusive,
+ 		store:      validated.Store,
+ 	}
+@@ -195,21 +209,33 @@ func newAppleSessionConfig(ctx context.Context, options option.HTTPClientOptions
+ 		}
+ 		config.userAnchors = userAnchors
+ 	}
+-	if len(tlsOptions.CertificatePublicKeySHA256) > 0 {
+-		config.pinnedPublicKeySHA256s = make([]byte, 0, len(tlsOptions.CertificatePublicKeySHA256)*applePinnedHashSize)
+-		for _, hashValue := range tlsOptions.CertificatePublicKeySHA256 {
+-			if len(hashValue) != applePinnedHashSize {
+-				if config.userAnchors != nil {
+-					config.userAnchors.Release()
+-				}
+-				return appleSessionConfig{}, E.New("invalid certificate_public_key_sha256 length: ", len(hashValue))
+-			}
+-			config.pinnedPublicKeySHA256s = append(config.pinnedPublicKeySHA256s, hashValue...)
++	config.pinnedCertificateSHA256s, err = flattenApplePinnedHashes(tlsOptions.CertificateSHA256, "certificate_sha256")
++	if err == nil {
++		config.pinnedPublicKeySHA256s, err = flattenApplePinnedHashes(tlsOptions.CertificatePublicKeySHA256, "certificate_public_key_sha256")
++	}
++	if err != nil {
++		if config.userAnchors != nil {
++			config.userAnchors.Release()
+ 		}
++		return appleSessionConfig{}, err
+ 	}
+ 	return config, nil
+ }
+ 
++func flattenApplePinnedHashes(hashValues [][]byte, optionName string) ([]byte, error) {
++	if len(hashValues) == 0 {
++		return nil, nil
++	}
++	flatHashes := make([]byte, 0, len(hashValues)*applePinnedHashSize)
++	for _, hashValue := range hashValues {
++		if len(hashValue) != applePinnedHashSize {
++			return nil, E.New("invalid ", optionName, " length: ", len(hashValue))
++		}
++		flatHashes = append(flatHashes, hashValue...)
++	}
++	return flatHashes, nil
++}
++
+ func (c *appleSessionConfig) close() {
+ 	if c.userAnchors != nil {
+ 		c.userAnchors.Release()
+@@ -236,10 +262,15 @@ func (s *appleTransportShared) newSession() (*C.box_apple_http_session_t, error)
+ 	defer C.free(unsafe.Pointer(cProxyUsername))
+ 	cProxyPassword := C.CString(s.bridge.Password())
+ 	defer C.free(unsafe.Pointer(cProxyPassword))
+-	var pinnedPointer *C.uint8_t
++	var pinnedCertificatePointer *C.uint8_t
++	if len(s.config.pinnedCertificateSHA256s) > 0 {
++		pinnedCertificatePointer = (*C.uint8_t)(C.CBytes(s.config.pinnedCertificateSHA256s))
++		defer C.free(unsafe.Pointer(pinnedCertificatePointer))
++	}
++	var pinnedPublicKeyPointer *C.uint8_t
+ 	if len(s.config.pinnedPublicKeySHA256s) > 0 {
+-		pinnedPointer = (*C.uint8_t)(C.CBytes(s.config.pinnedPublicKeySHA256s))
+-		defer C.free(unsafe.Pointer(pinnedPointer))
++		pinnedPublicKeyPointer = (*C.uint8_t)(C.CBytes(s.config.pinnedPublicKeySHA256s))
++		defer C.free(unsafe.Pointer(pinnedPublicKeyPointer))
+ 	}
+ 	anchors := certificate.AcquireAnchors(s.config.userAnchors, s.config.store)
+ 	var anchorsRef unsafe.Pointer
+@@ -248,17 +279,19 @@ func (s *appleTransportShared) newSession() (*C.box_apple_http_session_t, error)
+ 		defer anchors.Release()
+ 	}
+ 	cConfig := C.box_apple_http_session_config_t{
+-		proxy_host:                   cProxyHost,
+-		proxy_port:                   C.int(s.bridge.Port()),
+-		proxy_username:               cProxyUsername,
+-		proxy_password:               cProxyPassword,
+-		min_tls_version:              C.uint16_t(s.config.minVersion),
+-		max_tls_version:              C.uint16_t(s.config.maxVersion),
+-		insecure:                     C.bool(s.config.insecure),
+-		anchors_cf:                   anchorsRef,
+-		anchor_only:                  C.bool(s.config.anchorOnly),
+-		pinned_public_key_sha256:     pinnedPointer,
+-		pinned_public_key_sha256_len: C.size_t(len(s.config.pinnedPublicKeySHA256s)),
++		proxy_host:                    cProxyHost,
++		proxy_port:                    C.int(s.bridge.Port()),
++		proxy_username:                cProxyUsername,
++		proxy_password:                cProxyPassword,
++		min_tls_version:               C.uint16_t(s.config.minVersion),
++		max_tls_version:               C.uint16_t(s.config.maxVersion),
++		insecure:                      C.bool(s.config.insecure),
++		anchors_cf:                    anchorsRef,
++		anchor_only:                   C.bool(s.config.anchorOnly),
++		pinned_certificate_sha256:     pinnedCertificatePointer,
++		pinned_certificate_sha256_len: C.size_t(len(s.config.pinnedCertificateSHA256s)),
++		pinned_public_key_sha256:      pinnedPublicKeyPointer,
++		pinned_public_key_sha256_len:  C.size_t(len(s.config.pinnedPublicKeySHA256s)),
+ 	}
+ 	var cErr *C.char
+ 	session := C.box_apple_http_session_create(&cConfig, &cErr)
+diff --git a/common/httpclient/apple_transport_darwin.h b/common/httpclient/apple_transport_darwin.h
+index 4774a6b4d..7d89cdb7c 100644
+--- a/common/httpclient/apple_transport_darwin.h
++++ b/common/httpclient/apple_transport_darwin.h
+@@ -15,6 +15,8 @@ typedef struct box_apple_http_session_config {
+ 	bool insecure;
+ 	void *anchors_cf;
+ 	bool anchor_only;
++	const uint8_t *pinned_certificate_sha256;
++	size_t pinned_certificate_sha256_len;
+ 	const uint8_t *pinned_public_key_sha256;
+ 	size_t pinned_public_key_sha256_len;
+ } box_apple_http_session_config_t;
+@@ -62,9 +64,11 @@ void box_apple_http_task_close(box_apple_http_task_t *task);
+ 
+ void box_apple_http_response_free(box_apple_http_response_t *response);
+ 
+-char *box_apple_http_verify_public_key_sha256(
+-	uint8_t *known_hash_values,
+-	size_t known_hash_values_len,
++char *box_apple_http_verify_pinned_certificate(
++	uint8_t *certificate_hash_values,
++	size_t certificate_hash_values_len,
++	uint8_t *public_key_hash_values,
++	size_t public_key_hash_values_len,
+ 	uint8_t *leaf_cert,
+ 	size_t leaf_cert_len
+ );
+diff --git a/common/httpclient/apple_transport_darwin.m b/common/httpclient/apple_transport_darwin.m
+index 1e72a3e0a..5c1f67e78 100644
+--- a/common/httpclient/apple_transport_darwin.m
++++ b/common/httpclient/apple_transport_darwin.m
+@@ -100,6 +100,7 @@ static box_apple_http_response_t *box_create_response(NSHTTPURLResponse *httpRes
+ @property(nonatomic, assign) BOOL insecure;
+ @property(nonatomic, assign) BOOL anchorOnly;
+ @property(nonatomic, strong) NSArray *anchors;
++@property(nonatomic, strong) NSData *pinnedCertificateHashes;
+ @property(nonatomic, strong) NSData *pinnedPublicKeyHashes;
+ @end
+ 
+@@ -127,7 +128,7 @@ didReceiveChallenge:(NSURLAuthenticationChallenge *)challenge
+ 		return;
+ 	}
+ 	NSDate *verifyDate = box_apple_http_verify_date_for_request(task.currentRequest ?: task.originalRequest);
+-	BOOL needsCustomHandling = self.insecure || self.anchorOnly || self.anchors.count > 0 || self.pinnedPublicKeyHashes.length > 0 || verifyDate != nil;
++	BOOL needsCustomHandling = self.insecure || self.anchorOnly || self.anchors.count > 0 || self.pinnedCertificateHashes.length > 0 || self.pinnedPublicKeyHashes.length > 0 || verifyDate != nil;
+ 	if (!needsCustomHandling) {
+ 		completionHandler(NSURLSessionAuthChallengePerformDefaultHandling, nil);
+ 		return;
+@@ -136,7 +137,7 @@ didReceiveChallenge:(NSURLAuthenticationChallenge *)challenge
+ 	if (!self.insecure) {
+ 		ok = box_evaluate_trust(trustRef, self.anchors, self.anchorOnly, verifyDate);
+ 	}
+-	if (ok && self.pinnedPublicKeyHashes.length > 0) {
++	if (ok && (self.pinnedCertificateHashes.length > 0 || self.pinnedPublicKeyHashes.length > 0)) {
+ 		CFArrayRef certificateChain = SecTrustCopyCertificateChain(trustRef);
+ 		SecCertificateRef leafCertificate = NULL;
+ 		if (certificateChain != NULL && CFArrayGetCount(certificateChain) > 0) {
+@@ -146,7 +147,9 @@ didReceiveChallenge:(NSURLAuthenticationChallenge *)challenge
+ 			ok = NO;
+ 		} else {
+ 			NSData *leafData = CFBridgingRelease(SecCertificateCopyData(leafCertificate));
+-			char *pinError = box_apple_http_verify_public_key_sha256(
++			char *pinError = box_apple_http_verify_pinned_certificate(
++				(uint8_t *)self.pinnedCertificateHashes.bytes,
++				self.pinnedCertificateHashes.length,
+ 				(uint8_t *)self.pinnedPublicKeyHashes.bytes,
+ 				self.pinnedPublicKeyHashes.length,
+ 				(uint8_t *)leafData.bytes,
+@@ -216,6 +219,9 @@ box_apple_http_session_t *box_apple_http_session_create(
+ 			} else {
+ 				delegate.anchors = @[];
+ 			}
++			if (config->pinned_certificate_sha256 != NULL && config->pinned_certificate_sha256_len > 0) {
++				delegate.pinnedCertificateHashes = [NSData dataWithBytes:config->pinned_certificate_sha256 length:config->pinned_certificate_sha256_len];
++			}
+ 			if (config->pinned_public_key_sha256 != NULL && config->pinned_public_key_sha256_len > 0) {
+ 				delegate.pinnedPublicKeyHashes = [NSData dataWithBytes:config->pinned_public_key_sha256 length:config->pinned_public_key_sha256_len];
+ 			}
+diff --git a/common/httpclient/apple_transport_darwin_test.go b/common/httpclient/apple_transport_darwin_test.go
+index 13404068c..a1dde8169 100644
+--- a/common/httpclient/apple_transport_darwin_test.go
++++ b/common/httpclient/apple_transport_darwin_test.go
+@@ -53,12 +53,13 @@ type appleHTTPObservedRequest struct {
+ }
+ 
+ type appleHTTPTestServer struct {
+-	server         *httptest.Server
+-	baseURL        string
+-	dialHost       string
+-	certificate    stdtls.Certificate
+-	certificatePEM string
+-	publicKeyHash  []byte
++	server          *httptest.Server
++	baseURL         string
++	dialHost        string
++	certificate     stdtls.Certificate
++	certificatePEM  string
++	publicKeyHash   []byte
++	certificateHash []byte
+ }
+ 
+ type appleTestAnchors struct {
+@@ -392,30 +393,36 @@ func TestNewAppleSessionConfig(t *testing.T) {
+ 	}
+ }
+ 
+-func TestAppleTransportVerifyPublicKeySHA256(t *testing.T) {
++func TestAppleTransportVerifyPinnedCertificate(t *testing.T) {
+ 	serverCertificate, _ := newAppleHTTPTestCertificate(t, "localhost")
+-	goodHash := certificatePublicKeySHA256(t, serverCertificate.Certificate[0])
+-	badHash := append([]byte(nil), goodHash...)
++	goodPublicKeyHash := certificatePublicKeySHA256(t, serverCertificate.Certificate[0])
++	goodCertificateHash := certificateSHA256(serverCertificate.Certificate[0])
++	badHash := append([]byte(nil), goodPublicKeyHash...)
+ 	badHash[0] ^= 0xff
+ 
+-	err := verifyApplePinnedPublicKeySHA256(goodHash, serverCertificate.Certificate[0])
++	err := verifyApplePinnedCertificate(nil, goodPublicKeyHash, serverCertificate.Certificate[0])
+ 	if err != nil {
+-		t.Fatalf("expected correct pin to succeed: %v", err)
++		t.Fatalf("expected correct public key pin to succeed: %v", err)
+ 	}
+ 
+-	err = verifyApplePinnedPublicKeySHA256(badHash, serverCertificate.Certificate[0])
++	err = verifyApplePinnedCertificate(goodCertificateHash, nil, serverCertificate.Certificate[0])
++	if err != nil {
++		t.Fatalf("expected correct certificate pin to succeed: %v", err)
++	}
++
++	err = verifyApplePinnedCertificate(badHash, badHash, serverCertificate.Certificate[0])
+ 	if err == nil {
+ 		t.Fatal("expected incorrect pin to fail")
+ 	}
+-	if !strings.Contains(err.Error(), "unrecognized remote public key") {
++	if !strings.Contains(err.Error(), "unrecognized peer certificate") {
+ 		t.Fatalf("unexpected pin mismatch error: %v", err)
+ 	}
+ 
+-	err = verifyApplePinnedPublicKeySHA256(goodHash[:applePinnedHashSize-1], serverCertificate.Certificate[0])
++	err = verifyApplePinnedCertificate(nil, goodPublicKeyHash[:applePinnedHashSize-1], serverCertificate.Certificate[0])
+ 	if err == nil {
+ 		t.Fatal("expected malformed pin list to fail")
+ 	}
+-	if !strings.Contains(err.Error(), "invalid pinned public key list") {
++	if !strings.Contains(err.Error(), "invalid pinned hash list") {
+ 		t.Fatalf("unexpected malformed pin error: %v", err)
+ 	}
+ }
+@@ -589,6 +596,49 @@ func TestAppleTransportPinnedPublicKey(t *testing.T) {
+ 	}
+ }
+ 
++func TestAppleTransportPinnedCertificate(t *testing.T) {
++	server := startAppleHTTPTestServer(t, func(w http.ResponseWriter, r *http.Request) {
++		w.WriteHeader(http.StatusOK)
++		_, _ = w.Write([]byte("pinned"))
++	})
++
++	goodTransport := newAppleHTTPTestTransport(t, server, option.HTTPClientOptions{
++		Version: 2,
++		OutboundTLSOptionsContainer: option.OutboundTLSOptionsContainer{
++			TLS: &option.OutboundTLSOptions{
++				Enabled:           true,
++				ServerName:        "localhost",
++				CertificateSHA256: badoption.Listable[[]byte]{server.certificateHash},
++			},
++		},
++	})
++
++	response, err := goodTransport.RoundTrip(newAppleHTTPRequest(t, http.MethodGet, server.URL("/good"), nil))
++	if err != nil {
++		t.Fatalf("expected pinned request to succeed: %v", err)
++	}
++	response.Body.Close()
++
++	badHash := append([]byte(nil), server.certificateHash...)
++	badHash[0] ^= 0xff
++	badTransport := newAppleHTTPTestTransport(t, server, option.HTTPClientOptions{
++		Version: 2,
++		OutboundTLSOptionsContainer: option.OutboundTLSOptionsContainer{
++			TLS: &option.OutboundTLSOptions{
++				Enabled:           true,
++				ServerName:        "localhost",
++				CertificateSHA256: badoption.Listable[[]byte]{badHash},
++			},
++		},
++	})
++
++	response, err = badTransport.RoundTrip(newAppleHTTPRequest(t, http.MethodGet, server.URL("/bad"), nil))
++	if err == nil {
++		response.Body.Close()
++		t.Fatal("expected incorrect pinned certificate to fail")
++	}
++}
++
+ func TestAppleTransportGuardrails(t *testing.T) {
+ 	testCases := []struct {
+ 		name          string
+@@ -769,12 +819,13 @@ func startAppleHTTPTestServer(t *testing.T, handler http.HandlerFunc) *appleHTTP
+ 	baseURL.Host = net.JoinHostPort("localhost", parsedURL.Port())
+ 
+ 	return &appleHTTPTestServer{
+-		server:         server,
+-		baseURL:        baseURL.String(),
+-		dialHost:       parsedURL.Hostname(),
+-		certificate:    serverCertificate,
+-		certificatePEM: serverCertificatePEM,
+-		publicKeyHash:  certificatePublicKeySHA256(t, serverCertificate.Certificate[0]),
++		server:          server,
++		baseURL:         baseURL.String(),
++		dialHost:        parsedURL.Hostname(),
++		certificate:     serverCertificate,
++		certificatePEM:  serverCertificatePEM,
++		publicKeyHash:   certificatePublicKeySHA256(t, serverCertificate.Certificate[0]),
++		certificateHash: certificateSHA256(serverCertificate.Certificate[0]),
+ 	}
+ }
+ 
+@@ -881,6 +932,11 @@ func newAppleHTTPTestCertificate(t *testing.T, serverName string) (stdtls.Certif
+ 	return certificate, string(certificatePEM)
+ }
+ 
++func certificateSHA256(certificateDER []byte) []byte {
++	hashValue := sha256.Sum256(certificateDER)
++	return append([]byte(nil), hashValue[:]...)
++}
++
+ func certificatePublicKeySHA256(t *testing.T, certificateDER []byte) []byte {
+ 	t.Helper()
+ 
+diff --git a/common/tls/apple_client_platform.go b/common/tls/apple_client_platform.go
+index 462780ee6..597a38908 100644
+--- a/common/tls/apple_client_platform.go
++++ b/common/tls/apple_client_platform.go
+@@ -128,8 +128,8 @@ func (c *appleClientConfig) ClientHandshake(ctx context.Context, conn net.Conn)
+ 		C.box_apple_tls_client_free(client)
+ 		return nil, err
+ 	}
+-	if len(c.certificatePublicKeySHA256) > 0 {
+-		err = VerifyPublicKeySHA256(c.certificatePublicKeySHA256, rawCerts)
++	if len(c.certificateSHA256) > 0 || len(c.certificatePublicKeySHA256) > 0 {
++		err = VerifyPinnedCertificate(c.certificateSHA256, c.certificatePublicKeySHA256, rawCerts)
+ 		if err != nil {
+ 			C.box_apple_tls_client_cancel(client)
+ 			C.box_apple_tls_client_free(client)
+diff --git a/common/tls/pinned_certificate_test.go b/common/tls/pinned_certificate_test.go
+new file mode 100644
+index 000000000..b78a73e33
+--- /dev/null
++++ b/common/tls/pinned_certificate_test.go
+@@ -0,0 +1,175 @@
++package tls
++
++import (
++	"context"
++	"crypto/sha256"
++	stdtls "crypto/tls"
++	"crypto/x509"
++	"net"
++	"testing"
++	"time"
++
++	"github.com/sagernet/sing-box/log"
++	"github.com/sagernet/sing-box/option"
++	"github.com/sagernet/sing/common/json/badoption"
++	"github.com/sagernet/sing/common/logger"
++
++	"github.com/stretchr/testify/require"
++)
++
++const pinnedCertificateTestTimeout = 5 * time.Second
++
++type pinnedTestCertificate struct {
++	stdtls.Certificate
++	certificatePEM string
++	privateKeyPEM  string
++}
++
++func newPinnedTestCertificate(t *testing.T, serverName string) pinnedTestCertificate {
++	t.Helper()
++	privateKeyPEM, certificatePEM, err := GenerateCertificate(nil, nil, time.Now, serverName, time.Now().Add(time.Hour))
++	require.NoError(t, err)
++	certificate, err := stdtls.X509KeyPair(certificatePEM, privateKeyPEM)
++	require.NoError(t, err)
++	certificate.Leaf, err = x509.ParseCertificate(certificate.Certificate[0])
++	require.NoError(t, err)
++	return pinnedTestCertificate{certificate, string(certificatePEM), string(privateKeyPEM)}
++}
++
++func dialPinnedTestServer(t *testing.T, serverConfig *stdtls.Config, clientOptions option.OutboundTLSOptions) error {
++	t.Helper()
++	listener, err := net.Listen("tcp", "127.0.0.1:0")
++	require.NoError(t, err)
++	defer listener.Close()
++	serverDone := make(chan struct{})
++	go func() {
++		defer close(serverDone)
++		conn, acceptErr := listener.Accept()
++		if acceptErr != nil {
++			return
++		}
++		defer conn.Close()
++		conn.SetDeadline(time.Now().Add(pinnedCertificateTestTimeout))
++		stdtls.Server(conn, serverConfig).Handshake()
++	}()
++	ctx, cancel := context.WithTimeout(context.Background(), pinnedCertificateTestTimeout)
++	defer cancel()
++	clientConfig, err := NewClientWithOptions(ClientOptions{
++		Context: ctx,
++		Logger:  logger.NOP(),
++		Options: clientOptions,
++	})
++	require.NoError(t, err)
++	conn, err := net.DialTimeout("tcp", listener.Addr().String(), pinnedCertificateTestTimeout)
++	require.NoError(t, err)
++	defer conn.Close()
++	tlsConn, err := ClientHandshake(ctx, conn, clientConfig)
++	if err == nil {
++		tlsConn.Close()
++	}
++	<-serverDone
++	return err
++}
++
++func TestClientCertificateSHA256(t *testing.T) {
++	t.Parallel()
++	serverCertificate := newPinnedTestCertificate(t, "localhost")
++	serverConfig := &stdtls.Config{Certificates: []stdtls.Certificate{serverCertificate.Certificate}}
++	certificateHash := sha256.Sum256(serverCertificate.Leaf.Raw)
++	wrongHash := sha256.Sum256([]byte("not the certificate"))
++	publicKeyDER, err := x509.MarshalPKIXPublicKey(serverCertificate.Leaf.PublicKey)
++	require.NoError(t, err)
++	publicKeyHash := sha256.Sum256(publicKeyDER)
++
++	require.NoError(t, dialPinnedTestServer(t, serverConfig, option.OutboundTLSOptions{
++		Enabled:           true,
++		ServerName:        "localhost",
++		CertificateSHA256: badoption.Listable[[]byte]{certificateHash[:]},
++	}))
++	require.NoError(t, dialPinnedTestServer(t, serverConfig, option.OutboundTLSOptions{
++		Enabled:                    true,
++		ServerName:                 "localhost",
++		CertificateSHA256:          badoption.Listable[[]byte]{wrongHash[:]},
++		CertificatePublicKeySHA256: badoption.Listable[[]byte]{publicKeyHash[:]},
++	}))
++	require.Error(t, dialPinnedTestServer(t, serverConfig, option.OutboundTLSOptions{
++		Enabled:           true,
++		ServerName:        "localhost",
++		CertificateSHA256: badoption.Listable[[]byte]{wrongHash[:]},
++	}))
++	require.Error(t, dialPinnedTestServer(t, serverConfig, option.OutboundTLSOptions{
++		Enabled:                    true,
++		ServerName:                 "localhost",
++		CertificateSHA256:          badoption.Listable[[]byte]{wrongHash[:]},
++		CertificatePublicKeySHA256: badoption.Listable[[]byte]{wrongHash[:]},
++	}))
++}
++
++func acceptPinnedTestClient(t *testing.T, serverOptions option.InboundTLSOptions, clientConfig *stdtls.Config) error {
++	t.Helper()
++	ctx, cancel := context.WithTimeout(context.Background(), pinnedCertificateTestTimeout)
++	defer cancel()
++	serverConfig, err := NewServer(ctx, log.NewNOPFactory().Logger(), serverOptions)
++	require.NoError(t, err)
++	require.NoError(t, serverConfig.Start())
++	defer serverConfig.Close()
++	listener, err := net.Listen("tcp", "127.0.0.1:0")
++	require.NoError(t, err)
++	defer listener.Close()
++	serverResult := make(chan error, 1)
++	go func() {
++		conn, acceptErr := listener.Accept()
++		if acceptErr != nil {
++			serverResult <- acceptErr
++			return
++		}
++		defer conn.Close()
++		tlsConn, handshakeErr := ServerHandshake(ctx, conn, serverConfig)
++		if handshakeErr == nil {
++			tlsConn.Close()
++		}
++		serverResult <- handshakeErr
++	}()
++	conn, err := net.DialTimeout("tcp", listener.Addr().String(), pinnedCertificateTestTimeout)
++	require.NoError(t, err)
++	defer conn.Close()
++	conn.SetDeadline(time.Now().Add(pinnedCertificateTestTimeout))
++	stdtls.Client(conn, clientConfig).Handshake()
++	return <-serverResult
++}
++
++func TestServerClientCertificateSHA256(t *testing.T) {
++	t.Parallel()
++	serverCertificate := newPinnedTestCertificate(t, "localhost")
++	clientCertificate := newPinnedTestCertificate(t, "client")
++	otherCertificate := newPinnedTestCertificate(t, "other")
++	clientHash := sha256.Sum256(clientCertificate.Leaf.Raw)
++	serverOptions := option.InboundTLSOptions{
++		Enabled:                 true,
++		ServerName:              "localhost",
++		Certificate:             badoption.Listable[string]{serverCertificate.certificatePEM},
++		Key:                     badoption.Listable[string]{serverCertificate.privateKeyPEM},
++		ClientAuthentication:    option.ClientAuthType(stdtls.RequireAndVerifyClientCert),
++		ClientCertificateSHA256: badoption.Listable[[]byte]{clientHash[:]},
++	}
++	require.NoError(t, acceptPinnedTestClient(t, serverOptions, &stdtls.Config{
++		InsecureSkipVerify: true,
++		Certificates:       []stdtls.Certificate{clientCertificate.Certificate},
++	}))
++	require.Error(t, acceptPinnedTestClient(t, serverOptions, &stdtls.Config{
++		InsecureSkipVerify: true,
++		Certificates:       []stdtls.Certificate{otherCertificate.Certificate},
++	}))
++	require.Error(t, acceptPinnedTestClient(t, serverOptions, &stdtls.Config{
++		InsecureSkipVerify: true,
++	}))
++
++	serverOptions.ClientAuthentication = option.ClientAuthType(stdtls.VerifyClientCertIfGiven)
++	require.NoError(t, acceptPinnedTestClient(t, serverOptions, &stdtls.Config{
++		InsecureSkipVerify: true,
++	}))
++	require.Error(t, acceptPinnedTestClient(t, serverOptions, &stdtls.Config{
++		InsecureSkipVerify: true,
++		Certificates:       []stdtls.Certificate{otherCertificate.Certificate},
++	}))
++}
+diff --git a/common/tls/std_client.go b/common/tls/std_client.go
+index 80fa6cb28..2897d9688 100644
+--- a/common/tls/std_client.go
++++ b/common/tls/std_client.go
+@@ -8,6 +8,7 @@ import (
+ 	"crypto/x509"
+ 	"encoding/base64"
+ 	"net"
++	"slices"
+ 	"strings"
+ 	"time"
+ 
+@@ -134,13 +135,13 @@ func newSTDClient(ctx context.Context, logger logger.ContextLogger, serverAddres
+ 	} else if options.DisableSNI {
+ 		tlsConfig.InsecureSkipVerify = true
+ 	}
+-	if len(options.CertificatePublicKeySHA256) > 0 {
++	if len(options.CertificateSHA256) > 0 || len(options.CertificatePublicKeySHA256) > 0 {
+ 		if len(options.Certificate) > 0 || options.CertificatePath != "" {
+-			return nil, E.New("certificate_public_key_sha256 is conflict with certificate or certificate_path")
++			return nil, E.New("certificate_sha256 or certificate_public_key_sha256 is conflict with certificate or certificate_path")
+ 		}
+ 		tlsConfig.InsecureSkipVerify = true
+ 		tlsConfig.VerifyPeerCertificate = func(rawCerts [][]byte, verifiedChains [][]*x509.Certificate) error {
+-			return VerifyPublicKeySHA256(options.CertificatePublicKeySHA256, rawCerts)
++			return VerifyPinnedCertificate(options.CertificateSHA256, options.CertificatePublicKeySHA256, rawCerts)
+ 		}
+ 	}
+ 	if len(options.ALPN) > 0 {
+@@ -275,21 +276,26 @@ func verifyConnection(rootCAs *x509.CertPool, timeFunc func() time.Time, serverN
+ 	}
+ }
+ 
+-func VerifyPublicKeySHA256(knownHashValues [][]byte, rawCerts [][]byte) error {
++func VerifyPinnedCertificate(certificateHashes [][]byte, publicKeyHashes [][]byte, rawCerts [][]byte) error {
++	if len(rawCerts) == 0 {
++		return E.New("missing peer certificate")
++	}
++	certificateHash := sha256.Sum256(rawCerts[0])
++	if slices.ContainsFunc(certificateHashes, func(value []byte) bool { return bytes.Equal(value, certificateHash[:]) }) {
++		return nil
++	}
+ 	leafCertificate, err := x509.ParseCertificate(rawCerts[0])
+ 	if err != nil {
+-		return E.Cause(err, "failed to parse leaf certificate")
++		return E.Cause(err, "parse leaf certificate")
+ 	}
+-
+-	pubKeyBytes, err := x509.MarshalPKIXPublicKey(leafCertificate.PublicKey)
++	publicKeyBytes, err := x509.MarshalPKIXPublicKey(leafCertificate.PublicKey)
+ 	if err != nil {
+-		return E.Cause(err, "failed to marshal public key")
++		return E.Cause(err, "marshal public key")
+ 	}
+-	hashValue := sha256.Sum256(pubKeyBytes)
+-	for _, value := range knownHashValues {
+-		if bytes.Equal(value, hashValue[:]) {
+-			return nil
+-		}
++	publicKeyHash := sha256.Sum256(publicKeyBytes)
++	if slices.ContainsFunc(publicKeyHashes, func(value []byte) bool { return bytes.Equal(value, publicKeyHash[:]) }) {
++		return nil
+ 	}
+-	return E.New("unrecognized remote public key: ", base64.StdEncoding.EncodeToString(hashValue[:]))
++	return E.New("unrecognized peer certificate: sha256 ", base64.StdEncoding.EncodeToString(certificateHash[:]),
++		", public key sha256 ", base64.StdEncoding.EncodeToString(publicKeyHash[:]))
+ }
+diff --git a/common/tls/std_server.go b/common/tls/std_server.go
+index 171cc4f29..bc156d278 100644
+--- a/common/tls/std_server.go
++++ b/common/tls/std_server.go
+@@ -472,18 +472,23 @@ func NewSTDServer(ctx context.Context, logger log.ContextLogger, options option.
+ 				}
+ 			}
+ 			tlsConfig.ClientCAs = clientCertificateCA
+-		} else if len(options.ClientCertificatePublicKeySHA256) > 0 {
++		} else if len(options.ClientCertificateSHA256) > 0 || len(options.ClientCertificatePublicKeySHA256) > 0 {
++			var certificateOptional bool
+ 			switch tlsConfig.ClientAuth {
+ 			case tls.RequireAndVerifyClientCert:
+ 				tlsConfig.ClientAuth = tls.RequireAnyClientCert
+ 			case tls.VerifyClientCertIfGiven:
+ 				tlsConfig.ClientAuth = tls.RequestClientCert
++				certificateOptional = true
+ 			}
+ 			tlsConfig.VerifyPeerCertificate = func(rawCerts [][]byte, verifiedChains [][]*x509.Certificate) error {
+-				return VerifyPublicKeySHA256(options.ClientCertificatePublicKeySHA256, rawCerts)
++				if certificateOptional && len(rawCerts) == 0 {
++					return nil
++				}
++				return VerifyPinnedCertificate(options.ClientCertificateSHA256, options.ClientCertificatePublicKeySHA256, rawCerts)
+ 			}
+ 		} else {
+-			return nil, E.New("missing client_certificate, client_certificate_path or client_certificate_public_key_sha256 for client authentication")
++			return nil, E.New("missing client_certificate, client_certificate_path, client_certificate_sha256 or client_certificate_public_key_sha256 for client authentication")
+ 		}
+ 	}
+ 	var echKeyPath string
+diff --git a/common/tls/system_client.go b/common/tls/system_client.go
+index 06f16352b..559df943c 100644
+--- a/common/tls/system_client.go
++++ b/common/tls/system_client.go
+@@ -52,8 +52,8 @@ func ValidateSystemTLSOptions(ctx context.Context, options option.OutboundTLSOpt
+ 	if options.Spoof != "" || options.SpoofMethod != "" {
+ 		return SystemTLSValidated{}, E.New("spoof is unsupported in ", engineName)
+ 	}
+-	if len(options.CertificatePublicKeySHA256) > 0 && (len(options.Certificate) > 0 || options.CertificatePath != "") {
+-		return SystemTLSValidated{}, E.New("certificate_public_key_sha256 is conflict with certificate or certificate_path")
++	if (len(options.CertificateSHA256) > 0 || len(options.CertificatePublicKeySHA256) > 0) && (len(options.Certificate) > 0 || options.CertificatePath != "") {
++		return SystemTLSValidated{}, E.New("certificate_sha256 or certificate_public_key_sha256 is conflict with certificate or certificate_path")
+ 	}
+ 	var minVersion uint16
+ 	if options.MinVersion != "" {
+diff --git a/common/tls/system_client_engine.go b/common/tls/system_client_engine.go
+index 5fc89959f..5b8682ce1 100644
+--- a/common/tls/system_client_engine.go
++++ b/common/tls/system_client_engine.go
+@@ -23,6 +23,7 @@ type systemTLSConfig struct {
+ 	maxVersion                 uint16
+ 	insecure                   bool
+ 	anchorOnly                 bool
++	certificateSHA256          [][]byte
+ 	certificatePublicKeySHA256 [][]byte
+ 	timeFunc                   func() time.Time
+ 	store                      adapter.CertificateStore
+@@ -69,6 +70,7 @@ func (c *systemTLSConfig) clone() systemTLSConfig {
+ 		maxVersion:                 c.maxVersion,
+ 		insecure:                   c.insecure,
+ 		anchorOnly:                 c.anchorOnly,
++		certificateSHA256:          append([][]byte(nil), c.certificateSHA256...),
+ 		certificatePublicKeySHA256: append([][]byte(nil), c.certificatePublicKeySHA256...),
+ 		timeFunc:                   c.timeFunc,
+ 		store:                      c.store,
+@@ -99,8 +101,9 @@ func newSystemTLSConfig(ctx context.Context, serverAddress string, options optio
+ 		handshakeTimeout:           handshakeTimeout,
+ 		minVersion:                 validated.MinVersion,
+ 		maxVersion:                 validated.MaxVersion,
+-		insecure:                   options.Insecure || len(options.CertificatePublicKeySHA256) > 0,
++		insecure:                   options.Insecure || len(options.CertificateSHA256) > 0 || len(options.CertificatePublicKeySHA256) > 0,
+ 		anchorOnly:                 validated.Exclusive,
++		certificateSHA256:          append([][]byte(nil), options.CertificateSHA256...),
+ 		certificatePublicKeySHA256: append([][]byte(nil), options.CertificatePublicKeySHA256...),
+ 		timeFunc:                   ntp.TimeFuncFromContext(ctx),
+ 		store:                      validated.Store,
+diff --git a/common/tls/utls_client.go b/common/tls/utls_client.go
+index 16d0352d0..2b725d30d 100644
+--- a/common/tls/utls_client.go
++++ b/common/tls/utls_client.go
+@@ -209,13 +209,13 @@ func newUTLSClient(ctx context.Context, logger logger.ContextLogger, serverAddre
+ 			return nil, E.New("disable_sni is unsupported in reality")
+ 		}
+ 	}
+-	if len(options.CertificatePublicKeySHA256) > 0 {
++	if len(options.CertificateSHA256) > 0 || len(options.CertificatePublicKeySHA256) > 0 {
+ 		if len(options.Certificate) > 0 || options.CertificatePath != "" {
+-			return nil, E.New("certificate_public_key_sha256 is conflict with certificate or certificate_path")
++			return nil, E.New("certificate_sha256 or certificate_public_key_sha256 is conflict with certificate or certificate_path")
+ 		}
+ 		tlsConfig.InsecureSkipVerify = true
+ 		tlsConfig.VerifyPeerCertificate = func(rawCerts [][]byte, verifiedChains [][]*x509.Certificate) error {
+-			return VerifyPublicKeySHA256(options.CertificatePublicKeySHA256, rawCerts)
++			return VerifyPinnedCertificate(options.CertificateSHA256, options.CertificatePublicKeySHA256, rawCerts)
+ 		}
+ 	}
+ 	if len(options.ALPN) > 0 {
+diff --git a/common/tls/windows_client.go b/common/tls/windows_client.go
+index 9a865c0aa..4b9408bd9 100644
+--- a/common/tls/windows_client.go
++++ b/common/tls/windows_client.go
+@@ -102,8 +102,8 @@ func (c *windowsClientConfig) ClientHandshake(ctx context.Context, conn net.Conn
+ 	if err != nil {
+ 		return nil, err
+ 	}
+-	if len(c.certificatePublicKeySHA256) > 0 {
+-		err = VerifyPublicKeySHA256(c.certificatePublicKeySHA256, rawCerts)
++	if len(c.certificateSHA256) > 0 || len(c.certificatePublicKeySHA256) > 0 {
++		err = VerifyPinnedCertificate(c.certificateSHA256, c.certificatePublicKeySHA256, rawCerts)
+ 		if err != nil {
+ 			return nil, err
+ 		}
+diff --git a/common/tls/windows_client_test.go b/common/tls/windows_client_test.go
+index 755aea59d..2f813d3a4 100644
+--- a/common/tls/windows_client_test.go
++++ b/common/tls/windows_client_test.go
+@@ -593,6 +593,44 @@ func TestWindowsClientHandshakeHonorsPublicKeyPinFailure(t *testing.T) {
+ 	}
+ }
+ 
++func TestWindowsClientHandshakeHonorsCertificatePinSuccess(t *testing.T) {
++	serverCertificate, _ := newWindowsTestCertificate(t, "localhost")
++	pin := sha256.Sum256(serverCertificate.Leaf.Raw)
++	_, serverAddress := startWindowsTLSTestServer(t, &stdtls.Config{
++		Certificates: []stdtls.Certificate{serverCertificate},
++	})
++
++	clientConn, err := newWindowsTestClientConn(t, serverAddress, option.OutboundTLSOptions{
++		Enabled:           true,
++		Engine:            C.TLSEngineWindows,
++		ServerName:        "localhost",
++		CertificateSHA256: [][]byte{pin[:]},
++	})
++	if err != nil {
++		t.Fatal(err)
++	}
++	defer clientConn.Close()
++}
++
++func TestWindowsClientHandshakeHonorsCertificatePinFailure(t *testing.T) {
++	serverCertificate, _ := newWindowsTestCertificate(t, "localhost")
++	wrongPin := sha256.Sum256([]byte("not the certificate"))
++	_, serverAddress := startWindowsTLSTestServer(t, &stdtls.Config{
++		Certificates: []stdtls.Certificate{serverCertificate},
++	})
++
++	clientConn, err := newWindowsTestClientConn(t, serverAddress, option.OutboundTLSOptions{
++		Enabled:           true,
++		Engine:            C.TLSEngineWindows,
++		ServerName:        "localhost",
++		CertificateSHA256: [][]byte{wrongPin[:]},
++	})
++	if err == nil {
++		clientConn.Close()
++		t.Fatal("expected certificate pin mismatch to fail")
++	}
++}
++
+ func TestWindowsClientHandshakeContextCancellation(t *testing.T) {
+ 	listener, err := net.Listen("tcp", "127.0.0.1:0")
+ 	if err != nil {
+diff --git a/docs/configuration/shared/http-client.md b/docs/configuration/shared/http-client.md
+index dfa986b88..cb99d79d4 100644
+--- a/docs/configuration/shared/http-client.md
++++ b/docs/configuration/shared/http-client.md
+@@ -51,6 +51,7 @@ Supported fields:
+ * `tls.insecure`
+ * `tls.min_version` / `tls.max_version`
+ * `tls.certificate` / `tls.certificate_path`
++* `tls.certificate_sha256`
+ * `tls.certificate_public_key_sha256`
+ * Dial Fields
+ 
+diff --git a/docs/configuration/shared/http-client.zh.md b/docs/configuration/shared/http-client.zh.md
+index 7b28d4c30..cc80f1e09 100644
+--- a/docs/configuration/shared/http-client.zh.md
++++ b/docs/configuration/shared/http-client.zh.md
+@@ -51,6 +51,7 @@ icon: material/new-box
+ * `tls.insecure`
+ * `tls.min_version` / `tls.max_version`
+ * `tls.certificate` / `tls.certificate_path`
++* `tls.certificate_sha256`
+ * `tls.certificate_public_key_sha256`
+ * 拨号字段
+ 
+diff --git a/docs/configuration/shared/tls.md b/docs/configuration/shared/tls.md
+index 984c6cfe7..dea27617a 100644
+--- a/docs/configuration/shared/tls.md
++++ b/docs/configuration/shared/tls.md
+@@ -2,6 +2,11 @@
+ icon: material/new-box
+ ---
+ 
++!!! quote "Changes in sing-box 1.15.0"
++
++    :material-plus: [certificate_sha256](#certificate_sha256)  
++    :material-plus: [client_certificate_sha256](#client_certificate_sha256)
++
+ !!! quote "Changes in sing-box 1.14.0"
+ 
+     :material-plus: [certificate_provider](#certificate_provider)  
+@@ -53,6 +58,7 @@ icon: material/new-box
+   "client_authentication": "",
+   "client_certificate": [],
+   "client_certificate_path": [],
++  "client_certificate_sha256": [],
+   "client_certificate_public_key_sha256": [],
+   "key": [],
+   "key_path": "",
+@@ -122,6 +128,7 @@ icon: material/new-box
+   "curve_preferences": [],
+   "certificate": "",
+   "certificate_path": "",
++  "certificate_sha256": [],
+   "certificate_public_key_sha256": [],
+   "client_certificate": [],
+   "client_certificate_path": "",
+@@ -216,6 +223,7 @@ Supported fields:
+ * `min_version`
+ * `max_version`
+ * `certificate` / `certificate_path`
++* `certificate_sha256`
+ * `certificate_public_key_sha256`
+ * `handshake_timeout`
+ 
+@@ -315,6 +323,26 @@ Server certificates chain line array, in PEM format.
+ The path to server certificate chain, in PEM format.
+ 
+ 
++#### certificate_sha256
++
++!!! question "Since sing-box 1.15.0"
++
++==Client only==
++
++List of SHA-256 hashes of server certificates, in base64 format.
++
++The hash is computed over the whole DER-encoded certificate. Use `certificate_public_key_sha256` to pin only the public key.
++
++To generate the SHA-256 hash for a certificate, use the following commands:
++
++```bash
++# For a certificate file
++openssl x509 -in certificate.pem -outform der | openssl dgst -sha256 -binary | openssl enc -base64
++
++# For a certificate from a remote server
++echo | openssl s_client -servername example.com -connect example.com:443 2>/dev/null | openssl x509 -outform der | openssl dgst -sha256 -binary | openssl enc -base64
++```
++
+ #### certificate_public_key_sha256
+ 
+ !!! question "Since sing-box 1.13.0"
+@@ -397,7 +425,7 @@ Available values:
+ * `verify-if-given`
+ * `require-and-verify`
+ 
+-One of `client_certificate`, `client_certificate_path`, or `client_certificate_public_key_sha256` is required
++One of `client_certificate`, `client_certificate_path`, `client_certificate_sha256`, or `client_certificate_public_key_sha256` is required
+ if this option is set to `verify-if-given`, or `require-and-verify`.
+ 
+ #### client_certificate
+@@ -420,6 +448,16 @@ Client certificate chain line array, in PEM format.
+ 
+ List of path to client certificate chain, in PEM format.
+ 
++#### client_certificate_sha256
++
++!!! question "Since sing-box 1.15.0"
++
++==Server only==
++
++List of SHA-256 hashes of client certificates, in base64 format.
++
++The hash is computed over the whole DER-encoded certificate, see [certificate_sha256](#certificate_sha256).
++
+ #### client_certificate_public_key_sha256
+ 
+ !!! question "Since sing-box 1.13.0"
+diff --git a/docs/configuration/shared/tls.zh.md b/docs/configuration/shared/tls.zh.md
+index 0db72f43a..80712fe8d 100644
+--- a/docs/configuration/shared/tls.zh.md
++++ b/docs/configuration/shared/tls.zh.md
+@@ -2,6 +2,11 @@
+ icon: material/new-box
+ ---
+ 
++!!! quote "sing-box 1.15.0 中的更改"
++
++    :material-plus: [certificate_sha256](#certificate_sha256)  
++    :material-plus: [client_certificate_sha256](#client_certificate_sha256)
++
+ !!! quote "sing-box 1.14.0 中的更改"
+ 
+     :material-plus: [certificate_provider](#certificate_provider)  
+@@ -53,6 +58,7 @@ icon: material/new-box
+   "client_authentication": "",
+   "client_certificate": [],
+   "client_certificate_path": [],
++  "client_certificate_sha256": [],
+   "client_certificate_public_key_sha256": [],
+   "key": [],
+   "key_path": "",
+@@ -122,6 +128,7 @@ icon: material/new-box
+   "curve_preferences": [],
+   "certificate": "",
+   "certificate_path": "",
++  "certificate_sha256": [],
+   "certificate_public_key_sha256": [],
+   "client_certificate": [],
+   "client_certificate_path": "",
+@@ -216,6 +223,7 @@ TLS 版本值：
+ * `min_version`
+ * `max_version`
+ * `certificate` / `certificate_path`
++* `certificate_sha256`
+ * `certificate_public_key_sha256`
+ * `handshake_timeout`
+ 
+@@ -311,6 +319,26 @@ TLS 版本值：
+ 
+ 服务器证书链路径，PEM 格式。
+ 
++#### certificate_sha256
++
++!!! question "自 sing-box 1.15.0 起"
++
++==仅客户端==
++
++服务器证书的 SHA-256 哈希列表，base64 格式。
++
++哈希基于整个 DER 编码的证书计算。如果只需要固定公钥，请使用 `certificate_public_key_sha256`。
++
++要生成证书的 SHA-256 哈希，请使用以下命令：
++
++```bash
++# 对于证书文件
++openssl x509 -in certificate.pem -outform der | openssl dgst -sha256 -binary | openssl enc -base64
++
++# 对于远程服务器的证书
++echo | openssl s_client -servername example.com -connect example.com:443 2>/dev/null | openssl x509 -outform der | openssl dgst -sha256 -binary | openssl enc -base64
++```
++
+ #### certificate_public_key_sha256
+ 
+ !!! question "自 sing-box 1.13.0 起"
+@@ -398,7 +426,7 @@ echo | openssl s_client -servername example.com -connect example.com:443 2>/dev/
+ * `require-and-verify`
+ 
+ 如果此选项设置为 `verify-if-given` 或 `require-and-verify`，
+-则需要 `client_certificate`、`client_certificate_path` 或 `client_certificate_public_key_sha256` 中的一个。
++则需要 `client_certificate`、`client_certificate_path`、`client_certificate_sha256` 或 `client_certificate_public_key_sha256` 中的一个。
+ 
+ #### client_certificate
+ 
+@@ -420,6 +448,16 @@ echo | openssl s_client -servername example.com -connect example.com:443 2>/dev/
+ 
+ 客户端证书链路径列表，PEM 格式。
+ 
++#### client_certificate_sha256
++
++!!! question "自 sing-box 1.15.0 起"
++
++==仅服务器==
++
++客户端证书的 SHA-256 哈希列表，base64 格式。
++
++哈希基于整个 DER 编码的证书计算，参阅 [certificate_sha256](#certificate_sha256)。
++
+ #### client_certificate_public_key_sha256
+ 
+ !!! question "自 sing-box 1.13.0 起"
+diff --git a/docs/schema.json b/docs/schema.json
+index e028e4286..df9c68900 100644
+--- a/docs/schema.json
++++ b/docs/schema.json
+@@ -8442,6 +8442,43 @@
+             }
+           ]
+         },
++        "client_certificate_sha256": {
++          "anyOf": [
++            {
++              "anyOf": [
++                {
++                  "type": "string"
++                },
++                {
++                  "type": "array",
++                  "items": {
++                    "type": "integer",
++                    "minimum": 0,
++                    "maximum": 255
++                  }
++                }
++              ]
++            },
++            {
++              "type": "array",
++              "items": {
++                "anyOf": [
++                  {
++                    "type": "string"
++                  },
++                  {
++                    "type": "array",
++                    "items": {
++                      "type": "integer",
++                      "minimum": 0,
++                      "maximum": 255
++                    }
++                  }
++                ]
++              }
++            }
++          ]
++        },
+         "client_certificate_public_key_sha256": {
+           "anyOf": [
+             {
+@@ -14045,6 +14082,43 @@
+         "certificate_path": {
+           "type": "string"
+         },
++        "certificate_sha256": {
++          "anyOf": [
++            {
++              "anyOf": [
++                {
++                  "type": "string"
++                },
++                {
++                  "type": "array",
++                  "items": {
++                    "type": "integer",
++                    "minimum": 0,
++                    "maximum": 255
++                  }
++                }
++              ]
++            },
++            {
++              "type": "array",
++              "items": {
++                "anyOf": [
++                  {
++                    "type": "string"
++                  },
++                  {
++                    "type": "array",
++                    "items": {
++                      "type": "integer",
++                      "minimum": 0,
++                      "maximum": 255
++                    }
++                  }
++                ]
++              }
++            }
++          ]
++        },
+         "certificate_public_key_sha256": {
+           "anyOf": [
+             {
+diff --git a/option/tls.go b/option/tls.go
+index 5c807d676..414253361 100644
+--- a/option/tls.go
++++ b/option/tls.go
+@@ -24,6 +24,7 @@ type InboundTLSOptions struct {
+ 	ClientAuthentication             ClientAuthType                      `json:"client_authentication,omitempty"`
+ 	ClientCertificate                badoption.Listable[string]          `json:"client_certificate,omitempty"`
+ 	ClientCertificatePath            badoption.Listable[string]          `json:"client_certificate_path,omitempty"`
++	ClientCertificateSHA256          badoption.Listable[[]byte]          `json:"client_certificate_sha256,omitempty"`
+ 	ClientCertificatePublicKeySHA256 badoption.Listable[[]byte]          `json:"client_certificate_public_key_sha256,omitempty"`
+ 	Key                              badoption.Listable[string]          `json:"key,omitempty"`
+ 	KeyPath                          string                              `json:"key_path,omitempty"`
+@@ -117,6 +118,7 @@ type OutboundTLSOptions struct {
+ 	CurvePreferences           badoption.Listable[CurvePreference] `json:"curve_preferences,omitempty"`
+ 	Certificate                badoption.Listable[string]          `json:"certificate,omitempty"`
+ 	CertificatePath            string                              `json:"certificate_path,omitempty"`
++	CertificateSHA256          badoption.Listable[[]byte]          `json:"certificate_sha256,omitempty"`
+ 	CertificatePublicKeySHA256 badoption.Listable[[]byte]          `json:"certificate_public_key_sha256,omitempty"`
+ 	ClientCertificate          badoption.Listable[string]          `json:"client_certificate,omitempty"`
+ 	ClientCertificatePath      string                              `json:"client_certificate_path,omitempty"`
+-- 
+2.53.0
+
