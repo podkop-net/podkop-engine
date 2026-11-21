@@ -2,8 +2,9 @@
 
 [Русский](BENCHMARKS.ru.md)
 
-podkop-engine against vanilla sing-box of the same version. The newest comparison (r27 against
-1.14.4) comes first, then the earlier ones, which show what a patch did when it was made.
+podkop-engine against vanilla sing-box of the same version, and each release against the one
+before. The newest comparison (r28 against r27) comes first, then r27 against 1.14.4, then the
+earlier ones, which show what a patch did when it was made.
 
 How the newest one was measured: both binaries are built the same way (Go 1.26.8, static,
 `-trimpath`, the tags of the package; the engine adds `podkop_slim`, so the comparison includes
@@ -13,6 +14,33 @@ possible with 5 + 5 rounds). For CPU per DNS query and per connection it must al
 run of r27 against itself on that host (the A/A ratio: x86_64 1.05 and 0.93, arm64 0.99 and 1.00).
 Differences at p 0.03–0.1 are shown with their p. A single result that neither the other host nor a
 related test repeats is not counted; it is named below the table.
+
+## r28 against r27 (2026-11-21)
+
+The same two hosts, harness and rules as below; both arms are engine builds (r27 and r28, the
+same Go, flags and tags), so this shows what r28 changed. Proxy downloads go to the test server
+over the internet (REALITY on Xray 26.9.9, hysteria2 on sing-box).
+
+| Test | x86_64: r27 → r28 | arm64: r27 → r28 |
+|---|---|---|
+| DNS, a name of the lists (FakeIP) at 500 queries/s, CPU per query | the same | the same (103 µs both) |
+| DNS, FakeIP at saturation: queries a second | the same (12 050 → 11 800, p 0.55) | 15 740 → 14 840 (−6 %, p 0.008; a rerun of 8 rounds: −3 %, p 0.010), see below |
+| DNS, a name asked of an upstream server at 500/s, CPU per query | 256 → 244 µs (−5 %, p 0.008; not repeated on arm64) | the same |
+| Connections through the mixed inbound, CPU per connection | the same | the same; at 100 a second −2 % (p 0.016) |
+| Idle, 30 s after the start: RSS / anonymous memory | the same | the same |
+| Lists of 100 000 entries (domains and subnets in `.srs`, domains in source JSON): start, CPU, memory | the same | the same |
+| Proxy traffic, CPU per GB: hysteria2, REALITY with and without Vision, Trojan, Shadowsocks AES and ChaCha20 | the same (a noisy path that day: 1–12 MB/s) | the same (14–20 MB/s) |
+| REALITY with Vision, with the `finalmask` podkop sets against a dropped ClientHello (r28 alone) | not measured: the path was too noisy | the same: 17.6 → 17.2 MB/s, the same CPU per GB |
+| Static binary | 35.33 → 35.39 MB | 32.96 → 33.10 MB |
+
+- **DNS at saturation on arm64** came out 3–6 % slower with r28 in two runs. r28 changes no file
+  on that path (`dns/`, `route/`, FakeIP, the direct inbound, `log/`), the CPU profiles of the two
+  arms have the same shape, x86_64 shows no difference, and neither does FakeIP at 500 queries a
+  second. It is taken for an effect of the build (where the code lands in the binary), not a change
+  of r28, and not counted. The same holds for the two small gains (DNS of an upstream server on
+  x86_64, connections at 100/s on arm64).
+- **finalmask** cuts the ClientHello once per connection; downloads with and without it do not
+  differ.
 
 ## r27 against sing-box 1.14.4 (2026-11-17)
 
