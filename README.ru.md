@@ -13,7 +13,8 @@
 - **podkop 0.7.x** работает на нём, если поставить его вместо `sing-box` из OpenWrt; для podkop
   0.7.24 — 1.14.4-r26 и новее. Ссылки XHTTP и резервные выходы URLTest в podkop работают только с этой сборкой.
 - **[podkop-exp](https://github.com/podkop-net/podkop-experimental)** собирает тот же код в свой
-  бэкенд, пакет ему не нужен.
+  бэкенд, пакет ему не нужен. На что он опирается, записано в
+  [docs/EMBEDDING.md](docs/EMBEDDING.md) (на английском).
 
 ## Что добавляет к sing-box
 
@@ -106,6 +107,7 @@ sing-box из OpenWrt — в [docs/INSTALL.ru.md](docs/INSTALL.ru.md).
 | [docs/PATCHES.md](docs/PATCHES.md) | каждый патч к sing-box и что он меняет (на английском) |
 | [docs/BENCHMARKS.ru.md](docs/BENCHMARKS.ru.md) | замеры против sing-box без патчей |
 | [docs/LINKS.md](docs/LINKS.md) | ссылки, которые читает `decode-link`, ключ за ключом |
+| [docs/EMBEDDING.md](docs/EMBEDDING.md) | для программ, встраивающих движок (podkop-exp): Go API, опции, переменные окружения и тексты, на которые они опираются (на английском) |
 | [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md) | устройство репозитория, сборка, проверки (на английском) |
 | [docs/RELEASE.md](docs/RELEASE.md) | как делается выпуск |
 

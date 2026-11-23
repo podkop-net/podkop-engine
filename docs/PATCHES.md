@@ -44,6 +44,11 @@ lines of one feature sit in the patch of another (noted below), so not every int
 builds. Since r28, 0701 and 0702 also hold the lines of the link decoder (0307) and of the
 Features line (0308) for what they add.
 
+What a program that embeds the engine relies on (podkop-exp: the Go API of the fork, the options it
+writes, the environment, the formats and error texts it reads) is listed with its patch in
+[EMBEDDING.md](EMBEDDING.md). A patch that changes any of it changes that page in the same commit
+and is named under **embedding:** in the changelog entry of the release.
+
 ## 1.14.4 — 71 patches
 
 ### Layer 00: build

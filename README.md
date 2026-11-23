@@ -13,7 +13,8 @@ Who uses it:
 - **podkop 0.7.x** runs on it once you install it in place of OpenWrt's `sing-box`; for podkop
   0.7.24 take 1.14.4-r26 or newer. XHTTP links and URLTest fallbacks in podkop work only with this build.
 - **[podkop-exp](https://github.com/podkop-net/podkop-experimental)** builds the same code into its
-  own backend; it needs no package.
+  own backend; it needs no package. What it relies on is written down in
+  [docs/EMBEDDING.md](docs/EMBEDDING.md).
 
 ## What it adds to sing-box
 
@@ -106,6 +107,7 @@ X25519MLKEM768 (most large sites do). Updating Xray on the server cures it.
 | [docs/PATCHES.md](docs/PATCHES.md) | every patch to sing-box and what it changes |
 | [docs/BENCHMARKS.md](docs/BENCHMARKS.md) | measurements against vanilla sing-box |
 | [docs/LINKS.md](docs/LINKS.md) | the share links `decode-link` reads, key by key (in Russian) |
+| [docs/EMBEDDING.md](docs/EMBEDDING.md) | for programs that embed the engine (podkop-exp): the Go API, options, environment and texts they rely on |
 | [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md) | the layout of this repository, building, checks |
 | [docs/RELEASE.md](docs/RELEASE.md) | how a release is made (in Russian) |
 

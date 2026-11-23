@@ -485,6 +485,8 @@ DHT, and a WireGuard tunnel is not taken for uTP (since r18). Since r27.
 ## Programs that embed the engine
 
 Go APIs that podkop-experimental uses; neither `config.json` nor the command line reaches them.
+The two below are the larger ones; every symbol, option, variable and text such a program relies
+on is in [EMBEDDING.md](EMBEDDING.md).
 
 ### Outbounds replaced while sing-box runs
 
