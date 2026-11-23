@@ -1,7 +1,8 @@
 name: fork
 
-# The fork must be the upstream tag plus patches/ and nothing else (scripts/check-fork.sh).
-# Runs on every change of the patches or versions.env, and as the first gate of build.yml.
+# The fork must be the upstream tag plus patches/ and nothing else (scripts/check-fork.sh), and
+# its own tests must pass (job test). Runs on every change of the patches or versions.env, and as
+# the first gate of build.yml.
 on:
   push:
     paths: ["patches/**", "versions.env", "scripts/check-fork.sh", ".github/workflows/fork.yml"]
@@ -19,7 +20,107 @@ permissions:
 jobs:
   fork:
     runs-on: ubuntu-latest
+    outputs:
+      lines: ${{ steps.lines.outputs.lines }}
     steps:
       - uses: actions/checkout@v7
       - name: tag + patches == fork commit
         run: scripts/check-fork.sh ${{ inputs.lines }}
+      - name: The lines with a fork commit
+        id: lines
+        env:
+          ONLY: ${{ inputs.lines }}
+        run: |
+          . ./versions.env
+          # shellcheck disable=SC2086 # one word for each line
+          set -- $ONLY
+          # shellcheck disable=SC2086
+          [ $# -gt 0 ] || set -- $LINES
+          json=
+          for line in "$@"; do
+            eval "commit=\${SB_$(echo "$line" | tr . _)_FORK_COMMIT:-}"
+            [ -z "$commit" ] || json="$json${json:+,}\"$line\""
+          done
+          echo "lines=[$json]" >> "$GITHUB_OUTPUT"
+
+  # go test of the fork commit of each line, as root in the Go image of the builds, with the
+  # right to administer the network and raw sockets: the tags of the packages (podkop_slim), the
+  # full tags (every protocol of upstream), and -race on the packages of the hot swap (root),
+  # DNS and FakeIP, and the URL test group. SKIP names the tests that need more than the
+  # container gives: TestUnshareNamespace makes a network namespace ("fork/exec /proc/self/exe:
+  # operation not permitted" without CAP_SYS_ADMIN). On nexus (r28, 4 processors): 1451 tests
+  # and subtests passed with the tags of the packages, 1445 with the full tags, 6 skip
+  # themselves; 401 s with an empty build cache (197 s, 4 s, 97 s, race 104 s), 221 s with it.
+  test:
+    needs: fork
+    if: needs.fork.outputs.lines != '[]'
+    strategy:
+      fail-fast: false
+      matrix:
+        line: ${{ fromJSON(needs.fork.outputs.lines) }}
+    name: go test ${{ matrix.line }}
+    runs-on: ubuntu-latest
+    container:
+      image: golang:1.26.8
+      options: --cap-add NET_ADMIN --cap-add NET_RAW
+    # 401 s on nexus, times 3 or more for a slower runner, the download of the modules and the
+    # save of the cache (1.9 GB of builds)
+    timeout-minutes: 45
+    env:
+      SB_LINE: ${{ matrix.line }}
+      GOFLAGS: -buildvcs=false
+      GOMODCACHE: /cache/mod
+      GOCACHE: /cache/build
+      PACKAGE: with_quic,with_utls,with_clash_api,podkop_slim,badlinkname,tfogo_checklinkname0
+      FULL: with_quic,with_utls,with_clash_api,badlinkname,tfogo_checklinkname0
+      SKIP: '^TestUnshareNamespace$'
+    defaults:
+      run:
+        shell: bash
+        working-directory: sing-box
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: The fork commit of the line
+        id: commit
+        working-directory: .
+        run: |
+          . ./versions.env
+          eval "commit=\$SB_$(echo "$SB_LINE" | tr . _)_FORK_COMMIT"
+          echo "commit=$commit" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/checkout@v7
+        with:
+          repository: podkop-net/sing-box
+          ref: ${{ steps.commit.outputs.commit }}
+          path: sing-box
+
+      # the capture tests of common/tlsspoof watch the wire with tcpdump (upstream's runner has it)
+      - name: tcpdump
+        run: |
+          apt-get update -qq
+          apt-get install -y -qq --no-install-recommends tcpdump > /dev/null
+          tcpdump --version
+
+      - name: Cache Go modules and builds
+        uses: actions/cache@v6
+        with:
+          path: /cache
+          key: fork-test-${{ steps.commit.outputs.commit }}
+          restore-keys: fork-test-
+
+      - name: go test, the tags of the packages
+        run: CGO_ENABLED=0 go test -ldflags=-checklinkname=0 -count=1 -tags "$PACKAGE" -skip "$SKIP" ./...
+
+      # podkop-engine-full: the tags of the packages and podkop_full; only include tells them apart
+      - name: go test of include, the tags of podkop-engine-full
+        if: success() || failure()
+        run: CGO_ENABLED=0 go test -ldflags=-checklinkname=0 -count=1 -tags "$PACKAGE,podkop_full" ./include/
+
+      - name: go test, the full tags
+        if: success() || failure()
+        run: CGO_ENABLED=0 go test -ldflags=-checklinkname=0 -count=1 -tags "$FULL" -skip "$SKIP" ./...
+
+      - name: go test -race, the tags of the packages
+        if: success() || failure()
+        run: CGO_ENABLED=1 go test -ldflags=-checklinkname=0 -count=1 -race -tags "$PACKAGE" -skip "$SKIP" . ./dns/... ./protocol/group/...
