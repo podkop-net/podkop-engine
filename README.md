@@ -61,7 +61,7 @@ Two packages; install one of them.
 |---|---|---|
 | Inbounds | tproxy, direct, mixed | the same |
 | Outbounds | direct, socks, shadowsocks, trojan, vless, hysteria2, tuic, http, selector, urltest, block | the same, plus vmess, snell, tor (needs the tor package), ssh, shadowtls, anytls, hysteria, naive (NaiveProxy, [not on every architecture](docs/INSTALL.md#naiveproxy)) |
-| Package, r28: x86_64 / aarch64_cortex-a53 / mipsel_24kc | 9.8 / 8.8 / 8.8 MB | 15.6 / 14.3 / 15.4 MB |
+| Package, r29: x86_64 / aarch64_cortex-a53 / mipsel_24kc | 9.8 / 8.8 / 8.8 MB | 15.6 / 14.3 / 15.4 MB |
 
 Not in either package, compared with a full sing-box: other server inbounds, TUN,
 WireGuard and Tailscale inside sing-box (WireGuard and AmneziaWG work in podkop as OpenWrt
