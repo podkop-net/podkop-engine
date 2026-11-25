@@ -8,7 +8,7 @@ podkop-engine is also a Go library. [podkop-experimental](https://github.com/pod
 `sdk/check-engine.sh` refuses any other commit).
 
 This page is the contract between the engine and such a program: everything it relies on beyond
-upstream sing-box, as of r28 (fork `209086dbd08a`). The API of upstream sing-box (`box.New`,
+upstream sing-box, as of r29 (fork `f866c9d89834`). The API of upstream sing-box (`box.New`,
 `adapter`, `option`, the registries, the Clash API as upstream has it) is upstream's contract and is
 not repeated here. The options of a configuration are described in [FEATURES.md](FEATURES.md), the
 patches in [PATCHES.md](PATCHES.md).
@@ -27,7 +27,8 @@ podkop-exp holds its side in its code and tests: `src/backend/engine/fork.go` as
 of the next section at compile time, `imports_test.go` keeps the imports of sing-box inside its
 package `engine`, `doors_test.go` lists its files that use the Clash API or set the environment of
 the engine, and `TestProbeErrorClass` holds the error texts. They fail when podkop-exp moves its
-pin, not when the engine changes: the note is what tells it to look.
+pin, not when the engine changes: the note is what tells it to look. The engine's own side is held by
+`embedder_test.go` (0802, since r29).
 
 ## Go API of the fork
 
@@ -55,6 +56,10 @@ this form.
 | `option.DefaultHeadlessRule.IPRanges`, `.SourceIPRanges` (`*cidrset.Set`: `Len() int`, `Ranges() []netipx.IPRange`, `Ranges4() []uint64`) | 0419 | r15 (`Ranges4` r16) | the addresses of rule sets for the sets of its firewall |
 | `constant.RuleSetFormatText` (`"text"`) | 0208 | r15 | the format of lists written as text |
 | `constant.V2RayTransportTypeXHTTP` (`"xhttp"`) | 0206 | r11 | tells XHTTP servers apart |
+| `tls.ErrRealityVerification` | 0414 | r29 | tells a server whose certificate is not the one REALITY expects, by its type |
+| `adapter.DetectOutcomeKey(fingerprint, serverName string, destination M.Socksaddr) string` | 0421 | r29 | the key of the record of a server |
+| `rule.RemoteStart{Empty bool}` | 0402 | r29 | the empty start of remote rule sets for a box, without the environment |
+| `urltest.ContextWithTest(ctx) context.Context` | 0410 | r29 | marks its own dials through a group as tests |
 
 How the program reaches them, which decides how a change shows up:
 
@@ -70,7 +75,8 @@ How the program reaches them, which decides how a change shows up:
 - **In the context**, given by the program before `box.New`: the history of the URL tests
   (`service.ContextWithPtr(*urltest.HistoryStorage)`, upstream) and the download memory
   (`service.ContextWithPtr(*httpclient.DownloadMemory)`, which `httpclient.NewManager` takes),
-  both kept for the process; and, for a probe, `service.ContextWith[*option.UTLSFallbackOptions]`
+  both kept for the process; `service.ContextWithPtr(&rule.RemoteStart{Empty: true})`, the start of
+  the remote rule sets (r29); and, for a probe, `service.ContextWith[*option.UTLSFallbackOptions]`
   with `Enabled: false` and `service.ContextWith[adapter.CacheFile](ctx, nil)` on a context
   extended from the box's, before `OutboundRegistry.CreateOutbound` and the start stages of the
   copy.
@@ -91,6 +97,7 @@ by its `engine.Check`):
 | rule-set `format: "text"` | 0309 | r15 |
 | urltest `fallbacks`, `download_url` | 0410 | r10 |
 | urltest `urls`, `mode` (`loss`, `balance`), `loss_url`, `loss_interval`, `loss_threshold` | 0410, 0603 | r24 |
+| urltest `idle_timeout` of a fallback group in mode `loss` or `balance` | 0410 | r29 (bounds its loss probes) |
 | `tls.spoof` on a REALITY client | 0413 | r13 |
 | `tls.record_fragment` on a REALITY client | 0417 | r24 |
 
@@ -108,7 +115,7 @@ podkop-exp sets:
 
 | Variable | Read | Set by podkop-exp | Patch | Since |
 |---|---|---|---|---|
-| `SING_BOX_RULE_SET_START_EMPTY` | at each start of a remote rule set | the daemon, `1` with `os.Setenv` when the service has not set it | 0402 | r15 |
+| `SING_BOX_RULE_SET_START_EMPTY` | at each start of a remote rule set, unless `rule.RemoteStart` is in the context of the box (r29) | no longer set (the context says it) | 0402 | r15 |
 | `SING_BOX_DNS_FALLBACK` | once, when the process starts | its init script: `ubus` while `podkop.settings.dns_fallback` is on (the default) | 0404 | r4 (1.14: r5) |
 | `GOMEMLIMIT` | by Go; set, the engine leaves its own limit off | its init script, from `podkop.settings.memory_limit` | 0305 | r9 |
 
@@ -131,8 +138,9 @@ The handshake outcomes in the cache file (`LoadDetectOutcome`) are kept under
 joined by single spaces: the uTLS fingerprint as configured (`tls.utls.fingerprint`), the
 `tls.server_name` of the outbound and the server as dialed, `host:port` (`M.Socksaddr.String()`,
 IPv6 in brackets). The REALITY client records under it, and the fingerprint fallback keeps its
-choice under the same key (`common/tls`: `reality_client.go`, `utls_fallback.go`). podkop-exp
-builds the key from the outbounds of its configuration (`engine.ServersOf`).
+choice under the same key (`common/tls`: `reality_client.go`, `utls_fallback.go`). The key is made by
+`adapter.DetectOutcomeKey` (since r29; its form is unchanged). podkop-exp builds it from the
+outbounds of its configuration (`engine.ServersOf`).
 
 ### Error texts podkop-exp reads
 
@@ -140,7 +148,7 @@ podkop-exp tells the kind of a failed probe and cleans the errors of a check by 
 
 | Text | Where | podkop-exp |
 |---|---|---|
-| `reality verification failed` | `common/tls` (`realityVerificationFailed`, not exported) | a server whose certificate is not the one REALITY expects |
+| `reality verification failed` | `common/tls` (the text; the type is `tls.ErrRealityVerification` since r29, XHTTP keeps it) | a server whose certificate is not the one REALITY expects; read by its type since r29 |
 | `timeout: no recent network activity`, `timeout: handshake did not complete in time` | quic-go (the errors of the podkop-net fork; XHTTP over HTTP/3 passes on the text, not the type) | a QUIC handshake nothing answers |
 | `lookup ` | the errors of `dns.Router.Lookup` | a name that did not resolve |
 | `outbounds[0].`, `initialize outbound[0]: `, `create client transport: ` | the errors of `box.New` and of the outbounds | cut from the front of the error of a check of one outbound |
@@ -153,9 +161,9 @@ inbound connection`).
 
 ### The version
 
-The package sets `constant.Version` to `<sing-box version>-pdk-r<N>` (`1.14.4-pdk-r28`); podkop-exp
+The package sets `constant.Version` to `<sing-box version>-pdk-r<N>` (`1.14.4-pdk-r29`); podkop-exp
 sets it with its ldflags to `<sing-box version>-pdk-<12 hex digits of the fork commit>`
-(`1.14.4-pdk-209086dbd08a`) and reads both up to `-pdk-`.
+(`1.14.4-pdk-f866c9d89834`) and reads both up to `-pdk-`.
 
 ## Clash API
 
@@ -164,7 +172,9 @@ the Clash API of the configuration that runs, at the address and with the key it
 `GET /proxies`, `GET /proxies/{name}`, `GET /proxies/{name}/delay`, `GET /group/{name}/delay` (a
 round of the URL test of the fork's group: 0410, 0603), `PUT /proxies/{name}` and
 `POST /upgrade/ui`, with `Authorization: Bearer <secret>`. What these answer for the urltest group
-of the fork (`fallbacks`, `mode`, `loss` in `/proxies`) is part of this contract.
+of the fork (`fallbacks`, `mode`, `loss`, `balance` in `/proxies`) is part of this contract; since r29
+`/proxies` has no `balance` for a group in mode balance that is not in use (an empty list: in use, and
+no member in it).
 
 ## Build profile
 

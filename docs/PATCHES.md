@@ -584,7 +584,7 @@ Each patch holds the call sites of one layer-03 module; the module's entry says 
 #### 0802 box: a test of what a program that embeds this sing-box relies on
 `embedder-test` · since r29 · [patch](../patches/v1.14/0802-box-a-test-of-what-a-program-that-embeds-this-sing-b.patch)
 - `embedder_test.go`: a configuration and a box as podkop-experimental makes them, with everything
-  it uses of the fork.
+  of [EMBEDDING.md](EMBEDDING.md).
 
 ## 1.12.25 — 2 patches
 
