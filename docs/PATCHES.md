@@ -1,9 +1,9 @@
 # podkop-engine patches
 
 podkop-engine is upstream sing-box at a release tag plus the patches in `patches/v<line>/`, and
-nothing else. The 1.14 line is `v1.14.4` plus the 69 patches of `patches/v1.14`: the branch
-`podkop-engine-1.14` of podkop-net/sing-box at `209086dbd08a50faf48f13c80febbb30f1caf942`
-(`SB_1_14_FORK_COMMIT` in `versions.env`, release r28), the commit podkop-experimental pins in its
+nothing else. The 1.14 line is `v1.14.4` plus the 71 patches of `patches/v1.14`: the branch
+`podkop-engine-1.14` of podkop-net/sing-box at `f866c9d898343fa0aa2a6d2e088ab1ac3bc3a8fe`
+(`SB_1_14_FORK_COMMIT` in `versions.env`, release r29), the commit podkop-experimental pins in its
 `go.mod`. `scripts/check-fork.sh [-C <sing-box clone>]` applies the patches to the tag in a
 scratch index and compares the tree with that commit (CI runs it before every build). The 1.12
 line is `v1.12.25` plus 2 patches, with no fork commit. By hand, in a clone of SagerNet/sing-box:
@@ -28,6 +28,7 @@ layer × 100 + place in the layer.
 | 05 | 0501–0505 | added in r26: CPU and size (log lines, goroutine stacks, QUIC suites, CLI tools); upstream lines and new files in one patch |
 | 06 | 0601–0603 | added in r27: the BitTorrent sniffers and the loss of members over QUIC; same form as 05 |
 | 07 | 0701–0702 | added in r28: Xray's finalmask fragment and Xray's verification of the certificate; same form as 05 |
+| 08 | 0801–0802 | added in r29: the connections an inbound still holds, and a test of what embedding programs use; same form as 05 |
 
 Every patch ends with three trailers: `Pdk-Feature:` (the feature; a module of layer 03 and its
 hooks in layer 02 share it), `Pdk-Zone:` (`core`, `protocols`, `groups`, `tools`, `build`,
@@ -43,7 +44,7 @@ lines of one feature sit in the patch of another (noted below), so not every int
 builds. Since r28, 0701 and 0702 also hold the lines of the link decoder (0307) and of the
 Features line (0308) for what they add.
 
-## 1.14.4 — 69 patches
+## 1.14.4 — 71 patches
 
 ### Layer 00: build
 
@@ -158,7 +159,8 @@ Each patch holds the call sites of one layer-03 module; the module's entry says 
 - Browser-like request headers: Chrome's, unless `User-Agent` names `firefox`, `safari`, `edge`,
   `curl` or `golang`.
 - `Close` is a reset; idle pooled connections close with those of an unreferenced outbound (since
-  r18). Also defines `tls.QUICClientOptions` of 0311.
+  r18). Also defines `tls.QUICClientOptions` of 0311. An error XHTTP hides still tells
+  `tls.ErrRealityVerification` (since r29).
 
 #### 0307 tools decode-link: share links to outbounds
 `decode-link` · since r11 · [patch](../patches/v1.14/0307-tools-decode-link-share-links-to-outbounds.patch)
@@ -283,6 +285,7 @@ Each patch holds the call sites of one layer-03 module; the module's entry says 
 - Updates run 5 at a time, lists of 1 MiB and more one at a time; a failing set logs once, then a
   count every 10 minutes. `Router.UpdateRuleSets` (Go API) updates every remote set now; a set
   closed while it reads stops.
+- `rule.RemoteStart` in the context of a box tells the empty start over the environment (since r29).
 
 #### 0403 dns: the TCP, TLS and HTTPS transports under loss
 `dns-transport` · since r5 · [patch](../patches/v1.14/0403-dns-the-TCP-TLS-and-HTTPS-transports-under-loss.patch)
@@ -361,6 +364,17 @@ Each patch holds the call sites of one layer-03 module; the module's entry says 
   goes by the member its address falls on); a test, a download check or a loss probe reads 64 KB
   of response headers at most (net/http: 10 MB); the prober drops the times of first servers
   that have passed, so replaced outbounds are not kept.
+- Since r29 the loss probes (periodic and before a switch) run only while the group is in use: from
+  a connection dialed through it or attached by the router, until `idle_timeout` without another;
+  the dials of tests (marked in their context, `urltest.ContextWithTest`) are no use. A fallback is
+  not probed before a switch to it. In the first `loss_interval` of a use a member without a count
+  to decide by (700 segments) is probed with 1 MiB, one at a time, at most once a `loss_interval`;
+  a selection follows each. A selection waits for a probe before a switch that runs, 65 s at most.
+- Since r29 a group in mode `balance` that is not in use has no balance: it keeps its plain choice,
+  and makes the balance from the delays and the kept counts at the first connection, download
+  testing its members from then (not those that passed within the `loss_interval`). A group that
+  was idle begins with a round at its first connection (the router touches the group twice for a
+  connection, attached and dialed; the round was skipped).
 
 #### 0411 log: entries for the Clash API formatted only while read; a platform writer's level
 `log` · since r10 · [patch](../patches/v1.14/0411-log-entries-for-the-Clash-API-formatted-only-while-r.patch)
@@ -396,6 +410,8 @@ Each patch holds the call sites of one layer-03 module; the module's entry says 
   server answering as to a stranger moves on at once; 4 handshakes a dial at most.
 - The choice is kept per local address and in the cache file for 24 h; one dial probes, the others
   wait 5 s at most; when the cause is not the hello, it rests 30 s, doubling to 10 minutes.
+- A failed verification of REALITY is `tls.ErrRealityVerification` to `errors.Is` (since r29); the
+  text "reality verification failed" is as before.
 
 #### 0415 vless: VLESS Encryption of Xray for the outbound; a flow where it cannot work
 `vless` · since r13 (encryption since r14) · [patch](../patches/v1.14/0415-vless-VLESS-Encryption-of-Xray-for-the-outbound-a-fl.patch)
@@ -440,7 +456,8 @@ Each patch holds the call sites of one layer-03 module; the module's entry says 
   written only on a change.
 - Routed connections count bytes both ways and learn whether the remote side ended the stream
   (`adapter.RemoteEOFMarker`). The download results come from the URL test history of 0410.
-- `adapter/experimental.go` here also declares cache methods of 0402 and 0414.
+- `adapter/experimental.go` here also declares cache methods of 0402 and 0414. `adapter.DetectOutcomeKey`
+  makes the key of a server (since r29).
 - Since r28 the outcome of one server is written four times at once, then once in ten seconds
   (the latest state): a path that let some handshakes through and not others wrote the cache
   file, on flash, for every connection.
@@ -550,6 +567,20 @@ Each patch holds the call sites of one layer-03 module; the module's entry says 
 - The decoder keeps a pin with `insecure`, maps `vcn`, reads both in the XHTTP download, and gives
   naive neither. Feature names `tls.certificate_sha256`, `tls.certificate_server_name`.
 
+### Layer 08: the connections an inbound holds, and what embedding programs use (r29)
+
+#### 0801 listener: the connections an inbound still holds end with it
+`listener-held` · since r29 · [patch](../patches/v1.14/0801-listener-the-connections-an-inbound-still-holds-end-.patch)
+- A TCP connection whose inbound has not returned from its handler (a handshake that does not come, an
+  HTTP proxy connection kept alive between two requests) is closed when the listener closes; one the
+  router has is not touched. New file `common/listener/listener_accepted.go`, hooks in `listener.go`
+  and `listener_tcp.go`. Before, a kept-alive connection answered one "502 Bad Gateway" after a restart.
+
+#### 0802 box: a test of what a program that embeds this sing-box relies on
+`embedder-test` · since r29 · [patch](../patches/v1.14/0802-box-a-test-of-what-a-program-that-embeds-this-sing-b.patch)
+- `embedder_test.go`: a configuration and a box as podkop-experimental makes them, with everything
+  it uses of the fork.
+
 ## 1.12.25 — 2 patches
 
 The first two patches of the original series, without trailers; on 1.14 both are in 0401.
@@ -623,3 +654,5 @@ since r1 · [patch](../patches/v1.12/0002-utls-firefox-Firefox-148-safari-Safari
 | `urltest-quic-loss` | 0603 | loss of hysteria2 and tuic members |
 | `finalmask` | 0701 | Xray's fragment mask in the dialer; `fm`, `pcs` in links |
 | `certificate-server-name` | 0702 | `certificate_server_name`, a pinned CA; `vcn` in links |
+| `listener-held` | 0801 | connections an inbound still holds end with it |
+| `embedder-test` | 0802 | test of what an embedding program relies on |

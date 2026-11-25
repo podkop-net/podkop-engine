@@ -8,6 +8,16 @@ previous release and what it means for a user; a line is named only where a chan
 line. What each patch does: [docs/PATCHES.md](docs/PATCHES.md); the options: [docs/FEATURES.md](docs/FEATURES.md);
 full notes and packages: [GitHub releases](https://github.com/podkop-net/podkop-engine/releases).
 
+## r29 — 2026-11-25
+
+sing-box 1.14.4
+
+- **urltest:** in the modes `loss` and `balance` the loss probes run only while a group carries connections. A group that is the fallback of another is still tested with it, but nothing is downloaded through its servers until the group above has fallen back on it, and no longer than its `idle_timeout` after its last connection. Measured: 0 bytes through an idle fallback, r28 probed it as often as one in use.
+- **urltest:** a group that comes into use and has no count of its members' loss probes each of them once with 1 MiB, so loss decides within seconds of the switch to a fallback, not after four probes of 256 KiB (2 h). A balance that is not in use rests: its members are no longer download tested each time the best three change (up to 64 KiB a round). A switch waits for the loss probe that runs for it.
+- **urltest:** a group that was idle tests its members at its first connection, as it was meant to. The round was skipped, and the first connections went by a choice as old as the idle time until the next one, an `interval` later.
+- **inbounds:** when an inbound closes, the connections it still holds are closed with it. A kept-alive connection of an HTTP proxy used to answer one "502 Bad Gateway" after a restart.
+- **embedding:** `tls.ErrRealityVerification` (the text stays), `adapter.DetectOutcomeKey`, `rule.RemoteStart` in the context of a box (`SING_BOX_RULE_SET_START_EMPTY` stays), `urltest.ContextWithTest` for a program's own probes through a group; `/proxies` has no `balance` for a group in mode balance that is not in use. Nothing was removed.
+
 ## r28 — 2026-11-21
 
 sing-box 1.14.4

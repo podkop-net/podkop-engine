@@ -19,7 +19,7 @@
 
 Файлы — в [релизах](https://github.com/podkop-net/podkop-engine/releases), имя
 `podkop-engine_<версия>_openwrt_<pkgarch>.ipk` (или `.apk`), например
-`podkop-engine_1.14.4-r28_openwrt_aarch64_cortex-a53.ipk`.
+`podkop-engine_1.14.4-r29_openwrt_aarch64_cortex-a53.ipk`.
 
 - `<pkgarch>` — то, что печатает на роутере `opkg print-architecture` или `apk --print-arch`.
 - В `podkop-engine` есть всё, что использует podkop. `podkop-engine-full` нужен, только если в
@@ -32,7 +32,7 @@
 команда уже с подставленными именами:
 
 ```sh
-tag=v1.14.4-r28; n=podkop-engine_1.14.4-r28_openwrt_<pkgarch>.ipk
+tag=v1.14.4-r29; n=podkop-engine_1.14.4-r29_openwrt_<pkgarch>.ipk
 u=$(wget -qO- https://api.github.com/repos/podkop-net/podkop-engine/releases/tags/$tag | jsonfilter -e "@.assets[@.name='$n'].url") \
   && wget -O /tmp/pe.ipk --header='Accept: application/octet-stream' "$u"
 ```
@@ -94,7 +94,7 @@ service podkop restart
 Проверить, что работает:
 
 ```sh
-sing-box version   # sing-box version 1.14.4-pdk-r28 … Tags: with_quic,with_utls,with_clash_api,podkop_slim …
+sing-box version   # sing-box version 1.14.4-pdk-r29 … Tags: with_quic,with_utls,with_clash_api,podkop_slim …
 ```
 
 ## Откат на sing-box из OpenWrt

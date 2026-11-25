@@ -73,7 +73,7 @@ The init script passes these; a program that runs sing-box itself may set them.
 | `SING_BOX_RULESET_RECOVERED_HOOK` | `/usr/libexec/podkop-engine/lists-recovered`, with podkop installed | Shell command run when remote rule-sets that failed at start have come (one run for the sets that come within 5 s of each other, another for any that come later); their tags, comma-separated, are in `SING_BOX_RULESET_TAGS` | r2 |
 | `GOMEMLIMIT` | from `memory_limit` | Go's memory limit in place of the automatic one | r9 |
 | `SING_BOX_UTLS_FALLBACK` | — | Any non-empty value turns the [uTLS fingerprint fallback](#utls-fingerprint-fallback) on for a configuration without `experimental.utls_fallback` | r13 (any value since r17) |
-| `SING_BOX_RULE_SET_START_EMPTY` | — | A remote rule-set with nothing cached starts empty at once and downloads in the background, so the start does not wait for it (podkop-experimental sets it) | r15 |
+| `SING_BOX_RULE_SET_START_EMPTY` | — | A remote rule-set with nothing cached starts empty at once and downloads in the background, so the start does not wait for it (podkop-experimental sets it; `rule.RemoteStart` in the context of a box overrides it since r29) | r15 |
 
 ### Start without lists
 
@@ -342,6 +342,21 @@ r20; the wait is not part of the timeout), and one loss probe.
 - `balance`: connections are spread by source address over at most `balance_size` best members
   (within `tolerance`, loss not above `loss_threshold`). A device stays on its member, leaves it at
   once when it fails, and is spread again after `balance_idle` without connections.
+
+The probes run while the group carries connections (since r29): a group that is the fallback of
+another downloads nothing while the outbounds of that group answer. Its first choice goes by delay.
+The members it then probes and has no count of (the one in use and three others; in a balance those
+in it and two more) are each probed with 1 MiB once, one at a time, so loss decides within seconds;
+after that with 256 KiB every `loss_interval`. A member has one such probe in a `loss_interval` at
+most, and counts are kept for 24 hours. `idle_timeout` after the last connection the probes stop: a
+shorter `idle_timeout` (at least `interval`) on a fallback group stops them sooner once the group
+above has its outbounds back. A group that was idle tests its members at its first connection.
+
+A balance rests while the group carries no connections: it goes by its one choice, as `fastest`. The
+first connection after that is spread at once, by the delays; the download tests of the members run
+from then, and a member that fails one leaves the balance. A member that passed it within the
+`loss_interval` is not tested again. `/proxies` shows no `balance` while it rests, an empty one when
+no member is in it.
 
 `loss_url` should serve 1 MiB or more. The probe counts the lost segments of its own TCP connection
 (packet socket, root). A hysteria2 or tuic member is counted by its QUIC packets (since r27) when
