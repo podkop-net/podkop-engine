@@ -1,7 +1,7 @@
-From 8aa1f78625e2bf610627d9366a261a15eb15774d Mon Sep 17 00:00:00 2001
+From 6a80a48e98ef529d5c98dc2de99eadbe47d5719d Mon Sep 17 00:00:00 2001
 From: FiyeroT <me@fiyero.xyz>
 Date: Thu, 12 Nov 2026 21:41:21 +0300
-Subject: [PATCH 50/69] tls: the fingerprint fallback
+Subject: [PATCH 50/71] tls: the fingerprint fallback
 
 When a ClientHello of the configured uTLS fingerprint gets no acknowledgment, a dial goes on with
 another one: the hello without X25519MLKEM768 first, then firefox; the choice is kept in the cache
@@ -19,28 +19,33 @@ Pdk-Feature: tls-fp-fallback
 Pdk-Zone: protocols
 Pdk-Layer: 04
 ---
- box.go                                |    4 +
- common/tls/client.go                  |   76 +-
- common/tls/detour_test.go             |  165 ++++
- common/tls/ech.go                     |    6 +
- common/tls/hello_watch.go             |  116 +++
- common/tls/hello_watch_linux.go       |  100 +++
- common/tls/hello_watch_linux_test.go  |  336 ++++++++
- common/tls/hello_watch_stub.go        |    9 +
- common/tls/ktls.go                    |    6 +
- common/tls/reality_client.go          |   75 ++
- common/tls/utls_client.go             |   13 +
- common/tls/utls_fallback.go           |  806 +++++++++++++++++++
- common/tls/utls_fallback_test.go      | 1019 +++++++++++++++++++++++++
- common/tls/utls_mlkem.go              |   27 +
- experimental/cachefile/utls_choice.go |   43 ++
- option/experimental.go                |   15 +
- 16 files changed, 2811 insertions(+), 5 deletions(-)
+ box.go                                 |    4 +
+ common/tls/client.go                   |   76 +-
+ common/tls/detour_test.go              |  165 ++++
+ common/tls/ech.go                      |    6 +
+ common/tls/hello_watch.go              |  116 +++
+ common/tls/hello_watch_linux.go        |  100 +++
+ common/tls/hello_watch_linux_test.go   |  336 ++++++++
+ common/tls/hello_watch_stub.go         |    9 +
+ common/tls/ktls.go                     |    6 +
+ common/tls/reality_client.go           |   65 ++
+ common/tls/reality_error.go            |   33 +
+ common/tls/reality_error_test.go       |   55 ++
+ common/tls/reality_fingerprint_test.go |    3 +
+ common/tls/utls_client.go              |   13 +
+ common/tls/utls_fallback.go            |  806 +++++++++++++++++++
+ common/tls/utls_fallback_test.go       | 1019 ++++++++++++++++++++++++
+ common/tls/utls_mlkem.go               |   27 +
+ experimental/cachefile/utls_choice.go  |   43 +
+ option/experimental.go                 |   15 +
+ 19 files changed, 2892 insertions(+), 5 deletions(-)
  create mode 100644 common/tls/detour_test.go
  create mode 100644 common/tls/hello_watch.go
  create mode 100644 common/tls/hello_watch_linux.go
  create mode 100644 common/tls/hello_watch_linux_test.go
  create mode 100644 common/tls/hello_watch_stub.go
+ create mode 100644 common/tls/reality_error.go
+ create mode 100644 common/tls/reality_error_test.go
  create mode 100644 common/tls/utls_fallback.go
  create mode 100644 common/tls/utls_fallback_test.go
  create mode 100644 common/tls/utls_mlkem.go
@@ -955,10 +960,10 @@ index dd564f534..8f8a24a96 100644
  	ServerConfig
  	logger             logger.ContextLogger
 diff --git a/common/tls/reality_client.go b/common/tls/reality_client.go
-index 20597bda7..8ad21f88f 100644
+index 20597bda7..011256ea0 100644
 --- a/common/tls/reality_client.go
 +++ b/common/tls/reality_client.go
-@@ -49,6 +49,77 @@ type RealityClientConfig struct {
+@@ -49,6 +49,67 @@ type RealityClientConfig struct {
  	uClient   *UTLSClientConfig
  	publicKey []byte
  	shortID   [8]byte
@@ -982,8 +987,6 @@ index 20597bda7..8ad21f88f 100644
 +	realityHybridKeyShareNote = "REALITY servers since Xray-core v26.9.8 reject a Client Hello without an X25519MLKEM768 key share"
 +	// what to configure in place of such a fingerprint
 +	realityHybridKeyShareAdvice = ", use chrome, firefox, safari, random or randomized"
-+	// the text every failed verification begins with
-+	realityVerificationFailed = "reality verification failed"
 +)
 +
 +// realityStrangerError is the failure of a handshake with a fingerprint without the
@@ -1016,27 +1019,19 @@ index 20597bda7..8ad21f88f 100644
 +// handshake itself failed with, if it did. It names the fingerprint that may be the
 +// cause, and what to configure in its place when it is the configured one.
 +func (e *RealityClientConfig) verificationFailed(cause error) error {
-+	text := realityVerificationFailed
-+	if e.classicFingerprint != "" {
-+		text += ", possibly because of the uTLS fingerprint " + e.classicFingerprint + ": " + realityHybridKeyShareNote
-+		if !e.classicFallback {
-+			text += realityHybridKeyShareAdvice
-+		}
++	failure := &realityVerifyError{cause: cause}
++	if e.classicFingerprint == "" {
++		return failure
 +	}
-+	var err error
-+	if cause != nil {
-+		err = E.Cause(cause, text)
-+	} else {
-+		err = E.New(text)
++	failure.note = ", possibly because of the uTLS fingerprint " + e.classicFingerprint + ": " + realityHybridKeyShareNote
++	if !e.classicFallback {
++		failure.note += realityHybridKeyShareAdvice
 +	}
-+	if e.classicFingerprint != "" {
-+		return &realityStrangerError{err}
-+	}
-+	return err
++	return &realityStrangerError{failure}
  }
  
  func NewRealityClient(ctx context.Context, logger logger.ContextLogger, serverAddress string, options option.OutboundTLSOptions) (Config, error) {
-@@ -386,3 +457,7 @@ func (c *realityClientConnWrapper) ReaderReplaceable() bool {
+@@ -386,3 +447,7 @@ func (c *realityClientConnWrapper) ReaderReplaceable() bool {
  func (c *realityClientConnWrapper) WriterReplaceable() bool {
  	return false
  }
@@ -1044,6 +1039,129 @@ index 20597bda7..8ad21f88f 100644
 +func (e *RealityClientConfig) spoofs() bool {
 +	return e.uClient.spoof != ""
 +}
+diff --git a/common/tls/reality_error.go b/common/tls/reality_error.go
+new file mode 100644
+index 000000000..558c54c51
+--- /dev/null
++++ b/common/tls/reality_error.go
+@@ -0,0 +1,33 @@
++package tls
++
++import E "github.com/sagernet/sing/common/exceptions"
++
++// ErrRealityVerification is the failure of a handshake with a REALITY server that did not prove to
++// be it (podkop-engine): the certificate it answered with is not the one REALITY makes for this
++// client, as with a wrong public key or short ID, another server at the address, or a server that
++// takes this client for a stranger. The error of the handshake is it to errors.Is, has its text in
++// front, and unwraps to what the handshake failed with, if it did.
++var ErrRealityVerification = E.New("reality verification failed")
++
++// realityVerifyError is a failure of that kind.
++type realityVerifyError struct {
++	// after the text of ErrRealityVerification: what may be the cause
++	note  string
++	cause error
++}
++
++func (e *realityVerifyError) Error() string {
++	message := ErrRealityVerification.Error() + e.note
++	if e.cause != nil {
++		message += ": " + e.cause.Error()
++	}
++	return message
++}
++
++func (e *realityVerifyError) Is(target error) bool {
++	return target == ErrRealityVerification
++}
++
++func (e *realityVerifyError) Unwrap() error {
++	return e.cause
++}
+diff --git a/common/tls/reality_error_test.go b/common/tls/reality_error_test.go
+new file mode 100644
+index 000000000..e9a67bde9
+--- /dev/null
++++ b/common/tls/reality_error_test.go
+@@ -0,0 +1,55 @@
++//go:build with_utls
++
++package tls
++
++import (
++	"context"
++	"crypto/x509"
++	"errors"
++	"io"
++	"testing"
++
++	E "github.com/sagernet/sing/common/exceptions"
++
++	"github.com/stretchr/testify/require"
++)
++
++// Every failed verification is ErrRealityVerification, through what wraps it on the way up, and
++// keeps its text and its cause.
++func TestErrRealityVerification(t *testing.T) {
++	cause := x509.HostnameError{Certificate: &x509.Certificate{DNSNames: []string{"example.org"}}, Host: "example.com"}
++	const note = ", possibly because of the uTLS fingerprint edge: REALITY servers since Xray-core v26.9.8 reject a Client Hello without an X25519MLKEM768 key share"
++	for _, testCase := range []struct {
++		name   string
++		config RealityClientConfig
++		cause  error
++		text   string
++	}{
++		{"bare", RealityClientConfig{}, nil, "reality verification failed"},
++		{"with a cause", RealityClientConfig{}, io.EOF, "reality verification failed: EOF"},
++		{"a fingerprint without the key share", RealityClientConfig{classicFingerprint: "edge"}, nil,
++			"reality verification failed" + note + ", use chrome, firefox, safari, random or randomized"},
++		{"one the fallback has gone on to", RealityClientConfig{classicFingerprint: "edge", classicFallback: true}, cause,
++			"reality verification failed" + note + ": " + cause.Error()},
++	} {
++		t.Run(testCase.name, func(t *testing.T) {
++			err := testCase.config.verificationFailed(testCase.cause)
++			require.EqualError(t, err, testCase.text)
++			wrapped := E.Cause(err, "create client transport")
++			require.ErrorIs(t, wrapped, ErrRealityVerification)
++			require.True(t, realityVerificationError(wrapped))
++			if testCase.cause != nil {
++				require.ErrorIs(t, wrapped, testCase.cause)
++			}
++			var stranger *realityStrangerError
++			require.Equal(t, testCase.config.classicFingerprint != "", errors.As(wrapped, &stranger))
++		})
++	}
++	// the certificate of the target, refused by this host's roots, is a failed verification for the
++	// block detector, but no word of REALITY
++	require.True(t, realityVerificationError(cause))
++	require.NotErrorIs(t, cause, ErrRealityVerification)
++	for _, err := range []error{context.DeadlineExceeded, io.EOF, E.New("reality verification failed")} {
++		require.False(t, realityVerificationError(err), err)
++	}
++}
+diff --git a/common/tls/reality_fingerprint_test.go b/common/tls/reality_fingerprint_test.go
+index 81878772d..9903f67dd 100644
+--- a/common/tls/reality_fingerprint_test.go
++++ b/common/tls/reality_fingerprint_test.go
+@@ -273,6 +273,7 @@ func TestRealityVerificationFailureNamesFingerprint(t *testing.T) {
+ 			// a copy, as the transports that set their own ALPN make
+ 			_, err = ClientHandshake(ctx, client, config.Clone())
+ 			require.Error(t, err)
++			require.ErrorIs(t, err, ErrRealityVerification)
+ 			require.True(t, strings.HasPrefix(err.Error(), "reality verification failed"), err.Error())
+ 			if !testCase.named {
+ 				require.Equal(t, "reality verification failed", err.Error())
+@@ -337,8 +338,10 @@ func TestRealityRejectedCertificateNamesFingerprint(t *testing.T) {
+ 			if !testCase.named {
+ 				require.NotContains(t, err.Error(), "uTLS fingerprint")
+ 				require.NotContains(t, err.Error(), "reality verification failed")
++				require.NotErrorIs(t, err, ErrRealityVerification)
+ 				return
+ 			}
++			require.ErrorIs(t, err, ErrRealityVerification)
+ 			require.True(t, strings.HasPrefix(err.Error(), "reality verification failed"), err.Error())
+ 			require.Contains(t, err.Error(), "uTLS fingerprint "+testCase.fingerprint+":")
+ 			require.Contains(t, err.Error(), "Xray-core v26.9.8")
 diff --git a/common/tls/utls_client.go b/common/tls/utls_client.go
 index ce7493a8c..154df09a7 100644
 --- a/common/tls/utls_client.go
@@ -1095,7 +1213,7 @@ index ce7493a8c..154df09a7 100644
 +}
 diff --git a/common/tls/utls_fallback.go b/common/tls/utls_fallback.go
 new file mode 100644
-index 000000000..f2c0c159a
+index 000000000..fa043455b
 --- /dev/null
 +++ b/common/tls/utls_fallback.go
 @@ -0,0 +1,806 @@
@@ -1401,7 +1519,7 @@ index 000000000..f2c0c159a
 +	if f.key != "" {
 +		return
 +	}
-+	f.key = F.ToString(f.candidates[f.configured].name, " ", serverName, " ", destination)
++	f.key = adapter.DetectOutcomeKey(f.candidates[f.configured].name, serverName, destination)
 +	f.cache = service.FromContext[adapter.CacheFile](f.ctx)
 +	if f.cache == nil {
 +		return

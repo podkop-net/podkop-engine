@@ -1,7 +1,7 @@
-From 9c329e70ae94d2e6c0da8bf01bfc74494389a5ef Mon Sep 17 00:00:00 2001
+From 18c0cf3f587440237b7d16b0a08e357dd6d41ccd Mon Sep 17 00:00:00 2001
 From: FiyeroT <me@fiyero.xyz>
 Date: Thu, 12 Nov 2026 21:41:21 +0300
-Subject: [PATCH 48/69] clashapi, trafficcontrol: a failed listen, a failed UI,
+Subject: [PATCH 48/71] clashapi, trafficcontrol: a failed listen, a failed UI,
  records of connections
 
 A failed listen of the external controller does not fail the start, an external UI that fails to

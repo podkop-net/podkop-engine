@@ -1,7 +1,7 @@
-From f82fdaf6dc777ce7d7bd6d7b3f278ae3455879aa Mon Sep 17 00:00:00 2001
+From 127919c70a85aaa267e8bee4613915fd20310fc1 Mon Sep 17 00:00:00 2001
 From: FiyeroT <me@fiyero.xyz>
 Date: Thu, 12 Nov 2026 21:41:21 +0300
-Subject: [PATCH 52/69] vmess: the security auto is not zero under TLS
+Subject: [PATCH 52/71] vmess: the security auto is not zero under TLS
 
 The security auto of VMess is not zero under TLS.
 

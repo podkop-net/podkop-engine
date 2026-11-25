@@ -1,7 +1,7 @@
-From a41d43b86fb89622c3f96554e87d942bd67000b2 Mon Sep 17 00:00:00 2001
+From 989e7ec1dd70749dc6a536ba52a679675a2b5da4 Mon Sep 17 00:00:00 2001
 From: FiyeroT <me@fiyero.xyz>
 Date: Thu, 12 Nov 2026 21:41:21 +0300
-Subject: [PATCH 57/69] detector: what a block detector reads of each server
+Subject: [PATCH 57/71] detector: what a block detector reads of each server
 
 What the handshakes, the flows and the download tests of each server came to, for a block detector
 of the program that runs the box.
@@ -13,12 +13,14 @@ Pdk-Feature: detector
 Pdk-Zone: core
 Pdk-Layer: 04
 ---
+ adapter/detect_outcome.go                     |  15 +
+ adapter/detect_outcome_test.go                |  17 +
  adapter/experimental.go                       |  30 +
  adapter/router.go                             |   8 +
  common/tls/client.go                          |   7 +
  common/tls/detect_outcome.go                  | 158 +++++
  common/tls/detect_outcome_test.go             | 578 ++++++++++++++++++
- common/tls/reality_client.go                  |  69 +++
+ common/tls/reality_client.go                  |  67 ++
  common/trafficcontrol/detect_flows_test.go    | 309 ++++++++++
  common/trafficcontrol/manager.go              | 123 ++++
  common/trafficcontrol/tracker.go              |  86 ++-
@@ -29,7 +31,9 @@ Pdk-Layer: 04
  .../group/urltestgroup/urltest_detect_test.go | 188 ++++++
  route/conn.go                                 |   5 +
  route/conn_podkop_test.go                     | 128 ++++
- 16 files changed, 1887 insertions(+), 2 deletions(-)
+ 18 files changed, 1917 insertions(+), 2 deletions(-)
+ create mode 100644 adapter/detect_outcome.go
+ create mode 100644 adapter/detect_outcome_test.go
  create mode 100644 common/tls/detect_outcome.go
  create mode 100644 common/tls/detect_outcome_test.go
  create mode 100644 common/trafficcontrol/detect_flows_test.go
@@ -40,6 +44,50 @@ Pdk-Layer: 04
  create mode 100644 protocol/group/urltestgroup/urltest_detect_test.go
  create mode 100644 route/conn_podkop_test.go
 
+diff --git a/adapter/detect_outcome.go b/adapter/detect_outcome.go
+new file mode 100644
+index 000000000..a11e84940
+--- /dev/null
++++ b/adapter/detect_outcome.go
+@@ -0,0 +1,15 @@
++package adapter
++
++import M "github.com/sagernet/sing/common/metadata"
++
++// DetectOutcomeKey is the key of what a cache file keeps of the handshakes with a server
++// (podkop-engine): LoadDetectOutcome and LoadUTLSChoice. fingerprint is the uTLS fingerprint as
++// configured ("" is the default, chrome), serverName the server name of the TLS client, which is the
++// server where none is configured, and destination the server as it is dialed. It is also the key in
++// the files written before: its form does not change without the buckets.
++func DetectOutcomeKey(fingerprint string, serverName string, destination M.Socksaddr) string {
++	if fingerprint == "" {
++		fingerprint = "chrome"
++	}
++	return fingerprint + " " + serverName + " " + destination.String()
++}
+diff --git a/adapter/detect_outcome_test.go b/adapter/detect_outcome_test.go
+new file mode 100644
+index 000000000..a014f6818
+--- /dev/null
++++ b/adapter/detect_outcome_test.go
+@@ -0,0 +1,17 @@
++package adapter
++
++import (
++	"testing"
++
++	M "github.com/sagernet/sing/common/metadata"
++
++	"github.com/stretchr/testify/require"
++)
++
++// The form of the key is that of the records in the cache files.
++func TestDetectOutcomeKey(t *testing.T) {
++	require.Equal(t, "chrome www.example.com 192.0.2.1:443", DetectOutcomeKey("chrome", "www.example.com", M.ParseSocksaddrHostPort("192.0.2.1", 443)))
++	require.Equal(t, "chrome www.example.com 192.0.2.1:443", DetectOutcomeKey("", "www.example.com", M.ParseSocksaddrHostPort("192.0.2.1", 443)))
++	require.Equal(t, "edge srv.example.com srv.example.com:8443", DetectOutcomeKey("edge", "srv.example.com", M.ParseSocksaddrHostPort("srv.example.com", 8443)))
++	require.Equal(t, "firefox a.example.com [2001:db8::1]:443", DetectOutcomeKey("firefox", "a.example.com", M.ParseSocksaddr("[2001:db8::1]:443")))
++}
 diff --git a/adapter/experimental.go b/adapter/experimental.go
 index 7df508d49..56fdc47d5 100644
 --- a/adapter/experimental.go
@@ -284,7 +332,7 @@ index 000000000..034e01dcc
 +}
 diff --git a/common/tls/detect_outcome_test.go b/common/tls/detect_outcome_test.go
 new file mode 100644
-index 000000000..d1355111d
+index 000000000..73f0f1cb4
 --- /dev/null
 +++ b/common/tls/detect_outcome_test.go
 @@ -0,0 +1,578 @@
@@ -402,7 +450,7 @@ index 000000000..d1355111d
 +
 +// firstRefused is what the first candidate meets at a server that takes it for a stranger's.
 +func firstRefused() error {
-+	return &realityStrangerError{E.New(realityVerificationFailed)}
++	return &realityStrangerError{new(realityVerifyError)}
 +}
 +
 +// No ClientHello answered: no answer, and nothing else; a list that ends so does not say the
@@ -421,7 +469,7 @@ index 000000000..d1355111d
 +func TestDetectOutcomeWrongKey(t *testing.T) {
 +	cache := &choiceCache{choices: make(map[string]choiceEntry)}
 +	config, ctx := outcomeClient(t, cache)
-+	failList(t, ctx, config, firstRefused(), E.New(realityVerificationFailed))
++	failList(t, ctx, config, firstRefused(), new(realityVerifyError))
 +	entry := outcomeOf(t, cache, writerOf(config))
 +	require.Equal(t, adapter.DetectFailed, entry.flags)
 +	require.Empty(t, entry.fingerprint)
@@ -503,17 +551,17 @@ index 000000000..d1355111d
 +	failSaved(ctx, io.ErrUnexpectedEOF)
 +	canceled, cancel := context.WithCancel(ctx)
 +	cancel()
-+	failSaved(canceled, E.New(realityVerificationFailed))
++	failSaved(canceled, new(realityVerifyError))
 +	settled(t, writer)
 +	require.Equal(t, adapter.DetectRefused, outcomeOf(t, cache, writer).flags)
 +
-+	failSaved(ctx, E.New(realityVerificationFailed))
++	failSaved(ctx, new(realityVerifyError))
 +	entry := outcomeOf(t, cache, writer)
 +	require.Equal(t, adapter.DetectRefused|adapter.DetectFailed, entry.flags)
 +	require.Empty(t, entry.fingerprint)
 +	// the same state again writes nothing
 +	writes := cache.outcomeWriteCount()
-+	failSaved(ctx, E.New(realityVerificationFailed))
++	failSaved(ctx, new(realityVerifyError))
 +	settled(t, writer)
 +	require.Equal(t, writes, cache.outcomeWriteCount())
 +
@@ -837,9 +885,9 @@ index 000000000..d1355111d
 +
 +	// a failed verification, in each form it comes in
 +	for _, failure := range []error{
-+		E.New(realityVerificationFailed),
++		new(realityVerifyError),
 +		firstRefused(),
-+		E.Cause(errors.New("x"), realityVerificationFailed),
++		&realityVerifyError{cause: errors.New("x")},
 +	} {
 +		recorder.recordDetectOutcome(context.Background(), fallbackServer, failure)
 +		entry = outcomeOf(t, cache, writer)
@@ -867,7 +915,7 @@ index 000000000..d1355111d
 +	require.Nil(t, reality.outcome.cache)
 +}
 diff --git a/common/tls/reality_client.go b/common/tls/reality_client.go
-index e96afc3c1..82d390c57 100644
+index 423179b12..8ca47b31e 100644
 --- a/common/tls/reality_client.go
 +++ b/common/tls/reality_client.go
 @@ -17,11 +17,13 @@ import (
@@ -892,7 +940,7 @@ index e96afc3c1..82d390c57 100644
  
  	utls "github.com/metacubex/utls"
  	"golang.org/x/crypto/hkdf"
-@@ -196,6 +199,68 @@ func (e *RealityClientConfig) SetServerName(serverName string) {
+@@ -186,6 +189,66 @@ func (e *RealityClientConfig) SetServerName(serverName string) {
  	e.uClient.SetServerName(serverName)
  }
  
@@ -905,7 +953,7 @@ index e96afc3c1..82d390c57 100644
 +	if cache == nil {
 +		return
 +	}
-+	e.outcome.open(cache, e.fingerprint+" "+e.ServerName()+" "+destination.String())
++	e.outcome.open(cache, adapter.DetectOutcomeKey(e.fingerprint, e.ServerName(), destination))
 +	now := time.Now()
 +	switch {
 +	case handshakeErr == nil:
@@ -949,19 +997,17 @@ index e96afc3c1..82d390c57 100644
 +// the verification of REALITY, or of the certificate of the target it passed the connection on to.
 +func realityVerificationError(err error) bool {
 +	var (
-+		stranger         *realityStrangerError
 +		unknownAuthority x509.UnknownAuthorityError
 +		hostname         x509.HostnameError
 +		invalid          x509.CertificateInvalidError
 +	)
-+	return errors.As(err, &stranger) || errors.As(err, &unknownAuthority) || errors.As(err, &hostname) || errors.As(err, &invalid) ||
-+		strings.Contains(err.Error(), realityVerificationFailed)
++	return errors.Is(err, ErrRealityVerification) || errors.As(err, &unknownAuthority) || errors.As(err, &hostname) || errors.As(err, &invalid)
 +}
 +
  func (e *RealityClientConfig) NextProtos() []string {
  	return e.uClient.NextProtos()
  }
-@@ -388,6 +453,10 @@ func (e *RealityClientConfig) Clone() Config {
+@@ -378,6 +441,10 @@ func (e *RealityClientConfig) Clone() Config {
  		e.uClient.Clone().(*UTLSClientConfig),
  		e.publicKey,
  		e.shortID,

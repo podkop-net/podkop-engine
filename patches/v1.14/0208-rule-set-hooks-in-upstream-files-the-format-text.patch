@@ -1,7 +1,7 @@
 From 4100aca54d416e7abf63a00623ca9c1a92fd486d Mon Sep 17 00:00:00 2001
 From: FiyeroT <me@fiyero.xyz>
 Date: Thu, 12 Nov 2026 21:41:19 +0300
-Subject: [PATCH 12/69] rule-set, hooks in upstream files: the format text
+Subject: [PATCH 12/71] rule-set, hooks in upstream files: the format text
 
 The lines of upstream files that "rule-set: the format text" needs; the feature itself is its patch
 of layer 03, in files of its own.

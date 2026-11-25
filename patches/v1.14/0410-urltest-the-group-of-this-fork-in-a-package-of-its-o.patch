@@ -1,7 +1,7 @@
-From 25505840afead52f572cef0560c95903f8926067 Mon Sep 17 00:00:00 2001
+From d96f29c7d80791fee33180699c1c67996aa3282e Mon Sep 17 00:00:00 2001
 From: FiyeroT <me@fiyero.xyz>
 Date: Thu, 12 Nov 2026 21:41:21 +0300
-Subject: [PATCH 46/69] urltest: the group of this fork, in a package of its
+Subject: [PATCH 46/71] urltest: the group of this fork, in a package of its
  own
 
 The urltest group of podkop-engine in protocol/group/urltestgroup, registered for the type urltest
@@ -46,44 +46,53 @@ Pdk-Feature: urltest
 Pdk-Zone: groups
 Pdk-Layer: 04
 ---
- common/urltest/download.go                    |  85 ++
- common/urltest/download_test.go               |  75 ++
- common/urltest/history_detail.go              | 195 ++++
- common/urltest/loss.go                        | 356 +++++++
- common/urltest/loss_test.go                   | 143 +++
- common/urltest/urltest.go                     |  39 +-
- daemon/started_service.go                     |   3 +-
- docs/configuration/outbound/urltest.md        |  34 +
- experimental/clashapi/api_meta_group.go       |   4 +-
- experimental/clashapi/proxies.go              |  56 +-
- include/registry.go                           |   1 +
- option/group.go                               |  16 +
- protocol/group/selector_release.go            |   9 +
- protocol/group/selector_release_test.go       |  34 +
- protocol/group/urltestgroup/urltest.go        | 992 ++++++++++++++++++
- .../group/urltestgroup/urltest_balance.go     | 373 +++++++
- .../group/urltestgroup/urltest_download.go    | 211 ++++
- .../urltestgroup/urltest_download_test.go     | 488 +++++++++
- .../group/urltestgroup/urltest_failure.go     | 470 +++++++++
- .../urltestgroup/urltest_failure_test.go      | 494 +++++++++
- .../urltestgroup/urltest_fallback_test.go     | 386 +++++++
- .../urltestgroup/urltest_interval_test.go     |  91 ++
- protocol/group/urltestgroup/urltest_loss.go   | 394 +++++++
- .../group/urltestgroup/urltest_loss_test.go   | 571 ++++++++++
- .../urltestgroup/urltest_network_test.go      | 427 ++++++++
- protocol/group/urltestgroup/urltest_probe.go  | 297 ++++++
- .../group/urltestgroup/urltest_probe_test.go  | 390 +++++++
- .../group/urltestgroup/urltest_r20_test.go    | 231 ++++
- .../group/urltestgroup/urltest_response.go    | 443 ++++++++
- .../urltestgroup/urltest_response_test.go     | 522 +++++++++
- .../urltestgroup/urltest_review2_test.go      | 245 +++++
- route/network.go                              |   9 +
- 32 files changed, 8069 insertions(+), 15 deletions(-)
+ common/urltest/download.go                    |   86 ++
+ common/urltest/download_test.go               |   75 ++
+ common/urltest/history_detail.go              |  195 ++++
+ common/urltest/loss.go                        |  357 ++++++
+ common/urltest/loss_test.go                   |  143 +++
+ common/urltest/test_dial.go                   |   20 +
+ common/urltest/urltest.go                     |   40 +-
+ daemon/started_service.go                     |    3 +-
+ docs/configuration/outbound/urltest.md        |   34 +
+ experimental/clashapi/api_meta_group.go       |    4 +-
+ experimental/clashapi/proxies.go              |   56 +-
+ include/registry.go                           |    1 +
+ option/group.go                               |   16 +
+ protocol/group/selector_release.go            |    9 +
+ protocol/group/selector_release_test.go       |   34 +
+ protocol/group/urltestgroup/urltest.go        | 1005 +++++++++++++++++
+ .../group/urltestgroup/urltest_balance.go     |  405 +++++++
+ .../group/urltestgroup/urltest_download.go    |  218 ++++
+ .../urltestgroup/urltest_download_test.go     |  488 ++++++++
+ .../group/urltestgroup/urltest_failure.go     |  470 ++++++++
+ .../urltestgroup/urltest_failure_test.go      |  494 ++++++++
+ .../urltestgroup/urltest_fallback_test.go     |  386 +++++++
+ protocol/group/urltestgroup/urltest_first.go  |   57 +
+ .../group/urltestgroup/urltest_first_test.go  |  403 +++++++
+ .../urltestgroup/urltest_interval_test.go     |   91 ++
+ protocol/group/urltestgroup/urltest_loss.go   |  420 +++++++
+ .../group/urltestgroup/urltest_loss_test.go   |  575 ++++++++++
+ .../urltestgroup/urltest_network_test.go      |  427 +++++++
+ protocol/group/urltestgroup/urltest_probe.go  |  297 +++++
+ .../group/urltestgroup/urltest_probe_test.go  |  390 +++++++
+ .../group/urltestgroup/urltest_r20_test.go    |  231 ++++
+ .../group/urltestgroup/urltest_response.go    |  443 ++++++++
+ .../urltestgroup/urltest_response_test.go     |  522 +++++++++
+ protocol/group/urltestgroup/urltest_rest.go   |   94 ++
+ .../group/urltestgroup/urltest_rest_test.go   |  386 +++++++
+ .../urltestgroup/urltest_review2_test.go      |  245 ++++
+ .../group/urltestgroup/urltest_switch_test.go |  150 +++
+ protocol/group/urltestgroup/urltest_use.go    |   59 +
+ .../group/urltestgroup/urltest_use_test.go    |  328 ++++++
+ route/network.go                              |    9 +
+ 40 files changed, 9651 insertions(+), 15 deletions(-)
  create mode 100644 common/urltest/download.go
  create mode 100644 common/urltest/download_test.go
  create mode 100644 common/urltest/history_detail.go
  create mode 100644 common/urltest/loss.go
  create mode 100644 common/urltest/loss_test.go
+ create mode 100644 common/urltest/test_dial.go
  create mode 100644 protocol/group/selector_release.go
  create mode 100644 protocol/group/selector_release_test.go
  create mode 100644 protocol/group/urltestgroup/urltest.go
@@ -93,6 +102,8 @@ Pdk-Layer: 04
  create mode 100644 protocol/group/urltestgroup/urltest_failure.go
  create mode 100644 protocol/group/urltestgroup/urltest_failure_test.go
  create mode 100644 protocol/group/urltestgroup/urltest_fallback_test.go
+ create mode 100644 protocol/group/urltestgroup/urltest_first.go
+ create mode 100644 protocol/group/urltestgroup/urltest_first_test.go
  create mode 100644 protocol/group/urltestgroup/urltest_interval_test.go
  create mode 100644 protocol/group/urltestgroup/urltest_loss.go
  create mode 100644 protocol/group/urltestgroup/urltest_loss_test.go
@@ -102,14 +113,19 @@ Pdk-Layer: 04
  create mode 100644 protocol/group/urltestgroup/urltest_r20_test.go
  create mode 100644 protocol/group/urltestgroup/urltest_response.go
  create mode 100644 protocol/group/urltestgroup/urltest_response_test.go
+ create mode 100644 protocol/group/urltestgroup/urltest_rest.go
+ create mode 100644 protocol/group/urltestgroup/urltest_rest_test.go
  create mode 100644 protocol/group/urltestgroup/urltest_review2_test.go
+ create mode 100644 protocol/group/urltestgroup/urltest_switch_test.go
+ create mode 100644 protocol/group/urltestgroup/urltest_use.go
+ create mode 100644 protocol/group/urltestgroup/urltest_use_test.go
 
 diff --git a/common/urltest/download.go b/common/urltest/download.go
 new file mode 100644
-index 000000000..7ac78518d
+index 000000000..3e8fd878f
 --- /dev/null
 +++ b/common/urltest/download.go
-@@ -0,0 +1,85 @@
+@@ -0,0 +1,86 @@
 +package urltest
 +
 +import (
@@ -156,6 +172,7 @@ index 000000000..7ac78518d
 +			port = "443"
 +		}
 +	}
++	ctx = ContextWithTest(ctx)
 +	start := time.Now()
 +	instance, err := detour.DialContext(ctx, "tcp", M.ParseSocksaddrHostPortStr(hostname, port))
 +	if err != nil {
@@ -479,10 +496,10 @@ index 000000000..b84522a9e
 +}
 diff --git a/common/urltest/loss.go b/common/urltest/loss.go
 new file mode 100644
-index 000000000..143c413c3
+index 000000000..9c5f2da76
 --- /dev/null
 +++ b/common/urltest/loss.go
-@@ -0,0 +1,356 @@
+@@ -0,0 +1,357 @@
 +package urltest
 +
 +import (
@@ -586,6 +603,7 @@ index 000000000..143c413c3
 +			port = "443"
 +		}
 +	}
++	ctx = ContextWithTest(ctx)
 +	probeCtx, socket := probesock.With(ctx, probesock.Window)
 +	defer socket.Close()
 +	start := time.Now()
@@ -988,8 +1006,34 @@ index 000000000..8b17c4ad7
 +	// what the client took before it gave up: the limit and what was on the way, not megabytes
 +	require.Less(t, sent.Load(), int64(probeHeaderLimit+(4<<20)))
 +}
+diff --git a/common/urltest/test_dial.go b/common/urltest/test_dial.go
+new file mode 100644
+index 000000000..4e141df11
+--- /dev/null
++++ b/common/urltest/test_dial.go
+@@ -0,0 +1,20 @@
++package urltest
++
++import "context"
++
++type testKey struct{}
++
++// ContextWithTest marks ctx as that of a test (podkop-engine): the dials made with it, through a
++// group as any other, carry no traffic of a user. URLTest, DownloadTest and the loss probes mark
++// theirs. A program that probes an outbound by connections of its own may mark them as well.
++func ContextWithTest(ctx context.Context) context.Context {
++	return context.WithValue(ctx, (*testKey)(nil), true)
++}
++
++// TestFromContext tells a dial of a test. A connection that several dials share is told by the
++// dial that opened it: a multiplexed session a test opened through a detour stays the test's for
++// that detour, whatever goes over it later.
++func TestFromContext(ctx context.Context) bool {
++	test, _ := ctx.Value((*testKey)(nil)).(bool)
++	return test
++}
 diff --git a/common/urltest/urltest.go b/common/urltest/urltest.go
-index 26efe39cb..5e31ddee3 100644
+index 26efe39cb..4e9f2fe60 100644
 --- a/common/urltest/urltest.go
 +++ b/common/urltest/urltest.go
 @@ -24,11 +24,13 @@ type HistoryStorage struct {
@@ -1022,7 +1066,15 @@ index 26efe39cb..5e31ddee3 100644
  	s.notifyUpdated()
  	s.access.Unlock()
  }
-@@ -127,8 +131,32 @@ func urlTest(ctx context.Context, link string, detour N.Dialer) (t uint16, err e
+@@ -81,6 +85,7 @@ func (s *HistoryStorage) Close() error {
+ }
+ 
+ func URLTest(ctx context.Context, link string, detour N.Dialer) (uint16, error) {
++	ctx = ContextWithTest(ctx)
+ 	multiplexOutbound, isMultiplexOutbound := common.Cast[adapter.OutboundWithMultiplex](detour)
+ 	if isMultiplexOutbound && multiplexOutbound.MultiplexEnabled() {
+ 		warmContext := adapter.ContextWithKeepSession(ctx)
+@@ -127,8 +132,32 @@ func urlTest(ctx context.Context, link string, detour N.Dialer) (t uint16, err e
  	if err != nil {
  		return
  	}
@@ -1056,7 +1108,7 @@ index 26efe39cb..5e31ddee3 100644
  			DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
  				return instance, nil
  			},
-@@ -136,18 +164,11 @@ func urlTest(ctx context.Context, link string, detour N.Dialer) (t uint16, err e
+@@ -136,18 +165,11 @@ func urlTest(ctx context.Context, link string, detour N.Dialer) (t uint16, err e
  				Time:    ntp.TimeFuncFromContext(ctx),
  				RootCAs: adapter.RootPoolFromContext(ctx),
  			},
@@ -1363,10 +1415,10 @@ index 000000000..8068637ec
 +func (m *releaseMember) Network() []string { return []string{N.NetworkTCP, N.NetworkUDP} }
 diff --git a/protocol/group/urltestgroup/urltest.go b/protocol/group/urltestgroup/urltest.go
 new file mode 100644
-index 000000000..54d7f6814
+index 000000000..af5bf9e09
 --- /dev/null
 +++ b/protocol/group/urltestgroup/urltest.go
-@@ -0,0 +1,992 @@
+@@ -0,0 +1,1005 @@
 +package urltestgroup
 +
 +import (
@@ -1561,6 +1613,7 @@ index 000000000..54d7f6814
 +
 +func (s *URLTest) AttachConnection(closer io.Closer) func() {
 +	s.group.Touch()
++	s.group.used()
 +	return s.group.interruptGroup.Add(closer, true)
 +}
 +
@@ -1632,6 +1685,7 @@ index 000000000..54d7f6814
 +
 +func (s *URLTest) DialContext(ctx context.Context, network string, destination M.Socksaddr) (net.Conn, error) {
 +	s.group.Touch()
++	s.group.usedBy(ctx)
 +	var outbound adapter.Outbound
 +	switch N.NetworkName(network) {
 +	case N.NetworkTCP:
@@ -1693,6 +1747,7 @@ index 000000000..54d7f6814
 +
 +func (s *URLTest) ListenPacket(ctx context.Context, destination M.Socksaddr) (net.PacketConn, error) {
 +	s.group.Touch()
++	s.group.usedBy(ctx)
 +	outbound := s.group.selectedOutboundUDP.Load()
 +	balanced, release := s.group.balanced(ctx, N.NetworkUDP)
 +	if balanced != nil {
@@ -1744,6 +1799,8 @@ index 000000000..54d7f6814
 +	close                        chan struct{}
 +	started                      bool
 +	lastActive                   common.TypedValue[time.Time]
++	lastUse                      common.TypedValue[time.Time] // of a connection that is no test (used)
++	usedSince                    common.TypedValue[time.Time] // when the group came into use last (used)
 +	updatePending                atomic.Bool
 +	confirmAccess                sync.Mutex
 +	confirms                     map[string]*memberConfirm
@@ -1775,8 +1832,9 @@ index 000000000..54d7f6814
 +	mode         string
 +	loss         lossOptions
 +	balance      atomic.Pointer[balancer]
++	useStart     sync.Mutex // held while the group comes into use (startUse)
 +	lossRunning  atomic.Bool
-+	switchProbes sync.Map // member tag → a probe before a switch to it runs
++	switchProbes sync.Map // member tag → when the probe before a switch to it that runs began
 +	switchProbed sync.Map // member tag → when the last probe before a switch to it began
 +}
 +
@@ -1857,7 +1915,13 @@ index 000000000..54d7f6814
 +	g.ticker = ticker
 +	g.pauseCallback = pause.RegisterTicker(g.pause, ticker, g.interval, nil)
 +	g.keepTicking()
-+	go g.loopCheck(ticker, g.close)
++	// told here, not by the loop: a connection of the router touches the group as it is attached and
++	// again as it is dialed, the second time before the loop runs (podkop-engine)
++	idle := time.Since(g.lastActive.Load()) > g.interval
++	if idle {
++		g.lastActive.Store(time.Now())
++	}
++	go g.loopCheck(ticker, g.close, idle)
 +}
 +
 +func (g *URLTestGroup) Close() error {
@@ -1972,9 +2036,10 @@ index 000000000..54d7f6814
 +	return len(g.fallbacks) > 0 && common.Contains(g.fallbacks, detour)
 +}
 +
-+func (g *URLTestGroup) loopCheck(ticker *time.Ticker, closeChan <-chan struct{}) {
-+	if time.Since(g.lastActive.Load()) > g.interval {
-+		g.lastActive.Store(time.Now())
++// loopCheck runs a round an interval, and one at once for a group that was idle, until it is idle
++// again.
++func (g *URLTestGroup) loopCheck(ticker *time.Ticker, closeChan <-chan struct{}, idle bool) {
++	if idle {
 +		g.CheckOutbounds(g.ctx, false)
 +	}
 +	for {
@@ -2361,10 +2426,10 @@ index 000000000..54d7f6814
 +}
 diff --git a/protocol/group/urltestgroup/urltest_balance.go b/protocol/group/urltestgroup/urltest_balance.go
 new file mode 100644
-index 000000000..7876b2b5d
+index 000000000..5c15907a6
 --- /dev/null
 +++ b/protocol/group/urltestgroup/urltest_balance.go
-@@ -0,0 +1,373 @@
+@@ -0,0 +1,405 @@
 +package urltestgroup
 +
 +import (
@@ -2396,8 +2461,9 @@ index 000000000..7876b2b5d
 +// The members of the balance are at most balance_size outbounds that are up, whose delay
 +// (weighed by loss as in the mode loss) is within the tolerance of the best of them, and whose
 +// loss, less the loss of the line, is not over loss_threshold. A member comes in only once it
-+// has passed the download test, as the member a selection switches to. When none is in, the
-+// group goes by its plain choice, the fastest.
++// has passed the download test, as the member a selection switches to; at the moment the group
++// comes into use, before. When none is in, and while the group is not in use, the group goes by
++// its plain choice, the fastest.
 +
 +const (
 +	defaultBalanceSize = 3
@@ -2421,6 +2487,8 @@ index 000000000..7876b2b5d
 +	access    sync.Mutex
 +	tcp       []adapter.Outbound // the members of the balance for TCP, the best first
 +	udp       []adapter.Outbound
++	unchecked []adapter.Outbound // those of tcp whose download test has not run since they came in (startUse)
++	told      string             // the members the log told last
 +	devices   map[string]*balanceDevice
 +	lastSweep time.Time
 +	// lastFull: when the devices idle for balance_idle were last dropped for room (balanceDevices)
@@ -2470,15 +2538,19 @@ index 000000000..7876b2b5d
 +
 +// updateBalance chooses the members of the balance anew, after a selection (under
 +// updateAccess). A member that was not in the balance passes the download test before it
-+// comes in: a server frozen after 16 KB would hang the large downloads of its devices.
++// comes in: a server frozen after 16 KB would hang the large downloads of its devices. One that
++// passed it within the loss_interval is not tested again. A group that is not in use has no
++// balance (urltest_rest.go).
 +func (g *URLTestGroup) updateBalance() {
 +	b := g.balance.Load()
-+	if g.mode != modeBalance || b == nil {
++	if g.mode != modeBalance || b == nil || g.restBalance(b) {
 +		return
 +	}
 +	view := g.lossView()
 +	b.access.Lock()
-+	previous := slices.Clone(b.tcp)
++	previous := slices.DeleteFunc(slices.Clone(b.tcp), func(member adapter.Outbound) bool {
++		return slices.Contains(b.unchecked, member)
++	})
 +	b.access.Unlock()
 +	failed := make(map[string]bool)
 +	tested := make(map[string]bool)
@@ -2488,7 +2560,7 @@ index 000000000..7876b2b5d
 +		again := false
 +		for _, member := range tcp {
 +			tag := group.RealTag(member, N.NetworkTCP)
-+			if g.downloadLink == "" || member.Type() == C.TypeBlock || slices.Contains(previous, member) || tested[tag] {
++			if g.downloadLink == "" || member.Type() == C.TypeBlock || slices.Contains(previous, member) || tested[tag] || g.downloadPassed(tag) {
 +				continue
 +			}
 +			tested[tag] = true
@@ -2506,19 +2578,42 @@ index 000000000..7876b2b5d
 +		}
 +	}
 +	udp := g.balanceMembers(N.NetworkUDP, view, failed)
-+	b.access.Lock()
-+	changed := !slices.Equal(tcp, b.tcp) || !slices.Equal(udp, b.udp)
-+	b.tcp, b.udp = tcp, udp
-+	b.access.Unlock()
++	if g.restBalance(b) {
++		// the download tests took longer than the use
++		return
++	}
++	g.useStart.Lock()
++	changed := g.putBalance(b, tcp, udp, nil)
++	g.useStart.Unlock()
 +	if changed {
-+		tags := make([]string, len(tcp))
-+		for i, member := range tcp {
-+			tags[i] = member.Tag()
-+		}
-+		g.logger.Info("balance over ", len(tags), " outbounds: ", strings.Join(tags, ", "))
 +		// the members in use changed: the manager of idle connections keeps theirs
 +		g.history.NotifyUpdated()
 +	}
++}
++
++// putBalance puts members in the balance, those of unchecked to be download tested, and tells
++// whether that changed it. A balance another group took (a hot swap) is left as it is. The caller
++// holds useStart.
++func (g *URLTestGroup) putBalance(b *balancer, tcp []adapter.Outbound, udp []adapter.Outbound, unchecked []adapter.Outbound) bool {
++	tags := make([]string, len(tcp))
++	for i, member := range tcp {
++		tags[i] = member.Tag()
++	}
++	told := strings.Join(tags, ", ")
++	b.access.Lock()
++	if g.balance.Load() != b {
++		b.access.Unlock()
++		return false
++	}
++	changed := !slices.Equal(tcp, b.tcp) || !slices.Equal(udp, b.udp)
++	b.tcp, b.udp, b.unchecked = tcp, udp, unchecked
++	news := told != b.told
++	b.told = told
++	b.access.Unlock()
++	if news {
++		g.logger.Info("balance over ", len(tags), " outbounds: ", told)
++	}
++	return changed
 +}
 +
 +// takeBalance hands the balancer of a group that is replaced to its successor (a hot swap):
@@ -2543,7 +2638,7 @@ index 000000000..7876b2b5d
 +		return kept
 +	}
 +	b.access.Lock()
-+	b.tcp, b.udp = keep(b.tcp), keep(b.udp)
++	b.tcp, b.udp, b.unchecked = keep(b.tcp), keep(b.udp), keep(b.unchecked)
 +	b.takenFrom = from
 +	b.access.Unlock()
 +	g.balance.Store(b)
@@ -2672,8 +2767,8 @@ index 000000000..7876b2b5d
 +	}
 +}
 +
-+// balanceReferences are the tags of the members the balance uses: those in it and those its
-+// devices with connections still go by.
++// balanceReferences are the tags of the members the balance uses: those in it, while the group is
++// in use, and those its devices with connections still go by.
 +func (g *URLTestGroup) balanceReferences() []string {
 +	b := g.balance.Load()
 +	if b == nil {
@@ -2687,11 +2782,13 @@ index 000000000..7876b2b5d
 +			tags = append(tags, member.Tag())
 +		}
 +	}
-+	for _, member := range b.tcp {
-+		add(member)
-+	}
-+	for _, member := range b.udp {
-+		add(member)
++	if g.inUse() {
++		for _, member := range b.tcp {
++			add(member)
++		}
++		for _, member := range b.udp {
++			add(member)
++		}
 +	}
 +	for _, device := range b.devices {
 +		if device.active > 0 {
@@ -2713,14 +2810,14 @@ index 000000000..7876b2b5d
 +}
 +
 +// Balance returns the members of the balance for TCP and the devices with open connections
-+// on each; nil when the group does not balance.
++// on each; nil when the group does not balance, or its balance rests (urltest_rest.go).
 +func (s *URLTest) Balance() []BalanceMember {
 +	g := s.group
 +	if g == nil {
 +		return nil
 +	}
 +	b := g.balance.Load()
-+	if b == nil {
++	if b == nil || !g.inUse() {
 +		return nil
 +	}
 +	b.access.Lock()
@@ -2740,10 +2837,10 @@ index 000000000..7876b2b5d
 +}
 diff --git a/protocol/group/urltestgroup/urltest_download.go b/protocol/group/urltestgroup/urltest_download.go
 new file mode 100644
-index 000000000..58aa14997
+index 000000000..9d92184f5
 --- /dev/null
 +++ b/protocol/group/urltestgroup/urltest_download.go
-@@ -0,0 +1,211 @@
+@@ -0,0 +1,218 @@
 +package urltestgroup
 +
 +import (
@@ -2850,6 +2947,15 @@ index 000000000..58aa14997
 +			// made it a candidate again: it is tested, or it would keep out, by the
 +			// tolerance, a member that has recovered meanwhile
 +		}
++		// the switch waits for a count of the candidate: the member in use stays until the probe
++		// is done, and the selection then runs again with what it counted. A fallback is chosen by
++		// its place in the list, whatever it loses: nothing to wait for
++		waits := g.mode == modeLoss && currentAlive && candidate != current && !g.isFallback(candidate)
++		if waits && g.switchProbeRuns(tag) {
++			// without another download test: the selection after the probe makes the one before
++			// the switch
++			break
++		}
 +		if g.downloadLink != "" && !downloaded[tag] {
 +			start := time.Now()
 +			if g.downloadStopped(tag, candidate) {
@@ -2863,9 +2969,7 @@ index 000000000..58aa14997
 +			g.setFrozen(tag, time.Time{})
 +			downloaded[tag] = true
 +		}
-+		if g.mode == modeLoss && currentAlive && candidate != current && g.needsSwitchProbe(tag) {
-+			// the switch waits for a count of the candidate: the member in use stays until the
-+			// probe is done, and the selection then runs again with what it counted
++		if waits && g.needsSwitchProbe(tag) {
 +			g.startSwitchProbe(tag, candidate)
 +			break
 +		}
@@ -4817,6 +4921,478 @@ index 000000000..fa736f133
 +		require.Equal(t, []adapter.Outbound{a, f}, urlTest.group.members)
 +	}
 +}
+diff --git a/protocol/group/urltestgroup/urltest_first.go b/protocol/group/urltestgroup/urltest_first.go
+new file mode 100644
+index 000000000..f0a6f1fa8
+--- /dev/null
++++ b/protocol/group/urltestgroup/urltest_first.go
+@@ -0,0 +1,57 @@
++package urltestgroup
++
++import (
++	"time"
++
++	"github.com/sagernet/sing-box/adapter"
++	"github.com/sagernet/sing-box/common/urltest"
++)
++
++// The first loss probes of a group that comes into use (podkop-engine).
++//
++// A periodic probe is too small to decide by: the counts of a member sum up to lossMinSegments
++// after four of them, hours at the default interval. A group that carried nothing has no counts, and
++// the first connections may come because another group has fallen back on it: a loss that decides
++// two hours later decides nothing. So the members a group probes in the first loss_interval of a
++// use and that have no count to decide by are probed with LossProbeLarge, which decides alone, and a
++// selection follows each of these probes. They are as many, and come one after another, as the
++// periodic probes do. A member has one large probe in a loss_interval at most, so a group that is in
++// use now and then pays for its members once, and a member whose counts are kept from an earlier use,
++// or cannot be counted, is probed as ever.
++
++// lossProbeSize is the size of a periodic probe of a member.
++func (g *URLTestGroup) lossProbeSize(tag string) int64 {
++	now := time.Now()
++	if now.Sub(g.usedSince.Load()) >= g.loss.interval || !g.history.LossNotCounted(tag).IsZero() {
++		return urltest.LossProbeSmall
++	}
++	if started, probed := g.switchProbed.Load(tag); probed && now.Sub(started.(time.Time)) < g.loss.interval {
++		if last, _ := g.history.LossAttempt(tag); !last.Before(started.(time.Time)) {
++			return urltest.LossProbeSmall
++		}
++		// one before a switch that was given up for want of its turn
++	}
++	if _, known := g.history.LossOfWindow(tag, now, lossMinSegments); known {
++		return urltest.LossProbeSmall
++	}
++	return urltest.LossProbeLarge
++}
++
++// firstLossProbe runs a large probe of a member and asks for a selection once it is done. One
++// before a switch to the member that runs does as well, and is not made twice; a selection that
++// comes meanwhile takes this one for it.
++func (g *URLTestGroup) firstLossProbe(tag string, member adapter.Outbound) {
++	started := time.Now()
++	if _, running := g.switchProbes.LoadOrStore(tag, started); running {
++		return
++	}
++	g.probeLoss(tag, member, urltest.LossProbeLarge, true)
++	if last, _ := g.history.LossAttempt(tag); !last.Before(started) {
++		// one that was made: not one that had no turn
++		g.switchProbed.Store(tag, started)
++	}
++	g.switchProbes.CompareAndDelete(tag, started)
++	if g.ctx.Err() == nil {
++		g.requestUpdateCheck()
++	}
++}
+diff --git a/protocol/group/urltestgroup/urltest_first_test.go b/protocol/group/urltestgroup/urltest_first_test.go
+new file mode 100644
+index 000000000..086bd8ef6
+--- /dev/null
++++ b/protocol/group/urltestgroup/urltest_first_test.go
+@@ -0,0 +1,403 @@
++package urltestgroup
++
++import (
++	"fmt"
++	"net"
++	"net/http"
++	"net/http/httptest"
++	"sync"
++	"testing"
++	"time"
++
++	"github.com/sagernet/sing-box/adapter"
++	"github.com/sagernet/sing-box/common/urltest"
++	C "github.com/sagernet/sing-box/constant"
++	N "github.com/sagernet/sing/common/network"
++
++	"github.com/stretchr/testify/require"
++)
++
++// firstStand is a group of the servers a, b, ... with delays 100, 110, ... that was tested and is not
++// in use yet.
++type firstStand struct {
++	urlTest *URLTest
++	group   *URLTestGroup
++	members map[string]*testMember
++	server  *httptest.Server
++	access  sync.Mutex
++	order   []int64 // the sizes of the probes, as they came
++	running int
++	most    int
++	hold    func(number int) chan struct{} // what the probe of this number waits for
++}
++
++func newFirstStand(t *testing.T, mode string, count int) *firstStand {
++	s := &firstStand{members: make(map[string]*testMember)}
++	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		var last int64
++		fmt.Sscanf(r.Header.Get("Range"), "bytes=0-%d", &last)
++		s.access.Lock()
++		s.order = append(s.order, last+1)
++		number := len(s.order)
++		s.running++
++		s.most = max(s.most, s.running)
++		hold := s.hold
++		s.access.Unlock()
++		defer func() {
++			s.access.Lock()
++			s.running--
++			s.access.Unlock()
++		}()
++		if hold != nil {
++			if gate := hold(number); gate != nil {
++				select {
++				case <-gate:
++				case <-r.Context().Done():
++					return
++				}
++			}
++		}
++		// less than asked: at the window of a probe a megabyte takes seconds here
++		const body = 32 << 10
++		w.Header().Set("Content-Length", fmt.Sprint(body))
++		w.Write(make([]byte, body))
++	}))
++	t.Cleanup(server.Close)
++	s.server = server
++	var outbounds []adapter.Outbound
++	delays := make(map[string]uint16)
++	for i := range count {
++		tag := string(rune('a' + i))
++		s.members[tag] = newTestMember(C.TypeSOCKS, tag, dialProbe)
++		outbounds = append(outbounds, s.members[tag])
++		delays[tag] = uint16(100 + 10*i)
++	}
++	s.urlTest, s.group = newModeGroup(t, mode, outbounds, delays, func(group *URLTestGroup) {
++		group.tolerance = 5
++	})
++	s.group.loss.link = server.URL
++	// tested, and not in use
++	s.group.lastUse.Store(time.Time{})
++	return s
++}
++
++func (s *firstStand) sizes() (small int, large int) {
++	s.access.Lock()
++	defer s.access.Unlock()
++	for _, size := range s.order {
++		switch size {
++		case urltest.LossProbeSmall:
++			small++
++		case urltest.LossProbeLarge:
++			large++
++		}
++	}
++	return
++}
++
++func (s *firstStand) forget() {
++	s.access.Lock()
++	defer s.access.Unlock()
++	s.order = nil
++}
++
++func (s *firstStand) connect(t *testing.T) {
++	t.Helper()
++	conn, err := s.urlTest.DialContext(sourceContext("10.0.0.1"), N.NetworkTCP, balanceTarget(t))
++	require.NoError(t, err)
++	conn.Close()
++}
++
++// settled waits for the probes that run.
++func (s *firstStand) settled(t *testing.T) {
++	t.Helper()
++	require.Eventually(t, func() bool {
++		busy := s.group.lossRunning.Load() || s.group.updatePending.Load()
++		s.group.switchProbes.Range(func(_, _ any) bool {
++			busy = true
++			return false
++		})
++		return !busy
++	}, 20*time.Second, 10*time.Millisecond)
++}
++
++// A group that comes into use without counts probes the members it would probe once with the size
++// that decides alone: the one in use and the three best others, in the balance those of the balance
++// and two more, one after another. Nothing is made twice, at a round, or when the group comes into
++// use again.
++func TestFirstLossProbes(t *testing.T) {
++	for mode, targets := range map[string]int{modeLoss: lossCandidates + 1, modeBalance: defaultBalanceSize + 2} {
++		t.Run(mode, func(t *testing.T) {
++			s := newFirstStand(t, mode, 8)
++			s.connect(t)
++			require.Eventually(t, func() bool {
++				_, large := s.sizes()
++				return large == targets
++			}, 20*time.Second, 10*time.Millisecond)
++			s.settled(t)
++			small, large := s.sizes()
++			require.Equal(t, [2]int{0, targets}, [2]int{small, large})
++			require.Equal(t, 1, s.most, "one at a time")
++			for i, member := range []string{"a", "b", "c", "d", "e", "f", "g", "h"} {
++				probed, _ := s.group.history.LossAttempt(member)
++				require.Equal(t, i < targets, !probed.IsZero(), member)
++			}
++			// a round: nothing is due; idle and in use again, time after time: the same
++			s.group.lossRound()
++			for range 3 {
++				s.group.idleForTest()
++				s.connect(t)
++			}
++			s.settled(t)
++			small, large = s.sizes()
++			require.Equal(t, [2]int{0, targets}, [2]int{small, large})
++		})
++	}
++}
++
++// Due again, with the group in use again: a member that had a large probe within the loss_interval
++// has a small one, whatever the large one counted.
++func TestFirstLossProbeOnceAnInterval(t *testing.T) {
++	s := newFirstStand(t, modeLoss, 2)
++	s.connect(t)
++	require.Eventually(t, func() bool {
++		_, large := s.sizes()
++		return large == 2
++	}, 20*time.Second, 10*time.Millisecond)
++	s.settled(t)
++	_, known := s.group.history.LossOfWindow("a", time.Now(), lossMinSegments)
++	require.False(t, known, "a few segments over the loopback decide nothing")
++	due := func(large time.Duration) {
++		for _, tag := range []string{"a", "b"} {
++			// the large probe, and the last attempt, that long ago
++			s.group.switchProbed.Store(tag, time.Now().Add(-large))
++			s.group.history.StoreLossSample(tag, urltest.LossSample{At: time.Now().Add(-s.group.lossRest() - time.Second), Segments: 20})
++		}
++		s.group.idleForTest()
++		s.forget()
++		s.connect(t)
++		require.Eventually(t, func() bool {
++			small, large := s.sizes()
++			return small+large == 2
++		}, 20*time.Second, 10*time.Millisecond)
++		s.settled(t)
++	}
++	due(s.group.lossRest() + 2*time.Second)
++	small, large := s.sizes()
++	require.Equal(t, [2]int{2, 0}, [2]int{small, large})
++	// the large ones are older than the loss_interval
++	due(s.group.loss.interval + time.Second)
++	small, large = s.sizes()
++	require.Equal(t, [2]int{0, 2}, [2]int{small, large})
++}
++
++// What makes a periodic probe a large one.
++func TestLossProbeSize(t *testing.T) {
++	s := newFirstStand(t, modeLoss, 1)
++	group := s.group
++	size := func() int64 { return group.lossProbeSize("a") }
++	require.EqualValues(t, urltest.LossProbeSmall, size(), "never in use")
++	group.usedSince.Store(time.Now())
++	require.EqualValues(t, urltest.LossProbeLarge, size())
++	group.usedSince.Store(time.Now().Add(-group.loss.interval))
++	require.EqualValues(t, urltest.LossProbeSmall, size(), "in use for long")
++	group.usedSince.Store(time.Now())
++	storeLoss(group, "a", lossMinSegments-1, 5, 20*time.Millisecond)
++	require.EqualValues(t, urltest.LossProbeLarge, size(), "a count too small to decide by")
++	group.switchProbed.Store("a", time.Now())
++	require.EqualValues(t, urltest.LossProbeLarge, size(), "given up for want of its turn")
++	group.history.StoreLossFailure("a", time.Now())
++	require.EqualValues(t, urltest.LossProbeSmall, size(), "had one")
++	group.switchProbed.Delete("a")
++	storeLoss(group, "a", 1, 0, 20*time.Millisecond)
++	require.EqualValues(t, urltest.LossProbeSmall, size(), "a count to decide by")
++	group.history.DeleteURLTestHistory("a")
++	require.EqualValues(t, urltest.LossProbeLarge, size())
++	group.history.StoreLossNotCounted("a", time.Now().Add(-lossNotCountedRest))
++	require.EqualValues(t, urltest.LossProbeSmall, size(), "a member that could not be counted")
++
++	// a hot swap: the use began when it did
++	next, nextGroup := newTestURLTest(t, "", s.members["a"])
++	group.usedSince.Store(time.Now().Add(-time.Minute))
++	next.TakeOver(s.urlTest)
++	require.Equal(t, group.usedSince.Load(), nextGroup.usedSince.Load())
++}
++
++// The choice follows each large probe, not the round of them.
++func TestFirstLossProbeDecides(t *testing.T) {
++	s := newFirstStand(t, modeLoss, 4)
++	gate := make(chan struct{})
++	defer close(gate)
++	s.hold = func(number int) chan struct{} {
++		if number < 3 {
++			return nil
++		}
++		return gate
++	}
++	setResult(s.group, "b", 20)
++	tcp, _ := selectedTags(s.group)
++	require.Equal(t, "a", tcp)
++	s.connect(t)
++	waitChoice(t, s.group, "b")
++	require.True(t, s.group.lossRunning.Load(), "the third probe is held")
++}
++
++// One before a switch that runs is the member's first: it is not made twice.
++func TestFirstLossProbeRunsOnce(t *testing.T) {
++	s := newFirstStand(t, modeLoss, 2)
++	gate := make(chan struct{})
++	s.hold = func(int) chan struct{} { return gate }
++	s.group.used() // the first probe of a takes the turn
++	require.Eventually(t, func() bool {
++		_, large := s.sizes()
++		return large == 1
++	}, 10*time.Second, 10*time.Millisecond)
++	_, running := s.group.switchProbes.Load("a")
++	require.True(t, running, "a selection that would switch to a waits for it")
++	started := time.Now()
++	s.group.firstLossProbe("a", s.members["a"])
++	require.Less(t, time.Since(started), 5*time.Second, "it waited for the turn the first one has")
++	_, large := s.sizes()
++	require.Equal(t, 1, large)
++	close(gate)
++	s.settled(t)
++	_, large = s.sizes()
++	require.Equal(t, 2, large)
++}
++
++// A group that is idle again in the middle of its probes makes no more of them.
++func TestFirstLossProbesEndWithUse(t *testing.T) {
++	s := newFirstStand(t, modeLoss, 4)
++	gate := make(chan struct{})
++	s.hold = func(int) chan struct{} { return gate }
++	s.group.used()
++	require.Eventually(t, func() bool {
++		_, large := s.sizes()
++		return large == 1
++	}, 10*time.Second, 10*time.Millisecond)
++	s.group.idleForTest()
++	close(gate)
++	s.settled(t)
++	_, large := s.sizes()
++	require.Equal(t, 1, large)
++}
++
++// A large probe cut by a change of the network says nothing and was none: the next one is large too.
++func TestFirstLossProbeCut(t *testing.T) {
++	s := newFirstStand(t, modeLoss, 1)
++	s.group.lastUse.Store(time.Now())
++	s.group.usedSince.Store(time.Now())
++	gate := make(chan struct{})
++	defer close(gate)
++	s.hold = func(int) chan struct{} { return gate }
++	done := make(chan struct{})
++	go func() {
++		s.group.firstLossProbe("a", s.members["a"])
++		close(done)
++	}()
++	require.Eventually(t, func() bool {
++		_, large := s.sizes()
++		return large == 1
++	}, 10*time.Second, 10*time.Millisecond)
++	s.group.networkReset()
++	s.server.CloseClientConnections()
++	<-done
++	attempt, _ := s.group.history.LossAttempt("a")
++	require.True(t, attempt.IsZero())
++	require.EqualValues(t, urltest.LossProbeLarge, s.group.lossProbeSize("a"))
++	require.True(t, s.group.needsSwitchProbe("a"), "a switch to the member asks for one as well")
++}
++
++// Before a round has tested the members nothing is known of the best of them: the probes of a group
++// that comes into use wait for its end.
++func TestFirstLossProbesAfterRound(t *testing.T) {
++	s := newFirstStand(t, modeLoss, 2)
++	s.group.roundDone.Store(false)
++	s.connect(t)
++	s.settled(t)
++	require.Empty(t, s.order)
++	s.group.roundDone.Store(true)
++	s.group.lossRound()
++	require.Eventually(t, func() bool {
++		_, large := s.sizes()
++		return large == 2
++	}, 10*time.Second, 10*time.Millisecond)
++}
++
++// idle_timeout of one interval, and a connection now and then: each connection that finds the group
++// idle has a round at once, the ticker stops an interval or two after it, and the loss probes are made
++// once.
++func TestIdleTimeoutOfInterval(t *testing.T) {
++	const interval = 300 * time.Millisecond
++	s := newFirstStand(t, modeLoss, 2)
++	link, tests := testURL(t, 0)
++	s.group.links = linkList(link)
++	s.group.interval, s.group.idleTimeout = interval, interval
++	s.group.watchPause(&testPause{})
++	s.group.PostStart()
++	require.Eventually(t, func() bool { return tests.Load() == 2 }, 10*time.Second, time.Millisecond)
++	ticking := func() bool {
++		s.group.access.Lock()
++		defer s.group.access.Unlock()
++		return s.group.ticker != nil
++	}
++	time.Sleep(3 * interval)
++	require.Equal(t, int32(2), tests.Load(), "no rounds without connections")
++	for range 4 {
++		before := tests.Load()
++		s.connect(t)
++		require.True(t, ticking())
++		require.True(t, s.group.inUse())
++		time.Sleep(4 * interval)
++		require.False(t, ticking(), "the ticker stopped")
++		require.False(t, s.group.inUse())
++		rounds := (tests.Load() - before) / 2
++		require.GreaterOrEqual(t, rounds, int32(1))
++		require.LessOrEqual(t, rounds, int32(2))
++	}
++	s.settled(t)
++	small, large := s.sizes()
++	require.Equal(t, [2]int{0, 2}, [2]int{small, large})
++	// connections that come more often than the interval keep the rounds coming
++	before := tests.Load()
++	for range 12 {
++		s.connect(t)
++		time.Sleep(interval / 2)
++	}
++	require.True(t, ticking())
++	require.GreaterOrEqual(t, (tests.Load()-before)/2, int32(4))
++}
++
++// A connection of the router touches the group twice: as it is attached, and as it is dialed through
++// the group. The group that was idle has its round at once all the same, and the loss probes after it,
++// not an interval later.
++func TestIdleGroupRoundAtFirstConnection(t *testing.T) {
++	const interval = 20 * time.Second
++	for range 5 {
++		s := newFirstStand(t, modeLoss, 2)
++		link, tests := testURL(t, 0)
++		s.group.links = linkList(link)
++		s.group.interval, s.group.idleTimeout = interval, interval
++		s.group.watchPause(&testPause{})
++		s.group.started = true
++		idleSince := time.Now().Add(-2 * interval)
++		s.group.lastActive.Store(idleSince)
++		s.group.lastRound.Store(int64(idleSince.Sub(s.group.epoch)))
++		for _, member := range s.members {
++			s.group.history.StoreURLTestHistory(member.Tag(), &adapter.URLTestHistory{Time: idleSince, Delay: 100})
++		}
++		one, other := net.Pipe()
++		detach := s.urlTest.AttachConnection(one)
++		s.connect(t)
++		require.Eventually(t, func() bool { return tests.Load() == 2 }, interval/4, 10*time.Millisecond, "a round at once")
++		require.Eventually(t, func() bool {
++			_, large := s.sizes()
++			return large == 2
++		}, interval/4, 10*time.Millisecond, "the loss probes after it")
++		s.settled(t)
++		require.EqualValues(t, 2, tests.Load(), "one round")
++		detach()
++		one.Close()
++		other.Close()
++	}
++}
 diff --git a/protocol/group/urltestgroup/urltest_interval_test.go b/protocol/group/urltestgroup/urltest_interval_test.go
 new file mode 100644
 index 000000000..d1ba3ced5
@@ -4916,10 +5492,10 @@ index 000000000..d1ba3ced5
 +}
 diff --git a/protocol/group/urltestgroup/urltest_loss.go b/protocol/group/urltestgroup/urltest_loss.go
 new file mode 100644
-index 000000000..d93dfee7a
+index 000000000..ad4d1cc09
 --- /dev/null
 +++ b/protocol/group/urltestgroup/urltest_loss.go
-@@ -0,0 +1,394 @@
+@@ -0,0 +1,420 @@
 +package urltestgroup
 +
 +import (
@@ -4940,7 +5516,8 @@ index 000000000..d93dfee7a
 +// fastest (the default) chooses by the delay of the URL tests, as before. loss chooses by
 +// the delay weighed by the loss loss probes counted (urltest.LossProbe): the members it may
 +// switch to and the member in use are probed once a loss_interval with LossProbeSmall bytes,
-+// and a member the group would switch to without a fresh count first with LossProbeLarge.
++// and a member the group would switch to without a fresh count first with LossProbeLarge. A group
++// that carries no connections probes nothing (urltest_use.go).
 +// balance spreads the connections over the best members by their source address
 +// (urltest_balance.go), leaving out a member that loses more than loss_threshold percent.
 +//
@@ -5165,12 +5742,16 @@ index 000000000..d93dfee7a
 +	return !g.lossResting(tag)
 +}
 +
-+// needsSwitchProbe tells whether a member the group would switch to is probed first: it can
-+// be counted, no probe before a switch to it ran within the rest (one that counted too little
-+// to decide by, a slow path cut by the time limit, would be made again at every selection),
-+// no probe of it failed within the rest (a URL that answers a status through it would hold it
-+// back for good), and it has no count to decide by fresher than the interval.
++// needsSwitchProbe tells whether a member the group would switch to is probed first: the group is
++// in use (urltest_use.go), the member can be counted, no probe before a switch to it ran within the
++// rest (one that counted too little to decide by, a slow path cut by the time limit, would be made
++// again at every selection), no probe of it failed within the rest (a URL that answers a status
++// through it would hold it back for good), and it has no count to decide by fresher than the
++// interval.
 +func (g *URLTestGroup) needsSwitchProbe(tag string) bool {
++	if !g.inUse() {
++		return false
++	}
 +	if notCounted := g.history.LossNotCounted(tag); !notCounted.IsZero() && time.Since(notCounted) < lossNotCountedRest {
 +		return false
 +	}
@@ -5191,6 +5772,9 @@ index 000000000..d93dfee7a
 +// lossSlotWait bounds how long a probe waits for the probes of other groups.
 +const lossSlotWait = 30 * time.Second
 +
++// lossProbeTime bounds a probe once it has its turn.
++const lossProbeTime = urltest.LossProbeTimeout + 5*time.Second
++
 +// probeLoss runs a loss probe of size bytes through member and keeps what it counted; it
 +// reports whether a count was kept. A probe that kept none is recorded: the next one waits
 +// the rest, and only the first failure in a row is a warning.
@@ -5210,7 +5794,7 @@ index 000000000..d93dfee7a
 +	}
 +	// the probe's own time, after the wait: a megabyte at the window of the probe over a far
 +	// path takes most of it
-+	ctx, cancel := context.WithTimeout(g.ctx, urltest.LossProbeTimeout+5*time.Second)
++	ctx, cancel := context.WithTimeout(g.ctx, lossProbeTime)
 +	defer cancel()
 +	// a new connection to the first server of the member, like a URL test (probes)
 +	if probes.waitHop(ctx, firstHop(g.outbound, member)) != nil {
@@ -5244,18 +5828,31 @@ index 000000000..d93dfee7a
 +	return false
 +}
 +
++// switchProbeRuns tells whether a probe before a switch to a member runs: what it counts is
++// waited for, the member is not "probed lately" yet (needsSwitchProbe). A probe ends within its
++// time, whatever the far end does; one that did not (a dial that does not end with its context)
++// holds back no switch any longer.
++func (g *URLTestGroup) switchProbeRuns(tag string) bool {
++	started, running := g.switchProbes.Load(tag)
++	return running && time.Since(started.(time.Time)) < lossSlotWait+lossProbeTime
++}
++
 +// startSwitchProbe probes, in the background, a member the group would switch to, and asks
 +// for a selection once the probe is done: the selection does not wait for it (a megabyte
 +// may take half a minute, and a member in use that goes down meanwhile is left at once). One
 +// probe of a member at a time.
 +func (g *URLTestGroup) startSwitchProbe(tag string, member adapter.Outbound) {
-+	if _, running := g.switchProbes.LoadOrStore(tag, struct{}{}); running {
-+		return
++	started := time.Now()
++	if earlier, running := g.switchProbes.LoadOrStore(tag, started); running {
++		if g.switchProbeRuns(tag) || !g.switchProbes.CompareAndSwap(tag, earlier, started) {
++			return
++		}
 +	}
-+	g.switchProbed.Store(tag, time.Now())
++	g.switchProbed.Store(tag, started)
 +	go func() {
-+		defer g.switchProbes.Delete(tag)
 +		g.probeLoss(tag, member, urltest.LossProbeLarge, false)
++		// before the selection it asks for, which would wait for it
++		g.switchProbes.CompareAndDelete(tag, started)
 +		if g.ctx.Err() == nil {
 +			g.requestUpdateCheck()
 +		}
@@ -5289,20 +5886,25 @@ index 000000000..d93dfee7a
 +}
 +
 +// lossRound runs the periodic probes of the members that are due, after a round, in the
-+// background: one round of probes at a time. A count kept asks for a selection.
++// background: one round of probes at a time, while the group is in use (urltest_use.go). A count
++// kept asks for a selection.
 +func (g *URLTestGroup) lossRound() {
-+	if g.mode == modeFastest || g.closed.Load() || !g.lossRunning.CompareAndSwap(false, true) {
++	if g.mode == modeFastest || g.closed.Load() || !g.inUse() || !g.lossRunning.CompareAndSwap(false, true) {
 +		return
 +	}
 +	go func() {
 +		defer g.lossRunning.Store(false)
 +		counted := false
 +		for _, member := range g.lossTargets() {
-+			if g.ctx.Err() != nil || g.networkPaused() {
++			if g.ctx.Err() != nil || g.networkPaused() || !g.inUse() {
 +				return
 +			}
 +			tag := group.RealTag(member, N.NetworkTCP)
 +			if !g.lossDue(tag) {
++				continue
++			}
++			if g.lossProbeSize(tag) == urltest.LossProbeLarge {
++				g.firstLossProbe(tag, member)
 +				continue
 +			}
 +			if g.probeLoss(tag, member, urltest.LossProbeSmall, true) {
@@ -5316,10 +5918,10 @@ index 000000000..d93dfee7a
 +}
 diff --git a/protocol/group/urltestgroup/urltest_loss_test.go b/protocol/group/urltestgroup/urltest_loss_test.go
 new file mode 100644
-index 000000000..a1e4a6cd6
+index 000000000..b82c6ac51
 --- /dev/null
 +++ b/protocol/group/urltestgroup/urltest_loss_test.go
-@@ -0,0 +1,571 @@
+@@ -0,0 +1,575 @@
 +package urltestgroup
 +
 +import (
@@ -5397,6 +5999,8 @@ index 000000000..a1e4a6cd6
 +
 +func newModeGroup(t *testing.T, mode string, outbounds []adapter.Outbound, delays map[string]uint16, prepare func(group *URLTestGroup)) (*URLTest, *URLTestGroup) {
 +	urlTest, group := newTestFallbackGroup(t, "", "", outbounds, nil, nil)
++	// its probes end with the test: the probes of the process come one after another
++	t.Cleanup(func() { group.Close() })
 +	group.logger = formattingLogger(t)
 +	var err error
 +	group.mode, group.loss, err = groupMode(mode, "http://127.0.0.1:1/loss", 0, 0, 0, 0)
@@ -5408,6 +6012,8 @@ index 000000000..a1e4a6cd6
 +	if prepare != nil {
 +		prepare(group)
 +	}
++	// the loss probes of a group run while it is in use
++	group.lastUse.Store(time.Now())
 +	for tag, delay := range delays {
 +		setResult(group, tag, delay)
 +	}
@@ -8237,6 +8843,498 @@ index 000000000..e845235aa
 +	defer responses.access.Unlock()
 +	require.Empty(t, responses.pending, "the answer that came through the read waiter was not seen")
 +}
+diff --git a/protocol/group/urltestgroup/urltest_rest.go b/protocol/group/urltestgroup/urltest_rest.go
+new file mode 100644
+index 000000000..2cfe2a0cc
+--- /dev/null
++++ b/protocol/group/urltestgroup/urltest_rest.go
+@@ -0,0 +1,94 @@
++package urltestgroup
++
++import (
++	"time"
++
++	N "github.com/sagernet/sing/common/network"
++)
++
++// A balance at rest (podkop-engine).
++//
++// The balance of a group is the best of its members at each selection, and a member that comes in is
++// download tested. The best three of ten servers with about the same delay are others at almost every
++// round, so a balance costs 64 KiB a round, whether anything goes through the group or not. A group
++// that is not in use (urltest_use.go: the fallback of another, mostly) has no balance: it keeps its
++// plain choice, as the mode fastest does, download tested as any choice is before a switch to it.
++//
++// The balance is made when the group comes into use, from the delays the tests found and the counts
++// of loss that are kept, before the first connection is dialed: it and those that come with it are
++// spread as any. What the first connections do not have is the download test of their members, which
++// begins with the first of them: a member that fails it leaves the balance, and its devices go to
++// another at their next connection. A member that passed it within the loss_interval has no need of
++// it, so a group that is in use now and then is not download tested time after time; nor is a member
++// that left the balance and comes back. Before a round has tested the members there is no balance to
++// make: the first connections go by the plain choice, until the round's selection makes it.
++
++// startUse records a use at now, and tells whether the group comes into use by it. Who finds the
++// group in use finds its balance.
++func (g *URLTestGroup) startUse(now time.Time) bool {
++	if g.usedLately(now) {
++		g.lastUse.Store(now)
++		return false
++	}
++	g.useStart.Lock()
++	defer g.useStart.Unlock()
++	if g.usedLately(now) {
++		// another connection brought the group into use
++		g.lastUse.Store(now)
++		return false
++	}
++	g.startBalance()
++	g.lastUse.Store(now)
++	return true
++}
++
++func (g *URLTestGroup) usedLately(now time.Time) bool {
++	last := g.lastUse.Load()
++	return !last.IsZero() && now.Sub(last) <= g.idleTimeout
++}
++
++// startBalance makes the balance of a group that comes into use. The caller holds useStart.
++func (g *URLTestGroup) startBalance() {
++	b := g.balance.Load()
++	if g.mode != modeBalance || b == nil || !g.roundDone.Load() {
++		return
++	}
++	view := g.lossView()
++	tcp := g.balanceMembers(N.NetworkTCP, view, nil)
++	udp := g.balanceMembers(N.NetworkUDP, view, nil)
++	if g.putBalance(b, tcp, udp, tcp) {
++		g.history.NotifyUpdated()
++	}
++}
++
++// restBalance takes the members out of the balance of a group that is not in use, and tells whether
++// it is not. The connections its devices have go on.
++func (g *URLTestGroup) restBalance(b *balancer) bool {
++	g.useStart.Lock()
++	if g.inUse() {
++		g.useStart.Unlock()
++		return false
++	}
++	b.access.Lock()
++	had := g.balance.Load() == b && len(b.tcp)+len(b.udp) > 0
++	if had {
++		b.tcp, b.udp, b.unchecked = nil, nil, nil
++	}
++	b.access.Unlock()
++	g.useStart.Unlock()
++	if had {
++		g.logger.Debug("no connections for ", g.idleTimeout, ", the balance rests")
++		g.history.NotifyUpdated()
++	}
++	return true
++}
++
++// downloadPassed tells whether a member has passed the download test within the loss_interval, and
++// is not frozen since.
++func (g *URLTestGroup) downloadPassed(tag string) bool {
++	if _, isFrozen := g.frozen.Load()[tag]; isFrozen {
++		return false
++	}
++	result, known := g.history.LoadDownloadResult(tag)
++	return known && !result.Stopped && time.Since(result.At) < g.loss.interval
++}
+diff --git a/protocol/group/urltestgroup/urltest_rest_test.go b/protocol/group/urltestgroup/urltest_rest_test.go
+new file mode 100644
+index 000000000..8fe193ccf
+--- /dev/null
++++ b/protocol/group/urltestgroup/urltest_rest_test.go
+@@ -0,0 +1,386 @@
++package urltestgroup
++
++import (
++	"context"
++	"fmt"
++	"net"
++	"net/http"
++	"net/http/httptest"
++	"slices"
++	"strings"
++	"sync"
++	"testing"
++	"time"
++
++	"github.com/sagernet/sing-box/adapter"
++	"github.com/sagernet/sing-box/common/urltest"
++	C "github.com/sagernet/sing-box/constant"
++	"github.com/sagernet/sing-box/log"
++	M "github.com/sagernet/sing/common/metadata"
++	N "github.com/sagernet/sing/common/network"
++
++	"github.com/stretchr/testify/require"
++)
++
++// restStand is a balance of five servers with delays 100 to 140, of which three are in it, with a
++// download test. The server of the download test tells the member by the address it is reached at
++// (each member has a listener of its own).
++type restStand struct {
++	urlTest *URLTest
++	group   *URLTestGroup
++	target  M.Socksaddr
++	access  sync.Mutex
++	tests   map[string]int
++	stops   map[string]bool          // the members whose download stops
++	hold    map[string]chan struct{} // the members whose download waits
++}
++
++func newRestStand(t *testing.T) *restStand {
++	s := &restStand{target: balanceTarget(t), tests: make(map[string]int), stops: make(map[string]bool), hold: make(map[string]chan struct{})}
++	var outbounds []adapter.Outbound
++	delays := make(map[string]uint16)
++	for i, tag := range []string{"a", "b", "c", "d", "e"} {
++		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++			s.access.Lock()
++			s.tests[tag]++
++			stops, hold := s.stops[tag], s.hold[tag]
++			s.access.Unlock()
++			if hold != nil {
++				select {
++				case <-hold:
++				case <-r.Context().Done():
++					return
++				}
++			}
++			w.Header().Set("Content-Length", fmt.Sprint(urltest.DownloadTestSize))
++			if stops {
++				w.Write(make([]byte, 16<<10))
++				w.(http.Flusher).Flush()
++				panic(http.ErrAbortHandler)
++			}
++			w.Write(make([]byte, urltest.DownloadTestSize))
++		}))
++		t.Cleanup(server.Close)
++		address := server.Listener.Addr().String()
++		outbounds = append(outbounds, newTestMember(C.TypeSOCKS, tag, func(ctx context.Context, network string, destination M.Socksaddr) (net.Conn, error) {
++			if destination.Fqdn == "download.test" {
++				return (&net.Dialer{}).DialContext(ctx, network, address)
++			}
++			return dialWorking(ctx, network, destination)
++		}))
++		delays[tag] = uint16(100 + 10*i)
++	}
++	// with its first choice, download tested
++	s.urlTest, s.group = newTestFallbackGroup(t, "", "http://download.test/", outbounds, nil, delays)
++	t.Cleanup(func() { s.group.Close() })
++	s.group.logger = formattingLogger(t)
++	var err error
++	// the loss URL refuses: the probes are not what is looked at
++	s.group.mode, s.group.loss, err = groupMode(modeBalance, "http://127.0.0.1:1/loss", 0, 0, 0, 0)
++	require.NoError(t, err)
++	s.urlTest.mode, s.urlTest.loss = s.group.mode, s.group.loss
++	s.group.balance.Store(newBalancer())
++	s.group.performUpdateCheck()
++	return s
++}
++
++func (s *restStand) tested() map[string]int {
++	s.access.Lock()
++	defer s.access.Unlock()
++	tested := make(map[string]int)
++	for tag, count := range s.tests {
++		tested[tag] = count
++	}
++	return tested
++}
++
++func (s *restStand) connect(t *testing.T, source string) string {
++	t.Helper()
++	conn, err := s.urlTest.DialContext(sourceContext(source), N.NetworkTCP, s.target)
++	require.NoError(t, err)
++	conn.Close()
++	balance := s.group.balance.Load()
++	balance.access.Lock()
++	defer balance.access.Unlock()
++	device := balance.devices[source]
++	require.NotNil(t, device, "the connection went by the plain choice")
++	return device.member.Tag()
++}
++
++func (s *restStand) balance() []string {
++	tags := make([]string, 0, 3)
++	for _, member := range s.urlTest.Balance() {
++		tags = append(tags, member.Tag)
++	}
++	return tags
++}
++
++// restLog keeps the lines of a logger.
++type restLog struct {
++	access sync.Mutex
++	lines  strings.Builder
++}
++
++func (l *restLog) Write(p []byte) (int, error) {
++	l.access.Lock()
++	defer l.access.Unlock()
++	return l.lines.Write(p)
++}
++
++func (l *restLog) count(text string) int {
++	l.access.Lock()
++	defer l.access.Unlock()
++	return strings.Count(l.lines.String(), text)
++}
++
++// checked waits for the download tests that run.
++func (s *restStand) checked(t *testing.T) {
++	t.Helper()
++	require.Eventually(t, func() bool {
++		if s.group.updatePending.Load() || !s.group.updateAccess.TryLock() {
++			return false
++		}
++		s.group.updateAccess.Unlock()
++		return true
++	}, 20*time.Second, 5*time.Millisecond)
++}
++
++// Not in use, the balance rests: the delays change the best three at every selection, and nothing is
++// download tested but the one choice, which stays; no connection is kept but the choice's.
++func TestBalanceRests(t *testing.T) {
++	s := newRestStand(t)
++	for round := range 5 {
++		for i, tag := range []string{"a", "b", "c", "d", "e"} {
++			setResult(s.group, tag, uint16(100+10*((i+round)%5)))
++		}
++		s.group.performUpdateCheck()
++		require.Nil(t, s.urlTest.Balance())
++		require.Equal(t, "a", s.urlTest.Now())
++	}
++	require.Equal(t, map[string]int{"a": 1}, s.tested(), "the choice, before it was chosen")
++	require.Equal(t, []string{"a"}, s.urlTest.References())
++	// a test of the group above dials the choice
++	conn, err := s.urlTest.DialContext(urltest.ContextWithTest(context.Background()), N.NetworkTCP, s.target)
++	require.NoError(t, err)
++	conn.Close()
++	require.Nil(t, s.urlTest.Balance())
++	require.Empty(t, s.group.balance.Load().devices)
++}
++
++// The first connection after the group comes into use is spread, and so are those that come with it;
++// the download tests of the members run then, but of the choice's, which passed its own lately.
++func TestBalanceFirstConnection(t *testing.T) {
++	s := newRestStand(t)
++	best := s.group.balanceMembers(N.NetworkTCP, s.group.lossView(), nil)
++	require.Len(t, best, 3)
++	used := make(map[string]bool)
++	for i := range 30 {
++		source := fmt.Sprint("10.7.0.", i+1)
++		member := s.connect(t, source)
++		require.Equal(t, rendezvous(source, best).Tag(), member)
++		used[member] = true
++	}
++	require.Equal(t, map[string]bool{"a": true, "b": true, "c": true}, used)
++	require.Equal(t, []string{"a", "b", "c"}, s.balance())
++	s.checked(t)
++	require.Equal(t, map[string]int{"a": 1, "b": 1, "c": 1}, s.tested())
++	require.Equal(t, []string{"a", "b", "c"}, s.balance())
++	require.ElementsMatch(t, []string{"a", "b", "c"}, s.urlTest.References())
++	// and once: a selection tests no member again
++	s.group.performUpdateCheck()
++	require.Equal(t, map[string]int{"a": 1, "b": 1, "c": 1}, s.tested())
++}
++
++// The connections that come at once are all spread: none finds the group in use without its balance.
++func TestBalanceFirstConnectionsAtOnce(t *testing.T) {
++	for range 20 {
++		s := newRestStand(t)
++		best := s.group.balanceMembers(N.NetworkTCP, s.group.lossView(), nil)
++		start := make(chan struct{})
++		var waits sync.WaitGroup
++		// selections meanwhile, which take the balance of an idle group away
++		waits.Go(func() {
++			<-start
++			for range 20 {
++				s.group.performUpdateCheck()
++			}
++		})
++		for i := range 8 {
++			waits.Go(func() {
++				<-start
++				source := fmt.Sprint("10.8.0.", i+1)
++				conn, err := s.urlTest.DialContext(sourceContext(source), N.NetworkTCP, s.target)
++				if err == nil {
++					conn.Close()
++				}
++				balance := s.group.balance.Load()
++				balance.access.Lock()
++				device := balance.devices[source]
++				balance.access.Unlock()
++				if err != nil || device == nil || device.member != rendezvous(source, best) {
++					t.Errorf("the connection of %s went by the plain choice (%v)", source, err)
++				}
++			})
++		}
++		close(start)
++		waits.Wait()
++		s.group.Close()
++	}
++}
++
++// In use now and then: the balance rests between, and is the same again without a download test,
++// until those it had are older than the loss_interval. A member that comes back into the balance of
++// a group in use is not tested again either.
++func TestBalanceInUseNowAndThen(t *testing.T) {
++	s := newRestStand(t)
++	output := new(restLog)
++	factory := log.NewDefaultFactory(context.Background(), log.Formatter{BaseTime: time.Now(), DisableColors: true}, output, "", nil, false)
++	factory.SetLevel(log.LevelInfo)
++	require.NoError(t, factory.Start())
++	s.group.logger = factory.NewLogger("urltest")
++	s.connect(t, "10.9.0.1")
++	s.checked(t)
++	tested := map[string]int{"a": 1, "b": 1, "c": 1}
++	require.Equal(t, tested, s.tested())
++	for range 3 {
++		s.group.idleForTest()
++		require.Nil(t, s.urlTest.Balance())
++		require.Equal(t, []string{"a"}, s.urlTest.References())
++		s.group.performUpdateCheck()
++		require.Nil(t, s.urlTest.Balance())
++		require.Empty(t, s.group.balance.Load().tcp)
++		s.connect(t, "10.9.0.1")
++		require.Equal(t, []string{"a", "b", "c"}, s.balance())
++		s.checked(t)
++	}
++	require.Equal(t, tested, s.tested())
++	require.Equal(t, 1, output.count("balance over 3 outbounds: a, b, c"), "told once")
++
++	// in use, d takes the place of c and gives it back
++	setResult(s.group, "d", 105)
++	s.group.performUpdateCheck()
++	require.Equal(t, []string{"a", "d", "b"}, s.balance())
++	setResult(s.group, "d", 130)
++	s.group.performUpdateCheck()
++	require.Equal(t, []string{"a", "b", "c"}, s.balance())
++	tested["d"] = 1
++	require.Equal(t, tested, s.tested())
++
++	// the tests of b and c are due, a's is not
++	for _, tag := range []string{"b", "c"} {
++		s.group.history.StoreDownloadResult(tag, urltest.DownloadResult{At: time.Now().Add(-s.group.loss.interval - time.Second), Received: urltest.DownloadTestSize})
++	}
++	s.group.performUpdateCheck()
++	require.Equal(t, tested, s.tested(), "they are in the balance")
++	s.group.idleForTest()
++	s.connect(t, "10.9.0.1")
++	s.checked(t)
++	tested["b"], tested["c"] = 2, 2
++	require.Equal(t, tested, s.tested())
++}
++
++// A member that fails the download test after the group came into use leaves the balance, and its
++// devices go to another; it was frozen before it is tested again.
++func TestBalanceFirstConnectionFrozen(t *testing.T) {
++	s := newRestStand(t)
++	s.stops["b"] = true
++	sources := make(map[string]string)
++	for i := range 30 {
++		source := fmt.Sprint("10.10.0.", i+1)
++		sources[s.connect(t, source)] = source
++	}
++	s.checked(t)
++	require.Equal(t, []string{"a", "c", "d"}, s.balance())
++	require.Equal(t, map[string]int{"a": 1, "b": 1, "c": 1, "d": 1}, s.tested())
++	if source, has := sources["b"]; has {
++		require.NotEqual(t, "b", s.connect(t, source))
++	}
++	require.False(t, s.group.downloadPassed("b"))
++	// a result stored by another group before it froze here does not pass it
++	s.group.history.StoreDownloadResult("b", urltest.DownloadResult{At: time.Now(), Received: urltest.DownloadTestSize})
++	require.False(t, s.group.downloadPassed("b"))
++	// nor does one that stopped, though it was another group's and the member is not frozen here
++	require.True(t, s.group.downloadPassed("c"))
++	s.group.history.StoreDownloadResult("c", urltest.DownloadResult{At: time.Now(), Received: 16 << 10, Stopped: true})
++	require.False(t, s.group.downloadPassed("c"))
++	s.group.history.StoreDownloadResult("c", urltest.DownloadResult{At: time.Now(), Received: urltest.DownloadTestSize})
++	s.stops["b"] = false
++	setResult(s.group, "b", 110)
++	s.group.performUpdateCheck()
++	require.Equal(t, 2, s.tested()["b"])
++	require.Equal(t, []string{"a", "b", "c"}, s.balance())
++}
++
++// Before a round has tested the members there is no balance: the first connections go by the plain
++// choice, and the round's selection makes it.
++func TestBalanceBeforeRound(t *testing.T) {
++	s := newRestStand(t)
++	s.group.roundDone.Store(false)
++	conn, err := s.urlTest.DialContext(sourceContext("10.11.0.1"), N.NetworkTCP, s.target)
++	require.NoError(t, err)
++	conn.Close()
++	require.Empty(t, s.group.balance.Load().devices)
++	s.checked(t)
++	require.NotNil(t, s.urlTest.Balance())
++	require.Empty(t, s.balance(), "in use, and nothing in it")
++	s.group.roundDone.Store(true)
++	s.group.performUpdateCheck()
++	require.Equal(t, []string{"a", "b", "c"}, s.balance())
++	s.connect(t, "10.11.0.1")
++}
++
++// A group that is idle again before its download tests are done is at rest after them.
++func TestBalanceIdleBeforeTested(t *testing.T) {
++	s := newRestStand(t)
++	s.group.lossRunning.Store(true) // no probes, whose ends ask for selections
++	gate := make(chan struct{})
++	s.hold["b"] = gate
++	s.connect(t, "10.12.0.1")
++	require.Eventually(t, func() bool { return s.tested()["b"] == 1 }, 10*time.Second, 5*time.Millisecond)
++	s.group.idleForTest()
++	close(gate)
++	s.checked(t)
++	require.Nil(t, s.urlTest.Balance())
++	require.Empty(t, s.group.balance.Load().tcp)
++}
++
++// A hot swap: a balance in use goes on with the members not tested yet, which the new group tests;
++// one at rest rests on, and is made at the first connection. A selection of the group that was
++// replaced leaves the balance the other has.
++func TestBalanceRestTakeOver(t *testing.T) {
++	old, next := newRestStand(t), newRestStand(t)
++	next.group.history = old.group.history
++	swap := func() {
++		// without e, and without c when it is in the balance
++		next.group.outbounds = slices.DeleteFunc(slices.Clone(old.group.outbounds), func(member adapter.Outbound) bool {
++			return member.Tag() == "e" || member.Tag() == "c" && old.group.inUse()
++		})
++		next.group.members = next.group.outbounds
++		next.urlTest.TakeOver(old.urlTest)
++	}
++	gate := make(chan struct{})
++	old.hold["b"] = gate
++	old.connect(t, "10.13.0.1")
++	require.Eventually(t, func() bool { return old.tested()["b"] == 1 }, 10*time.Second, 5*time.Millisecond)
++	swap()
++	require.True(t, next.group.inUse())
++	require.Equal(t, []string{"a", "b"}, next.balance())
++	balance := next.group.balance.Load()
++	require.Len(t, balance.unchecked, 2)
++	require.Contains(t, balance.devices, "10.13.0.1")
++	close(gate)
++	old.checked(t)
++	require.Same(t, balance, next.group.balance.Load())
++	require.Len(t, balance.unchecked, 2, "the old group's tests are not the new one's")
++	next.group.performUpdateCheck()
++	require.Empty(t, balance.unchecked)
++	require.Equal(t, []string{"a", "b", "d"}, next.balance())
++
++	old, next = newRestStand(t), newRestStand(t)
++	next.group.history = old.group.history
++	swap()
++	require.False(t, next.group.inUse())
++	require.Nil(t, next.urlTest.Balance())
++	next.connect(t, "10.13.0.2")
++	require.Equal(t, []string{"a", "b", "c"}, next.balance())
++}
 diff --git a/protocol/group/urltestgroup/urltest_review2_test.go b/protocol/group/urltestgroup/urltest_review2_test.go
 new file mode 100644
 index 000000000..470a7fb45
@@ -8487,6 +9585,561 @@ index 000000000..470a7fb45
 +	require.Eventually(t, func() bool { return requests.Load() >= 1 }, 5*time.Second, 5*time.Millisecond, "no round where no member has a result")
 +	// the member has passed: the report is refuted, and the rounds go on by the ticker
 +	require.Eventually(t, func() bool { return requests.Load() >= 3 }, 5*time.Second, 10*time.Millisecond)
++}
+diff --git a/protocol/group/urltestgroup/urltest_switch_test.go b/protocol/group/urltestgroup/urltest_switch_test.go
+new file mode 100644
+index 000000000..4b02c0e43
+--- /dev/null
++++ b/protocol/group/urltestgroup/urltest_switch_test.go
+@@ -0,0 +1,150 @@
++package urltestgroup
++
++import (
++	"fmt"
++	"net/http"
++	"net/http/httptest"
++	"sync/atomic"
++	"testing"
++	"time"
++
++	"github.com/sagernet/sing-box/common/urltest"
++	C "github.com/sagernet/sing-box/constant"
++
++	"github.com/stretchr/testify/require"
++)
++
++// newHeldLossURL serves the loss URL; a probe is answered once release is called.
++func newHeldLossURL(t *testing.T, status int) (link string, requests *atomic.Int32, release func()) {
++	gate := make(chan struct{})
++	requests = new(atomic.Int32)
++	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		requests.Add(1)
++		select {
++		case <-gate:
++		case <-r.Context().Done():
++			return
++		}
++		if status != http.StatusOK {
++			w.WriteHeader(status)
++			return
++		}
++		w.Header().Set("Content-Length", fmt.Sprint(lossProbeBody))
++		w.Write(make([]byte, lossProbeBody))
++	}))
++	t.Cleanup(server.Close)
++	released := false
++	release = func() {
++		if !released {
++			released = true
++			close(gate)
++		}
++	}
++	t.Cleanup(release)
++	return server.URL, requests, release
++}
++
++// A selection that runs while a probe before a switch does (a group gets selections from its own
++// rounds, those of the group above and the connections that fail) waits for the probe as the first
++// did. The probe's end, whatever came of it, lets the switch go.
++func TestSwitchProbeWaitedFor(t *testing.T) {
++	for name, status := range map[string]int{"counted": http.StatusOK, "failed": http.StatusForbidden} {
++		t.Run(name, func(t *testing.T) {
++			link, requests, release := newHeldLossURL(t, status)
++			a, b := newTestMember(C.TypeSOCKS, "a", dialProbe), newTestMember(C.TypeSOCKS, "b", dialProbe)
++			_, group := newModeGroup(t, modeLoss, members(a, b), map[string]uint16{"a": 100, "b": 300}, nil)
++			group.loss.link = link
++			setResult(group, "b", 20)
++			for range 3 {
++				group.performUpdateCheck()
++				tcp, _ := selectedTags(group)
++				require.Equal(t, "a", tcp, "the probe of b runs")
++				require.True(t, group.switchProbeRuns("b"))
++				require.Eventually(t, func() bool { return requests.Load() == 1 }, 10*time.Second, 10*time.Millisecond)
++			}
++			release()
++			waitChoice(t, group, "b")
++			require.Equal(t, int32(1), requests.Load(), "one probe for all of them")
++			require.False(t, group.switchProbeRuns("b"))
++		})
++	}
++}
++
++// The selections that wait for the probe make no download test of their own: the one that began it
++// made one, and the one after it makes the one before the switch.
++func TestSwitchProbeOneDownloadTest(t *testing.T) {
++	var downloads atomic.Int32
++	download := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		downloads.Add(1)
++		w.Header().Set("Content-Length", fmt.Sprint(urltest.DownloadTestSize))
++		w.Write(make([]byte, urltest.DownloadTestSize))
++	}))
++	t.Cleanup(download.Close)
++	link, requests, release := newHeldLossURL(t, http.StatusOK)
++	a, b := newTestMember(C.TypeSOCKS, "a", dialProbe), newTestMember(C.TypeSOCKS, "b", dialProbe)
++	_, group := newModeGroup(t, modeLoss, members(a, b), map[string]uint16{"a": 100, "b": 300}, nil)
++	group.loss.link, group.downloadLink = link, download.URL
++	setResult(group, "b", 20)
++	for range 4 {
++		group.performUpdateCheck()
++	}
++	require.Eventually(t, func() bool { return requests.Load() == 1 }, 10*time.Second, 10*time.Millisecond)
++	tcp, _ := selectedTags(group)
++	require.Equal(t, "a", tcp)
++	require.Equal(t, int32(1), downloads.Load())
++	release()
++	waitChoice(t, group, "b")
++	require.Equal(t, int32(2), downloads.Load())
++}
++
++// The member in use that goes down while the probe runs is left at once.
++func TestSwitchProbeMemberInUseDown(t *testing.T) {
++	link, requests, _ := newHeldLossURL(t, http.StatusOK)
++	a, b := newTestMember(C.TypeSOCKS, "a", dialProbe), newTestMember(C.TypeSOCKS, "b", dialProbe)
++	_, group := newModeGroup(t, modeLoss, members(a, b), map[string]uint16{"a": 100, "b": 300}, nil)
++	group.loss.link = link
++	setResult(group, "b", 20)
++	group.performUpdateCheck()
++	require.Eventually(t, func() bool { return requests.Load() == 1 }, 10*time.Second, 10*time.Millisecond)
++	setResult(group, "a", 0)
++	group.performUpdateCheck()
++	tcp, _ := selectedTags(group)
++	require.Equal(t, "b", tcp)
++}
++
++// A probe that does not end (a dial that ignores its context) holds back a switch no longer than a
++// probe may take, and does not keep the next one from running.
++func TestSwitchProbeStuck(t *testing.T) {
++	newStuck := func(rest bool) (*URLTestGroup, *atomic.Int32, time.Time) {
++		link, requests, release := newHeldLossURL(t, http.StatusOK)
++		release()
++		a, b := newTestMember(C.TypeSOCKS, "a", dialProbe), newTestMember(C.TypeSOCKS, "b", dialProbe)
++		_, group := newModeGroup(t, modeLoss, members(a, b), map[string]uint16{"a": 100, "b": 300}, nil)
++		group.loss.link = link
++		stuck := time.Now().Add(-lossSlotWait - lossProbeTime - time.Second)
++		if rest {
++			stuck = stuck.Add(-group.lossRest())
++		}
++		group.switchProbes.Store("b", stuck)
++		group.switchProbed.Store("b", stuck)
++		setResult(group, "b", 20)
++		group.performUpdateCheck()
++		return group, requests, stuck
++	}
++	// within the rest: the switch goes without another probe
++	group, requests, _ := newStuck(false)
++	tcp, _ := selectedTags(group)
++	require.Equal(t, "b", tcp)
++	require.Zero(t, requests.Load())
++
++	// past it: another probe runs, and its end lets the switch go
++	group, requests, stuck := newStuck(true)
++	tcp, _ = selectedTags(group)
++	require.Equal(t, "a", tcp)
++	waitChoice(t, group, "b")
++	require.Equal(t, int32(1), requests.Load())
++	// the end of the stuck one is not the end of a later one
++	group.switchProbes.Store("b", time.Now())
++	group.switchProbes.CompareAndDelete("b", stuck)
++	require.True(t, group.switchProbeRuns("b"))
++}
+diff --git a/protocol/group/urltestgroup/urltest_use.go b/protocol/group/urltestgroup/urltest_use.go
+new file mode 100644
+index 000000000..eb5bb09ed
+--- /dev/null
++++ b/protocol/group/urltestgroup/urltest_use.go
+@@ -0,0 +1,59 @@
++package urltestgroup
++
++import (
++	"context"
++	"time"
++
++	"github.com/sagernet/sing-box/common/urltest"
++)
++
++// When a group is in use (podkop-engine).
++//
++// A loss probe is traffic: in the modes loss and balance a group of four members downloads a
++// megabyte of them every loss_interval, and one more before a switch. It is worth that for a group
++// that carries connections. A group that is the fallback of another carries none while the group
++// above has an outbound that answers, but it is tested with it, round after round, so that its
++// choice is a tested one at the moment it is needed (urlTestMembers of the group above): the
++// probes that followed each round of it were spent on a choice nobody used.
++//
++// So the loss probes run only while the group is in use: from a connection dialed through it, or
++// attached to it by the router, until idle_timeout without another. The dials of tests are not a
++// use (urltest.TestFromContext): the URL test of a nested group out of turn, the download test
++// before a switch to it and the loss probe of the group above all dial through it as a connection
++// would. A group that is not in use is tested and selects by its URL tests and its download test
++// as before, by the counts of loss it has from the time it was in use, as long as they are kept.
++// The first choice of a group that comes into use goes by the delays, as that of a group that was
++// just started; its probes start at once and change it at the selection that follows them
++// (lossProbeSize).
++
++// used records a use of the group. One that comes into use starts its loss probes, when a round of
++// this interval has tested the members; otherwise the round that comes next starts them (Touch
++// begins one for a group that was idle).
++func (g *URLTestGroup) used() {
++	now := time.Now()
++	if !g.startUse(now) {
++		return
++	}
++	g.usedSince.Store(now)
++	// not before a round has tested the members: the best of those tested so far are not the best
++	if g.roundDone.Load() && now.Sub(g.epoch)-time.Duration(g.lastRound.Load()) <= g.interval {
++		g.lossRound()
++	}
++	if g.mode == modeBalance && g.roundDone.Load() {
++		// the download tests of the members startUse put in the balance
++		g.requestUpdateCheck()
++	}
++}
++
++// usedBy is used for a dial with ctx, unless it is the dial of a test.
++func (g *URLTestGroup) usedBy(ctx context.Context) {
++	if !urltest.TestFromContext(ctx) {
++		g.used()
++	}
++}
++
++// inUse tells whether the group carries connections (used).
++func (g *URLTestGroup) inUse() bool {
++	last := g.lastUse.Load()
++	return !last.IsZero() && time.Since(last) <= g.idleTimeout
++}
+diff --git a/protocol/group/urltestgroup/urltest_use_test.go b/protocol/group/urltestgroup/urltest_use_test.go
+new file mode 100644
+index 000000000..aa693a676
+--- /dev/null
++++ b/protocol/group/urltestgroup/urltest_use_test.go
+@@ -0,0 +1,328 @@
++package urltestgroup
++
++import (
++	"context"
++	"fmt"
++	"net"
++	"net/http"
++	"net/http/httptest"
++	"sync"
++	"sync/atomic"
++	"syscall"
++	"testing"
++	"time"
++
++	"github.com/sagernet/sing-box/adapter"
++	"github.com/sagernet/sing-box/adapter/outbound"
++	"github.com/sagernet/sing-box/common/urltest"
++	C "github.com/sagernet/sing-box/constant"
++	M "github.com/sagernet/sing/common/metadata"
++	N "github.com/sagernet/sing/common/network"
++	"github.com/sagernet/sing/service"
++
++	"github.com/stretchr/testify/require"
++)
++
++// lossProbeServer serves the loss URL and counts what is asked of it, by the size of the probe.
++type lossProbeServer struct {
++	*httptest.Server
++	access sync.Mutex
++	sizes  map[int64]int
++}
++
++func newLossProbeServer(t *testing.T) *lossProbeServer {
++	s := &lossProbeServer{sizes: make(map[int64]int)}
++	s.Server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		var last int64
++		fmt.Sscanf(r.Header.Get("Range"), "bytes=0-%d", &last)
++		s.access.Lock()
++		s.sizes[last+1]++
++		s.access.Unlock()
++		// less than asked: at the window of a probe a megabyte takes seconds here, and the probes of
++		// the process come one after another
++		body := make([]byte, min(last+1, lossProbeBody))
++		w.Header().Set("Content-Length", fmt.Sprint(len(body)))
++		w.Write(body)
++	}))
++	t.Cleanup(s.Server.Close)
++	return s
++}
++
++// lossProbeBody is what the loss URLs of the tests serve at most: a probe counts a body shorter than
++// it asked for as far as it goes.
++const lossProbeBody = 32 << 10
++
++// probes are the small (periodic) and the large (before a switch) probes asked for.
++func (s *lossProbeServer) probes() (small int, large int) {
++	s.access.Lock()
++	defer s.access.Unlock()
++	return s.sizes[urltest.LossProbeSmall], s.sizes[urltest.LossProbeLarge]
++}
++
++// requireNoProbe holds that no probe comes: the spacing of the tests is 0 (TestMain), so one that
++// was started is there at once.
++func (s *lossProbeServer) requireNoProbe(t *testing.T, message string) {
++	t.Helper()
++	require.Never(t, func() bool {
++		small, large := s.probes()
++		return small+large > 0
++	}, 500*time.Millisecond, 20*time.Millisecond, message)
++}
++
++func (s *lossProbeServer) forget() {
++	s.access.Lock()
++	defer s.access.Unlock()
++	clear(s.sizes)
++}
++
++// reserveStand is a group of one server with a fallback of its own: a group of the servers b and c,
++// in a mode that counts the loss.
++type reserveStand struct {
++	loss          *lossProbeServer
++	mainDead      atomic.Bool
++	main, reserve *URLTest
++	target        M.Socksaddr
++}
++
++func newReserveStand(t *testing.T, mode string) *reserveStand {
++	// a delay of less than a millisecond is 0, and a member of delay 0 gives way to any other: the
++	// choice of the reserve would wander, with a probe before each switch
++	link, _ := testURL(t, 5*time.Millisecond)
++	s := &reserveStand{loss: newLossProbeServer(t), target: balanceTarget(t)}
++	a := newTestMember(C.TypeVLESS, "a", func(ctx context.Context, network string, destination M.Socksaddr) (net.Conn, error) {
++		if s.mainDead.Load() {
++			return nil, syscall.ECONNREFUSED
++		}
++		return dialWorking(ctx, network, destination)
++	})
++	b, c := newTestMember(C.TypeSOCKS, "b", dialProbe), newTestMember(C.TypeSOCKS, "c", dialProbe)
++	ctx := service.ContextWithPtr(context.Background(), urltest.NewHistoryStorage())
++	manager := &testOutboundManager{members: map[string]adapter.Outbound{"a": a, "b": b, "c": c}}
++	newGroup := func(tag string, mode string, outbounds, fallbacks []adapter.Outbound) *URLTest {
++		logger := formattingLogger(t)
++		group, err := NewURLTestGroup(ctx, manager, logger, outbounds, fallbacks, link, "", time.Minute, 50, 0, false)
++		require.NoError(t, err)
++		t.Cleanup(func() { group.Close() })
++		group.mode, group.loss, err = groupMode(mode, s.loss.URL, 0, 0, 0, 0)
++		require.NoError(t, err)
++		// every round probes
++		group.loss.interval = time.Nanosecond
++		if mode == modeBalance {
++			group.balance.Store(newBalancer())
++		}
++		urlTest := &URLTest{Adapter: outbound.NewAdapter(C.TypeURLTest, tag, []string{N.NetworkTCP, N.NetworkUDP}, nil), group: group, logger: logger}
++		manager.members[tag] = urlTest
++		return urlTest
++	}
++	s.reserve = newGroup("reserve", mode, members(b, c), nil)
++	s.main = newGroup("main", modeFastest, members(a), []adapter.Outbound{s.reserve})
++	return s
++}
++
++// round is a round of the main group, the reserve with it, and the loss probes it started.
++func (s *reserveStand) round(t *testing.T) {
++	t.Helper()
++	s.main.group.CheckOutbounds(context.Background(), true)
++	s.waitProbes(t)
++}
++
++// waitProbes waits for the probes of the reserve, those before a switch too.
++func (s *reserveStand) waitProbes(t *testing.T) {
++	t.Helper()
++	group := s.reserve.group
++	require.Eventually(t, func() bool {
++		running := group.lossRunning.Load() || group.updatePending.Load()
++		group.switchProbes.Range(func(tag, _ any) bool {
++			running = true
++			return false
++		})
++		return !running
++	}, 20*time.Second, 10*time.Millisecond)
++}
++
++// connect makes a connection through the main group, as the router does.
++func (s *reserveStand) connect(t *testing.T) {
++	t.Helper()
++	conn, err := s.main.DialContext(sourceContext("10.0.0.1"), N.NetworkTCP, s.target)
++	require.NoError(t, err)
++	conn.Close()
++}
++
++// idleForTest makes the group one that was last used longer ago than its idle_timeout.
++func (g *URLTestGroup) idleForTest() {
++	g.lastUse.Store(time.Now().Add(-g.idleTimeout - time.Second))
++}
++
++// A fallback that is a group, in the mode loss or balance: while the outbounds of the group above
++// answer it is tested with it, and selects, but no loss of its servers is probed, neither in the
++// rounds nor before a switch. Once the outbounds are down and connections go through it, its
++// servers are probed, until it has carried none for its idle_timeout.
++func TestFallbackGroupProbedInUse(t *testing.T) {
++	for _, mode := range []string{modeLoss, modeBalance} {
++		t.Run(mode, func(t *testing.T) {
++			s := newReserveStand(t, mode)
++			reserve := s.reserve.group
++			// idle: the rounds of the main group test the servers of the reserve
++			for range 3 {
++				s.round(t)
++				s.connect(t)
++			}
++			require.Equal(t, "a", s.main.Now())
++			require.NotNil(t, reserve.history.LoadURLTestHistory("b"))
++			require.NotNil(t, reserve.history.LoadURLTestHistory("c"))
++			require.False(t, reserve.inUse())
++			s.loss.requireNoProbe(t, "the servers of an idle fallback were probed")
++			// its choice goes by the URL tests, at once
++			for _, fast := range []string{"c", "b"} {
++				setResult(reserve, "b", 500)
++				setResult(reserve, "c", 500)
++				setResult(reserve, fast, 10)
++				reserve.performUpdateCheck()
++				require.Equal(t, fast, s.reserve.Now())
++			}
++			s.loss.requireNoProbe(t, "an idle fallback probed before a switch")
++
++			// the main server dies: the first connection finds the reserve by the delays, and the
++			// probes start
++			s.mainDead.Store(true)
++			_, err := s.main.DialContext(sourceContext("10.0.0.1"), N.NetworkTCP, s.target)
++			require.Error(t, err)
++			waitChoice(t, s.main.group, "reserve")
++			s.connect(t)
++			require.True(t, reserve.inUse())
++			require.Eventually(t, func() bool {
++				small, _ := s.loss.probes()
++				return small >= 2
++			}, 20*time.Second, 10*time.Millisecond, "the servers of a fallback in use were not probed")
++			s.waitProbes(t)
++
++			// in use, every round that is due probes
++			s.loss.forget()
++			s.round(t)
++			small, _ := s.loss.probes()
++			require.Equal(t, 2, small)
++
++			// the main server is back, and connections go through it
++			s.mainDead.Store(false)
++			s.round(t)
++			require.Equal(t, "a", s.main.Now())
++			reserve.idleForTest()
++			s.loss.forget()
++			s.connect(t)
++			s.round(t)
++			require.False(t, reserve.inUse())
++			s.loss.requireNoProbe(t, "the servers of a fallback that is idle again were probed")
++		})
++	}
++}
++
++// In use, the mode loss probes a server before it switches to it.
++func TestFallbackGroupSwitchProbe(t *testing.T) {
++	s := newReserveStand(t, modeLoss)
++	reserve := s.reserve.group
++	reserve.loss.interval = defaultLossInterval // one probe before a switch is enough for it
++	s.round(t)
++	setResult(reserve, "b", 10)
++	setResult(reserve, "c", 500)
++	reserve.performUpdateCheck()
++	require.Equal(t, "b", s.reserve.Now())
++	reserve.lossRunning.Store(true) // no periodic probe: the one before the switch is what is looked at
++	reserve.used()
++	setResult(reserve, "b", 500)
++	setResult(reserve, "c", 10)
++	reserve.performUpdateCheck()
++	require.Equal(t, "b", s.reserve.Now(), "the member in use stays while the probe runs")
++	waitChoice(t, reserve, "c")
++	_, large := s.loss.probes()
++	require.Equal(t, 1, large)
++}
++
++// What is a use: a connection dialed through the group or attached to it by the router. What is
++// not: the dials of the tests of the group above and of the Clash API, which go through the group
++// too. A group that was not started (it has no round yet) is used as any.
++func TestGroupInUse(t *testing.T) {
++	link, _ := testURL(t, 0)
++	download := newDownloadServer(t, "full")
++	loss := newLossProbeServer(t)
++	a := newTestMember(C.TypeSOCKS, "a", dialProbe)
++	newIdle := func() (*URLTest, *URLTestGroup) {
++		urlTest, group := newTestURLTest(t, link, a)
++		require.False(t, group.inUse())
++		return urlTest, group
++	}
++
++	urlTest, group := newIdle()
++	ctx := context.Background()
++	_, err := urltest.URLTest(ctx, link, urlTest)
++	require.NoError(t, err)
++	_, _, err = urltest.DownloadTest(ctx, download.URL, urlTest)
++	require.NoError(t, err)
++	_, err = urltest.LossProbe(ctx, loss.URL, urltest.LossProbeSmall, urlTest)
++	small, _ := loss.probes()
++	require.Equal(t, 1, small, err)
++	// hysteria2 and tuic: without a QUIC connection the probe ends after its first dial
++	dials := a.dials.Load()
++	_, err = urltest.LossProbeQUIC(ctx, loss.URL, urltest.LossProbeSmall, urlTest, quicTestMember{a})
++	require.ErrorIs(t, err, urltest.ErrLossNotCounted)
++	require.Greater(t, a.dials.Load(), dials)
++	_, _ = urlTest.ListenPacket(urltest.ContextWithTest(ctx), M.ParseSocksaddr("127.0.0.1:53"))
++	require.False(t, group.inUse(), "the dials of tests")
++
++	conn, err := urlTest.DialContext(ctx, N.NetworkTCP, balanceTarget(t))
++	require.NoError(t, err)
++	conn.Close()
++	require.True(t, group.inUse())
++	group.idleForTest()
++	require.False(t, group.inUse())
++	conn, err = urlTest.DialContext(ctx, N.NetworkTCP, balanceTarget(t))
++	require.NoError(t, err)
++	conn.Close()
++	require.True(t, group.inUse(), "in use again")
++
++	urlTest, group = newIdle()
++	_, _ = urlTest.ListenPacket(ctx, M.ParseSocksaddr("127.0.0.1:53"))
++	require.True(t, group.inUse(), "a packet connection")
++
++	urlTest, group = newIdle()
++	one, other := net.Pipe()
++	defer other.Close()
++	detach := urlTest.AttachConnection(one)
++	defer detach()
++	require.True(t, group.inUse(), "a connection the router attaches")
++}
++
++// A group in use stays one when another takes its tag.
++func TestTakeOverInUse(t *testing.T) {
++	link, _ := testURL(t, 0)
++	a := newTestMember(C.TypeSOCKS, "a", dialWorking)
++	old, oldGroup := newTestURLTest(t, link, a)
++	next, nextGroup := newTestURLTest(t, link, a)
++	next.TakeOver(old)
++	require.False(t, nextGroup.inUse())
++	oldGroup.used()
++	next.TakeOver(old)
++	require.True(t, nextGroup.inUse())
++}
++
++// A fallback is chosen by its place in the list: the mode loss does not probe it before the
++// switch, which would leave the connections on an outbound whose download stopped meanwhile.
++func TestLossModeFallbackNotProbedBeforeSwitch(t *testing.T) {
++	shortDownloadTimeout(t)
++	full, frozen := newDownloadServer(t, "full"), newDownloadServer(t, "close")
++	loss := newLossProbeServer(t)
++	a, f := newTestMember(C.TypeSOCKS, "a", dialTo(frozen)), newTestMember(C.TypeSOCKS, "f", dialTo(full))
++	_, group := newTestFallbackGroup(t, loss.URL, "", members(a), members(f), map[string]uint16{"a": 100, "f": 100})
++	var err error
++	group.mode, group.loss, err = groupMode(modeLoss, loss.URL, 0, 0, 0, 0)
++	require.NoError(t, err)
++	group.downloadLink = full.URL
++	group.used()
++	// a was taken frozen, as the last resort, and has passed a URL test since
++	group.setFrozen("a", time.Now().Add(-time.Minute))
++	tcp, _ := selectedTags(group)
++	require.Equal(t, "a", tcp)
++	group.performUpdateCheck()
++	tcp, _ = selectedTags(group)
++	require.Equal(t, "f", tcp, "a download through a stopped: the fallback at once")
++	loss.requireNoProbe(t, "a fallback was probed before the switch to it")
 +}
 diff --git a/route/network.go b/route/network.go
 index 1ff6e49e1..5912cdeb2 100644

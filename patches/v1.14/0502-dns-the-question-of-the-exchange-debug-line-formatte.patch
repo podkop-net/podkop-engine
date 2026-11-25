@@ -1,7 +1,7 @@
-From c33071e27fff715846f1229f2a8969fb5d898f46 Mon Sep 17 00:00:00 2001
+From 1abf49b0b699025fe438efe5579e7b61c73f1a33 Mon Sep 17 00:00:00 2001
 From: FiyeroT <me@fiyero.xyz>
 Date: Fri, 13 Nov 2026 21:14:28 +0300
-Subject: [PATCH 61/69] dns: the question of the exchange debug line formatted
+Subject: [PATCH 61/71] dns: the question of the exchange debug line formatted
  only when it is logged
 
 The router logged every query as "exchange <question>" with the question formatted before the

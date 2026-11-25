@@ -1,0 +1,403 @@
+From 2b83685977256ec983346752904eaf61657e38ec Mon Sep 17 00:00:00 2001
+From: FiyeroT <me@fiyero.xyz>
+Date: Tue, 24 Nov 2026 23:26:55 +0300
+Subject: [PATCH 70/71] listener: the connections an inbound still holds end
+ with it
+
+A TCP connection a listener accepted is ended by what the router dialed for it, or by its peer. One
+whose inbound still holds it has nothing dialed: a client of an HTTP proxy between two requests of a
+connection kept alive, a handshake that does not come. Such a connection stayed open when the box
+closed, and was served on by its closed inbound: the next request of the kept-alive connection was
+authenticated by the users the inbound had, and answered "502 Bad Gateway" by the closed router.
+
+The listener keeps the connections whose handler has not returned and closes them when it is closed.
+A handler returns when the connection is closed or when the router has it: a connection that was
+handed over is not touched. The client sees its connection closed, as by any HTTP server that stops,
+and dials again.
+
+The module is a file of its own; the hooks are a field and the close in listener.go and the call of
+the handler in listener_tcp.go.
+
+Measured with podkop-exp (lab/runs/2026-11-22-mixedkeep): the kept-alive connection answered 502 once
+after a restart. Tests: TestCloseEndsHeldConnections, TestHeldConnectionsForgotten (the listener),
+TestKeptAliveConnectionEndsWithBox (a box with a mixed inbound).
+
+A patch of its own (0801).
+
+Pdk-Feature: listener-held
+Pdk-Zone: core
+Pdk-Layer: 08
+---
+ common/listener/listener.go               |   5 +-
+ common/listener/listener_accepted.go      |  64 +++++++++++
+ common/listener/listener_accepted_test.go | 129 ++++++++++++++++++++++
+ common/listener/listener_tcp.go           |   2 +-
+ protocol/mixed/inbound_close_test.go      | 111 +++++++++++++++++++
+ 5 files changed, 309 insertions(+), 2 deletions(-)
+ create mode 100644 common/listener/listener_accepted.go
+ create mode 100644 common/listener/listener_accepted_test.go
+ create mode 100644 protocol/mixed/inbound_close_test.go
+
+diff --git a/common/listener/listener.go b/common/listener/listener.go
+index 40d9d0271..84f313423 100644
+--- a/common/listener/listener.go
++++ b/common/listener/listener.go
+@@ -36,6 +36,7 @@ type Listener struct {
+ 	tproxy                   bool
+ 
+ 	tcpListener          net.Listener
++	accepted             acceptedConns
+ 	systemProxy          settings.SystemProxy
+ 	udpConn              *net.UDPConn
+ 	udpAddr              M.Socksaddr
+@@ -129,10 +130,12 @@ func (l *Listener) Close() error {
+ 		}
+ 		err = E.Errors(err, l.systemProxy.Close())
+ 	}
+-	return E.Errors(err, common.Close(
++	err = E.Errors(err, common.Close(
+ 		l.tcpListener,
+ 		common.PtrOrNil(l.udpConn),
+ 	))
++	l.accepted.close()
++	return err
+ }
+ 
+ func (l *Listener) TCPListener() net.Listener {
+diff --git a/common/listener/listener_accepted.go b/common/listener/listener_accepted.go
+new file mode 100644
+index 000000000..0eb749c1c
+--- /dev/null
++++ b/common/listener/listener_accepted.go
+@@ -0,0 +1,64 @@
++package listener
++
++import (
++	"context"
++	"net"
++	"sync"
++
++	"github.com/sagernet/sing-box/adapter"
++)
++
++// The TCP connections a listener accepted and its inbound still holds (podkop-engine): those whose
++// handler has not returned. The handler of an inbound returns when the connection is closed or when
++// the router has it, which closes it with what it dialed; until then nothing but its peer ends it: a
++// handshake that does not come, a client of an HTTP proxy between two requests of a connection kept
++// alive. When the listener closes, such a connection would be served on by an inbound that is
++// closed: the next request of the kept-alive connection would be authenticated by the users the
++// inbound had, and answered "502 Bad Gateway" by a router that is closed. They are closed with the
++// listener, as an HTTP server closes its idle connections; a client dials again.
++type acceptedConns struct {
++	access sync.Mutex
++	conns  map[net.Conn]struct{}
++	closed bool
++}
++
++// add takes a connection, false once the listener is closed.
++func (c *acceptedConns) add(conn net.Conn) bool {
++	c.access.Lock()
++	defer c.access.Unlock()
++	if c.closed {
++		return false
++	}
++	if c.conns == nil {
++		c.conns = make(map[net.Conn]struct{})
++	}
++	c.conns[conn] = struct{}{}
++	return true
++}
++
++func (c *acceptedConns) remove(conn net.Conn) {
++	c.access.Lock()
++	defer c.access.Unlock()
++	delete(c.conns, conn)
++}
++
++// close closes the connections held, and those accepted from now on.
++func (c *acceptedConns) close() {
++	c.access.Lock()
++	conns := c.conns
++	c.conns, c.closed = nil, true
++	c.access.Unlock()
++	for conn := range conns {
++		conn.Close()
++	}
++}
++
++// handleTCP hands a connection to the inbound, which holds it until the call returns.
++func (l *Listener) handleTCP(ctx context.Context, conn net.Conn, metadata adapter.InboundContext) {
++	if !l.accepted.add(conn) {
++		conn.Close()
++		return
++	}
++	defer l.accepted.remove(conn)
++	l.connHandler.NewConnection(ctx, conn, metadata, nil)
++}
+diff --git a/common/listener/listener_accepted_test.go b/common/listener/listener_accepted_test.go
+new file mode 100644
+index 000000000..80e293f19
+--- /dev/null
++++ b/common/listener/listener_accepted_test.go
+@@ -0,0 +1,129 @@
++package listener
++
++import (
++	"bufio"
++	"context"
++	"net"
++	"net/netip"
++	"testing"
++	"time"
++
++	"github.com/sagernet/sing-box/adapter"
++	C "github.com/sagernet/sing-box/constant"
++	"github.com/sagernet/sing-box/log"
++	"github.com/sagernet/sing-box/option"
++	"github.com/sagernet/sing/common"
++	E "github.com/sagernet/sing/common/exceptions"
++	"github.com/sagernet/sing/common/json/badoption"
++	N "github.com/sagernet/sing/common/network"
++
++	"github.com/stretchr/testify/require"
++)
++
++// testInbound is the handler of a listener: a connection that says "hold" stays in its handler
++// until it ends, one that says "route" goes to the router (routed) and the handler returns.
++type testInbound struct {
++	routed chan net.Conn
++	ended  chan error
++}
++
++func (i *testInbound) NewConnection(ctx context.Context, conn net.Conn, metadata adapter.InboundContext, onClose N.CloseHandlerFunc) {
++	reader := bufio.NewReader(conn)
++	line, err := reader.ReadString('\n')
++	if err != nil {
++		i.ended <- err
++		conn.Close()
++		return
++	}
++	conn.Write([]byte("ok\n"))
++	if line == "route\n" {
++		i.routed <- conn
++		return
++	}
++	_, err = reader.ReadString('\n')
++	i.ended <- err
++	conn.Close()
++}
++
++func newTestListener(t *testing.T) (*Listener, *testInbound) {
++	inbound := &testInbound{routed: make(chan net.Conn, 1), ended: make(chan error, 1)}
++	listen := badoption.Addr(netip.MustParseAddr("127.0.0.1"))
++	listener := New(Options{
++		Context:           context.Background(),
++		Logger:            log.NewNOPFactory().NewLogger("test"),
++		Network:           []string{N.NetworkTCP},
++		Listen:            option.ListenOptions{Listen: common.Ptr(listen)},
++		ConnectionHandler: inbound,
++	})
++	require.NoError(t, listener.Start())
++	t.Cleanup(func() { listener.Close() })
++	return listener, inbound
++}
++
++func dialTestListener(t *testing.T, listener *Listener, say string) (net.Conn, *bufio.Reader) {
++	conn, err := net.DialTimeout("tcp", listener.TCPListener().Addr().String(), testWait)
++	require.NoError(t, err)
++	t.Cleanup(func() { conn.Close() })
++	require.NoError(t, conn.SetDeadline(time.Now().Add(testWait)))
++	reader := bufio.NewReader(conn)
++	if say != "" {
++		_, err = conn.Write([]byte(say + "\n"))
++		require.NoError(t, err)
++		answer, err := reader.ReadString('\n')
++		require.NoError(t, err)
++		require.Equal(t, "ok\n", answer)
++	}
++	return conn, reader
++}
++
++func held(listener *Listener) int {
++	listener.accepted.access.Lock()
++	defer listener.accepted.access.Unlock()
++	return len(listener.accepted.conns)
++}
++
++// The connections an inbound holds end with its listener: one that waits for its handshake, one that
++// waits for the next request. One that was handed over does not.
++func TestCloseEndsHeldConnections(t *testing.T) {
++	t.Parallel()
++	for _, say := range []string{"", "hold"} {
++		listener, inbound := newTestListener(t)
++		_, reader := dialTestListener(t, listener, say)
++		_, routedReader := dialTestListener(t, listener, "route")
++		routed := <-inbound.routed
++		defer routed.Close()
++		require.Eventually(t, func() bool { return held(listener) == 1 }, testWait, 5*time.Millisecond, "the connection handed over is not held")
++		require.NoError(t, listener.Close())
++		_, err := reader.ReadByte()
++		require.Error(t, err)
++		require.False(t, E.IsTimeout(err), "the held connection was left open: %v", err)
++		require.Error(t, <-inbound.ended)
++		// the router has the other one
++		_, err = routed.Write([]byte("from the router\n"))
++		require.NoError(t, err)
++		answer, err := routedReader.ReadString('\n')
++		require.NoError(t, err)
++		require.Equal(t, "from the router\n", answer)
++		require.Zero(t, held(listener))
++	}
++}
++
++// A connection that ended by itself is not kept, and one accepted while the listener closes is
++// closed.
++func TestHeldConnectionsForgotten(t *testing.T) {
++	t.Parallel()
++	listener, inbound := newTestListener(t)
++	conn, _ := dialTestListener(t, listener, "hold")
++	require.Equal(t, 1, held(listener))
++	conn.Close()
++	require.Error(t, <-inbound.ended)
++	require.Eventually(t, func() bool { return held(listener) == 0 }, testWait, 5*time.Millisecond)
++	require.NoError(t, listener.Close())
++
++	client, server := net.Pipe()
++	defer client.Close()
++	listener.handleTCP(context.Background(), server, adapter.InboundContext{InboundType: C.TypeMixed})
++	_, err := client.Read(make([]byte, 1))
++	require.Error(t, err)
++	require.Empty(t, inbound.ended, "a closed inbound serves nothing")
++}
+diff --git a/common/listener/listener_tcp.go b/common/listener/listener_tcp.go
+index 50643ea44..f9525e9bc 100644
+--- a/common/listener/listener_tcp.go
++++ b/common/listener/listener_tcp.go
+@@ -116,6 +116,6 @@ func (l *Listener) loopTCPIn() {
+ 		metadata.OriginDestination = M.SocksaddrFromNet(conn.LocalAddr()).Unwrap()
+ 		ctx := log.ContextWithNewID(l.ctx)
+ 		l.logger.InfoContext(ctx, "inbound connection from ", metadata.Source)
+-		go l.connHandler.NewConnection(ctx, conn, metadata, nil)
++		go l.handleTCP(ctx, conn, metadata)
+ 	}
+ }
+diff --git a/protocol/mixed/inbound_close_test.go b/protocol/mixed/inbound_close_test.go
+new file mode 100644
+index 000000000..ce171eee2
+--- /dev/null
++++ b/protocol/mixed/inbound_close_test.go
+@@ -0,0 +1,111 @@
++package mixed_test
++
++import (
++	"bufio"
++	"context"
++	"encoding/base64"
++	"fmt"
++	"net"
++	"net/http"
++	"net/http/httptest"
++	"strings"
++	"testing"
++	"time"
++
++	box "github.com/sagernet/sing-box"
++	"github.com/sagernet/sing-box/experimental/deprecated"
++	"github.com/sagernet/sing-box/include"
++	"github.com/sagernet/sing-box/log"
++	"github.com/sagernet/sing-box/option"
++	E "github.com/sagernet/sing/common/exceptions"
++	"github.com/sagernet/sing/service"
++
++	"github.com/stretchr/testify/require"
++)
++
++type quietWriter struct{}
++
++func (quietWriter) WriteMessage(log.Level, string) {}
++
++func startProxy(t *testing.T) (*box.Box, string) {
++	t.Chdir(t.TempDir())
++	free, err := net.Listen("tcp", "127.0.0.1:0")
++	require.NoError(t, err)
++	address := free.Addr().(*net.TCPAddr)
++	free.Close()
++	ctx := include.Context(service.ContextWith[deprecated.Manager](context.Background(), deprecated.NewStderrManager(log.StdLogger())))
++	var options option.Options
++	require.NoError(t, options.UnmarshalJSONContext(ctx, []byte(fmt.Sprint(`{
++		"inbounds": [{"type": "mixed", "tag": "in", "listen": "127.0.0.1", "listen_port": `, address.Port, `, "users": [{"username": "user", "password": "old"}]}],
++		"outbounds": [{"type": "direct", "tag": "direct"}]
++	}`))))
++	instance, err := box.New(box.Options{Context: ctx, Options: options, PlatformLogWriter: quietWriter{}})
++	require.NoError(t, err)
++	require.NoError(t, instance.Start())
++	t.Cleanup(func() { instance.Close() })
++	return instance, address.String()
++}
++
++func proxyRequest(conn net.Conn, reader *bufio.Reader, method, target string) (*http.Response, error) {
++	_, err := fmt.Fprintf(conn, "%s %s HTTP/1.1\r\nHost: %s\r\nProxy-Connection: keep-alive\r\nProxy-Authorization: Basic %s\r\n\r\n",
++		method, target, strings.TrimPrefix(target, "http://"), base64.StdEncoding.EncodeToString([]byte("user:old")))
++	if err != nil {
++		return nil, err
++	}
++	response, err := http.ReadResponse(reader, nil)
++	if err != nil {
++		return nil, err
++	}
++	if method != http.MethodConnect {
++		response.Body.Close()
++	}
++	return response, nil
++}
++
++// A connection of an HTTP proxy kept alive between two requests ends with the box: its next request
++// was served by the inbound of the closed box, with the users it had, and answered 502 by its closed
++// router. A tunnel, which the router has, ends with the connection it was dialed, as before.
++func TestKeptAliveConnectionEndsWithBox(t *testing.T) {
++	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		w.WriteHeader(http.StatusNoContent)
++	}))
++	t.Cleanup(server.Close)
++	instance, address := startProxy(t)
++	dial := func() (net.Conn, *bufio.Reader) {
++		conn, err := net.Dial("tcp", address)
++		require.NoError(t, err)
++		t.Cleanup(func() { conn.Close() })
++		require.NoError(t, conn.SetDeadline(time.Now().Add(20*time.Second)))
++		return conn, bufio.NewReader(conn)
++	}
++	kept, keptReader := dial()
++	for range 2 {
++		response, err := proxyRequest(kept, keptReader, http.MethodGet, server.URL+"/")
++		require.NoError(t, err)
++		require.Equal(t, http.StatusNoContent, response.StatusCode)
++	}
++	// nothing was sent on this one yet
++	silent, silentReader := dial()
++	tunnel, tunnelReader := dial()
++	response, err := proxyRequest(tunnel, tunnelReader, http.MethodConnect, strings.TrimPrefix(server.URL, "http://"))
++	require.NoError(t, err)
++	require.Equal(t, http.StatusOK, response.StatusCode)
++	_, err = tunnel.Write([]byte("GET / HTTP/1.1\r\nHost: test\r\n\r\n"))
++	require.NoError(t, err)
++	response, err = http.ReadResponse(tunnelReader, nil)
++	require.NoError(t, err)
++	require.Equal(t, http.StatusNoContent, response.StatusCode)
++
++	require.NoError(t, instance.Close())
++	response, err = proxyRequest(kept, keptReader, http.MethodGet, server.URL+"/")
++	if err == nil {
++		t.Fatal("the closed inbound answered ", response.Status)
++	}
++	require.False(t, E.IsTimeout(err), err)
++	for name, reader := range map[string]*bufio.Reader{"silent": silentReader, "tunnel": tunnelReader} {
++		_, err = reader.ReadByte()
++		require.Error(t, err, name)
++		require.False(t, E.IsTimeout(err), name)
++	}
++	_ = silent
++}
+-- 
+2.53.0
+

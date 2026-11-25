@@ -1,7 +1,7 @@
-From 120a3000227ca0a1cf495b52ae91a71d0ebba37e Mon Sep 17 00:00:00 2001
+From af3a072354cdbbec6f3cb628ef001d2f5a3391fb Mon Sep 17 00:00:00 2001
 From: FiyeroT <me@fiyero.xyz>
 Date: Thu, 12 Nov 2026 21:41:21 +0300
-Subject: [PATCH 58/69] http client: fallback clients, through which a remote
+Subject: [PATCH 58/71] http client: fallback clients, through which a remote
  rule-set repeats a failed download
 
 An HTTP client may name other shared clients as its fallbacks; a remote rule-set whose download
@@ -228,10 +228,10 @@ index c51b26435..5b878421b 100644
  
  type (
 diff --git a/route/rule/rule_set_remote.go b/route/rule/rule_set_remote.go
-index fec3b987f..c6b500b5c 100644
+index c3eea334d..a741b66e0 100644
 --- a/route/rule/rule_set_remote.go
 +++ b/route/rule/rule_set_remote.go
-@@ -52,6 +52,9 @@ type RemoteRuleSet struct {
+@@ -51,6 +51,9 @@ type RemoteRuleSet struct {
  	options        option.RuleSet
  	updateInterval time.Duration
  	httpClient     *http.Client
@@ -241,7 +241,7 @@ index fec3b987f..c6b500b5c 100644
  	access         sync.RWMutex
  	rules          []adapter.HeadlessRule
  	metadata       adapter.RuleSetMetadata
-@@ -136,6 +139,11 @@ func (s *RemoteRuleSet) StartContext(ctx context.Context, startContext *adapter.
+@@ -135,6 +138,11 @@ func (s *RemoteRuleSet) StartContext(ctx context.Context, startContext *adapter.
  	if err != nil {
  		return E.Cause(err, "create rule-set http client")
  	}
@@ -253,7 +253,7 @@ index fec3b987f..c6b500b5c 100644
  	var loadedFromInitialPath bool
  	if s.lastUpdated.IsZero() && s.initialPath != "" {
  		var content []byte
-@@ -527,6 +535,33 @@ func describeRuleSetBody(response *http.Response, size int64, sample []byte) str
+@@ -514,6 +522,33 @@ func describeRuleSetBody(response *http.Response, size int64, sample []byte) str
  // each of its fallback clients in turn. Each way has the whole stall timeout of its own; the start
  // deadline bounds them all. The error is that of every way.
  func (s *RemoteRuleSet) fetch(ctx context.Context, isStart bool) error {

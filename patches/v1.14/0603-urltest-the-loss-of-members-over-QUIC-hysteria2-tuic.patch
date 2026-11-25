@@ -1,7 +1,7 @@
-From 9239052f50ee79041cd360f14ed51632234f3f04 Mon Sep 17 00:00:00 2001
+From 62f2c7002cdb63979df0f5a523570268f1217a83 Mon Sep 17 00:00:00 2001
 From: FiyeroT <me@fiyero.xyz>
 Date: Sun, 15 Nov 2026 12:55:34 +0300
-Subject: [PATCH 67/69] urltest: the loss of members over QUIC (hysteria2,
+Subject: [PATCH 67/71] urltest: the loss of members over QUIC (hysteria2,
  tuic)
 
 The loss mode counted a member's loss by the retransmissions of a TCP connection of its own to
@@ -51,7 +51,7 @@ Pdk-Layer: 06
 ---
  adapter/quic_stats.go                         |  27 ++
  common/urltest/loss.go                        |   5 +
- common/urltest/loss_quic.go                   | 260 ++++++++++++++++
+ common/urltest/loss_quic.go                   | 261 ++++++++++++++++
  common/urltest/loss_quic_test.go              | 294 ++++++++++++++++++
  common/urltest/udpdrops_linux.go              |  41 +++
  common/urltest/udpdrops_other.go              |   8 +
@@ -60,7 +60,7 @@ Pdk-Layer: 06
  .../group/urltestgroup/urltest_loss_test.go   |  74 ++++-
  protocol/hysteria2/outbound.go                |  16 +
  protocol/tuic/outbound.go                     |  16 +
- 11 files changed, 819 insertions(+), 12 deletions(-)
+ 11 files changed, 820 insertions(+), 12 deletions(-)
  create mode 100644 adapter/quic_stats.go
  create mode 100644 common/urltest/loss_quic.go
  create mode 100644 common/urltest/loss_quic_test.go
@@ -102,7 +102,7 @@ index 000000000..0de94c244
 +	MinRTT              time.Duration
 +}
 diff --git a/common/urltest/loss.go b/common/urltest/loss.go
-index 143c413c3..1c3d499bc 100644
+index 9c5f2da76..f9390354e 100644
 --- a/common/urltest/loss.go
 +++ b/common/urltest/loss.go
 @@ -44,6 +44,11 @@ var ErrLossNotCounted = E.New("loss not counted")
@@ -119,10 +119,10 @@ index 143c413c3..1c3d499bc 100644
  // tests, as lossClientTimeout.
 diff --git a/common/urltest/loss_quic.go b/common/urltest/loss_quic.go
 new file mode 100644
-index 000000000..e11c2faa9
+index 000000000..c8be2141c
 --- /dev/null
 +++ b/common/urltest/loss_quic.go
-@@ -0,0 +1,260 @@
+@@ -0,0 +1,261 @@
 +package urltest
 +
 +import (
@@ -226,6 +226,7 @@ index 000000000..e11c2faa9
 +	}
 +	destination := M.ParseSocksaddrHostPortStr(linkURL.Hostname(), port)
 +	byParameter := linkURL.Query().Has("bytes")
++	ctx = ContextWithTest(ctx)
 +	start := time.Now()
 +	// a stream held open across the probe, dialed before the first count: a member whose connection
 +	// was idle dials it now, and the connection stays while the HTTP connections of the probe close
@@ -745,10 +746,10 @@ index 000000000..9297dd087
 +	return 0, false
 +}
 diff --git a/protocol/group/urltestgroup/urltest_loss.go b/protocol/group/urltestgroup/urltest_loss.go
-index d93dfee7a..6d4aa7531 100644
+index ad4d1cc09..abcafc343 100644
 --- a/protocol/group/urltestgroup/urltest_loss.go
 +++ b/protocol/group/urltestgroup/urltest_loss.go
-@@ -106,16 +106,57 @@ func groupMode(mode string, link string, interval time.Duration, threshold float
+@@ -107,16 +107,57 @@ func groupMode(mode string, link string, interval time.Duration, threshold float
  	return mode, options, nil
  }
  
@@ -812,7 +813,7 @@ index d93dfee7a..6d4aa7531 100644
  	if weighed > 65535 {
  		return 65535
  	}
-@@ -127,6 +168,7 @@ type memberLoss struct {
+@@ -128,6 +169,7 @@ type memberLoss struct {
  	percent float64 // over the window decided by
  	excess  float64 // less the loss of the line
  	rtt     time.Duration
@@ -820,7 +821,7 @@ index d93dfee7a..6d4aa7531 100644
  	known   bool
  }
  
-@@ -147,7 +189,7 @@ func (g *URLTestGroup) lossView() lossView {
+@@ -148,7 +190,7 @@ func (g *URLTestGroup) lossView() lossView {
  		if !known {
  			continue
  		}
@@ -829,7 +830,7 @@ index d93dfee7a..6d4aa7531 100644
  		if counted == 0 || loss.percent < floor {
  			floor = loss.percent
  		}
-@@ -175,7 +217,7 @@ func (v lossView) delay(tag string, history *adapter.URLTestHistory) uint16 {
+@@ -176,7 +218,7 @@ func (v lossView) delay(tag string, history *adapter.URLTestHistory) uint16 {
  		// no RTT of its own: a URL test takes a few round trips
  		rtt = time.Duration(history.Delay) * time.Millisecond / 3
  	}
@@ -838,7 +839,7 @@ index d93dfee7a..6d4aa7531 100644
  }
  
  // memberAlive tells whether a member may carry connections: it has a test result and has
-@@ -295,7 +337,15 @@ func (g *URLTestGroup) probeLoss(tag string, member adapter.Outbound, size int64
+@@ -303,7 +345,15 @@ func (g *URLTestGroup) probeLoss(tag string, member adapter.Outbound, size int64
  		return false
  	}
  	start := time.Now()
@@ -855,7 +856,7 @@ index d93dfee7a..6d4aa7531 100644
  	if g.ctx.Err() != nil {
  		// the group was closed or replaced: after a swap the tag may be another outbound's
  		return false
-@@ -307,7 +357,7 @@ func (g *URLTestGroup) probeLoss(tag string, member adapter.Outbound, size int64
+@@ -315,7 +365,7 @@ func (g *URLTestGroup) probeLoss(tag string, member adapter.Outbound, size int64
  			sample.Reordered, " bytes reordered, RTT ", sample.RTT.Milliseconds(), "ms, ", sample.Received, " bytes in ",
  			sample.Elapsed.Milliseconds(), "ms")
  		return true
@@ -891,7 +892,7 @@ index 000000000..d157ee4e5
 +// more than its loss costs. TUIC was not measured and is priced as hysteria2.
 +var quicLossPrice = lossPrice{perRTT: 1, perLoss: -10.28, perLossRTT: 0.5438, minRTT: 20}
 diff --git a/protocol/group/urltestgroup/urltest_loss_test.go b/protocol/group/urltestgroup/urltest_loss_test.go
-index a1e4a6cd6..3de571fa8 100644
+index b82c6ac51..b43359688 100644
 --- a/protocol/group/urltestgroup/urltest_loss_test.go
 +++ b/protocol/group/urltestgroup/urltest_loss_test.go
 @@ -27,12 +27,82 @@ import (

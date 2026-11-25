@@ -1,7 +1,7 @@
-From 04596f8990031fb11911f7a31c37479c5c722caa Mon Sep 17 00:00:00 2001
+From 5a26828e081193f65a92bc878351f27a6862d227 Mon Sep 17 00:00:00 2001
 From: FiyeroT <me@fiyero.xyz>
 Date: Thu, 12 Nov 2026 21:41:21 +0300
-Subject: [PATCH 45/69] transports: the dial and the close of v2ray transports
+Subject: [PATCH 45/71] transports: the dial and the close of v2ray transports
 
 A failed HTTP/2 dial frees the handshake write with its error; QUIC streams and gRPC lite wait for
 data without a buffer; the end of the dial context reaches the upgrade of websocket and httpupgrade;

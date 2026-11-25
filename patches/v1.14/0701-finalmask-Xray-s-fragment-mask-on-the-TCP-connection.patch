@@ -1,7 +1,7 @@
-From 1422cd2fb8e0c01dfdec8cc80f5ea52311e98816 Mon Sep 17 00:00:00 2001
+From 173d7d011ffc9e655cfb8093df92c1868b9e4501 Mon Sep 17 00:00:00 2001
 From: FiyeroT <me@fiyero.xyz>
 Date: Sat, 21 Nov 2026 14:16:35 +0300
-Subject: [PATCH 68/69] finalmask: Xray's fragment mask on the TCP connections
+Subject: [PATCH 68/71] finalmask: Xray's fragment mask on the TCP connections
  of an outbound; fm and pcs in links
 
 The dialer option finalmask {"tcp": [{"type": "fragment", ...}]} puts Xray's fragment mask

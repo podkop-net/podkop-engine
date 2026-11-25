@@ -1,7 +1,7 @@
-From 384881c1854a21f9bd221ddb76f3bf705fb38980 Mon Sep 17 00:00:00 2001
+From ddef9c12ba3a67fd8da95b8eea95451cc7e56e80 Mon Sep 17 00:00:00 2001
 From: FiyeroT <me@fiyero.xyz>
 Date: Thu, 12 Nov 2026 21:41:20 +0300
-Subject: [PATCH 35/69] dns: the transports group and provider
+Subject: [PATCH 35/71] dns: the transports group and provider
 
 A server of the type group asks its servers in order and, after one gave no answer in time, the rest
 together; provider is the DNS of the provider netifd knows.
@@ -16,12 +16,12 @@ Pdk-Layer: 03
 ---
  adapter/dns_podkop.go            |   64 ++
  dns/transport_group.go           |  830 ++++++++++++++++++++++++
- dns/transport_group_test.go      | 1009 ++++++++++++++++++++++++++++++
- dns/transport_provider.go        |  106 ++++
+ dns/transport_group_test.go      | 1027 ++++++++++++++++++++++++++++++
+ dns/transport_provider.go        |  106 +++
  dns/transport_provider_test.go   |  215 +++++++
  include/podkop_dns_group_test.go |  131 ++++
  option/dns_group.go              |   16 +
- 7 files changed, 2371 insertions(+)
+ 7 files changed, 2389 insertions(+)
  create mode 100644 adapter/dns_podkop.go
  create mode 100644 dns/transport_group.go
  create mode 100644 dns/transport_group_test.go
@@ -938,10 +938,10 @@ index 000000000..b575475f7
 +}
 diff --git a/dns/transport_group_test.go b/dns/transport_group_test.go
 new file mode 100644
-index 000000000..4cd2ee69c
+index 000000000..ae244946e
 --- /dev/null
 +++ b/dns/transport_group_test.go
-@@ -0,0 +1,1009 @@
+@@ -0,0 +1,1027 @@
 +package dns
 +
 +import (
@@ -953,6 +953,7 @@ index 000000000..4cd2ee69c
 +	"sync"
 +	"sync/atomic"
 +	"testing"
++	"testing/synctest"
 +	"time"
 +
 +	"github.com/sagernet/sing-box/adapter"
@@ -1355,15 +1356,28 @@ index 000000000..4cd2ee69c
 +}
 +
 +// "fastest" measures every member with background copies, then asks the fastest, fails
-+// over to the next fastest, and refreshes old measurements without delaying a reply.
++// over to the next fastest, and refreshes old measurements without delaying a reply. The time is
++// the test's own (synctest): an answer takes as long as its server says, however busy the host is.
 +func TestGroupFastest(t *testing.T) {
 +	t.Parallel()
-+	slow := newGroupTestMember("slow", groupTestAnswer(1, 80*time.Millisecond))
-+	fast := newGroupTestMember("fast", groupTestAnswer(2, 5*time.Millisecond))
-+	mid := newGroupTestMember("mid", groupTestAnswer(3, 40*time.Millisecond))
++	synctest.Test(t, testGroupFastest)
++}
++
++func testGroupFastest(t *testing.T) {
++	const slowDelay, fastDelay, midDelay = 80 * time.Millisecond, 5 * time.Millisecond, 40 * time.Millisecond
++	slow := newGroupTestMember("slow", groupTestAnswer(1, slowDelay))
++	fast := newGroupTestMember("fast", groupTestAnswer(2, fastDelay))
++	mid := newGroupTestMember("mid", groupTestAnswer(3, midDelay))
 +	group, _ := newGroupTest(t, nil, C.DNSGroupStrategyFastest, false, slow, fast, mid)
 +	measured := func(tag string) func() bool {
 +		return func() bool { return group.testMember(tag).SmoothedTime > 0 }
++	}
++	// expectFast: fast answers, in its own time, whatever copies are on their way
++	expectFast := func() {
++		t.Helper()
++		if elapsed := groupTestExpect(t, group, "10.0.0.2"); elapsed != fastDelay {
++			t.Errorf("fast answered after %v", elapsed)
++		}
 +	}
 +	// nothing measured: the order of the list; a copy measures the first not measured
 +	groupTestExpect(t, group, "10.0.0.1")
@@ -1371,27 +1385,31 @@ index 000000000..4cd2ee69c
 +	if mid.asked() != 0 {
 +		t.Fatal("more than one copy for one query")
 +	}
-+	groupTestExpect(t, group, "10.0.0.2") // measured before mid, which is not
++	expectFast() // measured before mid, which is not
++	// the copy to mid is on its way
++	synctest.Wait()
++	if mid.asked() != 1 || measured("mid")() {
++		t.Fatalf("mid asked %d times", mid.asked())
++	}
++	expectFast()
 +	waitFallbackTest(t, "mid is measured", measured("mid"))
 +	for i := 0; i < 5; i++ {
-+		// the copies to the others (old measurements) never delay the reply of fast
-+		if elapsed := groupTestExpect(t, group, "10.0.0.2"); elapsed > 35*time.Millisecond {
-+			t.Errorf("fast answered after %v", elapsed)
-+		}
++		expectFast()
 +	}
 +	state := group.GroupState()
-+	if !(state.Members[1].SmoothedTime < state.Members[2].SmoothedTime && state.Members[2].SmoothedTime < state.Members[0].SmoothedTime) {
++	if state.Members[1].SmoothedTime != fastDelay || state.Members[2].SmoothedTime != midDelay || state.Members[0].SmoothedTime != slowDelay {
 +		t.Fatalf("smoothed times %+v", state.Members)
 +	}
 +
-+	// old measurements are refreshed: one copy per query, to the oldest one
++	// old measurements are refreshed: one copy per query, to the oldest one, and the copies to the
++	// others never delay the reply of fast
 +	time.Sleep(groupTestTiming.staleAfter + 50*time.Millisecond)
 +	slowAsked, midAsked := slow.asked(), mid.asked()
-+	groupTestExpect(t, group, "10.0.0.2")
++	expectFast()
 +	waitFallbackTest(t, "a copy to slow", func() bool { return slow.asked() == slowAsked+1 })
-+	groupTestExpect(t, group, "10.0.0.2")
++	expectFast()
 +	waitFallbackTest(t, "a copy to mid", func() bool { return mid.asked() == midAsked+1 })
-+	groupTestExpect(t, group, "10.0.0.2")
++	expectFast()
 +	time.Sleep(100 * time.Millisecond)
 +	if slow.asked() != slowAsked+1 || mid.asked() != midAsked+1 {
 +		t.Errorf("copies sent to fresh measurements: slow %d, mid %d", slow.asked()-slowAsked, mid.asked()-midAsked)

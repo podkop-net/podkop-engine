@@ -1,7 +1,7 @@
-From 22455a4f0190a483f6aaf117d80b432b6941a2d5 Mon Sep 17 00:00:00 2001
+From 03b3309c857a016c056ea58b78c31d01809dd0c1 Mon Sep 17 00:00:00 2001
 From: FiyeroT <me@fiyero.xyz>
 Date: Sat, 14 Nov 2026 11:32:59 +0300
-Subject: [PATCH 64/69] go.mod: quic-go of the podkop-engine fork, Chrome's
+Subject: [PATCH 64/71] go.mod: quic-go of the podkop-engine fork, Chrome's
  QUIC suites in the order of the CPU
 
 The ClientHello of the Chrome QUIC parrot (hysteria2, xhttp over HTTP/3) offered AES-GCM first on

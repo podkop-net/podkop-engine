@@ -1,0 +1,806 @@
+From f866c9d898343fa0aa2a6d2e088ab1ac3bc3a8fe Mon Sep 17 00:00:00 2001
+From: FiyeroT <me@fiyero.xyz>
+Date: Tue, 24 Nov 2026 23:26:55 +0300
+Subject: [PATCH 71/71] box: a test of what a program that embeds this sing-box
+ relies on
+
+podkop-experimental builds this sing-box into its backend, and calls what the fork adds to
+upstream's API (podkop-engine's docs/EMBEDDING.md). A change that broke it was seen when that program
+moved to it. The test builds a configuration with every option it writes, the way "sing-box check"
+does, and runs a box as it does: a start with RemoteStart and StartWithoutClose, its own service,
+log writer and connection tracker, the rule sets and their update, FakeIP's Peek, the traffic and
+the detector's flows, the ways of the downloads, a copy of an outbound for a probe and the outcome
+of the handshakes under DetectOutcomeKey, UpdateOutbounds, the Clash API of a URL test, the readers
+of rule-set files and links, and the texts it goes by.
+
+A patch of its own (0802), for the series as a whole.
+
+Pdk-Feature: embedder-test
+Pdk-Zone: other
+Pdk-Layer: 08
+---
+ embedder_test.go | 772 +++++++++++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 772 insertions(+)
+ create mode 100644 embedder_test.go
+
+diff --git a/embedder_test.go b/embedder_test.go
+new file mode 100644
+index 000000000..cdb542df5
+--- /dev/null
++++ b/embedder_test.go
+@@ -0,0 +1,772 @@
++//go:build with_quic && with_utls && with_clash_api
++
++package box_test
++
++import (
++	"bufio"
++	"bytes"
++	"context"
++	"errors"
++	"fmt"
++	"io"
++	"net"
++	"net/http"
++	"net/http/httptest"
++	"net/netip"
++	"net/url"
++	"path/filepath"
++	"regexp"
++	"strings"
++	"sync"
++	"sync/atomic"
++	"testing"
++	"time"
++
++	"github.com/sagernet/sing-box"
++	"github.com/sagernet/sing-box/adapter"
++	boxService "github.com/sagernet/sing-box/adapter/service"
++	"github.com/sagernet/sing-box/common/domainset"
++	"github.com/sagernet/sing-box/common/httpclient"
++	"github.com/sagernet/sing-box/common/ruletext"
++	"github.com/sagernet/sing-box/common/sharelink"
++	"github.com/sagernet/sing-box/common/srs"
++	"github.com/sagernet/sing-box/common/tls"
++	"github.com/sagernet/sing-box/common/trafficcontrol"
++	"github.com/sagernet/sing-box/common/urltest"
++	C "github.com/sagernet/sing-box/constant"
++	"github.com/sagernet/sing-box/experimental/deprecated"
++	"github.com/sagernet/sing-box/include"
++	"github.com/sagernet/sing-box/log"
++	"github.com/sagernet/sing-box/option"
++	R "github.com/sagernet/sing-box/route/rule"
++	tun "github.com/sagernet/sing-tun"
++	E "github.com/sagernet/sing/common/exceptions"
++	"github.com/sagernet/sing/common/json"
++	M "github.com/sagernet/sing/common/metadata"
++	N "github.com/sagernet/sing/common/network"
++	"github.com/sagernet/sing/service"
++
++	mDNS "github.com/miekg/dns"
++	"github.com/stretchr/testify/require"
++)
++
++// What a program that embeds this sing-box relies on beyond upstream's API, the way
++// podkop-experimental uses it (its package engine; the list is podkop-engine's docs/EMBEDDING.md):
++// the Go API of the fork, the options only the fork reads, the keys and the texts it goes by. A
++// change of the series that breaks such a program fails here, not when the program moves to it. A
++// change that is meant is made here as well, and is a line of the release notes ("embedding:").
++
++// embedderContext is the context such a program builds its boxes in: the registries with a service
++// of its own, and what the boxes of the process share.
++func embedderContext(t *testing.T, history *urltest.HistoryStorage, memory *httpclient.DownloadMemory) context.Context {
++	registry := include.ServiceRegistry()
++	boxService.Register[embedderServiceOptions](registry, "embedder-service", newEmbedderService)
++	ctx := service.ContextWith[deprecated.Manager](context.Background(), deprecated.NewStderrManager(log.StdLogger()))
++	ctx = box.Context(ctx, include.InboundRegistry(), include.OutboundRegistry(), include.EndpointRegistry(),
++		include.DNSTransportRegistry(), registry, include.CertificateProviderRegistry())
++	ctx = service.ExtendContext(ctx)
++	ctx = service.ContextWithPtr(service.ContextWithPtr(ctx, history), memory)
++	ctx = service.ContextWithPtr(ctx, &R.RemoteStart{Empty: true})
++	ctx, cancel := context.WithCancel(ctx)
++	t.Cleanup(cancel)
++	return ctx
++}
++
++type embedderServiceOptions struct {
++	Table string `json:"table,omitempty"`
++}
++
++type embedderService struct {
++	boxService.Adapter
++}
++
++func newEmbedderService(ctx context.Context, logger log.ContextLogger, tag string, options embedderServiceOptions) (adapter.Service, error) {
++	if options.Table == "" {
++		return nil, E.New("missing table")
++	}
++	return &embedderService{boxService.NewAdapter("embedder-service", tag)}, nil
++}
++
++func (s *embedderService) Start(stage adapter.StartStage, scope *adapter.Scope) error { return nil }
++
++// embedderLog is the log writer of such a program: the lines of its level, without colours.
++type embedderLog struct {
++	access sync.Mutex
++	lines  []string
++}
++
++var (
++	_ log.PlatformWriterLevel  = (*embedderLog)(nil)
++	_ log.PlatformWriterColors = (*embedderLog)(nil)
++)
++
++func (l *embedderLog) Level() log.Level    { return log.LevelInfo }
++func (l *embedderLog) DisableColors() bool { return true }
++
++func (l *embedderLog) WriteMessage(level log.Level, message string) {
++	l.access.Lock()
++	defer l.access.Unlock()
++	l.lines = append(l.lines, log.FormatLevel(level)+" "+message)
++}
++
++func (l *embedderLog) find(part string) string {
++	l.access.Lock()
++	defer l.access.Unlock()
++	for _, line := range l.lines {
++		if strings.Contains(line, part) {
++			return line
++		}
++	}
++	return ""
++}
++
++// embedderHook is told of the connections the router routes.
++type embedderHook struct {
++	access sync.Mutex
++	routed []adapter.InboundContext
++}
++
++func (h *embedderHook) RoutedConnection(ctx context.Context, conn net.Conn, metadata adapter.InboundContext, matchedRule adapter.Rule, matchOutbound adapter.Outbound) net.Conn {
++	h.access.Lock()
++	defer h.access.Unlock()
++	h.routed = append(h.routed, metadata)
++	return conn
++}
++
++func (h *embedderHook) RoutedPacketConnection(ctx context.Context, conn N.PacketConn, metadata adapter.InboundContext, matchedRule adapter.Rule, matchOutbound adapter.Outbound) N.PacketConn {
++	return conn
++}
++
++func (h *embedderHook) RoutedFlow(ctx context.Context, metadata adapter.InboundContext, matchedRule adapter.Rule, matchOutbound adapter.Outbound) tun.FlowTracker {
++	return nil
++}
++
++func (h *embedderHook) inbounds() []string {
++	h.access.Lock()
++	defer h.access.Unlock()
++	var tags []string
++	for _, metadata := range h.routed {
++		tags = append(tags, metadata.Inbound)
++	}
++	return tags
++}
++
++const (
++	embedderUUID    = `"uuid": "9c17d9be-4eaa-4336-89ce-1ecdd76b7ac4"`
++	embedderReality = `"reality": {"enabled": true, "public_key": "6x33-mZSKbpyS22-wakXnzZvlay3BUianS6cPaJQ-Ow", "short_id": "01"}`
++)
++
++// A configuration of every option such a program writes is built, the way "sing-box check" does.
++func TestEmbedderConfiguration(t *testing.T) {
++	reality := func(name, fingerprint, more string) string {
++		return `{"type": "vless", "tag": "` + name + `", "server": "203.0.113.61", "server_port": 443, ` + embedderUUID + `, "flow": "xtls-rprx-vision",
++			"tls": {"enabled": true, "server_name": "www.example.com", "utls": {"enabled": true, "fingerprint": "` + fingerprint + `"}, ` + embedderReality + more + `}}`
++	}
++	group := func(tag, members, more string) string {
++		return `{"type": "urltest", "tag": "` + tag + `", "outbounds": [` + members + `], "urls": ["https://www.gstatic.com/generate_204", "https://cp.cloudflare.com/generate_204"],
++			"interval": "1m", "tolerance": 50, "download_url": "https://speed.cloudflare.com/__down?bytes=65536"` + more + `}`
++	}
++	content := `{
++		"log": {"disabled": false, "level": "warn", "timestamp": false},
++		"dns": {
++			"servers": [
++				{"type": "udp", "tag": "bootstrap-dns-server", "server": "77.88.8.8", "server_port": 53},
++				{"type": "udp", "tag": "dns-server-1", "server": "1.1.1.1", "server_port": 53},
++				{"type": "tls", "tag": "dns-server-2", "server": "dns.quad9.net", "server_port": 853, "domain_resolver": "bootstrap-dns-server"},
++				{"type": "https", "tag": "dns-server-3", "server": "dns.example.com", "path": "/q", "domain_resolver": "bootstrap-dns-server", "detour": "main-out"},
++				{"type": "provider", "tag": "isp"},
++				{"type": "group", "tag": "dns-server", "servers": ["dns-server-1", "dns-server-2", "dns-server-3"], "strategy": "fastest"},
++				{"type": "fakeip", "tag": "fakeip-server", "inet4_range": "198.18.0.0/15"}
++			],
++			"rules": [
++				{"action": "reject", "query_type": "HTTPS"},
++				{"action": "route", "server": "fakeip-server", "rewrite_ttl": 60, "rule_set": ["names", "addresses"]},
++				{"action": "route", "server": "isp", "domain": ["lan.example.com"]}
++			],
++			"final": "dns-server", "strategy": "ipv4_only", "ipv6_if_no_ipv4": true
++		},
++		"ntp": {}, "certificate": {}, "endpoints": [],
++		"http_clients": [{"tag": "lists", "outbounds": ["direct-out", "main-out"]}],
++		"inbounds": [
++			{"type": "tproxy", "tag": "tproxy-in", "listen": "127.0.0.1", "listen_port": 1602, "tcp_fast_open": true, "udp_fragment": true},
++			{"type": "direct", "tag": "dns-in", "listen": "127.0.0.42", "listen_port": 53},
++			{"type": "mixed", "tag": "mixed-in", "listen": "127.0.0.1", "listen_port": 2080, "users": [{"username": "u", "password": "p"}]}
++		],
++		"outbounds": [
++			{"type": "direct", "tag": "direct-out"},
++			{"type": "block", "tag": "block"},
++			` + strings.Join([]string{
++		reality("reality", "chrome", ""),
++		reality("reality spoofed", "firefox", `, "spoof": "www.example.org"`),
++		reality("reality cut", "edge", `, "record_fragment": true`),
++		`{"type": "vless", "tag": "xhttp", "server": "x.example.org", "server_port": 443, ` + embedderUUID + `, "tls": {"enabled": true, "server_name": "x.example.org",
++			"utls": {"enabled": true, "fingerprint": "chrome"}}, "transport": {"type": "xhttp", "path": "/x", "mode": "packet-up"}}`,
++		`{"type": "vless", "tag": "ws masked", "server": "ws.example.org", "server_port": 443, ` + embedderUUID + `, "finalmask": {"tcp": [{"type": "fragment",
++			"packets": "tlshello", "lengths": ["11-24"], "delays": ["0"]}]}, "tls": {"enabled": true, "server_name": "ws.example.org",
++			"certificate_server_name": ["front.example.org"]}, "transport": {"type": "ws", "path": "/ws", "headers": {"Host": "cdn.example.org"}}}`,
++		`{"type": "trojan", "tag": "trojan", "server": "203.0.113.62", "server_port": 443, "password": "p", "tls": {"enabled": true, "server_name": "t.example.org",
++			"certificate_sha256": ["` + strings.Repeat("ab", 32) + `"]}}`,
++		`{"type": "shadowsocks", "tag": "ss", "server": "203.0.113.63", "server_port": 8388, "method": "chacha20-ietf-poly1305", "password": "p",
++			"udp_over_tcp": {"enabled": true, "version": 2}}`,
++		`{"type": "hysteria2", "tag": "hy2", "server": "203.0.113.64", "server_port": 443, "password": "p", "obfs": {"type": "salamander", "password": "o"},
++			"tls": {"enabled": true, "server_name": "h.example.org", "alpn": ["h3"]}}`,
++		`{"type": "tuic", "tag": "tuic", "server": "203.0.113.65", "server_port": 443, ` + embedderUUID + `, "password": "p", "congestion_control": "bbr",
++			"tls": {"enabled": true, "server_name": "u.example.org", "alpn": ["h3"]}}`,
++		`{"type": "socks", "tag": "socks", "server": "203.0.113.66", "server_port": 1080, "username": "u", "password": "p"}`,
++		`{"type": "http", "tag": "http", "server": "203.0.113.67", "server_port": 8080}`,
++		`{"type": "socks", "tag": "through", "server": "203.0.113.68", "server_port": 1080, "detour": "reality"}`,
++		group("reserve-out", `"trojan", "ss"`, `, "mode": "loss", "loss_url": "https://speed.cloudflare.com/__down?bytes=1048576", "loss_interval": "30m", "idle_timeout": "1m"`),
++		group("balance-out", `"hy2", "tuic"`, `, "mode": "balance", "loss_url": "https://speed.cloudflare.com/__down?bytes=1048576", "loss_threshold": 2`),
++		group("main-urltest-out", `"reality", "xhttp"`, `, "fallbacks": ["reserve-out", "balance-out", "socks", "direct-out", "block"]`),
++		group("empty-urltest-out", ``, `, "fallbacks": ["http"]`),
++		`{"type": "selector", "tag": "main-out", "outbounds": ["main-urltest-out", "reality", "xhttp"], "default": "main-urltest-out"}`,
++	}, ",\n") + `
++		],
++		"route": {
++			"rules": [
++				{"action": "sniff", "inbound": ["tproxy-in", "dns-in"]},
++				{"action": "hijack-dns", "protocol": "dns"},
++				{"action": "route", "inbound": "tproxy-in", "outbound": "main-out", "rule_set": ["names", "addresses"]}
++			],
++			"rule_set": [
++				{"type": "remote", "tag": "names", "format": "text", "url": "https://lists.example.com/names.txt", "update_interval": "1d"},
++				{"type": "remote", "tag": "addresses", "format": "binary", "url": "https://lists.example.com/a.srs", "update_interval": "1d"}
++			],
++			"final": "direct-out", "default_mark": 2097152, "default_domain_resolver": "dns-server", "default_http_client": "lists"
++		},
++		"services": [{"type": "embedder-service", "tag": "own", "table": "t"}],
++		"experimental": {
++			"cache_file": {"enabled": true, "path": "` + filepath.Join(t.TempDir(), "cache.db") + `", "store_fakeip": true},
++			"clash_api": {"external_controller": "127.0.0.1:9090", "secret": "s"},
++			"utls_fallback": {"enabled": true}
++		}
++	}`
++	ctx := embedderContext(t, urltest.NewHistoryStorage(), httpclient.NewDownloadMemory())
++	options, err := json.UnmarshalExtendedContext[option.Options](ctx, []byte(content))
++	require.NoError(t, err)
++	instance, err := box.New(box.Options{Context: ctx, Options: options})
++	require.NoError(t, err)
++	require.NoError(t, instance.Close())
++
++	// the errors of one outbound, whose fronts are cut off
++	for _, testCase := range []struct{ outbound, message string }{
++		{`{"type": "vless", "server": "203.0.113.61", "server_port": 443, "nonsense": 1}`, "outbounds[0].nonsense: json: unknown field \"nonsense\""},
++		{`{"type": "vless", "server": "203.0.113.61", "server_port": 443, ` + embedderUUID + `, "flow": "other"}`, "initialize outbound[0]: "},
++		{`{"type": "vless", "server": "203.0.113.61", "server_port": 443, ` + embedderUUID + `, "transport": {"type": "xhttp", "mode": "other"}}`, "initialize outbound[0]: create client transport: "},
++	} {
++		ctx := embedderContext(t, urltest.NewHistoryStorage(), httpclient.NewDownloadMemory())
++		options, err := json.UnmarshalExtendedContext[option.Options](ctx, []byte(`{"log": {"disabled": true}, "outbounds": [`+testCase.outbound+`]}`))
++		if err == nil {
++			_, err = box.New(box.Options{Context: ctx, Options: options})
++		}
++		require.ErrorContains(t, err, testCase.message)
++	}
++}
++
++// embedderStand is a box such a program runs, and what it reaches.
++type embedderStand struct {
++	ctx       context.Context
++	box       *box.Box
++	log       embedderLog
++	hook      embedderHook
++	history   *urltest.HistoryStorage
++	memory    *httpclient.DownloadMemory
++	web       *httptest.Server
++	list      atomic.Value  // the content of the remote list
++	listGate  chan struct{} // closed: the list is served
++	lists     atomic.Int32  // the requests for it
++	mixedPort uint16
++	dnsPort   uint16
++	apiPort   uint16
++	// the server of the outbound stranger
++	stranger M.Socksaddr
++}
++
++// embedderPorts are free ports of the loopback, held until release: a port that is let go at once is
++// the one a server of the test may get next.
++func embedderPorts(t *testing.T, count int) (ports []uint16, release func()) {
++	var listeners []net.Listener
++	release = func() {
++		for _, listener := range listeners {
++			listener.Close()
++		}
++	}
++	t.Cleanup(release)
++	for range count {
++		listener, err := net.Listen("tcp", "127.0.0.1:0")
++		require.NoError(t, err)
++		listeners = append(listeners, listener)
++		ports = append(ports, uint16(listener.Addr().(*net.TCPAddr).Port))
++	}
++	return
++}
++
++// plainServer is a server of TLS whose certificate nobody trusts: to a REALITY client, one that is
++// not the server it should be.
++func plainServer(t *testing.T) M.Socksaddr {
++	server := httptest.NewTLSServer(http.NotFoundHandler())
++	t.Cleanup(server.Close)
++	return M.SocksaddrFromNet(server.Listener.Addr())
++}
++
++func (s *embedderStand) outbounds(serverA string) string {
++	return `
++		{"type": "direct", "tag": "direct-out"},
++		{"type": "block", "tag": "block"},
++		` + serverA + `,
++		{"type": "socks", "tag": "B", "server": "127.0.0.1", "server_port": ` + fmt.Sprint(s.mixedPort) + `, "username": "loop", "password": "p"},
++		{"type": "socks", "tag": "dead", "server": "127.0.0.1", "server_port": 1},
++		{"type": "vless", "tag": "stranger", "server": "127.0.0.1", "server_port": ` + fmt.Sprint(s.stranger.Port) + `, ` + embedderUUID + `,
++			"tls": {"enabled": true, "server_name": "www.example.com", "utls": {"enabled": true, "fingerprint": "edge"}, ` + embedderReality + `}},
++		{"type": "urltest", "tag": "reserve-out", "outbounds": ["dead", "B"], "urls": ["` + s.web.URL + `/204"], "interval": "1m", "tolerance": 50,
++			"download_url": "", "mode": "loss", "loss_url": "` + s.web.URL + `/loss"},
++		{"type": "urltest", "tag": "main-urltest-out", "outbounds": ["A"], "urls": ["` + s.web.URL + `/204"], "interval": "1m", "tolerance": 50,
++			"download_url": "` + s.web.URL + `/download", "fallbacks": ["reserve-out", "direct-out", "block"]},
++		{"type": "selector", "tag": "main-out", "outbounds": ["main-urltest-out", "A", "dead", "B"], "default": "main-urltest-out"}`
++}
++
++func (s *embedderStand) serverA(user string) string {
++	return `{"type": "socks", "tag": "A", "server": "127.0.0.1", "server_port": ` + fmt.Sprint(s.mixedPort) + `, "username": "` + user + `", "password": "p"}`
++}
++
++func newEmbedderStand(t *testing.T) *embedderStand {
++	ports, release := embedderPorts(t, 3)
++	s := &embedderStand{
++		history: urltest.NewHistoryStorage(), memory: httpclient.NewDownloadMemory(), listGate: make(chan struct{}),
++		mixedPort: ports[0], dnsPort: ports[1], apiPort: ports[2],
++	}
++	s.list.Store("example.com\n192.0.2.0/24\n")
++	s.stranger = plainServer(t)
++	s.web = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		switch r.URL.Path {
++		case "/204":
++			w.WriteHeader(http.StatusNoContent)
++		case "/list":
++			s.lists.Add(1)
++			select {
++			case <-s.listGate:
++			case <-r.Context().Done():
++				return
++			}
++			w.Write([]byte(s.list.Load().(string)))
++		default:
++			w.Write(make([]byte, urltest.LossProbeLarge))
++		}
++	}))
++	t.Cleanup(s.web.Close)
++	s.ctx = embedderContext(t, s.history, s.memory)
++	content := `{
++		"log": {"level": "debug"},
++		"dns": {
++			"servers": [
++				{"type": "udp", "tag": "dns-server-1", "server": "127.0.0.1", "server_port": 1},
++				{"type": "group", "tag": "dns-server", "servers": ["dns-server-1"]},
++				{"type": "fakeip", "tag": "fakeip-server", "inet4_range": "198.18.0.0/15"}
++			],
++			"rules": [{"action": "route", "server": "fakeip-server", "rewrite_ttl": 60, "domain": ["fake.example.com"]}],
++			"final": "dns-server", "strategy": "ipv4_only", "ipv6_if_no_ipv4": true
++		},
++		"http_clients": [{"tag": "lists", "outbounds": ["direct-out", "main-out"]}],
++		"inbounds": [
++			{"type": "direct", "tag": "dns-in", "listen": "127.0.0.1", "listen_port": ` + fmt.Sprint(s.dnsPort) + `},
++			{"type": "mixed", "tag": "mixed-in", "listen": "127.0.0.1", "listen_port": ` + fmt.Sprint(s.mixedPort) + `,
++				"users": [{"username": "main", "password": "p"}, {"username": "loop", "password": "p"}, {"username": "loop2", "password": "p"}]}
++		],
++		"outbounds": [` + s.outbounds(s.serverA("loop")) + `],
++		"route": {
++			"rules": [
++				{"action": "sniff", "inbound": ["dns-in"]},
++				{"action": "hijack-dns", "protocol": "dns"},
++				{"action": "route", "auth_user": ["loop", "loop2"], "outbound": "direct-out"},
++				{"action": "route", "auth_user": "main", "outbound": "main-out"}
++			],
++			"rule_set": [{"type": "remote", "tag": "list", "format": "text", "url": "` + s.web.URL + `/list", "update_interval": "1d"}],
++			"final": "direct-out", "default_http_client": "lists"
++		},
++		"services": [{"type": "embedder-service", "tag": "own", "table": "t"}],
++		"experimental": {
++			"cache_file": {"enabled": true, "path": "` + filepath.Join(t.TempDir(), "cache.db") + `", "store_fakeip": true},
++			"clash_api": {"external_controller": "127.0.0.1:` + fmt.Sprint(s.apiPort) + `", "secret": "s"},
++			"utls_fallback": {"enabled": true}
++		}
++	}`
++	options, err := json.UnmarshalExtendedContext[option.Options](s.ctx, []byte(content))
++	require.NoError(t, err)
++	s.box, err = box.New(box.Options{Context: s.ctx, Options: options, PlatformLogWriter: &s.log})
++	require.NoError(t, err)
++	t.Cleanup(func() { s.box.Close() })
++	service.FromContext[adapter.Router](s.ctx).AppendTracker(&s.hook)
++	release()
++	return s
++}
++
++func (s *embedderStand) get(t *testing.T, user string) (int, error) {
++	proxy := &url.URL{Scheme: "http", User: url.UserPassword(user, "p"), Host: fmt.Sprint("127.0.0.1:", s.mixedPort)}
++	client := &http.Client{Timeout: 10 * time.Second, Transport: &http.Transport{Proxy: http.ProxyURL(proxy), DisableKeepAlives: true}}
++	response, err := client.Get(s.web.URL + "/204")
++	if err != nil {
++		return 0, err
++	}
++	response.Body.Close()
++	return response.StatusCode, nil
++}
++
++func eventually(t *testing.T, condition func() bool, message string) {
++	t.Helper()
++	require.Eventually(t, condition, 20*time.Second, 50*time.Millisecond, message)
++}
++
++// The life of a box in such a program, with each thing it asks of one.
++func TestEmbedderBox(t *testing.T) {
++	s := newEmbedderStand(t)
++	router := service.FromContext[adapter.Router](s.ctx)
++	cacheFile := service.FromContext[adapter.CacheFile](s.ctx)
++	var updated atomic.Int32
++	ruleSet, found := router.RuleSet("list")
++	require.True(t, found)
++	ruleSet.RegisterCallback(func(adapter.RuleSet) { updated.Add(1) })
++
++	// the start: R.RemoteStart lets it not wait for the list
++	require.NoError(t, s.box.StartWithoutClose())
++	require.True(t, ruleSet.Metadata().ContainsIPCIDRRule, "nothing known of the list yet: it may have addresses")
++	require.Zero(t, updated.Load())
++	close(s.listGate)
++	eventually(t, func() bool { return updated.Load() > 0 }, "the list is downloaded after the start")
++	require.True(t, ruleSet.Metadata().ContainsIPCIDRRule)
++	saved := cacheFile.LoadRuleSet("list")
++	require.NotNil(t, saved)
++	require.Equal(t, s.list.Load(), string(saved.Content))
++	require.False(t, saved.LastUpdated.IsZero())
++
++	t.Run("RuleSets", func(t *testing.T) {
++		updater, can := router.(interface {
++			UpdateRuleSets(ctx context.Context) (R.RuleSetUpdateSummary, error)
++		})
++		require.True(t, can)
++		s.list.Store("example.org\n")
++		before := updated.Load()
++		summary, err := updater.UpdateRuleSets(context.Background())
++		require.NoError(t, err)
++		require.Equal(t, R.RuleSetUpdateSummary{Total: 1, Loaded: 1}, summary)
++		require.Greater(t, updated.Load(), before)
++		require.False(t, ruleSet.Metadata().ContainsIPCIDRRule)
++		require.Equal(t, "example.org\n", string(cacheFile.LoadRuleSet("list").Content))
++	})
++
++	t.Run("Traffic", func(t *testing.T) {
++		eventually(t, func() bool { return s.history.LoadURLTestHistory("A") != nil }, "the group tests its members")
++		eventually(t, func() bool { _, failed := s.history.LoadURLTestFailure("dead"); return failed }, "a failed test")
++		status, err := s.get(t, "main")
++		require.NoError(t, err)
++		require.Equal(t, http.StatusNoContent, status)
++		require.Contains(t, s.hook.inbounds(), "mixed-in")
++		manager := service.PtrFromContext[trafficcontrol.Manager](s.ctx)
++		require.NotNil(t, manager)
++		up, down := manager.Total()
++		require.Positive(t, up)
++		require.Positive(t, down)
++
++		// an open connection, whose client writes on after 5 s without a word of the server
++		listener, err := net.Listen("tcp", "127.0.0.1:0")
++		require.NoError(t, err)
++		defer listener.Close()
++		go func() {
++			conn, err := listener.Accept()
++			if err == nil {
++				conn.Write([]byte("hi"))
++				io.Copy(io.Discard, conn)
++			}
++		}()
++		conn, err := net.Dial("tcp", fmt.Sprint("127.0.0.1:", s.mixedPort))
++		require.NoError(t, err)
++		defer conn.Close()
++		fmt.Fprintf(conn, "CONNECT %s HTTP/1.1\r\nHost: x\r\nProxy-Authorization: Basic bWFpbjpw\r\n\r\n", listener.Addr())
++		conn.SetReadDeadline(time.Now().Add(10 * time.Second))
++		reader := bufio.NewReader(conn)
++		response, err := http.ReadResponse(reader, nil)
++		require.NoError(t, err)
++		require.Equal(t, http.StatusOK, response.StatusCode)
++		_, err = io.ReadFull(reader, make([]byte, 2))
++		require.NoError(t, err)
++		eventually(t, func() bool {
++			conn.Write([]byte("hello"))
++			for _, open := range manager.Connections() {
++				if open.Metadata.Network == N.NetworkTCP && open.Outbound == "A" && open.Upload.Load() >= 5 && open.Download.Load() == 2 && !open.CreatedAt.IsZero() {
++					return !open.PendingSince().IsZero()
++				}
++			}
++			return false
++		}, "the connection, with the member that carries it")
++		require.Positive(t, manager.ConnectionsLen())
++
++		// what the detector reads of the closed ones; the names are the API
++		var sample trafficcontrol.DetectFlowSample
++		for _, sample = range manager.DetectFlows() {
++			_ = []trafficcontrol.DetectFlow(sample.Cuts)
++			_, _ = sample.LastBigAt, sample.LastDataAt
++		}
++		_ = trafficcontrol.DetectFlow{Download: 1, Upload: 1, CreatedAt: time.Time{}, ClosedAt: time.Time{}, PendingSince: time.Time{}}
++		_, has := manager.DetectFlows()["A"]
++		require.True(t, has, "the connections of a proxy outbound")
++		manager.ForgetDetectFlows([]string{"A"})
++		require.NotContains(t, manager.DetectFlows(), "A")
++	})
++
++	t.Run("FakeIP", func(t *testing.T) {
++		store := service.FromContext[adapter.DNSTransportManager](s.ctx).FakeIP().Store()
++		peeker, can := store.(interface {
++			Peek(domain string, isIPv6 bool) (netip.Addr, bool)
++		})
++		require.True(t, can)
++		_, found := peeker.Peek("fake.example.com", false)
++		require.False(t, found, "a name is given no address by the question")
++		message := new(mDNS.Msg)
++		message.SetQuestion("fake.example.com.", mDNS.TypeA)
++		response, _, err := (&mDNS.Client{Timeout: 5 * time.Second}).Exchange(message, fmt.Sprint("127.0.0.1:", s.dnsPort))
++		require.NoError(t, err)
++		require.Len(t, response.Answer, 1)
++		address, found := peeker.Peek("fake.example.com", false)
++		require.True(t, found)
++		require.Equal(t, response.Answer[0].(*mDNS.A).A.String(), address.String())
++	})
++
++	t.Run("Downloads", func(t *testing.T) {
++		downloaders, can := service.FromContext[adapter.HTTPClientManager](s.ctx).(adapter.HTTPDownloaders)
++		require.True(t, can)
++		downloader, err := downloaders.ResolveDownloader(&option.HTTPClientOptions{Tag: "lists"})
++		require.NoError(t, err)
++		ways, _ := downloader.Ways("files.example.com")
++		require.Equal(t, []string{"direct-out", "main-out"}, ways)
++		downloader.Record("files.example.com", "direct-out", errors.New("no answer"), time.Second, 0)
++		downloader.Record("files.example.com", "main-out", nil, time.Second, 100)
++		ways, _ = downloader.Ways("files.example.com")
++		require.Equal(t, "main-out", ways[0], "the way that brought a file of the host")
++		s.memory.SetExcluded([]string{"main-out"})
++		ways, _ = downloader.Ways("files.example.com")
++		require.NotContains(t, ways, "main-out")
++		s.memory.SetExcluded(nil)
++		s.memory.Forget("direct-out")
++		s.memory.Forget("main-out")
++		ways, _ = downloader.Ways("files.example.com")
++		require.Equal(t, []string{"direct-out", "main-out"}, ways, "nothing known of them again")
++	})
++
++	t.Run("Outcomes", func(t *testing.T) {
++		stranger, _ := s.box.Outbound().Outbound("stranger")
++		key := adapter.DetectOutcomeKey("edge", "www.example.com", s.stranger)
++		_, _, _, loaded := cacheFile.LoadDetectOutcome(key)
++		require.False(t, loaded)
++
++		// a copy for a probe, without the fallback and without the cache: it records nothing
++		probeCtx := service.ExtendContext(s.ctx)
++		probeCtx = service.ContextWith[*option.UTLSFallbackOptions](probeCtx, &option.UTLSFallbackOptions{Enabled: false})
++		probeCtx = service.ContextWith[adapter.CacheFile](probeCtx, nil)
++		options, err := json.UnmarshalExtendedContext[option.Options](s.ctx, []byte(fmt.Sprint(`{"outbounds": [{"type": "vless", "tag": "stranger", "server": "127.0.0.1", "server_port": `, s.stranger.Port, `, `, embedderUUID, `,
++			"tls": {"enabled": true, "server_name": "www.example.com", "utls": {"enabled": true, "fingerprint": "chrome"}, `, embedderReality, `}}]}`)))
++		require.NoError(t, err)
++		decoded := options.Outbounds[0]
++		decoded.Options.(option.OutboundTLSOptionsWrapper).TakeOutboundTLSOptions().UTLS.Fingerprint = "edge"
++		dialerOptions := decoded.Options.(option.DialerOptionsWrapper).TakeDialerOptions()
++		decoded.Options.(option.DialerOptionsWrapper).ReplaceDialerOptions(dialerOptions)
++		factory := log.NewNOPFactory()
++		scope := adapter.NewScope(probeCtx, factory.Logger())
++		defer scope.Close()
++		copied, err := service.FromContext[adapter.OutboundRegistry](s.ctx).CreateOutbound(adapter.WithContext(scope.Context(), &adapter.InboundContext{Outbound: "stranger"}),
++			router, factory.NewLogger("stranger"), "stranger#probe", decoded.Type, decoded.Options)
++		require.NoError(t, err)
++		if lifecycle, has := copied.(adapter.Lifecycle); has {
++			for _, stage := range adapter.ListStartStages {
++				require.NoError(t, scope.Start("probe outbound", lifecycle, stage))
++			}
++		}
++		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
++		defer cancel()
++		_, err = copied.DialContext(ctx, N.NetworkTCP, M.ParseSocksaddr("192.0.2.1:443"))
++		require.ErrorIs(t, err, tls.ErrRealityVerification)
++		require.ErrorContains(t, err, "reality verification failed")
++		time.Sleep(100 * time.Millisecond)
++		_, _, _, loaded = cacheFile.LoadDetectOutcome(key)
++		require.False(t, loaded, "a probe records nothing")
++
++		// the outbound of the box, with the fallback: every candidate is refused
++		for range 4 {
++			_, err = stranger.DialContext(ctx, N.NetworkTCP, M.ParseSocksaddr("192.0.2.1:443"))
++			require.Error(t, err)
++		}
++		eventually(t, func() bool {
++			flags, _, at, loaded := cacheFile.LoadDetectOutcome(key)
++			return loaded && flags&adapter.DetectFailed != 0 && flags&adapter.DetectNoAnswer == 0 && time.Since(at) < time.Minute
++		}, "the outcome under the key of the server")
++		_ = adapter.DetectRefused
++	})
++
++	t.Run("Log", func(t *testing.T) {
++		// the lines of the level, plain, with the level and the seconds in front
++		line := s.log.find("sing-box started")
++		require.Regexp(t, regexp.MustCompile(`^info INFO\[[0-9]+\] `), line)
++		require.NotContains(t, strings.Join(s.log.lines, "\n"), "\x1b")
++		require.Empty(t, s.log.find("debug DEBUG"), "lines below the level")
++		status, err := s.get(t, "wrong")
++		require.NoError(t, err)
++		require.Equal(t, http.StatusProxyAuthRequired, status)
++		eventually(t, func() bool {
++			return s.log.find("authentication failed, username=") != ""
++		}, "the failed login")
++		require.NotEmpty(t, s.log.find("inbound/mixed[mixed-in]: [main] inbound connection to "))
++	})
++
++	t.Run("ClashAPI", func(t *testing.T) {
++		request, _ := http.NewRequest(http.MethodGet, fmt.Sprint("http://127.0.0.1:", s.apiPort, "/proxies"), nil)
++		request.Header.Set("Authorization", "Bearer s")
++		var content struct {
++			Proxies map[string]struct {
++				Now       string   `json:"now"`
++				All       []string `json:"all"`
++				Fallbacks []string `json:"fallbacks"`
++				Mode      string   `json:"mode"`
++			} `json:"proxies"`
++		}
++		eventually(t, func() bool {
++			response, err := http.DefaultClient.Do(request)
++			if err != nil {
++				return false
++			}
++			defer response.Body.Close()
++			var body bytes.Buffer
++			body.ReadFrom(response.Body)
++			return json.Unmarshal(body.Bytes(), &content) == nil && content.Proxies["main-urltest-out"].Now == "A"
++		}, "the Clash API answers")
++		require.Equal(t, []string{"A", "reserve-out", "direct-out", "block"}, content.Proxies["main-urltest-out"].All)
++		require.Equal(t, []string{"reserve-out", "direct-out", "block"}, content.Proxies["main-urltest-out"].Fallbacks)
++		require.Equal(t, "loss", content.Proxies["reserve-out"].Mode)
++	})
++
++	t.Run("UpdateOutbounds", func(t *testing.T) {
++		parse := func(outbounds string) []option.Outbound {
++			options, err := json.UnmarshalExtendedContext[option.Options](s.ctx, []byte(`{"outbounds": [`+outbounds+`]}`))
++			require.NoError(t, err)
++			return options.Outbounds
++		}
++		old, _ := s.box.Outbound().Outbound("A")
++		_, err := s.box.UpdateOutbounds(parse(`{"type": "selector", "tag": "main-out", "outbounds": ["nothing"]}`), nil, 0)
++		require.Error(t, err, "refused")
++		now, _ := s.box.Outbound().Outbound("A")
++		require.Same(t, old, now)
++		require.Error(t, box.ErrTooManyKept)
++
++		// a server changed and one added, the groups with it and the selectors over them
++		require.True(t, must[interface{ SelectOutbound(tag string) bool }](t, s, "main-out").SelectOutbound("B"))
++		update, err := s.box.UpdateOutbounds(parse(s.serverA("loop2")+`,
++			{"type": "socks", "tag": "C", "server": "127.0.0.1", "server_port": 1},
++			{"type": "urltest", "tag": "main-urltest-out", "outbounds": ["A", "C"], "urls": ["`+s.web.URL+`/204"], "interval": "1m", "download_url": "", "fallbacks": ["reserve-out", "direct-out"]},
++			{"type": "selector", "tag": "main-out", "outbounds": ["main-urltest-out", "A", "B", "C"], "default": "main-urltest-out"}`), nil, 0)
++		require.NoError(t, err)
++		require.Equal(t, 1, update.Added)
++		require.Equal(t, 3, update.Replaced)
++		require.GreaterOrEqual(t, update.Kept, 0)
++		require.Zero(t, update.Removed)
++		now, _ = s.box.Outbound().Outbound("A")
++		require.NotSame(t, old, now)
++		require.Equal(t, "B", cacheFile.LoadSelected("main-out"), "the choice of the selector is kept")
++		require.NoError(t, cacheFile.StoreSelected("main-out", "main-urltest-out"))
++		require.True(t, must[interface{ SelectOutbound(tag string) bool }](t, s, "main-out").SelectOutbound("main-urltest-out"))
++		status, err := s.get(t, "main")
++		require.NoError(t, err)
++		require.Equal(t, http.StatusNoContent, status)
++		eventually(t, func() bool { return s.log.find("[loop2] inbound connection to ") != "" }, "a connection after the update goes by the new server")
++	})
++
++	t.Run("History", func(t *testing.T) {
++		at, failed := s.history.LoadURLTestFailure("dead")
++		require.True(t, failed)
++		require.False(t, at.IsZero())
++		s.history.StoreDownloadResult("A", urltest.DownloadResult{At: time.Now(), Received: 16 << 10, Stopped: true})
++		result, has := s.history.LoadDownloadResult("A")
++		require.True(t, has)
++		require.True(t, result.Stopped)
++		require.Equal(t, int64(16<<10), result.Received)
++		s.history.DeleteURLTestHistory("A")
++		require.Nil(t, s.history.LoadURLTestHistory("A"))
++	})
++
++	require.NoError(t, s.box.Close())
++}
++
++// must finds an outbound of the box and what it can do.
++func must[T any](t *testing.T, s *embedderStand, tag string) T {
++	outbound, found := s.box.Outbound().Outbound(tag)
++	require.True(t, found)
++	can, is := outbound.(T)
++	require.True(t, is)
++	return can
++}
++
++// A start that fails is the caller's to close: StartWithoutClose leaves the box as it is.
++func TestEmbedderFailedStart(t *testing.T) {
++	taken, err := net.Listen("tcp", "127.0.0.1:0")
++	require.NoError(t, err)
++	defer taken.Close()
++	ctx := embedderContext(t, urltest.NewHistoryStorage(), httpclient.NewDownloadMemory())
++	options, err := json.UnmarshalExtendedContext[option.Options](ctx, []byte(fmt.Sprint(`{"inbounds": [{"type": "mixed", "listen": "127.0.0.1", "listen_port": `, taken.Addr().(*net.TCPAddr).Port, `}]}`)))
++	require.NoError(t, err)
++	instance, err := box.New(box.Options{Context: ctx, Options: options, PlatformLogWriter: new(embedderLog)})
++	require.NoError(t, err)
++	require.Error(t, instance.StartWithoutClose())
++	require.NoError(t, instance.Close())
++}
++
++// The readers such a program shares with the box: rule-set files and share links.
++func TestEmbedderReaders(t *testing.T) {
++	text, skipped, err := ruletext.ReadAddresses([]byte("example.com\n192.0.2.0/24\n2001:db8::/32\nnot a name\n"))
++	require.NoError(t, err)
++	require.Equal(t, 1, skipped.Count)
++	require.Equal(t, "not a name", skipped.First)
++	source := []byte(`{"version": 3, "rules": [{"domain_suffix": ["example.com"], "ip_cidr": ["192.0.2.0/24", "2001:db8::/32"], "source_ip_cidr": ["10.0.0.0/8"]}]}`)
++	named, err := domainset.ReadSource(source)
++	require.NoError(t, err)
++	addresses, err := domainset.ReadSourceAddresses(source)
++	require.NoError(t, err)
++	var binary bytes.Buffer
++	plain, err := json.UnmarshalExtended[option.PlainRuleSetCompat](source)
++	require.NoError(t, err)
++	require.NoError(t, srs.Write(&binary, plain.Options, plain.Version))
++	read, err := srs.ReadSets(bytes.NewReader(binary.Bytes()))
++	require.NoError(t, err)
++	for name, compat := range map[string]option.PlainRuleSetCompat{"text": text, "source": named, "addresses": addresses, "binary": read} {
++		ruleSet, err := compat.Upgrade()
++		require.NoError(t, err, name)
++		var four []uint64
++		var all int
++		for _, rule := range ruleSet.Rules {
++			require.NotEqual(t, C.RuleTypeLogical, rule.Type, name)
++			if ranges := rule.DefaultOptions.IPRanges; ranges != nil {
++				four = append(four, ranges.Ranges4()...)
++				all += len(ranges.Ranges())
++				require.Equal(t, len(ranges.Ranges()), ranges.Len(), name)
++			}
++			switch name {
++			case "source":
++				require.NotNil(t, rule.DefaultOptions.DomainSet)
++				require.NotNil(t, rule.DefaultOptions.SourceIPRanges)
++			case "binary":
++				require.NotNil(t, rule.DefaultOptions.DomainMatcher)
++				require.NotNil(t, rule.DefaultOptions.SourceIPRanges)
++			}
++		}
++		require.Equal(t, []uint64{0xc0000200<<32 | 0xc00002ff}, four, name)
++		require.Equal(t, 2, all, name)
++	}
++	require.Equal(t, "text", C.RuleSetFormatText)
++	require.Equal(t, "xhttp", C.V2RayTransportTypeXHTTP)
++
++	outbound, warnings, err := sharelink.Decode("vless://9c17d9be-4eaa-4336-89ce-1ecdd76b7ac4@203.0.113.61:443?security=tls&sni=www.example.com&type=ws&path=%2Fsecret#name")
++	require.NoError(t, err)
++	require.Empty(t, warnings)
++	require.Equal(t, C.TypeVLESS, outbound.Type)
++	require.Contains(t, outbound.Secrets(), "9c17d9be-4eaa-4336-89ce-1ecdd76b7ac4")
++	_ = []string(outbound.Unplain())
++	require.NotContains(t, sharelink.PlainMessage("the user 9c17d9be-4eaa-4336-89ce-1ecdd76b7ac4 is unknown", outbound.Secrets()), "9c17d9be")
++	require.Equal(t, "a b", sharelink.OneLine("a\nb"))
++	_, _, err = sharelink.Decode("nothing")
++	require.Error(t, err)
++}
+-- 
+2.53.0
+

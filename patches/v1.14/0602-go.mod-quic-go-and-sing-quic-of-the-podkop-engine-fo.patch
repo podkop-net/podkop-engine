@@ -1,7 +1,7 @@
-From 1c085e2c246466322daeaa3cfd8651b33a8937fa Mon Sep 17 00:00:00 2001
+From 90cbd866083f9c3cf1eef4afe1038eaef83b4c1c Mon Sep 17 00:00:00 2001
 From: FiyeroT <me@fiyero.xyz>
 Date: Sun, 15 Nov 2026 13:10:41 +0300
-Subject: [PATCH 66/69] go.mod: quic-go and sing-quic of the podkop-engine
+Subject: [PATCH 66/71] go.mod: quic-go and sing-quic of the podkop-engine
  forks, the statistics of a QUIC connection
 
 The loss of a member over QUIC is counted by the packets of its QUIC connection.

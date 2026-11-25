@@ -1,7 +1,7 @@
-From 60788f4d7c14581851bd6b386239a7dc9bb798a7 Mon Sep 17 00:00:00 2001
+From 5f5289ab0e749a6e1bba38a60cec67fd60ce9c0a Mon Sep 17 00:00:00 2001
 From: FiyeroT <me@fiyero.xyz>
 Date: Thu, 12 Nov 2026 21:41:20 +0300
-Subject: [PATCH 25/69] xhttp: the client of Xray's XHTTP transport
+Subject: [PATCH 25/71] xhttp: the client of Xray's XHTTP transport
 
 The XHTTP transport of Xray for the client: packet-up, stream-up and stream-one over HTTP/1.1,
 HTTP/2 and HTTP/3, the download leg, BBR and the Chrome QUIC profile over HTTP/3, the backoff, the
@@ -49,7 +49,8 @@ Pdk-Layer: 03
  transport/v2rayxhttp/client_test.go      | 546 +++++++++++++++++++++
  transport/v2rayxhttp/config.go           | 411 ++++++++++++++++
  transport/v2rayxhttp/config_test.go      | 144 ++++++
- transport/v2rayxhttp/conn.go             | 540 +++++++++++++++++++++
+ transport/v2rayxhttp/conn.go             | 549 +++++++++++++++++++++
+ transport/v2rayxhttp/error_test.go       |  28 ++
  transport/v2rayxhttp/frame_size.go       |  73 +++
  transport/v2rayxhttp/frame_size_test.go  | 116 +++++
  transport/v2rayxhttp/http3.go            | 288 +++++++++++
@@ -67,7 +68,7 @@ Pdk-Layer: 03
  transport/v2rayxhttp/server_test.go      | 395 +++++++++++++++
  transport/v2rayxhttp/upload.go           | 351 ++++++++++++++
  transport/v2rayxhttp/upload_end_test.go  |  81 ++++
- 30 files changed, 6078 insertions(+)
+ 31 files changed, 6115 insertions(+)
  create mode 100644 common/tls/quic_config.go
  create mode 100644 common/tls/utls_quic.go
  create mode 100644 option/v2ray_xhttp.go
@@ -81,6 +82,7 @@ Pdk-Layer: 03
  create mode 100644 transport/v2rayxhttp/config.go
  create mode 100644 transport/v2rayxhttp/config_test.go
  create mode 100644 transport/v2rayxhttp/conn.go
+ create mode 100644 transport/v2rayxhttp/error_test.go
  create mode 100644 transport/v2rayxhttp/frame_size.go
  create mode 100644 transport/v2rayxhttp/frame_size_test.go
  create mode 100644 transport/v2rayxhttp/http3.go
@@ -2363,14 +2365,15 @@ index 000000000..ca4ffd383
 +}
 diff --git a/transport/v2rayxhttp/conn.go b/transport/v2rayxhttp/conn.go
 new file mode 100644
-index 000000000..bd3e68bab
+index 000000000..2a8d72314
 --- /dev/null
 +++ b/transport/v2rayxhttp/conn.go
-@@ -0,0 +1,540 @@
+@@ -0,0 +1,549 @@
 +package v2rayxhttp
 +
 +import (
 +	"context"
++	"errors"
 +	"io"
 +	"net"
 +	"net/http"
@@ -2381,6 +2384,7 @@ index 000000000..bd3e68bab
 +	"time"
 +
 +	"github.com/sagernet/sing-box/common/readwait"
++	"github.com/sagernet/sing-box/common/tls"
 +	"github.com/sagernet/sing/common/baderror"
 +	E "github.com/sagernet/sing/common/exceptions"
 +	M "github.com/sagernet/sing/common/metadata"
@@ -2888,10 +2892,17 @@ index 000000000..bd3e68bab
 +// in crypto/tls and makes that client's read loop spin on it forever.
 +type transportError struct {
 +	message string
++	// the one thing of the error hidden that is told: the server is not the REALITY server it
++	// should be
++	realityVerification bool
 +}
 +
 +func (e *transportError) Error() string {
 +	return e.message
++}
++
++func (e *transportError) Is(target error) bool {
++	return e.realityVerification && target == tls.ErrRealityVerification
 +}
 +
 +func hideHTTPError(err error) error {
@@ -2905,7 +2916,41 @@ index 000000000..bd3e68bab
 +	if _, isHidden := err.(*transportError); isHidden {
 +		return err
 +	}
-+	return &transportError{err.Error()}
++	return &transportError{err.Error(), errors.Is(err, tls.ErrRealityVerification)}
++}
+diff --git a/transport/v2rayxhttp/error_test.go b/transport/v2rayxhttp/error_test.go
+new file mode 100644
+index 000000000..e78a0377c
+--- /dev/null
++++ b/transport/v2rayxhttp/error_test.go
+@@ -0,0 +1,28 @@
++package v2rayxhttp
++
++import (
++	"context"
++	"net/http"
++	"os"
++	"testing"
++
++	"github.com/sagernet/sing-box/common/tls"
++	E "github.com/sagernet/sing/common/exceptions"
++
++	"github.com/stretchr/testify/require"
++)
++
++// Of an error hidden nothing is told but its text and whether a REALITY server failed the
++// verification.
++func TestHiddenRealityVerification(t *testing.T) {
++	hidden := hideHTTPError(E.Cause(tls.ErrRealityVerification, "dial"))
++	require.EqualError(t, hidden, "dial: reality verification failed")
++	for _, err := range []error{hidden, hideHTTPError(hidden), E.Cause(hidden, "xhttp")} {
++		require.ErrorIs(t, err, tls.ErrRealityVerification)
++	}
++	for _, cause := range []error{os.ErrDeadlineExceeded, context.Canceled, http.ErrServerClosed} {
++		err := hideHTTPError(E.Cause(cause, "reality verification failed"))
++		require.NotErrorIs(t, err, tls.ErrRealityVerification)
++		require.NotErrorIs(t, err, cause)
++	}
 +}
 diff --git a/transport/v2rayxhttp/frame_size.go b/transport/v2rayxhttp/frame_size.go
 new file mode 100644

@@ -1,7 +1,7 @@
 From f7d16bb107f2ef8e51af99e4f795f8e1d2000698 Mon Sep 17 00:00:00 2001
 From: FiyeroT <me@fiyero.xyz>
 Date: Sat, 21 Nov 2026 14:00:56 +0300
-Subject: [PATCH 04/69] tls: certificate_sha256, a pin of the whole server
+Subject: [PATCH 04/71] tls: certificate_sha256, a pin of the whole server
  certificate
 
 Upstream e7ad8a875 (sing-box 1.15.0-alpha.13), carried back as it is: certificate_sha256 for

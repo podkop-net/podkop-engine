@@ -1,7 +1,7 @@
-From 03e45f6fe092483401fa83524de236c87c18be9b Mon Sep 17 00:00:00 2001
+From a78d3c00b12e20061872446f3d05cb05f1c654c7 Mon Sep 17 00:00:00 2001
 From: FiyeroT <me@fiyero.xyz>
 Date: Thu, 12 Nov 2026 21:41:20 +0300
-Subject: [PATCH 38/69] rule-set: the download, the start and the update of
+Subject: [PATCH 38/71] rule-set: the download, the start and the update of
  remote rule-sets
 
 A remote rule-set starts empty when its first download fails and retries, its fetch is bounded by
@@ -43,18 +43,20 @@ Pdk-Layer: 04
  route/rule/rule_set_hook_test.go              |  74 ++++
  route/rule/rule_set_local.go                  |  38 +-
  route/rule/rule_set_local_race_test.go        |  61 +++
- route/rule/rule_set_remote.go                 | 417 ++++++++++++++++--
+ route/rule/rule_set_remote.go                 | 404 ++++++++++++++++--
  route/rule/rule_set_remote_body_test.go       | 172 ++++++++
  route/rule/rule_set_remote_checked_test.go    |  69 +++
  route/rule/rule_set_remote_race_test.go       |  47 ++
  route/rule/rule_set_remote_start_test.go      | 100 +++++
- route/rule/rule_set_remote_stop_test.go       |  48 ++
+ route/rule/rule_set_remote_stop_test.go       |  48 +++
  route/rule/rule_set_remote_timeout_test.go    | 107 +++++
+ route/rule/rule_set_start.go                  |  34 ++
  route/rule/rule_set_start_empty_test.go       | 139 ++++++
+ route/rule/rule_set_start_test.go             |  52 +++
  route/rule/rule_set_update_log_test.go        | 101 +++++
- route/rule/rule_set_updater.go                | 146 +++++-
+ route/rule/rule_set_updater.go                | 146 ++++++-
  route/rule/rule_set_updater_test.go           | 161 +++++++
- 22 files changed, 1948 insertions(+), 56 deletions(-)
+ 24 files changed, 2021 insertions(+), 56 deletions(-)
  create mode 100644 common/domainset/stop_test.go
  create mode 100644 common/httpclient/dial_context_test.go
  create mode 100644 common/ruletext/stop_test.go
@@ -69,7 +71,9 @@ Pdk-Layer: 04
  create mode 100644 route/rule/rule_set_remote_start_test.go
  create mode 100644 route/rule/rule_set_remote_stop_test.go
  create mode 100644 route/rule/rule_set_remote_timeout_test.go
+ create mode 100644 route/rule/rule_set_start.go
  create mode 100644 route/rule/rule_set_start_empty_test.go
+ create mode 100644 route/rule/rule_set_start_test.go
  create mode 100644 route/rule/rule_set_update_log_test.go
  create mode 100644 route/rule/rule_set_updater_test.go
 
@@ -720,10 +724,10 @@ index 000000000..21f95d2b9
 +	wg.Wait()
 +}
 diff --git a/route/rule/rule_set_remote.go b/route/rule/rule_set_remote.go
-index e673b74ae..fec3b987f 100644
+index e673b74ae..c3eea334d 100644
 --- a/route/rule/rule_set_remote.go
 +++ b/route/rule/rule_set_remote.go
-@@ -1,18 +1,27 @@
+@@ -1,18 +1,26 @@
  package rule
  
  import (
@@ -734,7 +738,6 @@ index e673b74ae..fec3b987f 100644
 +	"errors"
  	"io"
  	"net/http"
-+	"os"
  	"path/filepath"
 +	"strconv"
  	"strings"
@@ -751,7 +754,7 @@ index e673b74ae..fec3b987f 100644
  	"github.com/sagernet/sing-box/common/srs"
  	C "github.com/sagernet/sing-box/constant"
  	"github.com/sagernet/sing-box/experimental/deprecated"
-@@ -20,7 +29,6 @@ import (
+@@ -20,7 +28,6 @@ import (
  	"github.com/sagernet/sing/common"
  	E "github.com/sagernet/sing/common/exceptions"
  	F "github.com/sagernet/sing/common/format"
@@ -759,7 +762,7 @@ index e673b74ae..fec3b987f 100644
  	"github.com/sagernet/sing/common/logger"
  	"github.com/sagernet/sing/common/x/list"
  	"github.com/sagernet/sing/service"
-@@ -49,10 +57,19 @@ type RemoteRuleSet struct {
+@@ -49,10 +56,19 @@ type RemoteRuleSet struct {
  	metadata       adapter.RuleSetMetadata
  	lastUpdated    time.Time
  	lastEtag       string
@@ -779,7 +782,7 @@ index e673b74ae..fec3b987f 100644
  }
  
  func NewRemoteRuleSet(ctx context.Context, logger logger.ContextLogger, tag string, options option.RuleSet) (*RemoteRuleSet, error) {
-@@ -89,7 +106,22 @@ func (s *RemoteRuleSet) Name() string {
+@@ -89,7 +105,22 @@ func (s *RemoteRuleSet) Name() string {
  }
  
  func (s *RemoteRuleSet) String() string {
@@ -803,7 +806,7 @@ index e673b74ae..fec3b987f 100644
  }
  
  func (s *RemoteRuleSet) StartContext(ctx context.Context, startContext *adapter.HTTPStartContext) error {
-@@ -100,21 +132,9 @@ func (s *RemoteRuleSet) StartContext(ctx context.Context, startContext *adapter.
+@@ -100,21 +131,9 @@ func (s *RemoteRuleSet) StartContext(ctx context.Context, startContext *adapter.
  	}
  	startContext.Register(transport)
  	s.httpClient = &http.Client{Transport: transport}
@@ -828,7 +831,7 @@ index e673b74ae..fec3b987f 100644
  	}
  	var loadedFromInitialPath bool
  	if s.lastUpdated.IsZero() && s.initialPath != "" {
-@@ -130,17 +150,88 @@ func (s *RemoteRuleSet) StartContext(ctx context.Context, startContext *adapter.
+@@ -130,17 +149,76 @@ func (s *RemoteRuleSet) StartContext(ctx context.Context, startContext *adapter.
  		}
  	}
  	if s.lastUpdated.IsZero() && !loadedFromInitialPath {
@@ -871,7 +874,7 @@ index e673b74ae..fec3b987f 100644
 +
 +// startWithNothingLoaded starts a set that has neither a cached nor an initial content.
 +func (s *RemoteRuleSet) startWithNothingLoaded(ctx context.Context) {
-+	if ruleSetStartEmpty() {
++	if remoteStartEmpty(s.ctx) {
 +		// nothing waits for the download: the inbounds start now, the updater fetches the
 +		// set right after the start and the callbacks tell who needs to know
 +		s.logger.Info("initial rule-set: ", s.tag, ", nothing cached: starting empty, downloading in the background")
@@ -885,18 +888,6 @@ index e673b74ae..fec3b987f 100644
 +		s.logger.Error("initial rule-set: ", s.tag, ", starting empty and retrying: ", logText(err))
 +		s.startEmpty()
 +	}
-+}
-+
-+// ruleSetStartEmpty tells whether a remote rule-set with nothing cached and no initial
-+// file starts empty at once instead of downloading its list during the start
-+// (SING_BOX_RULE_SET_START_EMPTY set to anything). The start downloads the sets five at
-+// a time, each up to the start deadline, and the inbounds wait for all of them: a box
-+// that replaces another one (a program that applies a new configuration, a restart) is
-+// deaf for that long. Starting empty, the box answers at once and the rules that use
-+// the set match nothing until the download comes; what they would have matched in the
-+// meantime goes by the other rules.
-+var ruleSetStartEmpty = func() bool {
-+	return os.Getenv("SING_BOX_RULE_SET_START_EMPTY") != ""
 +}
 +
 +// startEmpty marks a set that starts without content; the updater fetches it at once
@@ -921,7 +912,7 @@ index e673b74ae..fec3b987f 100644
  	return s.metadata
  }
  
-@@ -162,7 +253,7 @@ func (s *RemoteRuleSet) DecRef() {
+@@ -162,7 +240,7 @@ func (s *RemoteRuleSet) DecRef() {
  
  func (s *RemoteRuleSet) Cleanup() {
  	if s.refs.Load() == 0 {
@@ -930,7 +921,7 @@ index e673b74ae..fec3b987f 100644
  	}
  }
  
-@@ -178,19 +269,33 @@ func (s *RemoteRuleSet) UnregisterCallback(element *list.Element[adapter.RuleSet
+@@ -178,19 +256,33 @@ func (s *RemoteRuleSet) UnregisterCallback(element *list.Element[adapter.RuleSet
  	s.callbacks.Remove(element)
  }
  
@@ -966,7 +957,7 @@ index e673b74ae..fec3b987f 100644
  		if err != nil {
  			return err
  		}
-@@ -212,6 +317,9 @@ func (s *RemoteRuleSet) loadBytes(content []byte) error {
+@@ -212,6 +304,9 @@ func (s *RemoteRuleSet) loadBytes(content []byte) error {
  	}
  	rules := make([]adapter.HeadlessRule, len(plainRuleSet.Rules))
  	for i, ruleOptions := range plainRuleSet.Rules {
@@ -976,7 +967,7 @@ index e673b74ae..fec3b987f 100644
  		rules[i], err = NewHeadlessRule(s.ctx, ruleOptions)
  		if err != nil {
  			return E.Cause(err, "parse rule_set.rules.[", i, "]")
-@@ -225,25 +333,224 @@ func (s *RemoteRuleSet) loadBytes(content []byte) error {
+@@ -225,25 +320,224 @@ func (s *RemoteRuleSet) loadBytes(content []byte) error {
  	s.access.Lock()
  	s.metadata = metadata
  	s.rules = rules
@@ -1101,10 +1092,10 @@ index e673b74ae..fec3b987f 100644
 +	n, err := r.reader.Read(p)
 +	if n > 0 {
 +		r.reset()
- 	}
++	}
 +	return n, err
- }
- 
++}
++
 +// readRuleSetBody reads the body of a 200 response. What cannot be a rule-set is refused
 +// before it is held in memory: a declared length above the cap, and for the binary format a
 +// body that does not start with the magic bytes (an error or login page served with status
@@ -1170,12 +1161,12 @@ index e673b74ae..fec3b987f 100644
 +	description.WriteString(strconv.Quote(contentType))
 +	if len(sample) > ruleSetSampleSize {
 +		sample = sample[:ruleSetSampleSize]
-+	}
+ 	}
 +	description.WriteString(", starts with ")
 +	description.WriteString(strconv.Quote(string(sample)))
 +	return description.String()
-+}
-+
+ }
+ 
 +// fetch downloads the list through the http client of the rule-set and, while that fails, through
 +// each of its fallback clients in turn. Each way has the whole stall timeout of its own; the start
 +// deadline bounds them all. The error is that of every way.
@@ -1207,7 +1198,7 @@ index e673b74ae..fec3b987f 100644
  	request, err := http.NewRequest("GET", s.url, nil)
  	if err != nil {
  		return err
-@@ -252,18 +559,32 @@ func (s *RemoteRuleSet) fetch(ctx context.Context, isStart bool) error {
+@@ -252,18 +546,32 @@ func (s *RemoteRuleSet) fetch(ctx context.Context, isStart bool) error {
  		request.Header.Set("If-None-Match", s.lastEtag)
  	}
  	if !isStart {
@@ -1244,7 +1235,7 @@ index e673b74ae..fec3b987f 100644
  			savedRuleSet := s.cacheFile.LoadRuleSet(s.tag)
  			if savedRuleSet != nil {
  				savedRuleSet.LastUpdated = s.lastUpdated
-@@ -280,14 +601,27 @@ func (s *RemoteRuleSet) fetch(ctx context.Context, isStart bool) error {
+@@ -280,14 +588,27 @@ func (s *RemoteRuleSet) fetch(ctx context.Context, isStart bool) error {
  	default:
  		return E.New("unexpected status: ", response.Status)
  	}
@@ -1276,7 +1267,7 @@ index e673b74ae..fec3b987f 100644
  	eTagHeader := response.Header.Get("Etag")
  	if eTagHeader != "" {
  		s.lastEtag = eTagHeader
-@@ -305,6 +639,7 @@ func (s *RemoteRuleSet) fetch(ctx context.Context, isStart bool) error {
+@@ -305,6 +626,7 @@ func (s *RemoteRuleSet) fetch(ctx context.Context, isStart bool) error {
  		}
  	}
  	s.logger.Info("updated rule-set ", s.tag)
@@ -1284,7 +1275,7 @@ index e673b74ae..fec3b987f 100644
  	return nil
  }
  
-@@ -333,15 +668,15 @@ func (s *RemoteRuleSet) resolveTransport() (adapter.HTTPTransport, error) {
+@@ -333,15 +655,15 @@ func (s *RemoteRuleSet) resolveTransport() (adapter.HTTPTransport, error) {
  }
  
  func (s *RemoteRuleSet) Close() error {
@@ -1882,6 +1873,46 @@ index 000000000..a86ced09a
 +	ruleSetStallTimeout, ruleSetStartDeadline = stall, startDeadline
 +	return func() { ruleSetStallTimeout, ruleSetStartDeadline = oldStall, oldStart }
 +}
+diff --git a/route/rule/rule_set_start.go b/route/rule/rule_set_start.go
+new file mode 100644
+index 000000000..749c61884
+--- /dev/null
++++ b/route/rule/rule_set_start.go
+@@ -0,0 +1,34 @@
++package rule
++
++import (
++	"context"
++	"os"
++
++	"github.com/sagernet/sing/service"
++)
++
++// RemoteStart is how the remote rule-sets of a box start (podkop-engine), told by a program that
++// embeds sing-box in the context of the box (service.ContextWithPtr). Without it the environment
++// tells: Empty is SING_BOX_RULE_SET_START_EMPTY set to anything.
++type RemoteStart struct {
++	// Empty: a set with nothing cached and no initial file starts empty at once instead of
++	// downloading its list during the start. The start downloads the sets five at a time, each up
++	// to the start deadline, and the inbounds wait for all of them: a box that replaces another one
++	// (a program that applies a new configuration, a restart) is deaf for that long. Starting empty,
++	// the box answers at once and the rules that use the set match nothing until the download comes;
++	// what they would have matched in the meantime goes by the other rules.
++	Empty bool
++}
++
++// remoteStartEmpty is RemoteStart.Empty for the box of ctx.
++func remoteStartEmpty(ctx context.Context) bool {
++	if start := service.PtrFromContext[RemoteStart](ctx); start != nil {
++		return start.Empty
++	}
++	return ruleSetStartEmpty()
++}
++
++// ruleSetStartEmpty is what the environment tells. A variable for the tests.
++var ruleSetStartEmpty = func() bool {
++	return os.Getenv("SING_BOX_RULE_SET_START_EMPTY") != ""
++}
 diff --git a/route/rule/rule_set_start_empty_test.go b/route/rule/rule_set_start_empty_test.go
 new file mode 100644
 index 000000000..d032fb877
@@ -2024,6 +2055,64 @@ index 000000000..d032fb877
 +			require.True(t, ruleSet.Metadata().ContainsIPCIDRRule)
 +			require.Equal(t, 0, logs.count("Legacy Address Filter Fields"), logs.dump())
 +			require.Equal(t, int32(2), requests.Load(), "the start fetch and one load")
++		})
++	}
++}
+diff --git a/route/rule/rule_set_start_test.go b/route/rule/rule_set_start_test.go
+new file mode 100644
+index 000000000..1e37cdcfb
+--- /dev/null
++++ b/route/rule/rule_set_start_test.go
+@@ -0,0 +1,52 @@
++package rule
++
++import (
++	"context"
++	"net/http"
++	"net/http/httptest"
++	"sync/atomic"
++	"testing"
++
++	C "github.com/sagernet/sing-box/constant"
++	"github.com/sagernet/sing/service"
++
++	"github.com/stretchr/testify/require"
++)
++
++// RemoteStart in the context of the box tells whether a set with nothing cached starts empty, over
++// the environment either way; without it the environment tells, as before.
++func TestRemoteStart(t *testing.T) {
++	var requests atomic.Int32
++	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		requests.Add(1)
++		w.Write([]byte(`{"version":3,"rules":[{"domain_suffix":["example.com"]}]}`))
++	}))
++	defer server.Close()
++	defer func(saved func() bool) { ruleSetStartEmpty = saved }(ruleSetStartEmpty)
++	for _, testCase := range []struct {
++		name        string
++		environment bool
++		start       *RemoteStart
++		empty       bool
++	}{
++		{"nothing", false, nil, false},
++		{"the environment", true, nil, true},
++		{"the context", false, &RemoteStart{Empty: true}, true},
++		{"the context over the environment", true, &RemoteStart{}, false},
++	} {
++		t.Run(testCase.name, func(t *testing.T) {
++			requests.Store(0)
++			ruleSetStartEmpty = func() bool { return testCase.environment }
++			ctx := service.ContextWithDefaultRegistry(context.Background())
++			if testCase.start != nil {
++				ctx = service.ContextWithPtr(ctx, testCase.start)
++			}
++			set := newTestRuleSet(server.URL)
++			set.ctx = ctx
++			set.options.Format = C.RuleSetFormatSource
++			set.startWithNothingLoaded(ctx)
++			require.Equal(t, testCase.empty, set.startedEmpty)
++			require.Equal(t, testCase.empty, requests.Load() == 0)
 +		})
 +	}
 +}

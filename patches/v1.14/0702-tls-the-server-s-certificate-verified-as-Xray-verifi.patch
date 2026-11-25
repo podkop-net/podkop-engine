@@ -1,7 +1,7 @@
-From 209086dbd08a50faf48f13c80febbb30f1caf942 Mon Sep 17 00:00:00 2001
+From 4448266f3447a19de3d9b8f70b0ad99a19bd88ad Mon Sep 17 00:00:00 2001
 From: FiyeroT <me@fiyero.xyz>
 Date: Sat, 21 Nov 2026 18:34:03 +0300
-Subject: [PATCH 69/69] tls: the server's certificate verified as Xray verifies
+Subject: [PATCH 69/71] tls: the server's certificate verified as Xray verifies
  it: other names, a pinned CA
 
 certificate_server_name is a list of names: the server's certificate is verified against the
@@ -784,10 +784,10 @@ index 000000000..f76cc1b4a
 +	require.ErrorContains(t, err, "certificate_server_name is unavailable in reality")
 +}
 diff --git a/common/tls/reality_client.go b/common/tls/reality_client.go
-index 82d390c57..5536ea150 100644
+index 8ca47b31e..4e40ccc34 100644
 --- a/common/tls/reality_client.go
 +++ b/common/tls/reality_client.go
-@@ -134,6 +134,10 @@ func newRealityClient(ctx context.Context, logger logger.ContextLogger, serverAd
+@@ -124,6 +124,10 @@ func newRealityClient(ctx context.Context, logger logger.ContextLogger, serverAd
  	if options.UTLS == nil || !options.UTLS.Enabled {
  		return nil, E.New("uTLS is required by reality client")
  	}

@@ -1,7 +1,7 @@
-From 4cc06354c7696cf380e678d70db7abca484086f8 Mon Sep 17 00:00:00 2001
+From 4a49b3885fd20da040714ba42a72f30c43ec01ba Mon Sep 17 00:00:00 2001
 From: FiyeroT <me@fiyero.xyz>
 Date: Thu, 12 Nov 2026 21:41:20 +0300
-Subject: [PATCH 33/69] box: outbounds replaced while the box runs
+Subject: [PATCH 33/71] box: outbounds replaced while the box runs
 
 Outbounds are replaced while the box runs: a group that takes the tag of another starts from what it
 knew, the replaced one lets go of its members a while later, a detour finds the outbound of its tag
@@ -20,13 +20,13 @@ Pdk-Layer: 03
  adapter/outbound/manager_podkop.go       |  90 ++++
  adapter/outbound/manager_podkop_test.go  | 112 +++++
  box_podkop.go                            | 583 +++++++++++++++++++++++
- box_podkop_test.go                       | 415 ++++++++++++++++
+ box_podkop_test.go                       | 418 ++++++++++++++++
  common/dialer/detour_podkop.go           |  20 +
  common/dialer/detour_podkop_test.go      |  65 +++
  export_podkop_test.go                    |  33 ++
- protocol/group/urltestgroup/swap.go      | 224 +++++++++
+ protocol/group/urltestgroup/swap.go      | 227 +++++++++
  protocol/group/urltestgroup/swap_test.go | 214 +++++++++
- 11 files changed, 1861 insertions(+)
+ 11 files changed, 1867 insertions(+)
  create mode 100644 adapter/lifecycle_podkop.go
  create mode 100644 adapter/lifecycle_podkop_test.go
  create mode 100644 adapter/outbound/manager_podkop.go
@@ -961,10 +961,10 @@ index 000000000..a5570b2ea
 +}
 diff --git a/box_podkop_test.go b/box_podkop_test.go
 new file mode 100644
-index 000000000..3fe09cb2e
+index 000000000..fcf7a27b3
 --- /dev/null
 +++ b/box_podkop_test.go
-@@ -0,0 +1,415 @@
+@@ -0,0 +1,418 @@
 +package box_test
 +
 +import (
@@ -1282,6 +1282,9 @@ index 000000000..3fe09cb2e
 +			Balance() []urltestgroup.BalanceMember
 +		}).Balance() != nil
 +	}
++	// the balance of a group that is not in use rests
++	require.False(t, balancing())
++	h.dial(group)
 +	require.True(t, balancing())
 +
 +	_, err = h.update(`{"type": "testserver", "tag": "s4", "fail_late": true}, `+balance("s1", "s2", "s4"), nil, 0)
@@ -1518,10 +1521,10 @@ index 000000000..5e1e7a413
 +var DrainMin, DrainMax = drainMin, drainMax
 diff --git a/protocol/group/urltestgroup/swap.go b/protocol/group/urltestgroup/swap.go
 new file mode 100644
-index 000000000..8c237c779
+index 000000000..591206b69
 --- /dev/null
 +++ b/protocol/group/urltestgroup/swap.go
-@@ -0,0 +1,224 @@
+@@ -0,0 +1,227 @@
 +package urltestgroup
 +
 +import (
@@ -1584,6 +1587,9 @@ index 000000000..8c237c779
 +		}
 +		g.frozen.Store(kept)
 +	}
++	// a group in use goes on as one: its loss probes do not wait for the next connection
++	g.lastUse.Store(from.lastUse.Load())
++	g.usedSince.Store(from.usedSince.Load())
 +	// a balance goes on with its devices: their connections end on the balancer they began on
 +	g.takeBalance(from)
 +	g.hotStart = true

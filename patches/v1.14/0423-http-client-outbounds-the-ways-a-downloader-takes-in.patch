@@ -1,7 +1,7 @@
-From b83527d172d4a4dac1e003b4dc2dd52e4eb41a42 Mon Sep 17 00:00:00 2001
+From 36d86d9cfe64b6b5dfe02bb795aeabfc187a8c37 Mon Sep 17 00:00:00 2001
 From: FiyeroT <me@fiyero.xyz>
 Date: Fri, 13 Nov 2026 14:38:32 +0300
-Subject: [PATCH 59/69] http client: outbounds, the ways a downloader takes in
+Subject: [PATCH 59/71] http client: outbounds, the ways a downloader takes in
  the order of what it knows of them
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8
@@ -1253,10 +1253,10 @@ index 5507de93c..96295d073 100644
 +	return len(s.currentRules())
 +}
 diff --git a/route/rule/rule_set_remote.go b/route/rule/rule_set_remote.go
-index c6b500b5c..bb61387d0 100644
+index a741b66e0..31cd7601b 100644
 --- a/route/rule/rule_set_remote.go
 +++ b/route/rule/rule_set_remote.go
-@@ -53,8 +53,10 @@ type RemoteRuleSet struct {
+@@ -52,8 +52,10 @@ type RemoteRuleSet struct {
  	updateInterval time.Duration
  	httpClient     *http.Client
  	// the clients a fetch that failed through httpClient is repeated through, in order
@@ -1268,7 +1268,7 @@ index c6b500b5c..bb61387d0 100644
  	access         sync.RWMutex
  	rules          []adapter.HeadlessRule
  	metadata       adapter.RuleSetMetadata
-@@ -143,6 +145,14 @@ func (s *RemoteRuleSet) StartContext(ctx context.Context, startContext *adapter.
+@@ -142,6 +144,14 @@ func (s *RemoteRuleSet) StartContext(ctx context.Context, startContext *adapter.
  		startContext.Register(fallback.Transport)
  		s.fallbacks = append(s.fallbacks, ruleSetFallback{tag: fallback.Tag, client: &http.Client{Transport: fallback.Transport}})
  	}
@@ -1283,7 +1283,7 @@ index c6b500b5c..bb61387d0 100644
  	s.loadCached()
  	var loadedFromInitialPath bool
  	if s.lastUpdated.IsZero() && s.initialPath != "" {
-@@ -450,12 +460,17 @@ var (
+@@ -437,12 +447,17 @@ var (
  type stallResetReader struct {
  	reader io.Reader
  	reset  func()
@@ -1301,7 +1301,7 @@ index c6b500b5c..bb61387d0 100644
  	}
  	return n, err
  }
-@@ -531,8 +546,9 @@ func describeRuleSetBody(response *http.Response, size int64, sample []byte) str
+@@ -518,8 +533,9 @@ func describeRuleSetBody(response *http.Response, size int64, sample []byte) str
  	return description.String()
  }
  
@@ -1313,7 +1313,7 @@ index c6b500b5c..bb61387d0 100644
  // deadline bounds them all. The error is that of every way.
  func (s *RemoteRuleSet) fetch(ctx context.Context, isStart bool) error {
  	if isStart {
-@@ -540,6 +556,9 @@ func (s *RemoteRuleSet) fetch(ctx context.Context, isStart bool) error {
+@@ -527,6 +543,9 @@ func (s *RemoteRuleSet) fetch(ctx context.Context, isStart bool) error {
  		ctx, stop = context.WithTimeout(ctx, ruleSetStartDeadline)
  		defer stop()
  	}
@@ -1323,7 +1323,7 @@ index c6b500b5c..bb61387d0 100644
  	err := s.fetchThrough(ctx, s.httpClient, isStart)
  	if err == nil || len(s.fallbacks) == 0 {
  		return err
-@@ -560,8 +579,26 @@ func (s *RemoteRuleSet) fetch(ctx context.Context, isStart bool) error {
+@@ -547,8 +566,26 @@ func (s *RemoteRuleSet) fetch(ctx context.Context, isStart bool) error {
  	return E.Errors(errs...)
  }
  
@@ -1351,7 +1351,7 @@ index c6b500b5c..bb61387d0 100644
  	s.logger.Debug("updating rule-set ", s.tag, " from URL: ", s.url)
  	// a group that switches members closes the connections it does not know as routed
  	// ones: a list half downloaded through it would wait for the next update_interval
-@@ -588,10 +625,10 @@ func (s *RemoteRuleSet) fetchThrough(ctx context.Context, client *http.Client, i
+@@ -575,10 +612,10 @@ func (s *RemoteRuleSet) fetchThrough(ctx context.Context, client *http.Client, i
  	}
  	request, err := http.NewRequest("GET", s.url, nil)
  	if err != nil {
@@ -1365,7 +1365,7 @@ index c6b500b5c..bb61387d0 100644
  	}
  	if !isStart {
  		defer client.CloseIdleConnections()
-@@ -603,18 +640,38 @@ func (s *RemoteRuleSet) fetchThrough(ctx context.Context, client *http.Client, i
+@@ -590,18 +627,38 @@ func (s *RemoteRuleSet) fetchThrough(ctx context.Context, client *http.Client, i
  			// next batch of rule-sets into the same wait
  			client.Transport.(adapter.HTTPTransport).Reset()
  		}
@@ -1406,7 +1406,7 @@ index c6b500b5c..bb61387d0 100644
  			if err != nil {
  				s.logger.Error("save rule-set updated time: ", err)
  				return nil
-@@ -624,7 +681,7 @@ func (s *RemoteRuleSet) fetchThrough(ctx context.Context, client *http.Client, i
+@@ -611,7 +668,7 @@ func (s *RemoteRuleSet) fetchThrough(ctx context.Context, client *http.Client, i
  			if savedRuleSet != nil {
  				savedRuleSet.LastUpdated = s.lastUpdated
  				savedRuleSet.URLHash = s.urlHash[:]
@@ -1415,7 +1415,7 @@ index c6b500b5c..bb61387d0 100644
  				if err != nil {
  					s.logger.Error("save rule-set updated time: ", err)
  					return nil
-@@ -633,22 +690,14 @@ func (s *RemoteRuleSet) fetchThrough(ctx context.Context, client *http.Client, i
+@@ -620,22 +677,14 @@ func (s *RemoteRuleSet) fetchThrough(ctx context.Context, client *http.Client, i
  		}
  		s.logger.Info("update rule-set ", s.tag, ": not modified")
  		return nil
