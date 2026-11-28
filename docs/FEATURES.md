@@ -225,8 +225,8 @@ every transport. Feature name `dialer.finalmask`. Since r28.
 
 ```json
 "finalmask": {"tcp": [
-  {"type": "fragment", "packets": "1-1", "length": "100-200", "max_split": "2"},
-  {"type": "fragment", "packets": "tlshello", "length": "11-24", "delay": "0"}
+  {"type": "fragment", "packets": "tlshello", "length": "11-24", "delay": "0"},
+  {"type": "fragment", "packets": "1-1", "length": "100-200", "max_split": "2"}
 ]}
 ```
 
@@ -238,8 +238,10 @@ every transport. Feature name `dialer.finalmask`. Since r28.
 | `delay`, `delays` | milliseconds after each piece; with `tlshello` a single delay of `0` sends the records in one write, anything else a write per record |
 | `max_split` | at most this many pieces, the last one taking the rest |
 
-Masks in a list are chained as in Xray, the first next to the socket: above, the records of the
-ClientHello go out in two TCP pieces, the first of 100–200 bytes. On two ISPs that drop the
+Masks in a list are chained as in Xray: the first one takes the writes first, the last one is next
+to the socket (since r30; r28 and r29 read the list the other way round, so a list of two masks
+written for them must be reversed). Above, the ClientHello is cut into records, and the write of
+those records into two TCP pieces, the first of 100–200 bytes. On two ISPs that drop the
 ClientHello of some servers this form passed 165 of 168 times; `tlshello` alone in one write was
 dropped whenever the hello fits one packet (the 508 bytes of `edge` and `ios`), and a write per
 record never passed. A pause ends when the connection closes or at its write deadline. With a

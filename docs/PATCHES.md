@@ -1,13 +1,13 @@
 # podkop-engine patches
 
 podkop-engine is upstream sing-box at a release tag plus the patches in `patches/v<line>/`, and
-nothing else. The 1.14 line is `v1.14.4` plus the 71 patches of `patches/v1.14`: the branch
-`podkop-engine-1.14` of podkop-net/sing-box at `f866c9d898343fa0aa2a6d2e088ab1ac3bc3a8fe`
-(`SB_1_14_FORK_COMMIT` in `versions.env`, release r29), the commit podkop-experimental pins in its
+nothing else. The 1.14 line is `v1.14.6` plus the 71 patches of `patches/v1.14`: the branch
+`podkop-engine-1.14` of podkop-net/sing-box at `d9a9a9a216d731cf4fb0e267bee0b098a232ad1e`
+(`SB_1_14_FORK_COMMIT` in `versions.env`, release r30), the commit podkop-experimental pins in its
 `go.mod`. `scripts/check-fork.sh [-C <sing-box clone>]` applies the patches to the tag in a
 scratch index and compares the tree with that commit (CI runs it before every build). The 1.12
 line is `v1.12.25` plus 2 patches, with no fork commit. By hand, in a clone of SagerNet/sing-box:
-`git checkout -b pe-1.14 v1.14.4 && git am -3 <podkop-engine>/patches/v1.14/*.patch`; the OpenWrt
+`git checkout -b pe-1.14 v1.14.6 && git am -3 <podkop-engine>/patches/v1.14/*.patch`; the OpenWrt
 package applies the same files with quilt. Each entry below says what a patch changes; the patch
 has the code, its header the reasons and the measurements. "since rN" is the podkop-engine release
 in which the feature first shipped, on any line (r22 and r23 were never released; their changes
@@ -38,7 +38,7 @@ were made of (branch `archive/r25-1.14-commits` of podkop-net/sing-box).
 Rules (`docs/RELEASE.md`): a fix of a feature goes into its patch (`git commit --fixup`,
 `git rebase --autosquash`); a new feature is a new patch in its layer; files come from
 `git format-patch --no-renames` (quilt reads no git renames). A move to a new tag is
-`git rebase --onto <tag> v1.14.4`, checked with `git range-diff`; layer 03 adds only new files, so
+`git rebase --onto <tag> <previous tag>`, checked with `git range-diff`; layer 03 adds only new files, so
 conflicts come from the patches that edit upstream files. Only the whole series is checked: a few
 lines of one feature sit in the patch of another (noted below), so not every intermediate tree
 builds. Since r28, 0701 and 0702 also hold the lines of the link decoder (0307) and of the
@@ -49,7 +49,7 @@ writes, the environment, the formats and error texts it reads) is listed with it
 [EMBEDDING.md](EMBEDDING.md). A patch that changes any of it changes that page in the same commit
 and is named under **embedding:** in the changelog entry of the release.
 
-## 1.14.4 — 71 patches
+## 1.14.6 — 71 patches
 
 ### Layer 00: build
 
@@ -215,7 +215,7 @@ Each patch holds the call sites of one layer-03 module; the module's entry says 
 
 #### 0313 route: a chain with a URL test is dialed through the URL test
 `route-chain` · since r18 · hooks: 0212 · [patch](../patches/v1.14/0313-route-a-chain-with-a-URL-test-is-dialed-through-the-.patch)
-- sing-box 1.14.4 dials the member a group selected, past the group; here a chain is dialed
+- sing-box (still 1.14.6) dials the member a group selected, past the group; here a chain is dialed
   through its first URL test group, which judges the dials of its members itself.
   This patch is the test; the change is in 0212.
 
@@ -265,7 +265,9 @@ Each patch holds the call sites of one layer-03 module; the module's entry says 
 #### 0401 tls: uTLS and REALITY clients as Xray and the browsers do
 `utls-reality` · since r1 · [patch](../patches/v1.14/0401-tls-uTLS-and-REALITY-clients-as-Xray-and-the-browser.patch)
 - REALITY keeps the X25519MLKEM768 key share (Xray-core v26.9.8+ servers reject a ClientHello
-  without it) and announces client version 26.3.27.
+  without it) and announces client version 26.3.27. sing-box 1.14.5 keeps the key share too but
+  announces 1.8.2, which Xray-core v26.7.11–v26.9.7 refuse by default; the version here stays.
+  Taken from 1.14.5: the configured clock and roots in the verification and the session ID.
 - `firefox` = Firefox 148, `safari` = Safari 26.3 (Xray-core's specs from
   refraction-networking/utls@aa6edf4); `random` picks chrome, firefox or safari; `randomized`
   offers X25519MLKEM768 with its key share and always sends ALPN; chrome, edge, ios, qq, 360 and
@@ -291,11 +293,18 @@ Each patch holds the call sites of one layer-03 module; the module's entry says 
   count every 10 minutes. `Router.UpdateRuleSets` (Go API) updates every remote set now; a set
   closed while it reads stops.
 - `rule.RemoteStart` in the context of a box tells the empty start over the environment (since r29).
+- Since r30 on upstream's atomic content of a set (sing-box 1.14.5, which fixed the same race): a
+  match, the metadata and the content for rule-set items read without a lock or an allocation; a set
+  closed while its new content is stored holds none. The rules of a set no rule uses are dropped and
+  its metadata kept (upstream drops both): a program reads what a list holds also of a rule that is
+  off.
 
 #### 0403 dns: the TCP, TLS and HTTPS transports under loss
 `dns-transport` · since r5 · [patch](../patches/v1.14/0403-dns-the-TCP-TLS-and-HTTPS-transports-under-loss.patch)
 - A pipelined TCP or TLS connection carries at most 16 queries in flight, more get a connection of
-  their own (Yandex DNS over TLS resets one with about 20).
+  their own (Yandex DNS over TLS resets one with about 20). Since r30 a query takes its place when it
+  is dispatched: sing-box 1.14.5 starts each exchange on a goroutine, and a burst counted by the
+  queries already registered passed the limit.
 - DoH resets its transport on a timeout only when no later query was answered (by the monotonic
   clock), and asks a query again once when the server closed HTTP/2 without a GOAWAY.
 
@@ -315,12 +324,17 @@ Each patch holds the call sites of one layer-03 module; the module's entry says 
 
 #### 0405 fakeip: a store that answers from memory and saves in the background
 `fakeip` · since r6 (the store in memory since r7) · [patch](../patches/v1.14/0405-fakeip-a-store-that-answers-from-memory-and-saves-in.patch)
-- `TableStore` takes the place of upstream's store in the FakeIP transport (upstream's files stay
-  as they are): the whole table in memory, saved to the cache file in the background.
+- Upstream's FakeIP server with `TableStore` in place of its store: the whole table in memory, saved
+  to the cache file in the background. Since r30 all of it is new files and one line of
+  `include/registry.go`: `RegisterTableTransport` registers `NewTableTransport`, which builds the
+  server with upstream's `NewTransport` (its checks of the options) and puts the store in; the methods
+  of the cache file are in a file of their own, a reset of the file told by its database.
 - New names are answered while the file cannot be written; after a crash or kill, addresses that
   may have been given out are held back (the saved position runs 1024 ahead).
 - A record unused for 24 h is removed; at most 65536 records a range. `Peek` tells an address
-  without giving one; the Clash API FakeIP flush resets the store in memory too.
+  without giving one; the Clash API FakeIP flush resets the store in memory too (upstream's flush,
+  since 1.14.6 for every FakeIP server). A name given out while a reset resets the file keeps its
+  record, and the reserve is saved again before the next new name (r30).
 
 #### 0406 route: a FakeIP address without a record goes by the sniffed domain
 `fakeip-route` · since r7 · [patch](../patches/v1.14/0406-route-a-FakeIP-address-without-a-record-goes-by-the-.patch)
@@ -375,6 +389,11 @@ Each patch holds the call sites of one layer-03 module; the module's entry says 
   not probed before a switch to it. In the first `loss_interval` of a use a member without a count
   to decide by (700 segments) is probed with 1 MiB, one at a time, at most once a `loss_interval`;
   a selection follows each. A selection waits for a probe before a switch that runs, 65 s at most.
+- Since r30 (sing-box 1.14.5 references): `References` reports what the group dials through now (its
+  choice, the members of a balance in use; no DNS server), its outbounds and fallbacks are its
+  dependencies, so a missing one fails when the box is created; upstream's `UpdateURLTestHistory`
+  keeps the history of a member as the group writes it. Not taken from upstream's group: a switch away
+  from a failed member while no member has a result, one history write a round.
 - Since r29 a group in mode `balance` that is not in use has no balance: it keeps its plain choice,
   and makes the balance from the delays and the kept counts at the first connection, download
   testing its members from then (not those that passed within the `loss_interval`). A group that
@@ -417,6 +436,12 @@ Each patch holds the call sites of one layer-03 module; the module's entry says 
   wait 5 s at most; when the cause is not the hello, it rests 30 s, doubling to 10 minutes.
 - A failed verification of REALITY is `tls.ErrRealityVerification` to `errors.Is` (since r29); the
   text "reality verification failed" is as before.
+- Since sing-box 1.14.5 a client that fails the REALITY verification sends the target the request a
+  browser would before the error returns; here it is bounded at 2 s, so the fallback tries its next
+  candidate at most 2 s later (common targets answer their first page within 1.34 s of the
+  handshake; www.microsoft.com answered nothing in 20 s). An ECH rejection is retried with the
+  server's ECH configuration (upstream's `DialTLSContext`), not taken for a failure of the
+  fingerprint (r30).
 
 #### 0415 vless: VLESS Encryption of Xray for the outbound; a flow where it cannot work
 `vless` · since r13 (encryption since r14) · [patch](../patches/v1.14/0415-vless-VLESS-Encryption-of-Xray-for-the-outbound-a-fl.patch)
@@ -548,8 +573,9 @@ Each patch holds the call sites of one layer-03 module; the module's entry says 
 - The dial option `finalmask` `{"tcp": [{"type": "fragment", …}]}`: Xray's fragment mask on every
   TCP connection the outbound opens itself, beneath TLS, REALITY and every transport. `packets`
   `tlshello` (the ClientHello cut into TLS records), `N-M` or empty, `length`/`lengths`,
-  `delay`/`delays`, `max_split`; masks in a list are chained as in Xray. Ranges are drawn as Xray
-  draws them. A pause ends at close and at the write deadline; through `detour` it does nothing.
+  `delay`/`delays`, `max_split`; masks in a list are chained as in Xray, the last one next to the
+  socket (since r30; r28 and r29 put the first one there, so two masks went in the reverse of
+  Xray's order). Ranges are drawn as Xray draws them. A pause ends at close and at the write deadline; through `detour` it does nothing.
   Feature name `dialer.finalmask`.
 - Measured on routers of three ISPs (podkop-exp `lab/runs/2026-11-21-fmcheck*`): where the
   ClientHello of the servers is dropped, records of 11–24 bytes written in two TCP pieces (the

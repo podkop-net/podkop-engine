@@ -69,6 +69,9 @@ How the program reaches them, which decides how a change shows up:
   FakeIP, `adapter.HTTPDownloaders` on `service.FromContext[adapter.HTTPClientManager]`. A change
   still builds and the feature is quietly gone; podkop-exp's `fork.go` turns it back into a build
   error.
+- **By behaviour** of an object sing-box made: the metadata of a rule set no rule uses (a list of a
+  rule that is off) stays when its rules are dropped (0402; upstream drops both since 1.14.5), and
+  podkop-exp reads it for its firewall. A change still builds; the embedder test (0802) fails.
 - **Implemented by the program**, asked by sing-box: `log.PlatformWriterLevel`,
   `log.PlatformWriterColors`. A change makes sing-box stop asking; the program gets every line,
   coloured.
@@ -161,9 +164,9 @@ inbound connection`).
 
 ### The version
 
-The package sets `constant.Version` to `<sing-box version>-pdk-r<N>` (`1.14.4-pdk-r29`); podkop-exp
+The package sets `constant.Version` to `<sing-box version>-pdk-r<N>` (`1.14.6-pdk-r30`); podkop-exp
 sets it with its ldflags to `<sing-box version>-pdk-<12 hex digits of the fork commit>`
-(`1.14.4-pdk-f866c9d89834`) and reads both up to `-pdk-`.
+(`1.14.6-pdk-d9a9a9a216d7`) and reads both up to `-pdk-`.
 
 ## Clash API
 

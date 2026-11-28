@@ -12,19 +12,19 @@
    `FiyeroT <me@fiyero.xyz>` (`git config user.name FiyeroT; git config user.email me@fiyero.xyz`):
    она попадает в `From:` патчей и в коммиты.
    ```sh
-   git checkout -b pe-1.14 v1.14.4
+   git checkout -b pe-1.14 v1.14.6
    git am -3 /path/podkop-engine/patches/v1.14/*.patch     # конфликты — поправить, git am --continue
-   git format-patch v1.14.4 -o /path/podkop-engine/patches/v1.14/   # заменить старые файлы
+   git format-patch v1.14.6 -o /path/podkop-engine/patches/v1.14/   # заменить старые файлы
    ```
    Форк — это тег плюс патчи и ничего больше: ветка `podkop-engine-<ветка>` в podkop-net/sing-box
    продвигается только коммитами, которые становятся патчами этого репозитория. На 1.12 и 1.13
-   новые коммиты форка — новые файлы в конце серии (`git format-patch v1.14.4..<коммит>`); старые
+   новые коммиты форка — новые файлы в конце серии (`git format-patch v1.14.6..<коммит>`); старые
    файлы при этом меняются только в счётчике `[PATCH n/N]`.
    На 1.14 (с r25) серия — один патч на функцию, по слоям (`00xx`–`06xx`, см. [PATCHES.md](PATCHES.md)):
    исправление функции вливается в её патч (`git commit --fixup` и `git rebase --autosquash`),
    новая функция — новый патч в своём слое. Файлы — `git format-patch --no-renames` (quilt пакета
    не читает переименований git), номер файла — слой·100 + место в слое; проверка —
-   `scripts/check-fork.sh`. Перенос на новый тег: `git rebase --onto <тег> v1.14.4` и сверка
+   `scripts/check-fork.sh`. Перенос на новый тег: `git rebase --onto <тег> <прежний тег>` и сверка
    `git range-diff` старой и новой серий; конфликты бывают в патчах, которые правят файлы upstream: слои 00 (`include/`, `go.mod`), 02, 04, 05 и 06 (слой 03 — только новые файлы).
    Для патча include (0035 в r9) проверить, не появились ли в `include/registry.go` новые
    регистрации: новый тип выхода — в `include/podkop_full.go` и `podkop_full_stub.go`, новый вход,
@@ -42,9 +42,9 @@
    [FiyeroT/sing-vmess](https://github.com/FiyeroT/sing-vmess),
    [podkop-net/quic-go](https://github.com/podkop-net/quic-go) и
    [podkop-net/sing-quic](https://github.com/podkop-net/sing-quic): директивы `replace` в `go.mod`,
-   патчи `go.mod: …`. Исправление в библиотеке — это коммит в ветке форка (все три: `pdk-1.14.4`),
-   новый тег (sing-vmess: `v0.2.9-pdk.N`, quic-go: `v0.61.0-sing-box-mod.12-pdk.N`, sing-quic:
-   `v0.7.2-pdk.N` — upstream 7e0a5869a5f4, которую берёт sing-box 1.14.4) и новые строки
+   патчи `go.mod: …`. Исправление в библиотеке — это коммит в ветке форка (все три: `pdk-1.14.6`, с r30),
+   новый тег (sing-vmess: `v0.2.9-pdk.N`, quic-go: `v0.61.0-sing-box-mod.15-pdk.N`, sing-quic:
+   `v0.7.2-pdk.N` — upstream 6fa4bb84d0bd, которую берёт sing-box 1.14.6) и новые строки
    `go.mod` и `go.sum` в sing-box. Тег должен быть опубликован до сборки: SDK берёт модули через
    прокси Go. `replace` из go.mod зависимости не действует в модуле, который её требует:
    podkop-experimental повторяет их в своём go.mod, `sdk/check-engine.sh` там это сверяет.
