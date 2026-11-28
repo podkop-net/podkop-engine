@@ -80,11 +80,11 @@ sing-box из OpenWrt — в [docs/INSTALL.ru.md](docs/INSTALL.ru.md).
 
 ## Версии
 
-- Теги — `v<версия sing-box>-r<ревизия>`, например `v1.14.4-r29`. Ревизия — номер выпуска
+- Теги — `v<версия sing-box>-r<ревизия>`, например `v1.14.6-r30`. Ревизия — номер выпуска
   podkop-engine, один на все линии, собранные в нём.
-- Поддерживается линия **1.14** (sing-box 1.14.4, 71 патч). У 1.12.25 был один выпуск (r1, два
+- Поддерживается линия **1.14** (sing-box 1.14.6, 71 патч). У 1.12.25 был один выпуск (r1, два
   патча). Линия 1.13 закончилась на `v1.13.21-r18`.
-- `sing-box version` печатает `1.14.4-pdk-r29` и строку `Features:` — что добавляет эта сборка.
+- `sing-box version` печатает `1.14.6-pdk-r30` и строку `Features:` — что добавляет эта сборка.
 - Форк — это тег upstream плюс [патчи](docs/PATCHES.md) и ничего больше: ветка
   `podkop-engine-1.14` в [podkop-net/sing-box](https://github.com/podkop-net/sing-box).
 - Собирается Go 1.26.8 из openwrt/packages: `.ipk` — в SDK OpenWrt 24.10, `.apk` — в SDK 25.12,
@@ -102,7 +102,7 @@ sing-box из OpenWrt — в [docs/INSTALL.ru.md](docs/INSTALL.ru.md).
 | | |
 |---|---|
 | [docs/INSTALL.ru.md](docs/INSTALL.ru.md) | установка, переход между пакетами, обновление, удаление; служба failsafe; архитектуры NaiveProxy |
-| [CHANGELOG.ru.md](CHANGELOG.ru.md) | что изменилось в каждом выпуске, r1 … r29 |
+| [CHANGELOG.ru.md](CHANGELOG.ru.md) | что изменилось в каждом выпуске, r1 … r30 |
 | [docs/FEATURES.ru.md](docs/FEATURES.ru.md) | опции и инструменты этой сборки, с примерами |
 | [docs/PATCHES.md](docs/PATCHES.md) | каждый патч к sing-box и что он меняет (на английском) |
 | [docs/BENCHMARKS.ru.md](docs/BENCHMARKS.ru.md) | замеры против sing-box без патчей |

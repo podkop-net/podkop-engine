@@ -80,11 +80,11 @@ to OpenWrt's sing-box are in [docs/INSTALL.md](docs/INSTALL.md).
 
 ## Versions
 
-- Tags are `v<sing-box version>-r<revision>`, for example `v1.14.4-r29`. The revision is the
+- Tags are `v<sing-box version>-r<revision>`, for example `v1.14.6-r30`. The revision is the
   release of podkop-engine; one revision covers every line built in it.
-- **1.14** is the line that is maintained (sing-box 1.14.4, 71 patches). 1.12.25 had one release
+- **1.14** is the line that is maintained (sing-box 1.14.6, 71 patches). 1.12.25 had one release
   (r1, two patches). The 1.13 line ended with `v1.13.21-r18`.
-- `sing-box version` prints `1.14.4-pdk-r29` and a `Features:` line with what this build adds.
+- `sing-box version` prints `1.14.6-pdk-r30` and a `Features:` line with what this build adds.
 - The fork is the upstream tag plus [the patches](docs/PATCHES.md) and nothing else: branch
   `podkop-engine-1.14` of [podkop-net/sing-box](https://github.com/podkop-net/sing-box).
 - Built with Go 1.26.8 from openwrt/packages, `.ipk` in the SDK of OpenWrt 24.10 and `.apk` in the
@@ -102,7 +102,7 @@ X25519MLKEM768 (most large sites do). Updating Xray on the server cures it.
 | | |
 |---|---|
 | [docs/INSTALL.md](docs/INSTALL.md) | install, switch packages, upgrade, remove; the failsafe service; NaiveProxy architectures |
-| [CHANGELOG.md](CHANGELOG.md) | what changed in each release, r1 … r29 |
+| [CHANGELOG.md](CHANGELOG.md) | what changed in each release, r1 … r30 |
 | [docs/FEATURES.md](docs/FEATURES.md) | the options and tools this build adds, with examples |
 | [docs/PATCHES.md](docs/PATCHES.md) | every patch to sing-box and what it changes |
 | [docs/BENCHMARKS.md](docs/BENCHMARKS.md) | measurements against vanilla sing-box |
