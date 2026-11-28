@@ -1,4 +1,4 @@
-From f1fd1bbfe86a6a988de64aed67ef52d4ffb36d67 Mon Sep 17 00:00:00 2001
+From fc376c7bc4924bd27129d7a8b522698b1f9da877 Mon Sep 17 00:00:00 2001
 From: FiyeroT <me@fiyero.xyz>
 Date: Sat, 14 Nov 2026 11:24:11 +0300
 Subject: [PATCH 63/71] warm: the deep paths of a new UDP session and of its
@@ -222,7 +222,7 @@ index 000000000..b952cba53
 +	}
 +}
 diff --git a/dns/client.go b/dns/client.go
-index a56f19270..83bf4f6ff 100644
+index e94bdae03..f78e7a47f 100644
 --- a/dns/client.go
 +++ b/dns/client.go
 @@ -13,6 +13,7 @@ import (

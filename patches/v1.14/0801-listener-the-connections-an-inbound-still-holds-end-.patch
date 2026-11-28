@@ -1,4 +1,4 @@
-From 2b83685977256ec983346752904eaf61657e38ec Mon Sep 17 00:00:00 2001
+From 94593c3cf0294356cf35000d32ca48c496e9c474 Mon Sep 17 00:00:00 2001
 From: FiyeroT <me@fiyero.xyz>
 Date: Tue, 24 Nov 2026 23:26:55 +0300
 Subject: [PATCH 70/71] listener: the connections an inbound still holds end
@@ -39,10 +39,10 @@ Pdk-Layer: 08
  create mode 100644 protocol/mixed/inbound_close_test.go
 
 diff --git a/common/listener/listener.go b/common/listener/listener.go
-index 40d9d0271..84f313423 100644
+index c584ad37d..cdd4c15cf 100644
 --- a/common/listener/listener.go
 +++ b/common/listener/listener.go
-@@ -36,6 +36,7 @@ type Listener struct {
+@@ -40,6 +40,7 @@ type Listener struct {
  	tproxy                   bool
  
  	tcpListener          net.Listener
@@ -50,7 +50,7 @@ index 40d9d0271..84f313423 100644
  	systemProxy          settings.SystemProxy
  	udpConn              *net.UDPConn
  	udpAddr              M.Socksaddr
-@@ -129,10 +130,12 @@ func (l *Listener) Close() error {
+@@ -143,10 +144,12 @@ func (l *Listener) Close() error {
  		}
  		err = E.Errors(err, l.systemProxy.Close())
  	}
@@ -63,7 +63,7 @@ index 40d9d0271..84f313423 100644
 +	return err
  }
  
- func (l *Listener) TCPListener() net.Listener {
+ func (l *Listener) bindInterfaceFunc() control.Func {
 diff --git a/common/listener/listener_accepted.go b/common/listener/listener_accepted.go
 new file mode 100644
 index 000000000..0eb749c1c
@@ -270,10 +270,10 @@ index 000000000..80e293f19
 +	require.Empty(t, inbound.ended, "a closed inbound serves nothing")
 +}
 diff --git a/common/listener/listener_tcp.go b/common/listener/listener_tcp.go
-index 50643ea44..f9525e9bc 100644
+index 59d797994..f88a53c89 100644
 --- a/common/listener/listener_tcp.go
 +++ b/common/listener/listener_tcp.go
-@@ -116,6 +116,6 @@ func (l *Listener) loopTCPIn() {
+@@ -123,6 +123,6 @@ func (l *Listener) loopTCPIn() {
  		metadata.OriginDestination = M.SocksaddrFromNet(conn.LocalAddr()).Unwrap()
  		ctx := log.ContextWithNewID(l.ctx)
  		l.logger.InfoContext(ctx, "inbound connection from ", metadata.Source)

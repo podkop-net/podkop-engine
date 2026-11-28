@@ -1,4 +1,4 @@
-From fe38deba71393d79ca467d95f99a23548106aca7 Mon Sep 17 00:00:00 2001
+From f8983a3d85dfef77e71c6a6cf871d3a04f7927c0 Mon Sep 17 00:00:00 2001
 From: FiyeroT <me@fiyero.xyz>
 Date: Thu, 12 Nov 2026 21:41:21 +0300
 Subject: [PATCH 43/71] sniff: bounded, panic-safe, buffers given back
@@ -31,10 +31,10 @@ Pdk-Layer: 04
  common/sniff/sniff.go             |  41 ++++++-
  common/sniff/tls.go               |   8 +-
  common/sniff/tls_test.go          | 129 +++++++++++++++++++++++
- route/route.go                    |  59 +++++++++++
+ route/route.go                    |  57 ++++++++++
  route/route_sniff_test.go         | 109 +++++++++++++++++++
  route/router.go                   |   2 +
- 13 files changed, 697 insertions(+), 4 deletions(-)
+ 13 files changed, 695 insertions(+), 4 deletions(-)
  create mode 100644 common/sniff/quic_crafted_test.go
  create mode 100644 common/sniff/recover_test.go
  create mode 100644 common/sniff/tls_test.go
@@ -166,10 +166,10 @@ index d78b0bf59..00466bb2c 100644
 +	require.Empty(t, metadata.Protocol)
 +}
 diff --git a/common/sniff/quic.go b/common/sniff/quic.go
-index 4f6dcf067..1a5fd2155 100644
+index d31583d0c..1047da3ea 100644
 --- a/common/sniff/quic.go
 +++ b/common/sniff/quic.go
-@@ -249,6 +249,17 @@ func QUICClientHello(ctx context.Context, metadata *adapter.InboundContext, pack
+@@ -251,6 +251,17 @@ func QUICClientHello(ctx context.Context, metadata *adapter.InboundContext, pack
  				return os.ErrInvalid
  			}
  			index := len(decrypted) - decryptedReader.Len()
@@ -187,7 +187,7 @@ index 4f6dcf067..1a5fd2155 100644
  			fragments = append(fragments, qCryptoFragment{offset, length, decrypted[index : index+int(length)]})
  			_, err = decryptedReader.Seek(int64(length), io.SeekCurrent)
  			if err != nil {
-@@ -284,6 +295,15 @@ func QUICClientHello(ctx context.Context, metadata *adapter.InboundContext, pack
+@@ -286,6 +297,15 @@ func QUICClientHello(ctx context.Context, metadata *adapter.InboundContext, pack
  	for _, fragment := range fragments {
  		frameLen += fragment.length
  	}
@@ -539,12 +539,12 @@ index b3651e1ff..a4f61dd14 100644
  			return nil
  		}
 diff --git a/common/sniff/tls.go b/common/sniff/tls.go
-index e994c8aa6..4ead32dc3 100644
+index 905b32697..d623e5681 100644
 --- a/common/sniff/tls.go
 +++ b/common/sniff/tls.go
-@@ -13,12 +13,18 @@ import (
- 	M "github.com/sagernet/sing/common/metadata"
- )
+@@ -16,12 +16,18 @@ import (
+ 
+ const extensionEncryptedClientHello = 0xfe0d
  
 +// errClientHelloCaptured ends the server handshake as soon as the ClientHello is parsed.
 +// Returning (nil, nil) from GetConfigForClient would let it go on into the server's key
@@ -698,37 +698,35 @@ index 000000000..1bc9f6776
 +	}
 +}
 diff --git a/route/route.go b/route/route.go
-index 389339a83..851208d31 100644
+index b7874ac1e..d6e548ccd 100644
 --- a/route/route.go
 +++ b/route/route.go
-@@ -7,6 +7,7 @@ import (
- 	"net"
+@@ -8,6 +8,7 @@ import (
  	"net/netip"
+ 	"slices"
  	"strings"
 +	"sync"
  	"time"
  
  	"github.com/sagernet/sing-box/adapter"
-@@ -109,6 +110,8 @@ func (r *Router) routeConnection(ctx context.Context, conn net.Conn, metadata ad
+@@ -105,6 +106,7 @@ func (r *Router) routeConnection(ctx context.Context, conn net.Conn, metadata ad
  	}
  	selectedRule, _, buffers, _, err := r.matchRule(ctx, &metadata, conn, nil)
  	if err != nil {
 +		// what sniffing read before the failure goes back to its pool
-+		buf.ReleaseMulti(buffers)
+ 		buf.ReleaseMulti(buffers)
  		return err
  	}
- 	var selectedOutbound adapter.Outbound
-@@ -291,6 +294,9 @@ func (r *Router) routePacketConnection(ctx context.Context, conn N.PacketConn, m
+@@ -280,6 +282,8 @@ func (r *Router) routePacketConnection(ctx context.Context, conn N.PacketConn, m
  	}
  	selectedRule, _, _, packetBuffers, err := r.matchRule(ctx, &metadata, nil, conn)
  	if err != nil {
 +		// the packets sniffing held (a QUIC ClientHello split over datagrams) go back to
 +		// their pool
-+		N.ReleaseMultiPacketBuffer(packetBuffers)
+ 		N.ReleaseMultiPacketBuffer(packetBuffers)
  		return err
  	}
- 	var selectedOutbound adapter.Outbound
-@@ -400,6 +406,7 @@ func (r *Router) PreMatch(metadata adapter.InboundContext, firstPacket []byte) a
+@@ -390,6 +394,7 @@ func (r *Router) PreMatch(metadata adapter.InboundContext, firstPacket []byte) a
  				packetSniffers = defaultPacketSniffers
  			}
  			sniffErr := sniff.PeekPacket(ctx, &metadata, firstPacket, packetSniffers...)
@@ -736,7 +734,7 @@ index 389339a83..851208d31 100644
  			metadata.SnifferNames = action.SnifferNames
  			metadata.SniffError = sniffErr
  			if sniffErr != nil {
-@@ -795,6 +802,51 @@ match:
+@@ -774,6 +779,51 @@ match:
  	return
  }
  
@@ -788,7 +786,7 @@ index 389339a83..851208d31 100644
  func (r *Router) actionSniff(
  	ctx context.Context, metadata *adapter.InboundContext, action *R.RuleActionSniff,
  	inputConn net.Conn, inputPacketConn N.PacketConn, inputBuffers []*buf.Buffer, inputPacketBuffers []*N.PacketBuffer,
-@@ -836,6 +888,7 @@ func (r *Router) actionSniff(
+@@ -815,6 +865,7 @@ func (r *Router) actionSniff(
  			action.Timeout,
  			streamSniffers...,
  		)
@@ -796,7 +794,7 @@ index 389339a83..851208d31 100644
  		metadata.SnifferNames = action.SnifferNames
  		metadata.SniffError = err
  		if err == nil {
-@@ -901,6 +954,11 @@ func (r *Router) actionSniff(
+@@ -873,6 +924,11 @@ func (r *Router) actionSniff(
  			goto finally
  		}
  		for {
@@ -808,14 +806,14 @@ index 389339a83..851208d31 100644
  			var (
  				sniffBuffer = buf.NewPacket()
  				destination M.Socksaddr
-@@ -961,6 +1019,7 @@ func (r *Router) actionSniff(
+@@ -933,6 +989,7 @@ func (r *Router) actionSniff(
  			goto finally
  		}
  	finally:
 +		r.logSnifferPanic(ctx, err)
  		if err == nil {
- 			//goland:noinspection GoDeprecation
- 			if action.OverrideDestination && M.IsDomainName(metadata.Domain) {
+ 			if metadata.Domain != "" && metadata.Client != "" {
+ 				r.logger.DebugContext(ctx, "sniffed packet protocol: ", metadata.Protocol, ", domain: ", metadata.Domain, ", client: ", metadata.Client)
 diff --git a/route/route_sniff_test.go b/route/route_sniff_test.go
 new file mode 100644
 index 000000000..cb0907c55
@@ -932,15 +930,15 @@ index 000000000..cb0907c55
 +	N.ReleaseMultiPacketBuffer(packetBuffers)
 +}
 diff --git a/route/router.go b/route/router.go
-index 9e129c490..d2d27aeef 100644
+index 776c4d6a7..912ac52d2 100644
 --- a/route/router.go
 +++ b/route/router.go
-@@ -47,6 +47,8 @@ type Router struct {
- 	pauseManager      pause.Manager
- 	trackers          []adapter.ConnectionTracker
- 	platformInterface adapter.PlatformInterface
-+	loopRefusals      loopRefusalLog
-+	snifferPanics     snifferPanicLog
+@@ -53,6 +53,8 @@ type Router struct {
+ 	pauseManager                 pause.Manager
+ 	trackers                     []adapter.ConnectionTracker
+ 	platformInterface            adapter.PlatformInterface
++	loopRefusals                 loopRefusalLog
++	snifferPanics                snifferPanicLog
  }
  
  func NewRouter(ctx context.Context, logFactory log.Factory, options option.RouteOptions, dnsOptions option.DNSOptions) *Router {

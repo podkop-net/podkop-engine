@@ -1,4 +1,4 @@
-From 525bff608033665fc313fdfac6439ef2007cba2b Mon Sep 17 00:00:00 2001
+From 670579295eba030d76546ceb75d3372106cf09b9 Mon Sep 17 00:00:00 2001
 From: FiyeroT <me@fiyero.xyz>
 Date: Thu, 12 Nov 2026 21:41:20 +0300
 Subject: [PATCH 39/71] dns: the TCP, TLS and HTTPS transports under loss
@@ -17,14 +17,16 @@ Pdk-Feature: dns-transport
 Pdk-Zone: core
 Pdk-Layer: 04
 ---
- dns/transport/https.go       |  37 ++++++
- dns/transport/https_test.go  | 218 +++++++++++++++++++++++++++++++++++
- dns/transport/multiplexer.go |  15 +++
- 3 files changed, 270 insertions(+)
+ dns/transport/https.go                     |  37 ++++
+ dns/transport/https_test.go                | 218 +++++++++++++++++++++
+ dns/transport/multiplexer.go               |  30 +++
+ dns/transport/multiplexer_inflight_test.go | 112 +++++++++++
+ 4 files changed, 397 insertions(+)
  create mode 100644 dns/transport/https_test.go
+ create mode 100644 dns/transport/multiplexer_inflight_test.go
 
 diff --git a/dns/transport/https.go b/dns/transport/https.go
-index 9325886aa..6acbacd8b 100644
+index b50cfc9cf..a1e1edc48 100644
 --- a/dns/transport/https.go
 +++ b/dns/transport/https.go
 @@ -53,6 +53,10 @@ type HTTPSTransport struct {
@@ -38,7 +40,7 @@ index 9325886aa..6acbacd8b 100644
  }
  
  func NewHTTPS(ctx context.Context, logger log.ContextLogger, tag string, options option.RemoteHTTPSDNSServerOptions) (adapter.DNSTransport, error) {
-@@ -134,6 +138,7 @@ func NewHTTPSRaw(
+@@ -141,6 +145,7 @@ func NewHTTPSRaw(
  	}
  	transport := &HTTPSTransport{
  		TransportAdapter: adapter,
@@ -46,7 +48,7 @@ index 9325886aa..6acbacd8b 100644
  		logger:           logger,
  		dialer:           dialer,
  		destination:      destination,
-@@ -186,11 +191,31 @@ func (t *HTTPSTransport) resetTransportLocked() {
+@@ -193,11 +198,31 @@ func (t *HTTPSTransport) resetTransportLocked() {
  func (t *HTTPSTransport) Exchange(ctx context.Context, message *mDNS.Msg) (*mDNS.Msg, error) {
  	startAt := time.Now()
  	response, err := t.exchange(ctx, message)
@@ -78,7 +80,7 @@ index 9325886aa..6acbacd8b 100644
  			t.transportAccess.Lock()
  			defer t.transportAccess.Unlock()
  			if t.transportResetAt.After(startAt) {
-@@ -200,9 +225,21 @@ func (t *HTTPSTransport) Exchange(ctx context.Context, message *mDNS.Msg) (*mDNS
+@@ -207,9 +232,21 @@ func (t *HTTPSTransport) Exchange(ctx context.Context, message *mDNS.Msg) (*mDNS
  		}
  		return nil, err
  	}
@@ -325,18 +327,32 @@ index 000000000..849768ae6
 +	require.EqualValues(t, 1, server.requests.Load())
 +}
 diff --git a/dns/transport/multiplexer.go b/dns/transport/multiplexer.go
-index 1b6e88c86..47e6613b0 100644
+index 85f861bd3..07cd8026e 100644
 --- a/dns/transport/multiplexer.go
 +++ b/dns/transport/multiplexer.go
-@@ -155,9 +155,24 @@ func (m *queryMultiplexer) dispatch(ctx context.Context, message *mDNS.Msg, call
+@@ -48,6 +48,7 @@ type queryMultiplexer struct {
+ 	reuseState     atomic.Int32
+ 	demoteFailures atomic.Int32
+ 	keepIdle       atomic.Bool
++	shared         atomic.Int32 // queries on the shared connection, not yet ended (podkop-engine)
+ 
+ 	probeAccess   sync.Mutex
+ 	probeEpoch    uint32
+@@ -156,9 +157,38 @@ func (m *queryMultiplexer) dispatch(ctx context.Context, message *mDNS.Msg, call
  		go m.exchangeSingle(ctx, message, callback)
  		return
  	}
-+	if m.options.probeReuse && m.inflight() >= pipelineMaxInflight {
-+		go m.exchangeSingle(ctx, message, callback)
-+		return
++	if m.options.probeReuse {
++		// the place on the shared connection is taken here, before the goroutine registers the
++		// query: a burst of queries counted by what is registered would pass the limit together
++		if m.shared.Add(1) > pipelineMaxInflight {
++			m.shared.Add(-1)
++			go m.exchangeSingle(ctx, message, callback)
++			return
++		}
++		callback = m.releaseShared(callback)
 +	}
- 	m.exchangeAsync(ctx, message, callback, retryReadError)
+ 	go m.exchangeAsync(ctx, message, callback, retryReadError)
  }
  
 +// Some servers reset a TCP/TLS connection that carries too many queries at once:
@@ -344,15 +360,141 @@ index 1b6e88c86..47e6613b0 100644
 +// shared connection get a connection of their own instead.
 +const pipelineMaxInflight = 16
 +
-+func (m *queryMultiplexer) inflight() int {
-+	m.queryAccess.Lock()
-+	defer m.queryAccess.Unlock()
-+	return len(m.queries)
++// releaseShared gives the place of a query on the shared connection back when its callback is
++// called, which is once for every query (an answer, an error, the end of its context or of the
++// connection). A query sent again after a read error is dispatched anew and holds a second
++// place until it ends: the limit errs on the safe side.
++func (m *queryMultiplexer) releaseShared(callback func(response *mDNS.Msg, err error)) func(response *mDNS.Msg, err error) {
++	var released atomic.Bool
++	return func(response *mDNS.Msg, err error) {
++		if released.CompareAndSwap(false, true) {
++			m.shared.Add(-1)
++		}
++		callback(response, err)
++	}
 +}
 +
  func (m *queryMultiplexer) exchangeSingle(ctx context.Context, message *mDNS.Msg, callback func(response *mDNS.Msg, err error)) {
  	conn, err := m.options.dial(ctx)
  	if err != nil {
+diff --git a/dns/transport/multiplexer_inflight_test.go b/dns/transport/multiplexer_inflight_test.go
+new file mode 100644
+index 000000000..8bffd0a4a
+--- /dev/null
++++ b/dns/transport/multiplexer_inflight_test.go
+@@ -0,0 +1,112 @@
++package transport
++
++import (
++	"context"
++	"fmt"
++	"net"
++	"sync"
++	"testing"
++	"time"
++
++	mDNS "github.com/miekg/dns"
++)
++
++// A burst of queries to a server that answers none puts at most pipelineMaxInflight of them on
++// the shared connection at once; the others get connections of their own, and every place is
++// given back when the queries end (podkop-engine, dns-transport). Upstream starts the exchange
++// of a dispatched query on a goroutine, so the limit cannot be counted by the queries already
++// registered.
++func TestMultiplexerSharedLimitUnderBurst(t *testing.T) {
++	t.Parallel()
++	listener, err := net.Listen("tcp", "127.0.0.1:0")
++	if err != nil {
++		t.Fatal(err)
++	}
++	defer listener.Close()
++	var (
++		access sync.Mutex
++		counts = make(map[net.Conn]int)
++		total  int
++	)
++	go func() {
++		for {
++			conn, acceptErr := listener.Accept()
++			if acceptErr != nil {
++				return
++			}
++			go func() {
++				defer conn.Close()
++				for {
++					_, readErr := ReadMessage(conn)
++					if readErr != nil {
++						return
++					}
++					access.Lock()
++					counts[conn]++
++					total++
++					access.Unlock()
++				}
++			}()
++		}
++	}()
++	multiplexer := newQueryMultiplexer(queryMultiplexerOptions{
++		dial: func(ctx context.Context) (net.Conn, error) {
++			return net.Dial("tcp", listener.Addr().String())
++		},
++		write: func(conn net.Conn, message *mDNS.Msg, queryId uint16) error {
++			return WriteMessage(conn, queryId, message)
++		},
++		readNext: func(conn net.Conn) (*mDNS.Msg, error) {
++			return ReadMessage(conn)
++		},
++		probeReuse: true,
++	})
++	defer multiplexer.Close()
++	multiplexer.reuseState.Store(reuseStateSupported)
++
++	const queries = 3 * pipelineMaxInflight
++	ctx, cancel := context.WithCancel(context.Background())
++	defer cancel()
++	var ended sync.WaitGroup
++	ended.Add(queries)
++	for i := range queries {
++		message := new(mDNS.Msg)
++		message.SetQuestion(fmt.Sprintf("q%d.example.com.", i), mDNS.TypeA)
++		multiplexer.ExchangeAsync(ctx, message, func(*mDNS.Msg, error) { ended.Done() })
++	}
++	deadline := time.Now().Add(5 * time.Second)
++	for {
++		access.Lock()
++		got := total
++		access.Unlock()
++		if got == queries {
++			break
++		}
++		if time.Now().After(deadline) {
++			t.Fatalf("the server got %d of %d queries", got, queries)
++		}
++		time.Sleep(10 * time.Millisecond)
++	}
++	access.Lock()
++	for _, count := range counts {
++		if count > pipelineMaxInflight {
++			t.Errorf("a connection carried %d unanswered queries, the limit is %d", count, pipelineMaxInflight)
++		}
++	}
++	access.Unlock()
++
++	cancel()
++	allEnded := make(chan struct{})
++	go func() {
++		ended.Wait()
++		close(allEnded)
++	}()
++	select {
++	case <-allEnded:
++	case <-time.After(5 * time.Second):
++		t.Fatal("not every query ended after its context did")
++	}
++	if shared := multiplexer.shared.Load(); shared != 0 {
++		t.Fatalf("%d places of the shared connection were not given back", shared)
++	}
++}
 -- 
 2.53.0
 

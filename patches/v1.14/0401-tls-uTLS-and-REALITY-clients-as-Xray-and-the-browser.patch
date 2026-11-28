@@ -1,4 +1,4 @@
-From 521fc245e444d9d84d3ee13b0bb1d48b2e5d1ccd Mon Sep 17 00:00:00 2001
+From 5208cf0968f01aaab61cf6c13be6fe3e9f96fc19 Mon Sep 17 00:00:00 2001
 From: FiyeroT <me@fiyero.xyz>
 Date: Thu, 12 Nov 2026 21:41:20 +0300
 Subject: [PATCH 37/71] tls: uTLS and REALITY clients as Xray and the browsers
@@ -26,38 +26,24 @@ Pdk-Feature: utls-reality
 Pdk-Zone: protocols
 Pdk-Layer: 04
 ---
- common/badtls/read_wait.go             |   2 +-
  common/tls/client.go                   |  25 +-
  common/tls/client_read_wait_test.go    |  83 ++++++
- common/tls/reality_client.go           |  84 ++++--
+ common/tls/reality_client.go           |  74 ++++-
  common/tls/reality_fingerprint_test.go | 398 +++++++++++++++++++++++++
  common/tls/reality_server.go           |   5 +
- common/tls/utls_client.go              |  57 +++-
+ common/tls/utls_client.go              |  55 +++-
  common/tls/utls_spec.go                | 280 +++++++++++++++++
- common/tls/utls_spec_test.go           | 100 +++++++
+ common/tls/utls_spec_test.go           | 102 +++++++
  docs/configuration/shared/tls.md       |   5 +
  docs/configuration/shared/tls.zh.md    |   4 +
- 11 files changed, 1006 insertions(+), 37 deletions(-)
+ 10 files changed, 1015 insertions(+), 16 deletions(-)
  create mode 100644 common/tls/client_read_wait_test.go
  create mode 100644 common/tls/reality_fingerprint_test.go
  create mode 100644 common/tls/utls_spec.go
  create mode 100644 common/tls/utls_spec_test.go
 
-diff --git a/common/badtls/read_wait.go b/common/badtls/read_wait.go
-index 982f0f17f..0922323de 100644
---- a/common/badtls/read_wait.go
-+++ b/common/badtls/read_wait.go
-@@ -62,7 +62,7 @@ func (c *ReadWaitConn) WaitReadBuffer() (buffer *buf.Buffer, err error) {
- 	}
- 	buffer.Truncate(n)
- 
--	if n != 0 && c.rawConn.Input.Len() == 0 && c.rawConn.Input.Len() > 0 &&
-+	if n != 0 && c.rawConn.Input.Len() == 0 && c.rawConn.RawInput.Len() > 0 &&
- 		// recordType(c.RawInput.Bytes()[0]) == recordTypeAlert {
- 		c.rawConn.RawInput.Bytes()[0] == 21 {
- 		_ = c.rawConn.ReadRecord()
 diff --git a/common/tls/client.go b/common/tls/client.go
-index 7b303687c..ae6b23198 100644
+index c6f05fc1b..6e1a63ddb 100644
 --- a/common/tls/client.go
 +++ b/common/tls/client.go
 @@ -7,10 +7,12 @@ import (
@@ -73,7 +59,7 @@ index 7b303687c..ae6b23198 100644
  	"github.com/sagernet/sing-box/option"
  	E "github.com/sagernet/sing/common/exceptions"
  	"github.com/sagernet/sing/common/logger"
-@@ -122,6 +124,28 @@ func ClientHandshake(ctx context.Context, conn net.Conn, config Config) (Conn, e
+@@ -119,6 +121,28 @@ func ClientHandshake(ctx context.Context, conn net.Conn, config Config) (Conn, e
  	return tlsConn, nil
  }
  
@@ -102,8 +88,8 @@ index 7b303687c..ae6b23198 100644
  type Dialer interface {
  	N.Dialer
  	DialTLSContext(ctx context.Context, destination M.Socksaddr) (Conn, error)
-@@ -168,7 +192,6 @@ func (d *defaultDialer) dialContext(ctx context.Context, destination M.Socksaddr
- 		}
+@@ -176,7 +200,6 @@ func (d *defaultDialer) dialContext(ctx context.Context, destination M.Socksaddr
+ 		conn.Close()
  		return nil, err
  	}
 -	return tlsConn, nil
@@ -200,18 +186,18 @@ index 000000000..8f6fdb43d
 +	require.Equal(t, Conn(conn), withReadWait(conn))
 +}
 diff --git a/common/tls/reality_client.go b/common/tls/reality_client.go
-index be4806fe6..20597bda7 100644
+index ccb69aa1c..77aa9d43b 100644
 --- a/common/tls/reality_client.go
 +++ b/common/tls/reality_client.go
-@@ -30,7 +30,6 @@ import (
- 	"github.com/sagernet/sing-box/adapter"
- 	C "github.com/sagernet/sing-box/constant"
- 	"github.com/sagernet/sing-box/option"
--	"github.com/sagernet/sing/common"
- 	"github.com/sagernet/sing/common/debug"
- 	E "github.com/sagernet/sing/common/exceptions"
- 	"github.com/sagernet/sing/common/logger"
-@@ -60,8 +59,10 @@ func newRealityClient(ctx context.Context, logger logger.ContextLogger, serverAd
+@@ -43,6 +43,7 @@ import (
+ var _ ConfigCompat = (*RealityClientConfig)(nil)
+ 
+ type RealityClientConfig struct {
++	ctx       context.Context
+ 	uClient   *UTLSClientConfig
+ 	publicKey []byte
+ 	shortID   [8]byte
+@@ -56,8 +57,10 @@ func newRealityClient(ctx context.Context, logger logger.ContextLogger, serverAd
  	if options.UTLS == nil || !options.UTLS.Enabled {
  		return nil, E.New("uTLS is required by reality client")
  	}
@@ -223,8 +209,8 @@ index be4806fe6..20597bda7 100644
 +		return nil, err
  	}
  
- 	uClient, err := newUTLSClient(ctx, logger, serverAddress, options, allowEmptyServerName)
-@@ -77,6 +78,10 @@ func newRealityClient(ctx context.Context, logger logger.ContextLogger, serverAd
+ 	uClient, err := newUTLSClient(ctx, logger, serverAddress, options, allowEmptyServerName, nil, false)
+@@ -73,6 +76,10 @@ func newRealityClient(ctx context.Context, logger logger.ContextLogger, serverAd
  		return nil, E.New("invalid public_key")
  	}
  	var shortID [8]byte
@@ -235,11 +221,11 @@ index be4806fe6..20597bda7 100644
  	decodedLen, err := hex.Decode(shortID[:], []byte(options.Reality.ShortID))
  	if err != nil {
  		return nil, E.Cause(err, "decode short_id")
-@@ -85,7 +90,18 @@ func newRealityClient(ctx context.Context, logger logger.ContextLogger, serverAd
+@@ -81,7 +88,18 @@ func newRealityClient(ctx context.Context, logger logger.ContextLogger, serverAd
  		return nil, E.New("invalid short_id")
  	}
  
--	var config Config = &RealityClientConfig{ctx, uClient.(*UTLSClientConfig), publicKey, shortID}
+-	var config Config = &RealityClientConfig{uClient.(*UTLSClientConfig), publicKey, shortID}
 +	realityConfig := &RealityClientConfig{ctx: ctx, uClient: uClient.(*UTLSClientConfig), publicKey: publicKey, shortID: shortID, outcome: new(detectOutcomeWriter)}
 +	realityConfig.fingerprint = options.UTLS.Fingerprint
 +	if realityConfig.fingerprint == "" {
@@ -255,73 +241,52 @@ index be4806fe6..20597bda7 100644
  	if options.KernelRx || options.KernelTx {
  		if !C.IsLinux {
  			return nil, E.New("kTLS is only supported on Linux")
-@@ -146,32 +162,32 @@ func (e *RealityClientConfig) ClientHandshake(ctx context.Context, conn net.Conn
+@@ -150,14 +168,41 @@ func (e *RealityClientConfig) ClientHandshake(ctx context.Context, conn net.Conn
  	if err != nil {
  		return nil, err
  	}
--	for _, extension := range uConn.Extensions {
--		if ce, ok := extension.(*utls.SupportedCurvesExtension); ok {
--			ce.Curves = common.Filter(ce.Curves, func(curveID utls.CurveID) bool {
--				return curveID != utls.X25519MLKEM768
--			})
--		}
--		if ks, ok := extension.(*utls.KeyShareExtension); ok {
--			ks.KeyShares = common.Filter(ks.KeyShares, func(share utls.KeyShare) bool {
--				return share.Group != utls.X25519MLKEM768
--			})
--		}
 +	uConn, err := newUClient(conn, uConfig, e.uClient.id)
 +	if err != nil {
 +		return nil, err
- 	}
++	}
 +	verifier.UConn = uConn
 +	// X25519MLKEM768 is kept as the fingerprint carries it: REALITY servers
 +	// since Xray-core v26.9.8 (XTLS/REALITY@8cdf7bf) reject a Client Hello
 +	// without an X25519MLKEM768 key share placed before the optional X25519 one.
- 	err = uConn.BuildHandshakeState()
- 	if err != nil {
- 		return nil, err
- 	}
--
--	if len(uConfig.NextProtos) > 0 {
--		for _, extension := range uConn.Extensions {
--			if alpnExtension, isALPN := extension.(*utls.ALPNExtension); isALPN {
--				alpnExtension.AlpnProtocols = uConfig.NextProtos
--				break
--			}
++	err = uConn.BuildHandshakeState()
++	if err != nil {
++		return nil, err
++	}
 +	if e.uClient.noMLKEM {
-+		// a candidate of the fingerprint fallback: the ClientHello as stock sing-box sends it
++		// a candidate of the fingerprint fallback: the ClientHello as stock sing-box sent it up to 1.14.4
 +		dropMLKEM(uConn)
 +		err = uConn.BuildHandshakeState()
 +		if err != nil {
 +			return nil, err
- 		}
- 	}
- 
++		}
++	}
++
 +	// The ALPN of the ClientHello is the fingerprint's: BuildHandshakeState has already put
 +	// its list in uConfig.NextProtos, and changing the extension here would not reach the
 +	// wire before the session ID is sealed below anyway. Only "randomized" reads the
 +	// configured ALPN, when it builds its spec.
-+
+ 
  	hello := uConn.HandshakeState.Hello
  	hello.SessionId = make([]byte, 32)
  	copy(hello.Raw[39:], hello.SessionId)
-@@ -184,9 +200,11 @@ func (e *RealityClientConfig) ClientHandshake(ctx context.Context, conn net.Conn
- 	}
- 	binary.BigEndian.PutUint64(hello.SessionId, uint64(nowTime.Unix()))
  
 -	hello.SessionId[0] = 1
 -	hello.SessionId[1] = 8
--	hello.SessionId[2] = 1
+-	hello.SessionId[2] = 2
 +	// Client version checked against the server's minClientVer
 +	// (Xray-core v26.7.x defaults to 26.3.27 and refuses older clients).
 +	hello.SessionId[0] = 26
 +	hello.SessionId[1] = 3
 +	hello.SessionId[2] = 27
- 	binary.BigEndian.PutUint32(hello.SessionId[4:], uint32(time.Now().Unix()))
+ 	binary.BigEndian.PutUint32(hello.SessionId[4:], uint32(nowTime.Unix()))
  	copy(hello.SessionId[8:], e.shortID[:])
  	if debug.Enabled {
-@@ -200,7 +218,12 @@ func (e *RealityClientConfig) ClientHandshake(ctx context.Context, conn net.Conn
+@@ -171,7 +216,12 @@ func (e *RealityClientConfig) ClientHandshake(ctx context.Context, conn net.Conn
  	if keyShareKeys == nil {
  		return nil, E.New("nil KeyShareKeys")
  	}
@@ -334,7 +299,7 @@ index be4806fe6..20597bda7 100644
  	if ecdheKey == nil {
  		return nil, E.New("nil ecdheKey")
  	}
-@@ -227,6 +250,11 @@ func (e *RealityClientConfig) ClientHandshake(ctx context.Context, conn net.Conn
+@@ -198,6 +248,11 @@ func (e *RealityClientConfig) ClientHandshake(ctx context.Context, conn net.Conn
  
  	err = uConn.HandshakeContext(ctx)
  	if err != nil {
@@ -346,10 +311,10 @@ index be4806fe6..20597bda7 100644
  		return nil, err
  	}
  
-@@ -236,9 +264,10 @@ func (e *RealityClientConfig) ClientHandshake(ctx context.Context, conn net.Conn
+@@ -207,9 +262,10 @@ func (e *RealityClientConfig) ClientHandshake(ctx context.Context, conn net.Conn
  
  	if !verifier.verified {
- 		go realityClientFallback(e.ctx, uConn, e.uClient.ServerName(), e.uClient.id)
+ 		realityClientFallback(ctx, uConn, e.uClient.ServerName(), e.uClient.id)
 -		return nil, E.New("reality verification failed")
 +		return nil, e.verificationFailed(nil)
  	}
@@ -358,16 +323,24 @@ index be4806fe6..20597bda7 100644
  	return &realityClientConnWrapper{uConn}, nil
  }
  
-@@ -288,6 +317,8 @@ type realityVerifier struct {
- 	serverName string
- 	authKey    []byte
- 	verified   bool
+@@ -243,6 +299,7 @@ func realityClientFallback(ctx context.Context, uConn net.Conn, serverName strin
+ 
+ func (e *RealityClientConfig) Clone() Config {
+ 	return &RealityClientConfig{
++		e.ctx,
+ 		e.uClient.Clone().(*UTLSClientConfig),
+ 		e.publicKey,
+ 		e.shortID,
+@@ -256,6 +313,8 @@ type realityVerifier struct {
+ 	currentTime time.Time
+ 	authKey     []byte
+ 	verified    bool
 +	// the certificate is not the server's and did not pass the system verification
 +	rejected bool
  }
  
  func (c *realityVerifier) VerifyPeerCertificate(rawCerts [][]byte, verifiedChains [][]*x509.Certificate) error {
-@@ -309,6 +340,7 @@ func (c *realityVerifier) VerifyPeerCertificate(rawCerts [][]byte, verifiedChain
+@@ -279,6 +338,7 @@ func (c *realityVerifier) VerifyPeerCertificate(rawCerts [][]byte, verifiedChain
  		opts.Intermediates.AddCert(cert)
  	}
  	if _, err := certs[0].Verify(opts); err != nil {
@@ -796,10 +769,10 @@ index 8ad59e144..6c04cfc57 100644
  			if err != nil {
  				return nil, E.Cause(err, "decode short_id[", i, "]: ", shortIDString)
 diff --git a/common/tls/utls_client.go b/common/tls/utls_client.go
-index 2b725d30d..ce7493a8c 100644
+index 54bc4778a..8a8da68b9 100644
 --- a/common/tls/utls_client.go
 +++ b/common/tls/utls_client.go
-@@ -90,7 +90,11 @@ func (c *UTLSClientConfig) Client(conn net.Conn) (Conn, error) {
+@@ -91,7 +91,11 @@ func (c *UTLSClientConfig) Client(conn net.Conn) (Conn, error) {
  	if err != nil {
  		return nil, err
  	}
@@ -812,7 +785,7 @@ index 2b725d30d..ce7493a8c 100644
  }
  
  func (c *UTLSClientConfig) SetSessionIDGenerator(generator func(clientHello []byte, sessionID []byte) error) {
-@@ -165,6 +169,11 @@ type utlsALPNWrapper struct {
+@@ -175,6 +179,11 @@ type utlsALPNWrapper struct {
  }
  
  func (c *utlsALPNWrapper) HandshakeContext(ctx context.Context) error {
@@ -824,11 +797,11 @@ index 2b725d30d..ce7493a8c 100644
  	if len(c.nextProtocols) > 0 {
  		err := c.BuildHandshakeState()
  		if err != nil {
-@@ -181,7 +190,34 @@ func (c *utlsALPNWrapper) HandshakeContext(ctx context.Context) error {
+@@ -191,7 +200,34 @@ func (c *utlsALPNWrapper) HandshakeContext(ctx context.Context) error {
  			}
  		}
  	}
--	return c.UConn.HandshakeContext(ctx)
+-	return c.utlsConnWrapper.HandshakeContext(ctx)
 +	if c.noMLKEM {
 +		err := c.BuildHandshakeState()
 +		if err != nil {
@@ -840,7 +813,7 @@ index 2b725d30d..ce7493a8c 100644
 +			return err
 +		}
 +	}
-+	err := c.UConn.HandshakeContext(ctx)
++	err := c.utlsConnWrapper.HandshakeContext(ctx)
 +	if err != nil {
 +		return err
 +	}
@@ -860,14 +833,12 @@ index 2b725d30d..ce7493a8c 100644
  }
  
  func NewUTLSClient(ctx context.Context, logger logger.ContextLogger, serverAddress string, options option.OutboundTLSOptions) (Config, error) {
-@@ -353,17 +389,20 @@ var (
+@@ -363,17 +399,20 @@ var (
  func init() {
  	modernFingerprints := []utls.ClientHelloID{
  		utls.HelloChrome_Auto,
 -		utls.HelloFirefox_Auto,
--		utls.HelloEdge_Auto,
 -		utls.HelloSafari_Auto,
--		utls.HelloIOS_Auto,
 +		helloFirefox148,
 +		helloSafari26_3,
  	}
@@ -876,17 +847,18 @@ index 2b725d30d..ce7493a8c 100644
  	weights := utls.DefaultWeights
  	weights.TLSVersMax_Set_VersionTLS13 = 1
  	weights.FirstKeyShare_Set_CurveP256 = 0
--	randomizedFingerprint = utls.HelloRandomized
 +	// X25519MLKEM768 always offered: REALITY servers since Xray-core v26.9.8 refuse a
 +	// Client Hello without it (its key share: randomizedSpec).
-+	weights.CurveIDs_Append_X25519 = 1
+ 	weights.CurveIDs_Append_X25519 = 1
+-	weights.KeyShare_Append_RandomGroups = 1
+-	randomizedFingerprint = utls.HelloRandomized
 +	// ALPN always sent, as Xray-core does: without it gRPC and HTTP/2 transports cannot
 +	// agree on h2, for as long as the process keeps the seed.
 +	randomizedFingerprint = utls.HelloRandomizedALPN
  	randomizedFingerprint.Seed, _ = utls.NewPRNGSeed()
  	randomizedFingerprint.Weights = &weights
  }
-@@ -375,11 +414,11 @@ func uTLSClientHelloID(name string) (utls.ClientHelloID, error) {
+@@ -385,11 +424,11 @@ func uTLSClientHelloID(name string) (utls.ClientHelloID, error) {
  	case "chrome", "":
  		return utls.HelloChrome_Auto, nil
  	case "firefox":
@@ -1188,10 +1160,10 @@ index 000000000..7e2d575bb
 +}
 diff --git a/common/tls/utls_spec_test.go b/common/tls/utls_spec_test.go
 new file mode 100644
-index 000000000..04a7cc5fb
+index 000000000..3249027a0
 --- /dev/null
 +++ b/common/tls/utls_spec_test.go
-@@ -0,0 +1,100 @@
+@@ -0,0 +1,102 @@
 +//go:build with_utls
 +
 +package tls
@@ -1252,9 +1224,11 @@ index 000000000..04a7cc5fb
 +	return first
 +}
 +
-+// Once the handshake state is released, a connection made from the specification no longer
-+// holds the extension objects, which one made by ID does: for chrome that is the
-+// X25519MLKEM768 key share alone, 1216 bytes.
++// Once the handshake state is released, a connection made from the specification holds less
++// than one made by ID. For chrome, 2000 connections on nexus: with utls v1.9.0-alpha.1 (sing-box
++// 1.14.5 and later) 1172 to 1191 bytes less a connection over 10 runs of both tag sets (4126 to
++// 4139 by ID, 2951 to 2953 by specification); with v1.8.7 (r29) 2847 to 2855 less, the
++// X25519MLKEM768 key share (1216 bytes) among them. The floor is 1 KiB.
 +func TestNewUClientSpecReleased(t *testing.T) {
 +	const connections = 2000
 +	held := func(name string, create func(config *utls.Config) *utls.UConn) int {
@@ -1288,7 +1262,7 @@ index 000000000..04a7cc5fb
 +		t.Logf("%s: %d bytes held per connection by ID, %d by specification, %d less", name, byID, bySpec, byID-bySpec)
 +		require.Less(t, bySpec, byID, name)
 +		if name == "chrome" {
-+			require.GreaterOrEqual(t, byID-bySpec, 1216, name)
++			require.GreaterOrEqual(t, byID-bySpec, 1024, name)
 +		}
 +	}
 +}

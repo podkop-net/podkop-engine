@@ -1,4 +1,4 @@
-From 8063bcc75205018782c398bfaf79a5f45b2853cb Mon Sep 17 00:00:00 2001
+From c54e3c142c82c996a25a4c8ad57a18a0320f827f Mon Sep 17 00:00:00 2001
 From: FiyeroT <me@fiyero.xyz>
 Date: Thu, 12 Nov 2026 21:41:21 +0300
 Subject: [PATCH 51/71] vless: VLESS Encryption of Xray for the outbound; a
@@ -44,7 +44,7 @@ Pdk-Layer: 04
  create mode 100644 protocol/vless/encryption_test.go
 
 diff --git a/go.mod b/go.mod
-index 81ec75e44..f4bf8c02e 100644
+index 281190163..0e6478a50 100644
 --- a/go.mod
 +++ b/go.mod
 @@ -81,6 +81,7 @@ require (
@@ -1736,7 +1736,7 @@ index 000000000..808a85903
 +	require.Equal(t, conn, same)
 +}
 diff --git a/protocol/vless/outbound.go b/protocol/vless/outbound.go
-index c0ece0a2d..d15969d58 100644
+index b3cbaf056..86fe4a420 100644
 --- a/protocol/vless/outbound.go
 +++ b/protocol/vless/outbound.go
 @@ -12,6 +12,7 @@ import (
@@ -1756,9 +1756,9 @@ index c0ece0a2d..d15969d58 100644
  }
  
  func NewOutbound(ctx context.Context, router adapter.Router, logger log.ContextLogger, tag string, options option.VLESSOutboundOptions) (adapter.Outbound, error) {
-@@ -73,6 +76,28 @@ func NewOutbound(ctx context.Context, router adapter.Router, logger log.ContextL
+@@ -76,6 +79,28 @@ func NewOutbound(ctx context.Context, router adapter.Router, logger log.ContextL
+ 			outbound.tlsDialer = tls.NewDialer(outboundDialer, outbound.tlsConfig)
  		}
- 		outbound.tlsDialer = tls.NewDialer(outboundDialer, outbound.tlsConfig)
  	}
 +	if options.Encryption != "" && options.Encryption != "none" {
 +		outbound.encryption, err = encryption.NewClient(options.Encryption)
@@ -1785,7 +1785,7 @@ index c0ece0a2d..d15969d58 100644
  	if options.Transport != nil {
  		outbound.transport, err = v2ray.NewClientTransport(ctx, outbound.dialer, outbound.serverAddr, common.PtrValueOrDefault(options.Transport), outbound.tlsConfig)
  		if err != nil {
-@@ -201,6 +226,10 @@ func (h *vlessDialer) DialContext(ctx context.Context, network string, destinati
+@@ -204,6 +229,10 @@ func (h *vlessDialer) DialContext(ctx context.Context, network string, destinati
  	if err != nil {
  		return nil, err
  	}
@@ -1796,7 +1796,7 @@ index c0ece0a2d..d15969d58 100644
  	switch N.NetworkName(network) {
  	case N.NetworkTCP:
  		h.logger.InfoContext(ctx, "outbound connection to ", destination)
-@@ -244,6 +273,10 @@ func (h *vlessDialer) ListenPacket(ctx context.Context, destination M.Socksaddr)
+@@ -247,6 +276,10 @@ func (h *vlessDialer) ListenPacket(ctx context.Context, destination M.Socksaddr)
  		common.Close(conn)
  		return nil, err
  	}

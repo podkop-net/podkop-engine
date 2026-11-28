@@ -1,4 +1,4 @@
-From d96f29c7d80791fee33180699c1c67996aa3282e Mon Sep 17 00:00:00 2001
+From c4566a64fbe2256c9860667abc47403636762a9b Mon Sep 17 00:00:00 2001
 From: FiyeroT <me@fiyero.xyz>
 Date: Thu, 12 Nov 2026 21:41:21 +0300
 Subject: [PATCH 46/71] urltest: the group of this fork, in a package of its
@@ -49,10 +49,11 @@ Pdk-Layer: 04
  common/urltest/download.go                    |   86 ++
  common/urltest/download_test.go               |   75 ++
  common/urltest/history_detail.go              |  195 ++++
+ common/urltest/history_update_test.go         |   36 +
  common/urltest/loss.go                        |  357 ++++++
  common/urltest/loss_test.go                   |  143 +++
  common/urltest/test_dial.go                   |   20 +
- common/urltest/urltest.go                     |   40 +-
+ common/urltest/urltest.go                     |   44 +-
  daemon/started_service.go                     |    3 +-
  docs/configuration/outbound/urltest.md        |   34 +
  experimental/clashapi/api_meta_group.go       |    4 +-
@@ -61,8 +62,9 @@ Pdk-Layer: 04
  option/group.go                               |   16 +
  protocol/group/selector_release.go            |    9 +
  protocol/group/selector_release_test.go       |   34 +
- protocol/group/urltestgroup/urltest.go        | 1005 +++++++++++++++++
+ protocol/group/urltestgroup/urltest.go        | 1011 +++++++++++++++++
  .../group/urltestgroup/urltest_balance.go     |  405 +++++++
+ .../group/urltestgroup/urltest_box_test.go    |   98 ++
  .../group/urltestgroup/urltest_download.go    |  218 ++++
  .../urltestgroup/urltest_download_test.go     |  488 ++++++++
  .../group/urltestgroup/urltest_failure.go     |  470 ++++++++
@@ -77,19 +79,22 @@ Pdk-Layer: 04
  protocol/group/urltestgroup/urltest_probe.go  |  297 +++++
  .../group/urltestgroup/urltest_probe_test.go  |  390 +++++++
  .../group/urltestgroup/urltest_r20_test.go    |  231 ++++
+ .../urltestgroup/urltest_references_test.go   |   69 ++
  .../group/urltestgroup/urltest_response.go    |  443 ++++++++
  .../urltestgroup/urltest_response_test.go     |  522 +++++++++
  protocol/group/urltestgroup/urltest_rest.go   |   94 ++
  .../group/urltestgroup/urltest_rest_test.go   |  386 +++++++
  .../urltestgroup/urltest_review2_test.go      |  245 ++++
+ .../urltestgroup/urltest_started_test.go      |   29 +
  .../group/urltestgroup/urltest_switch_test.go |  150 +++
  protocol/group/urltestgroup/urltest_use.go    |   59 +
  .../group/urltestgroup/urltest_use_test.go    |  328 ++++++
  route/network.go                              |    9 +
- 40 files changed, 9651 insertions(+), 15 deletions(-)
+ 44 files changed, 9893 insertions(+), 15 deletions(-)
  create mode 100644 common/urltest/download.go
  create mode 100644 common/urltest/download_test.go
  create mode 100644 common/urltest/history_detail.go
+ create mode 100644 common/urltest/history_update_test.go
  create mode 100644 common/urltest/loss.go
  create mode 100644 common/urltest/loss_test.go
  create mode 100644 common/urltest/test_dial.go
@@ -97,6 +102,7 @@ Pdk-Layer: 04
  create mode 100644 protocol/group/selector_release_test.go
  create mode 100644 protocol/group/urltestgroup/urltest.go
  create mode 100644 protocol/group/urltestgroup/urltest_balance.go
+ create mode 100644 protocol/group/urltestgroup/urltest_box_test.go
  create mode 100644 protocol/group/urltestgroup/urltest_download.go
  create mode 100644 protocol/group/urltestgroup/urltest_download_test.go
  create mode 100644 protocol/group/urltestgroup/urltest_failure.go
@@ -111,11 +117,13 @@ Pdk-Layer: 04
  create mode 100644 protocol/group/urltestgroup/urltest_probe.go
  create mode 100644 protocol/group/urltestgroup/urltest_probe_test.go
  create mode 100644 protocol/group/urltestgroup/urltest_r20_test.go
+ create mode 100644 protocol/group/urltestgroup/urltest_references_test.go
  create mode 100644 protocol/group/urltestgroup/urltest_response.go
  create mode 100644 protocol/group/urltestgroup/urltest_response_test.go
  create mode 100644 protocol/group/urltestgroup/urltest_rest.go
  create mode 100644 protocol/group/urltestgroup/urltest_rest_test.go
  create mode 100644 protocol/group/urltestgroup/urltest_review2_test.go
+ create mode 100644 protocol/group/urltestgroup/urltest_started_test.go
  create mode 100644 protocol/group/urltestgroup/urltest_switch_test.go
  create mode 100644 protocol/group/urltestgroup/urltest_use.go
  create mode 100644 protocol/group/urltestgroup/urltest_use_test.go
@@ -493,6 +501,48 @@ index 000000000..b84522a9e
 +	defer s.access.RUnlock()
 +	result, loaded = s.detail.downloads[tag]
 +	return
++}
+diff --git a/common/urltest/history_update_test.go b/common/urltest/history_update_test.go
+new file mode 100644
+index 000000000..a441bf7a1
+--- /dev/null
++++ b/common/urltest/history_update_test.go
+@@ -0,0 +1,36 @@
++package urltest
++
++import (
++	"testing"
++	"time"
++
++	"github.com/sagernet/sing-box/adapter"
++
++	"github.com/stretchr/testify/require"
++)
++
++// A round stored at once (UpdateURLTestHistory, the URL test of upstream's group, which the daemon
++// runs for a selector) keeps what the history knows of a tag beyond its delay as one result at a
++// time does: a stored tag has passed, a deleted one is forgotten.
++func TestHistoryStorageUpdate(t *testing.T) {
++	storage := NewHistoryStorage()
++	at := time.Unix(100, 0)
++	storage.StoreURLTestFailure("passed", at)
++	storage.StoreURLTestHistory("deleted", &adapter.URLTestHistory{Time: at, Delay: 10})
++	storage.StoreURLTestSample("deleted", 1, 3, 10)
++	storage.StoreURLTestLinkResult("deleted", "https://example.com/", true)
++	storage.StoreURLTestFailure("failed", at)
++	storage.UpdateURLTestHistory(map[string]*adapter.URLTestHistory{"passed": {Time: at, Delay: 20}}, []string{"deleted"})
++
++	require.Equal(t, uint16(20), storage.LoadURLTestHistory("passed").Delay)
++	_, loaded := storage.LoadURLTestFailure("passed")
++	require.False(t, loaded, "a failure of a tag stored since")
++
++	require.Nil(t, storage.LoadURLTestHistory("deleted"))
++	require.Empty(t, storage.LoadURLTestSamples("deleted"), "the delays of a tag deleted since")
++	_, known := storage.URLTestLinkAnswered("deleted", "https://example.com/")
++	require.False(t, known, "the URLs of a tag deleted since")
++
++	_, loaded = storage.LoadURLTestFailure("failed")
++	require.True(t, loaded, "a tag the update does not name")
 +}
 diff --git a/common/urltest/loss.go b/common/urltest/loss.go
 new file mode 100644
@@ -1033,10 +1083,10 @@ index 000000000..4e141df11
 +	return test
 +}
 diff --git a/common/urltest/urltest.go b/common/urltest/urltest.go
-index 26efe39cb..4e9f2fe60 100644
+index 73cf13c5b..c8b6d67a0 100644
 --- a/common/urltest/urltest.go
 +++ b/common/urltest/urltest.go
-@@ -24,11 +24,13 @@ type HistoryStorage struct {
+@@ -25,11 +25,13 @@ type HistoryStorage struct {
  	access       sync.RWMutex
  	delayHistory map[string]*adapter.URLTestHistory
  	updateHooks  []*observable.Subscriber[struct{}]
@@ -1050,7 +1100,7 @@ index 26efe39cb..4e9f2fe60 100644
  	}
  }
  
-@@ -56,6 +58,7 @@ func (s *HistoryStorage) LoadURLTestHistory(tag string) *adapter.URLTestHistory
+@@ -57,6 +59,7 @@ func (s *HistoryStorage) LoadURLTestHistory(tag string) *adapter.URLTestHistory
  func (s *HistoryStorage) DeleteURLTestHistory(tag string) {
  	s.access.Lock()
  	delete(s.delayHistory, tag)
@@ -1058,7 +1108,7 @@ index 26efe39cb..4e9f2fe60 100644
  	s.notifyUpdated()
  	s.access.Unlock()
  }
-@@ -63,6 +66,7 @@ func (s *HistoryStorage) DeleteURLTestHistory(tag string) {
+@@ -64,6 +67,7 @@ func (s *HistoryStorage) DeleteURLTestHistory(tag string) {
  func (s *HistoryStorage) StoreURLTestHistory(tag string, history *adapter.URLTestHistory) {
  	s.access.Lock()
  	s.delayHistory[tag] = history
@@ -1066,7 +1116,20 @@ index 26efe39cb..4e9f2fe60 100644
  	s.notifyUpdated()
  	s.access.Unlock()
  }
-@@ -81,6 +85,7 @@ func (s *HistoryStorage) Close() error {
+@@ -73,8 +77,12 @@ func (s *HistoryStorage) UpdateURLTestHistory(stored map[string]*adapter.URLTest
+ 	defer s.access.Unlock()
+ 	for _, tag := range deleted {
+ 		delete(s.delayHistory, tag)
++		s.detail.forget(tag)
+ 	}
+ 	maps.Copy(s.delayHistory, stored)
++	for tag := range stored {
++		s.detail.passed(tag)
++	}
+ }
+ 
+ func (s *HistoryStorage) notifyUpdated() {
+@@ -91,6 +99,7 @@ func (s *HistoryStorage) Close() error {
  }
  
  func URLTest(ctx context.Context, link string, detour N.Dialer) (uint16, error) {
@@ -1074,7 +1137,7 @@ index 26efe39cb..4e9f2fe60 100644
  	multiplexOutbound, isMultiplexOutbound := common.Cast[adapter.OutboundWithMultiplex](detour)
  	if isMultiplexOutbound && multiplexOutbound.MultiplexEnabled() {
  		warmContext := adapter.ContextWithKeepSession(ctx)
-@@ -127,8 +132,32 @@ func urlTest(ctx context.Context, link string, detour N.Dialer) (t uint16, err e
+@@ -137,8 +146,32 @@ func urlTest(ctx context.Context, link string, detour N.Dialer) (t uint16, err e
  	if err != nil {
  		return
  	}
@@ -1108,7 +1171,7 @@ index 26efe39cb..4e9f2fe60 100644
  			DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
  				return instance, nil
  			},
-@@ -136,18 +165,11 @@ func urlTest(ctx context.Context, link string, detour N.Dialer) (t uint16, err e
+@@ -146,18 +179,11 @@ func urlTest(ctx context.Context, link string, detour N.Dialer) (t uint16, err e
  				Time:    ntp.TimeFuncFromContext(ctx),
  				RootCAs: adapter.RootPoolFromContext(ctx),
  			},
@@ -1129,7 +1192,7 @@ index 26efe39cb..4e9f2fe60 100644
 -	return
  }
 diff --git a/daemon/started_service.go b/daemon/started_service.go
-index 41c9c926a..55e76271a 100644
+index f772a54be..13ed81a48 100644
 --- a/daemon/started_service.go
 +++ b/daemon/started_service.go
 @@ -20,6 +20,7 @@ import (
@@ -1139,8 +1202,8 @@ index 41c9c926a..55e76271a 100644
 +	"github.com/sagernet/sing-box/protocol/group/urltestgroup"
  	"github.com/sagernet/sing-box/service/oomkiller"
  	"github.com/sagernet/sing/common"
- 	"github.com/sagernet/sing/common/memory"
-@@ -728,7 +729,7 @@ func (s *StartedService) URLTest(ctx context.Context, request *URLTestRequest) (
+ 	E "github.com/sagernet/sing/common/exceptions"
+@@ -729,7 +730,7 @@ func (s *StartedService) URLTest(ctx context.Context, request *URLTestRequest) (
  		return nil, status.Error(codes.NotFound, "outbound not found: "+outboundTag)
  	}
  	historyStorage := boxService.urlTestHistoryStorage
@@ -1317,7 +1380,7 @@ index fd8a6e23d..9c664ea9b 100644
  					Time:  time.Now(),
  					Delay: delay,
 diff --git a/include/registry.go b/include/registry.go
-index 201eb4c2e..fa31e5f66 100644
+index 6ecebcea1..f33affb97 100644
 --- a/include/registry.go
 +++ b/include/registry.go
 @@ -21,6 +21,7 @@ import (
@@ -1415,10 +1478,10 @@ index 000000000..8068637ec
 +func (m *releaseMember) Network() []string { return []string{N.NetworkTCP, N.NetworkUDP} }
 diff --git a/protocol/group/urltestgroup/urltest.go b/protocol/group/urltestgroup/urltest.go
 new file mode 100644
-index 000000000..af5bf9e09
+index 000000000..d37cf39c5
 --- /dev/null
 +++ b/protocol/group/urltestgroup/urltest.go
-@@ -0,0 +1,1005 @@
+@@ -0,0 +1,1011 @@
 +package urltestgroup
 +
 +import (
@@ -1617,10 +1680,16 @@ index 000000000..af5bf9e09
 +	return s.group.interruptGroup.Add(closer, true)
 +}
 +
-+func (s *URLTest) References() []string {
++// References are the outbounds the group dials through now, for the reference manager, which
++// keeps their idle connections (and the DNS servers of their domain_resolver): the choice for
++// TCP and for UDP, a fallback when it is the choice, and the members of a balance in use. The
++// other outbounds and fallbacks are its Dependencies (the order of the start, the check of a
++// configuration); a round dials them for a moment only, as upstream's group. The group names no
++// DNS server itself.
++func (s *URLTest) References() (outbounds []string, dnsServers []string) {
 +	group := s.group
 +	if group == nil {
-+		return nil
++		return nil, nil
 +	}
 +	var references []string
 +	selectedTCP, selectedUDP := group.selectedOutboundTCP.Load(), group.selectedOutboundUDP.Load()
@@ -1637,7 +1706,7 @@ index 000000000..af5bf9e09
 +			references = append(references, tag)
 +		}
 +	}
-+	return references
++	return references, nil
 +}
 +
 +func (s *URLTest) URLTest(ctx context.Context) (map[string]uint16, error) {
@@ -1797,7 +1866,7 @@ index 000000000..af5bf9e09
 +	updateAccess                 sync.Mutex
 +	ticker                       *time.Ticker
 +	close                        chan struct{}
-+	started                      bool
++	started                      atomic.Bool // set under access by PostStart, read by Touch before the lock
 +	lastActive                   common.TypedValue[time.Time]
 +	lastUse                      common.TypedValue[time.Time] // of a connection that is no test (used)
 +	usedSince                    common.TypedValue[time.Time] // when the group came into use last (used)
@@ -1888,7 +1957,7 @@ index 000000000..af5bf9e09
 +	if g.closed.Load() {
 +		return
 +	}
-+	g.started = true
++	g.started.Store(true)
 +	g.lastActive.Store(time.Now())
 +	if g.hotStart {
 +		go g.checkUntested()
@@ -1898,7 +1967,7 @@ index 000000000..af5bf9e09
 +}
 +
 +func (g *URLTestGroup) Touch() {
-+	if !g.started {
++	if !g.started.Load() {
 +		return
 +	}
 +	g.access.Lock()
@@ -2834,6 +2903,110 @@ index 000000000..5c15907a6
 +		}
 +	}
 +	return members
++}
+diff --git a/protocol/group/urltestgroup/urltest_box_test.go b/protocol/group/urltestgroup/urltest_box_test.go
+new file mode 100644
+index 000000000..98c46cea7
+--- /dev/null
++++ b/protocol/group/urltestgroup/urltest_box_test.go
+@@ -0,0 +1,98 @@
++package urltestgroup_test
++
++import (
++	"context"
++	"fmt"
++	"net"
++	"net/http"
++	"net/http/httptest"
++	"testing"
++	"time"
++
++	"github.com/sagernet/sing-box"
++	"github.com/sagernet/sing-box/adapter"
++	"github.com/sagernet/sing-box/experimental/deprecated"
++	"github.com/sagernet/sing-box/include"
++	"github.com/sagernet/sing-box/log"
++	"github.com/sagernet/sing-box/option"
++	"github.com/sagernet/sing/common/json"
++	N "github.com/sagernet/sing/common/network"
++	"github.com/sagernet/sing/service"
++
++	"github.com/stretchr/testify/require"
++)
++
++// newGroupBox creates an instance from a configuration, as sing-box check does.
++func newGroupBox(t *testing.T, content string) (*box.Box, error) {
++	t.Helper()
++	ctx := include.Context(service.ContextWith(context.Background(), deprecated.NewStderrManager(log.StdLogger())))
++	options, err := json.UnmarshalExtendedContext[option.Options](ctx, []byte(content))
++	require.NoError(t, err)
++	return box.New(box.Options{Context: ctx, Options: options})
++}
++
++// A group that names an outbound or a fallback the configuration does not have is refused when
++// the box is created (sing-box 1.14.5 orders the outbounds by their dependencies then), as
++// upstream's group is: sing-box check reports it, not the start. A fallback listed after the
++// group is no missing one.
++func TestBoxRefusesAMissingMember(t *testing.T) {
++	for _, members := range []string{
++		`"outbounds": ["a", "missing"]`,
++		`"outbounds": ["a"], "fallbacks": ["missing"]`,
++		`"outbounds": [], "fallbacks": ["missing", "a"]`,
++	} {
++		_, err := newGroupBox(t, `{
++			"log": {"disabled": true},
++			"outbounds": [
++				{"type": "urltest", "tag": "g", `+members+`},
++				{"type": "direct", "tag": "a"}
++			]
++		}`)
++		require.ErrorContains(t, err, "dependency[missing] not found for outbound[g]", members)
++	}
++	instance, err := newGroupBox(t, `{
++		"log": {"disabled": true},
++		"outbounds": [
++			{"type": "urltest", "tag": "g", "outbounds": ["a"], "fallbacks": ["f"]},
++			{"type": "direct", "tag": "a"},
++			{"type": "direct", "tag": "f"}
++		]
++	}`)
++	require.NoError(t, err)
++	require.NoError(t, instance.Close())
++}
++
++// A box whose group has a dead outbound and a fallback listed after it starts, and the group falls
++// back to it: the fallback is a dependency of the group, started before it, and what the group then
++// references.
++func TestBoxStartsWithAFallbackAfterTheGroup(t *testing.T) {
++	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		w.WriteHeader(http.StatusNoContent)
++	}))
++	t.Cleanup(server.Close)
++	closed, err := net.Listen("tcp", "127.0.0.1:0")
++	require.NoError(t, err)
++	deadPort := closed.Addr().(*net.TCPAddr).Port
++	require.NoError(t, closed.Close())
++	instance, err := newGroupBox(t, fmt.Sprintf(`{
++		"log": {"disabled": true},
++		"outbounds": [
++			{"type": "urltest", "tag": "g", "outbounds": ["dead"], "fallbacks": ["f"], "url": %q, "download_url": ""},
++			{"type": "socks", "tag": "dead", "server": "127.0.0.1", "server_port": %d},
++			{"type": "direct", "tag": "f"}
++		],
++		"route": {"final": "g"}
++	}`, server.URL, deadPort))
++	require.NoError(t, err)
++	t.Cleanup(func() { instance.Close() })
++	require.NoError(t, instance.Start())
++	outbound, loaded := instance.Outbound().Outbound("g")
++	require.True(t, loaded)
++	group := outbound.(adapter.OutboundGroup)
++	require.Eventually(t, func() bool {
++		return group.Selected(N.NetworkTCP).Tag() == "f"
++	}, 10*time.Second, 20*time.Millisecond)
++	references, dnsServers := outbound.(adapter.Referrer).References()
++	require.Equal(t, []string{"f"}, references)
++	require.Empty(t, dnsServers)
 +}
 diff --git a/protocol/group/urltestgroup/urltest_download.go b/protocol/group/urltestgroup/urltest_download.go
 new file mode 100644
@@ -4986,7 +5159,7 @@ index 000000000..f0a6f1fa8
 +}
 diff --git a/protocol/group/urltestgroup/urltest_first_test.go b/protocol/group/urltestgroup/urltest_first_test.go
 new file mode 100644
-index 000000000..086bd8ef6
+index 000000000..00775e4fd
 --- /dev/null
 +++ b/protocol/group/urltestgroup/urltest_first_test.go
 @@ -0,0 +1,403 @@
@@ -5371,7 +5544,7 @@ index 000000000..086bd8ef6
 +		s.group.links = linkList(link)
 +		s.group.interval, s.group.idleTimeout = interval, interval
 +		s.group.watchPause(&testPause{})
-+		s.group.started = true
++		s.group.started.Store(true)
 +		idleSince := time.Now().Add(-2 * interval)
 +		s.group.lastActive.Store(idleSince)
 +		s.group.lastRound.Store(int64(idleSince.Sub(s.group.epoch)))
@@ -5918,7 +6091,7 @@ index 000000000..ad4d1cc09
 +}
 diff --git a/protocol/group/urltestgroup/urltest_loss_test.go b/protocol/group/urltestgroup/urltest_loss_test.go
 new file mode 100644
-index 000000000..b82c6ac51
+index 000000000..5835513bf
 --- /dev/null
 +++ b/protocol/group/urltestgroup/urltest_loss_test.go
 @@ -0,0 +1,575 @@
@@ -6460,7 +6633,7 @@ index 000000000..b82c6ac51
 +func TestBalanceReferences(t *testing.T) {
 +	a, b, c := newTestMember(C.TypeSOCKS, "a", dialWorking), newTestMember(C.TypeSOCKS, "b", dialWorking), newTestMember(C.TypeSOCKS, "c", dialWorking)
 +	urlTest, _ := newModeGroup(t, modeBalance, members(a, b, c), map[string]uint16{"a": 100, "b": 110, "c": 120}, nil)
-+	require.ElementsMatch(t, []string{"a", "b", "c"}, urlTest.References())
++	require.ElementsMatch(t, []string{"a", "b", "c"}, outboundReferences(t, urlTest))
 +}
 +
 +// A member that comes into the balance passes the download test first: one whose download
@@ -7866,6 +8039,81 @@ index 000000000..b630a055e
 +	require.True(t, group.confirmFailure("a", a))
 +	require.Eventually(t, func() bool { return a.dials.Load() > 0 }, 5*time.Second, 10*time.Millisecond)
 +}
+diff --git a/protocol/group/urltestgroup/urltest_references_test.go b/protocol/group/urltestgroup/urltest_references_test.go
+new file mode 100644
+index 000000000..a542725f0
+--- /dev/null
++++ b/protocol/group/urltestgroup/urltest_references_test.go
+@@ -0,0 +1,69 @@
++package urltestgroup
++
++import (
++	"context"
++	"testing"
++
++	"github.com/sagernet/sing-box/adapter"
++	"github.com/sagernet/sing-box/adapter/outbound"
++	C "github.com/sagernet/sing-box/constant"
++	"github.com/sagernet/sing-box/log"
++	"github.com/sagernet/sing-box/option"
++	N "github.com/sagernet/sing/common/network"
++
++	"github.com/stretchr/testify/require"
++)
++
++// outboundReferences are the outbounds the group references (adapter.Referrer); it names no DNS
++// server.
++func outboundReferences(t *testing.T, urlTest *URLTest) []string {
++	t.Helper()
++	var referrer adapter.Referrer = urlTest
++	outbounds, dnsServers := referrer.References()
++	require.Empty(t, dnsServers)
++	return outbounds
++}
++
++// The group references what it dials through: the choice of each network, a fallback when it is
++// the choice. Its dependencies, from which the box orders the start and checks a configuration,
++// are all the outbounds and fallbacks.
++func TestReferencesFollowTheChoice(t *testing.T) {
++	link, _ := testURL(t, 0)
++	a := newTestMember(C.TypeVLESS, "a", dialWorking)
++	b := newTestMember(C.TypeVLESS, "b", dialWorking)
++	tcpOnly := &testMember{Adapter: outbound.NewAdapter(C.TypeVLESS, "tcp", []string{N.NetworkTCP}, nil), dial: dialWorking}
++	f := newTestMember(C.TypeSOCKS, "f", dialWorking)
++	urlTest, group := newTestFallbackGroup(t, link, "", members(a, b, tcpOnly), members(f), map[string]uint16{"a": 400, "b": 300, "f": 10})
++	require.Equal(t, []string{"b"}, outboundReferences(t, urlTest))
++
++	// the fastest for TCP carries no UDP: both are referenced
++	setResult(group, "tcp", 100)
++	group.performUpdateCheck()
++	require.Equal(t, []string{"tcp", "b"}, outboundReferences(t, urlTest))
++
++	// no outbound answers: the fallback is the choice
++	for _, tag := range []string{"a", "b", "tcp"} {
++		setResult(group, tag, 0)
++	}
++	group.performUpdateCheck()
++	require.Equal(t, []string{"f"}, outboundReferences(t, urlTest))
++
++	setResult(group, "a", 200)
++	group.performUpdateCheck()
++	require.Equal(t, []string{"a"}, outboundReferences(t, urlTest))
++
++	// before its start a group references nothing, as upstream's
++	require.Empty(t, outboundReferences(t, &URLTest{}))
++
++	created, err := NewURLTest(context.Background(), nil, log.NewNOPFactory().NewLogger("urltest"), "g", option.URLTestOutboundOptions{
++		Outbounds: []string{"a", "b"},
++		Fallbacks: []string{"f"},
++	})
++	require.NoError(t, err)
++	require.Equal(t, []string{"a", "b", "f"}, created.Dependencies())
++	created, err = NewURLTest(context.Background(), nil, log.NewNOPFactory().NewLogger("urltest"), "g", option.URLTestOutboundOptions{
++		Fallbacks: []string{"f", "block"},
++	})
++	require.NoError(t, err)
++	require.Equal(t, []string{"f", "block"}, created.Dependencies())
++}
 diff --git a/protocol/group/urltestgroup/urltest_response.go b/protocol/group/urltestgroup/urltest_response.go
 new file mode 100644
 index 000000000..5382362df
@@ -8945,7 +9193,7 @@ index 000000000..2cfe2a0cc
 +}
 diff --git a/protocol/group/urltestgroup/urltest_rest_test.go b/protocol/group/urltestgroup/urltest_rest_test.go
 new file mode 100644
-index 000000000..8fe193ccf
+index 000000000..251cc5bd9
 --- /dev/null
 +++ b/protocol/group/urltestgroup/urltest_rest_test.go
 @@ -0,0 +1,386 @@
@@ -9109,7 +9357,7 @@ index 000000000..8fe193ccf
 +		require.Equal(t, "a", s.urlTest.Now())
 +	}
 +	require.Equal(t, map[string]int{"a": 1}, s.tested(), "the choice, before it was chosen")
-+	require.Equal(t, []string{"a"}, s.urlTest.References())
++	require.Equal(t, []string{"a"}, outboundReferences(t, s.urlTest))
 +	// a test of the group above dials the choice
 +	conn, err := s.urlTest.DialContext(urltest.ContextWithTest(context.Background()), N.NetworkTCP, s.target)
 +	require.NoError(t, err)
@@ -9136,7 +9384,7 @@ index 000000000..8fe193ccf
 +	s.checked(t)
 +	require.Equal(t, map[string]int{"a": 1, "b": 1, "c": 1}, s.tested())
 +	require.Equal(t, []string{"a", "b", "c"}, s.balance())
-+	require.ElementsMatch(t, []string{"a", "b", "c"}, s.urlTest.References())
++	require.ElementsMatch(t, []string{"a", "b", "c"}, outboundReferences(t, s.urlTest))
 +	// and once: a selection tests no member again
 +	s.group.performUpdateCheck()
 +	require.Equal(t, map[string]int{"a": 1, "b": 1, "c": 1}, s.tested())
@@ -9196,7 +9444,7 @@ index 000000000..8fe193ccf
 +	for range 3 {
 +		s.group.idleForTest()
 +		require.Nil(t, s.urlTest.Balance())
-+		require.Equal(t, []string{"a"}, s.urlTest.References())
++		require.Equal(t, []string{"a"}, outboundReferences(t, s.urlTest))
 +		s.group.performUpdateCheck()
 +		require.Nil(t, s.urlTest.Balance())
 +		require.Empty(t, s.group.balance.Load().tcp)
@@ -9337,7 +9585,7 @@ index 000000000..8fe193ccf
 +}
 diff --git a/protocol/group/urltestgroup/urltest_review2_test.go b/protocol/group/urltestgroup/urltest_review2_test.go
 new file mode 100644
-index 000000000..470a7fb45
+index 000000000..c3a7a4fc8
 --- /dev/null
 +++ b/protocol/group/urltestgroup/urltest_review2_test.go
 @@ -0,0 +1,245 @@
@@ -9504,7 +9752,7 @@ index 000000000..470a7fb45
 +	paused.set(true)
 +	group.watchPause(paused)
 +	group.interval = 200 * time.Millisecond
-+	group.started = true
++	group.started.Store(true)
 +	group.lastActive.Store(time.Now())
 +	t.Cleanup(func() { group.Close() })
 +
@@ -9569,7 +9817,7 @@ index 000000000..470a7fb45
 +	paused.set(true)
 +	group.watchPause(paused)
 +	group.interval = 200 * time.Millisecond
-+	group.started = true
++	group.started.Store(true)
 +	group.lastActive.Store(time.Now())
 +	// the round at start has just failed
 +	group.lastRound.Store(int64(time.Since(group.epoch)))
@@ -9585,6 +9833,41 @@ index 000000000..470a7fb45
 +	require.Eventually(t, func() bool { return requests.Load() >= 1 }, 5*time.Second, 5*time.Millisecond, "no round where no member has a result")
 +	// the member has passed: the report is refuted, and the rounds go on by the ticker
 +	require.Eventually(t, func() bool { return requests.Load() >= 3 }, 5*time.Second, 10*time.Millisecond)
++}
+diff --git a/protocol/group/urltestgroup/urltest_started_test.go b/protocol/group/urltestgroup/urltest_started_test.go
+new file mode 100644
+index 000000000..d6cd14bb8
+--- /dev/null
++++ b/protocol/group/urltestgroup/urltest_started_test.go
+@@ -0,0 +1,29 @@
++package urltestgroup
++
++import (
++	"testing"
++
++	C "github.com/sagernet/sing-box/constant"
++
++	"github.com/stretchr/testify/require"
++)
++
++// The dials that come while the group starts read whether it has started before they take its lock,
++// which PostStart holds as it says so: run with -race, nothing is found (upstream 37fffa325 made the
++// flag of its group atomic too).
++func TestTouchWhileStarting(t *testing.T) {
++	link, _ := testURL(t, 0)
++	_, group := newTestURLTest(t, link, newTestMember(C.TypeSOCKS, "a", dialWorking))
++	group.watchPause(&testPause{})
++	t.Cleanup(func() { group.Close() })
++	done := make(chan struct{})
++	go func() {
++		defer close(done)
++		for range 1000 {
++			group.Touch()
++		}
++	}()
++	group.PostStart()
++	<-done
++	require.True(t, group.started.Load())
 +}
 diff --git a/protocol/group/urltestgroup/urltest_switch_test.go b/protocol/group/urltestgroup/urltest_switch_test.go
 new file mode 100644

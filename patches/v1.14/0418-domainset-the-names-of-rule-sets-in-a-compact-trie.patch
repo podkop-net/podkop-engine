@@ -1,4 +1,4 @@
-From 18cc5013f14c1b41b67aa46cf75c7976145ae99d Mon Sep 17 00:00:00 2001
+From d335fd34cb5bf99f3446d51c1e43d52d9f78928c Mon Sep 17 00:00:00 2001
 From: FiyeroT <me@fiyero.xyz>
 Date: Thu, 12 Nov 2026 21:41:21 +0300
 Subject: [PATCH 54/71] domainset: the names of rule-sets in a compact trie
@@ -2775,7 +2775,7 @@ index 7e6484ea8..b241c1898 100644
  	var domainHost string
  	if metadata.Domain != "" {
 diff --git a/route/rule/rule_set_local.go b/route/rule/rule_set_local.go
-index 183e1d6cf..2644f725d 100644
+index e304c2625..39632a66e 100644
 --- a/route/rule/rule_set_local.go
 +++ b/route/rule/rule_set_local.go
 @@ -9,6 +9,8 @@ import (

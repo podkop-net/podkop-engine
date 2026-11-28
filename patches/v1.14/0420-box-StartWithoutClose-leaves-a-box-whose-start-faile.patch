@@ -1,4 +1,4 @@
-From d6041b088297de4ab6f27449efdf6db807463c25 Mon Sep 17 00:00:00 2001
+From aac073d399c08842bea5821fc611d61069db9c1d Mon Sep 17 00:00:00 2001
 From: FiyeroT <me@fiyero.xyz>
 Date: Thu, 12 Nov 2026 21:41:21 +0300
 Subject: [PATCH 56/71] box: StartWithoutClose leaves a box whose start failed
@@ -17,10 +17,10 @@ Pdk-Layer: 04
  1 file changed, 11 insertions(+)
 
 diff --git a/box.go b/box.go
-index d9d90b90f..60e450dbd 100644
+index 329a8e31d..0bbe66b70 100644
 --- a/box.go
 +++ b/box.go
-@@ -504,6 +504,17 @@ func (s *Box) PreStart() error {
+@@ -514,6 +514,17 @@ func (s *Box) PreStart() error {
  }
  
  func (s *Box) Start() error {

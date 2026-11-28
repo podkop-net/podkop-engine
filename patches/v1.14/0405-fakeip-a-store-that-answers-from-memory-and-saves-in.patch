@@ -1,12 +1,22 @@
-From 32919ae54c316d37195fc83724a9a0915b0c3f20 Mon Sep 17 00:00:00 2001
+From 9b8ef42927dd220574214da131cb86145e6068c7 Mon Sep 17 00:00:00 2001
 From: FiyeroT <me@fiyero.xyz>
-Date: Thu, 12 Nov 2026 21:41:20 +0300
+Date: Sat, 28 Nov 2026 16:55:38 +0300
 Subject: [PATCH 41/71] fakeip: a store that answers from memory and saves in
  the background
 
 TableStore: the whole map in memory, saved to the cache file in the background, new names answered
-while the file cannot be written, Peek tells an address without giving one. The transport makes it
-in place of upstream's Store; upstream's store and memory storage stay as they are.
+while the file cannot be written, Peek tells an address without giving one.
+
+The FakeIP server is upstream's: NewTableTransport builds it with upstream's NewTransport (its
+checks of the options, its answers) and puts a TableStore in place of the store NewTransport built,
+which only checks the ranges and is never started. RegisterTableTransport, one line in
+include/registry.go after upstream's RegisterTransport, takes its place in the registry. The cache
+file methods of the store are in a file of their own; the store tells a database that resetDB
+replaced (or could not) by the database itself, with no field of the cache file. Upstream's store,
+its storages, the cache file and the Clash API stay as upstream has them: since v1.14.6 the Clash
+API flush resets the store of every FakeIP server, which is TableStore.Reset. A name given an
+address while Reset resets the cache file keeps it, and the reserve is saved again before the next
+new name.
 
 Made of these commits of the earlier series (branch archive/r25-1.14-commits):
   4021c908c dns/fakeip: answer from memory, save to the cache file in the background
@@ -19,47 +29,42 @@ Pdk-Feature: fakeip
 Pdk-Zone: core
 Pdk-Layer: 04
 ---
- dns/transport/fakeip/fakeip.go                |    2 +-
- dns/transport/fakeip/table_store.go           | 1048 +++++++++++++
+ dns/transport/fakeip/table_store.go           | 1081 +++++++++++++
  .../fakeip/table_store_cachefile_test.go      |  123 ++
  .../fakeip/table_store_clock_test.go          |   42 +
- dns/transport/fakeip/table_store_test.go      | 1300 +++++++++++++++++
- experimental/cachefile/cache.go               |    9 +-
- experimental/cachefile/fakeip.go              |  132 ++
- experimental/cachefile/fakeip_test.go         |  123 ++
- experimental/clashapi/cache.go                |   21 +-
- 9 files changed, 2786 insertions(+), 14 deletions(-)
+ dns/transport/fakeip/table_store_test.go      | 1342 +++++++++++++++++
+ dns/transport/fakeip/table_transport.go       |   39 +
+ dns/transport/fakeip/table_transport_test.go  |   85 ++
+ experimental/cachefile/fakeip_table.go        |  151 ++
+ experimental/cachefile/fakeip_table_test.go   |  223 +++
+ experimental/clashapi/cache_fakeip_test.go    |   70 +
+ include/fakeip_table_test.go                  |   68 +
+ include/registry.go                           |    1 +
+ 11 files changed, 3225 insertions(+)
  create mode 100644 dns/transport/fakeip/table_store.go
  create mode 100644 dns/transport/fakeip/table_store_cachefile_test.go
  create mode 100644 dns/transport/fakeip/table_store_clock_test.go
  create mode 100644 dns/transport/fakeip/table_store_test.go
- create mode 100644 experimental/cachefile/fakeip_test.go
+ create mode 100644 dns/transport/fakeip/table_transport.go
+ create mode 100644 dns/transport/fakeip/table_transport_test.go
+ create mode 100644 experimental/cachefile/fakeip_table.go
+ create mode 100644 experimental/cachefile/fakeip_table_test.go
+ create mode 100644 experimental/clashapi/cache_fakeip_test.go
+ create mode 100644 include/fakeip_table_test.go
 
-diff --git a/dns/transport/fakeip/fakeip.go b/dns/transport/fakeip/fakeip.go
-index 03daeffbe..cb67404f4 100644
---- a/dns/transport/fakeip/fakeip.go
-+++ b/dns/transport/fakeip/fakeip.go
-@@ -35,7 +35,7 @@ func NewTransport(ctx context.Context, logger log.ContextLogger, tag string, opt
- 	if !inet4Range.IsValid() && !inet6Range.IsValid() {
- 		return nil, E.New("at least one of inet4_range or inet6_range must be set")
- 	}
--	store := NewStore(ctx, logger, inet4Range, inet6Range)
-+	store := NewTableStore(ctx, logger, inet4Range, inet6Range)
- 	return &Transport{
- 		TransportAdapter: dns.NewTransportAdapter(C.DNSTypeFakeIP, tag, nil),
- 		logger:           logger,
 diff --git a/dns/transport/fakeip/table_store.go b/dns/transport/fakeip/table_store.go
 new file mode 100644
-index 000000000..79027c105
+index 000000000..547f998dd
 --- /dev/null
 +++ b/dns/transport/fakeip/table_store.go
-@@ -0,0 +1,1048 @@
+@@ -0,0 +1,1081 @@
 +package fakeip
 +
 +import (
 +	"cmp"
 +	"context"
 +	"encoding/binary"
++	"maps"
 +	"math"
 +	"net/netip"
 +	"slices"
@@ -105,9 +110,10 @@ index 000000000..79027c105
 +	// in one transaction. clean: the store stops, the position is exact and is also
 +	// written where older versions read it.
 +	FakeIPSaveChanges(puts map[netip.Addr]string, deletes []netip.Addr, metadata *adapter.FakeIPMetadata, clean bool) error
-+	// FakeIPGeneration changes when the storage lost its content (a damaged cache file
-+	// is recreated).
-+	FakeIPGeneration() uint64
++	// FakeIPGeneration returns a value that changes when the storage lost its content (a
++	// damaged cache file is recreated, or could not be). Values are compared with ==; the
++	// store keeps the last one it saw.
++	FakeIPGeneration() any
 +	FakeIPReset() error
 +}
 +
@@ -410,7 +416,7 @@ index 000000000..79027c105
 +
 +	storage    tableStorage // nil: nothing is saved
 +	saveAccess sync.Mutex   // one write to the storage at a time
-+	generation uint64
++	generation any
 +	// the last write to the storage failed: queries do not wait for it, see allocate
 +	storageFailed bool
 +
@@ -673,6 +679,13 @@ index 000000000..79027c105
 +)
 +
 +func (s *TableStore) allocate(p *pool, domain string) (netip.Addr, int, error) {
++	// read before the pools are locked: the cache file locks its database while it
++	// recreates it, and the pools are not held for that
++	var generation any
++	saved := s.storage != nil
++	if saved {
++		generation = s.storage.FakeIPGeneration()
++	}
 +	s.access.Lock()
 +	defer s.access.Unlock()
 +	if r := p.byName[domain]; r != nil {
@@ -685,8 +698,7 @@ index 000000000..79027c105
 +	if p.full() {
 +		return netip.Addr{}, needRoom, nil
 +	}
-+	saved := s.storage != nil
-+	if saved && s.storage.FakeIPGeneration() != s.generation {
++	if saved && generation != s.generation {
 +		// the cache file was recreated: nothing is given out until it has the table and
 +		// the reserve again
 +		return netip.Addr{}, needReserve, nil
@@ -758,27 +770,51 @@ index 000000000..79027c105
 +	return r.domain, true
 +}
 +
-+// Reset forgets every address. The allocation position stays: clients may still hold the
-+// addresses given out so far.
++// Reset forgets every address given out before it is called. The allocation position
++// stays: clients may still hold the addresses given out so far.
 +func (s *TableStore) Reset() error {
 +	s.saveAccess.Lock()
 +	defer s.saveAccess.Unlock()
-+	if s.storage != nil {
-+		// first: if it fails, the memory still agrees with the storage
-+		err := s.storage.FakeIPReset()
-+		if err != nil {
-+			return err
++	s.access.Lock()
++	if s.storage == nil {
++		defer s.access.Unlock()
++		for _, p := range s.pools() {
++			clear(p.byName)
++			clear(p.byOffset)
++			p.expired = nil
 +		}
++		return nil
++	}
++	// The storage is reset first: if that fails, the memory still agrees with it. Queries
++	// are answered meanwhile; a name given an address while the storage is reset keeps it,
++	// and its record is saved after the reset (no save runs before: saveAccess).
++	forget := make([][]*record, 0, 2)
++	for _, p := range s.pools() {
++		forget = append(forget, slices.Collect(maps.Values(p.byOffset)))
++	}
++	s.access.Unlock()
++	err := s.storage.FakeIPReset()
++	if err != nil {
++		return err
 +	}
 +	s.access.Lock()
 +	defer s.access.Unlock()
-+	for _, p := range s.pools() {
-+		clear(p.byName)
-+		clear(p.byOffset)
-+		p.dirty = nil
++	for i, p := range s.pools() {
++		for _, r := range forget[i] {
++			if p.byOffset[r.offset] == r {
++				p.remove(r)
++			}
++		}
++		p.dirty = slices.DeleteFunc(p.dirty, func(r *record) bool { return p.byOffset[r.offset] != r })
 +		p.expired = nil
++		// the storage has none of them now
 +		p.forgotten = nil
++		// the reserve is saved again before the next new name: which buckets the reset
++		// of the cache file removes is upstream's choice (today it keeps the cursor)
++		p.reserved = false
++		p.budget = 0
 +	}
++	s.signal()
 +	return nil
 +}
 +
@@ -809,8 +845,8 @@ index 000000000..79027c105
 +	}
 +	pools := s.pools()
 +	if generation != s.generation {
-+		// the cache file was damaged and is recreated: the table and the reserve go there
-+		// again
++		// the cache file was damaged and is recreated (or could not be, and the writes
++		// fail until the store stops): the table and the reserve go there again
 +		s.generation = generation
 +		var count int
 +		for _, p := range pools {
@@ -827,7 +863,7 @@ index 000000000..79027c105
 +			}
 +			count += len(p.dirty)
 +		}
-+		s.logger.Warn("fakeip: the cache file was recreated, saving ", count, " addresses again")
++		s.logger.Warn("fakeip: the cache file was reset, saving ", count, " addresses again")
 +	}
 +	if request.reserve || request.room != nil {
 +		needed := request.room != nil && request.room.full()
@@ -1037,9 +1073,10 @@ index 000000000..79027c105
 +
 +// savePending tells whether there is something to save.
 +func (s *TableStore) savePending() bool {
++	generation := s.storage.FakeIPGeneration()
 +	s.access.RLock()
 +	defer s.access.RUnlock()
-+	if s.storage.FakeIPGeneration() != s.generation {
++	if generation != s.generation {
 +		return true
 +	}
 +	for _, p := range s.pools() {
@@ -1281,10 +1318,10 @@ index 000000000..009f5e8ed
 +}
 diff --git a/dns/transport/fakeip/table_store_test.go b/dns/transport/fakeip/table_store_test.go
 new file mode 100644
-index 000000000..7fe1ed339
+index 000000000..ee9dfabb5
 --- /dev/null
 +++ b/dns/transport/fakeip/table_store_test.go
-@@ -0,0 +1,1300 @@
+@@ -0,0 +1,1342 @@
 +package fakeip
 +
 +import (
@@ -1316,6 +1353,7 @@ index 000000000..7fe1ed339
 +	resetError  error
 +	saves       int
 +	onSave      func() // runs while a save is on its way to the storage
++	onReset     func() // runs while a reset is on its way to the storage
 +}
 +
 +func newFakeStorage() *fakeStorage {
@@ -1392,19 +1430,25 @@ index 000000000..7fe1ed339
 +	return nil
 +}
 +
-+func (f *fakeStorage) FakeIPGeneration() uint64 {
++func (f *fakeStorage) FakeIPGeneration() any {
 +	f.access.Lock()
 +	defer f.access.Unlock()
 +	return f.generation
 +}
 +
++// FakeIPReset is the reset of the cache file (upstream's): the records and the position of
++// a clean stop go, the position saved ahead stays.
 +func (f *fakeStorage) FakeIPReset() error {
++	if f.onReset != nil {
++		f.onReset()
++	}
 +	f.access.Lock()
 +	defer f.access.Unlock()
 +	if f.resetError != nil {
 +		return f.resetError
 +	}
 +	clear(f.table)
++	f.cleanKey = nil
 +	return nil
 +}
 +
@@ -1974,9 +2018,44 @@ index 000000000..7fe1ed339
 +	require.Equal(t, 0, storage.records())
 +	_, loaded := store.Lookup(old)
 +	require.False(t, loaded)
++	saves := storage.saves
 +	require.Equal(t, address("198.18.0.4"), mustCreate(t, store, "a.test"), "clients may still hold the old addresses")
++	require.Equal(t, saves+1, storage.saves, "the reserve is saved again before the next new name")
++	require.Equal(t, address("198.18.4.3"), storage.cursor.Inet4Current)
 +	require.NoError(t, store.save(saveRequest{}))
 +	require.Equal(t, 1, storage.records())
++
++	// without a storage
++	store = newTestStore(t, nil, "198.18.0.0/15", "")
++	old = mustCreate(t, store, "a.test")
++	require.NoError(t, store.Reset())
++	_, loaded = store.Lookup(old)
++	require.False(t, loaded)
++	require.Equal(t, address("198.18.0.3"), mustCreate(t, store, "a.test"))
++}
++
++// A name given an address while the storage is reset was asked after the flush: it keeps
++// its record, and the record is saved.
++func TestNameGivenOutDuringResetKeepsItsRecord(t *testing.T) {
++	t.Parallel()
++	storage := newFakeStorage()
++	store := newTestStore(t, storage, "198.18.0.0/15", "")
++	old := mustCreate(t, store, "old.test")
++	require.NoError(t, store.save(saveRequest{}))
++	var during netip.Addr
++	storage.onReset = func() {
++		during = mustCreate(t, store, "during.test")
++	}
++	require.NoError(t, store.Reset())
++	_, loaded := store.Lookup(old)
++	require.False(t, loaded)
++	domain, loaded := store.Lookup(during)
++	require.True(t, loaded)
++	require.Equal(t, "during.test", domain)
++	require.Equal(t, during, mustCreate(t, store, "during.test"))
++	require.NoError(t, store.save(saveRequest{}))
++	require.Equal(t, 1, storage.records())
++	require.Equal(t, "during.test", storage.domainOf(during))
 +}
 +
 +func TestIPv6Range(t *testing.T) {
@@ -2585,77 +2664,178 @@ index 000000000..7fe1ed339
 +		}
 +	})
 +}
-diff --git a/experimental/cachefile/cache.go b/experimental/cachefile/cache.go
-index daf94ba61..56b2b5862 100644
---- a/experimental/cachefile/cache.go
-+++ b/experimental/cachefile/cache.go
-@@ -8,6 +8,7 @@ import (
- 	"os"
- 	"strings"
- 	"sync"
-+	"sync/atomic"
- 	"time"
- 
- 	"github.com/sagernet/bbolt"
-@@ -61,6 +62,7 @@ type CacheFile struct {
- 	optimisticTimeout  time.Duration
- 	DB                 *bbolt.DB
- 	dbAccess           sync.RWMutex
-+	generation         atomic.Uint64 // counts resetDB: what was saved before is gone
- 	saveMetadataAccess sync.Mutex
- 	saveMetadata       *adapter.FakeIPMetadata
- 	saveMetadataTimer  *time.Timer
-@@ -327,6 +329,7 @@ func (c *CacheFile) resetDB(failedDB *bbolt.DB, reason any) {
- 		return
- 	}
- 	c.logger.Error("database corrupted: ", reason, ": resetting")
-+	c.generation.Add(1)
- 	failedDB.Close()
- 	filemanager.Remove(c.ctx, c.path)
- 	db, err := bbolt.Open(c.path, 0o666, &bbolt.Options{Timeout: time.Second})
-@@ -500,11 +503,7 @@ func (c *CacheFile) StoreRuleSetChecked(tag string, at time.Time) error {
- 		if err != nil {
- 			return err
- 		}
--		setBinary, err := set.MarshalBinary()
--		if err != nil {
--			return err
--		}
--		return bucket.Put([]byte(tag), setBinary)
-+		return bucket.Put([]byte(tag), binary.BigEndian.AppendUint64(nil, uint64(at.UnixNano())))
- 	})
- }
- 
-diff --git a/experimental/cachefile/fakeip.go b/experimental/cachefile/fakeip.go
-index 814c2048d..8ec7d8eaa 100644
---- a/experimental/cachefile/fakeip.go
-+++ b/experimental/cachefile/fakeip.go
-@@ -1,6 +1,7 @@
- package cachefile
- 
- import (
+diff --git a/dns/transport/fakeip/table_transport.go b/dns/transport/fakeip/table_transport.go
+new file mode 100644
+index 000000000..ff8728361
+--- /dev/null
++++ b/dns/transport/fakeip/table_transport.go
+@@ -0,0 +1,39 @@
++package fakeip
++
++import (
++	"context"
++	"fmt"
++	"net/netip"
++
++	"github.com/sagernet/sing-box/adapter"
++	C "github.com/sagernet/sing-box/constant"
++	"github.com/sagernet/sing-box/dns"
++	"github.com/sagernet/sing-box/log"
++	"github.com/sagernet/sing-box/option"
++	E "github.com/sagernet/sing/common/exceptions"
++)
++
++// RegisterTableTransport registers the FakeIP server of NewTableTransport. It is called
++// after RegisterTransport and takes the place of upstream's server: a registry keeps the
++// last constructor registered for a type.
++func RegisterTableTransport(registry *dns.TransportRegistry) {
++	dns.RegisterTransport[option.FakeIPDNSServerOptions](registry, C.DNSTypeFakeIP, NewTableTransport)
++}
++
++// NewTableTransport is upstream's FakeIP server with a TableStore in place of upstream's
++// store. The server is upstream's NewTransport as it is: its checks of the options and its
++// answers. The store NewTransport builds only checks the ranges (it reads nothing and
++// starts nothing before Start) and is dropped unstarted.
++func NewTableTransport(ctx context.Context, logger log.ContextLogger, tag string, options option.FakeIPDNSServerOptions) (adapter.DNSTransport, error) {
++	transport, err := NewTransport(ctx, logger, tag, options)
++	if err != nil {
++		return nil, err
++	}
++	server, isServer := transport.(*Transport)
++	if !isServer {
++		return nil, E.New("fakeip: NewTransport returned ", fmt.Sprintf("%T", transport), ", the store in memory has no place in it")
++	}
++	// the ranges as NewTransport reads them
++	server.store = NewTableStore(ctx, logger, options.Inet4Range.Build(netip.Prefix{}), options.Inet6Range.Build(netip.Prefix{}))
++	return server, nil
++}
+diff --git a/dns/transport/fakeip/table_transport_test.go b/dns/transport/fakeip/table_transport_test.go
+new file mode 100644
+index 000000000..a39f42a67
+--- /dev/null
++++ b/dns/transport/fakeip/table_transport_test.go
+@@ -0,0 +1,85 @@
++package fakeip
++
++import (
++	"context"
++	"net/netip"
++	"testing"
++
++	"github.com/sagernet/sing-box/adapter"
++	C "github.com/sagernet/sing-box/constant"
++	"github.com/sagernet/sing-box/dns"
++	"github.com/sagernet/sing-box/log"
++	"github.com/sagernet/sing-box/option"
++	"github.com/sagernet/sing/common/json/badoption"
++
++	mDNS "github.com/miekg/dns"
++	"github.com/stretchr/testify/require"
++)
++
++func prefixOption(text string) *badoption.Prefix {
++	prefix := badoption.Prefix(netip.MustParsePrefix(text))
++	return &prefix
++}
++
++// The server is upstream's, with the store of this fork; upstream's checks of the options
++// stay.
++func TestTableTransport(t *testing.T) {
++	t.Parallel()
++	ctx := context.Background()
++	logger := log.NewNOPFactory().NewLogger("dns")
++	transport, err := NewTableTransport(ctx, logger, "fakeip", option.FakeIPDNSServerOptions{
++		Inet4Range: prefixOption("198.18.0.0/15"),
++		Inet6Range: prefixOption("fc00::/18"),
++	})
++	require.NoError(t, err)
++	require.Equal(t, C.DNSTypeFakeIP, transport.Type())
++	require.Equal(t, "fakeip", transport.Tag())
++	server, isFakeIP := transport.(adapter.FakeIPTransport)
++	require.True(t, isFakeIP)
++	store, isTable := server.Store().(*TableStore)
++	require.True(t, isTable, "%T", server.Store())
++	require.Equal(t, netip.MustParsePrefix("198.18.0.0/15"), store.inet4Range)
++	require.Equal(t, netip.MustParsePrefix("fc00::/18"), store.inet6Range)
++	scope := adapter.NewScope(ctx, logger)
++	require.NoError(t, transport.Start(adapter.StartStateStart, scope))
++
++	message := new(mDNS.Msg)
++	message.SetQuestion("Example.COM.", mDNS.TypeAAAA)
++	response, err := transport.Exchange(ctx, message)
++	require.NoError(t, err)
++	require.Len(t, response.Answer, 1)
++	address, found := store.Peek("example.com", true)
++	require.True(t, found)
++	require.Equal(t, address.String(), response.Answer[0].(*mDNS.AAAA).AAAA.String())
++	domain, loaded := store.Lookup(address)
++	require.True(t, loaded)
++	require.Equal(t, "example.com", domain)
++	require.NoError(t, scope.Close())
++
++	for _, testCase := range []struct {
++		options option.FakeIPDNSServerOptions
++		message string
++	}{
++		{option.FakeIPDNSServerOptions{}, "at least one of inet4_range or inet6_range must be set"},
++		{option.FakeIPDNSServerOptions{Inet4Range: prefixOption("198.18.0.0/31")}, "inet4_range must have at least 2 host bits"},
++		{option.FakeIPDNSServerOptions{Inet6Range: prefixOption("fc00::/127")}, "inet6_range must have at least 2 host bits"},
++	} {
++		_, err = NewTableTransport(ctx, logger, "fakeip", testCase.options)
++		require.ErrorContains(t, err, testCase.message)
++	}
++}
++
++// RegisterTableTransport takes the place of upstream's server in a registry that has it.
++func TestRegisterTableTransport(t *testing.T) {
++	t.Parallel()
++	registry := dns.NewTransportRegistry()
++	RegisterTransport(registry)
++	RegisterTableTransport(registry)
++	options, loaded := registry.CreateOptions(C.DNSTypeFakeIP)
++	require.True(t, loaded)
++	options.(*option.FakeIPDNSServerOptions).Inet4Range = prefixOption("198.18.0.0/15")
++	transport, err := registry.CreateDNSTransport(context.Background(), log.NewNOPFactory().NewLogger("dns"), "fakeip", C.DNSTypeFakeIP, options)
++	require.NoError(t, err)
++	_, isTable := transport.(adapter.FakeIPTransport).Store().(*TableStore)
++	require.True(t, isTable)
++}
+diff --git a/experimental/cachefile/fakeip_table.go b/experimental/cachefile/fakeip_table.go
+new file mode 100644
+index 000000000..9f3c50793
+--- /dev/null
++++ b/experimental/cachefile/fakeip_table.go
+@@ -0,0 +1,151 @@
++package cachefile
++
++import (
 +	"bytes"
- 	"net/netip"
- 	"os"
- 	"time"
-@@ -19,8 +20,139 @@ var (
- 	bucketFakeIPDomain4 = []byte(fakeipBucketPrefix + "domain4")
- 	bucketFakeIPDomain6 = []byte(fakeipBucketPrefix + "domain6")
- 	keyMetadata         = []byte(fakeipBucketPrefix + "metadata")
-+	// the allocation position of a store that keeps the map in memory, saved ahead of
-+	// the addresses given out; a bucket of its own keeps the write small
-+	bucketFakeIPCursor = []byte(fakeipBucketPrefix + "cursor")
- )
- 
++	"net/netip"
++
++	"github.com/sagernet/bbolt"
++	"github.com/sagernet/sing-box/adapter"
++)
++
++// What the FakeIP store that keeps the whole map in memory (dns/transport/fakeip.TableStore)
++// needs of the cache file: the table read once at start, then only the changes written.
++// It keeps upstream's records (the address table of bucketFakeIP, the position under
++// keyMetadata); upstream's methods in fakeip.go stay as upstream has them.
++
++// the allocation position of a store that keeps the map in memory, saved ahead of the
++// addresses given out; a bucket of its own keeps the write small. Its name has the prefix
++// that start keeps the buckets of.
++var bucketFakeIPCursor = []byte(fakeipBucketPrefix + "cursor")
++
 +// FakeIPLoadTable gives the saved addresses to a store that keeps the whole map in memory
 +// and returns the saved allocation position, if there is one. Such a store needs only the
 +// table of addresses: the index of domains, which it builds itself, is removed, and so are
 +// the records load refuses.
 +//
-+// The position saved on a clean stop, where every version keeps it, comes first (clean is
-+// true then): it is written only on a clean stop and removed as soon as addresses are given
-+// out again, so if it is there, the last process to stop wrote it and no address was given
-+// out since. Else the position saved ahead of the addresses given out.
++// The position under keyMetadata, where every version keeps it, comes first (clean is true
++// then): this store writes it only on a clean stop and removes it as soon as addresses are
++// given out again, and upstream's store writes it ahead of the addresses it gives out
++// (FakeIPReserve); either way no address past it has been given out. Else the position this
++// store saved ahead of the addresses given out.
 +//
 +// The table is read first and the file is changed after that: what was read is valid even
 +// if the change fails.
@@ -2769,33 +2949,37 @@ index 814c2048d..8ec7d8eaa 100644
 +	})
 +}
 +
-+// FakeIPGeneration changes when the cache file was damaged and recreated: everything
-+// saved before is gone.
-+func (c *CacheFile) FakeIPGeneration() uint64 {
-+	return c.generation.Load()
++// FakeIPGeneration returns a value that changes when everything saved before is gone: the
++// database itself, read as view, batch and update read it. resetDB replaces a damaged
++// database with a new one, bbolt.Open gives a new *bbolt.DB, or with none (nil) when that
++// fails. A caller that keeps the value it compares with keeps that database from being
++// freed, so no later one can have its address.
++func (c *CacheFile) FakeIPGeneration() any {
++	return c.database()
 +}
-+
- func (c *CacheFile) FakeIPMetadata() *adapter.FakeIPMetadata {
- 	var metadata adapter.FakeIPMetadata
- 	err := c.batch(func(tx *bbolt.Tx) error {
-diff --git a/experimental/cachefile/fakeip_test.go b/experimental/cachefile/fakeip_test.go
+diff --git a/experimental/cachefile/fakeip_table_test.go b/experimental/cachefile/fakeip_table_test.go
 new file mode 100644
-index 000000000..a18c89050
+index 000000000..adc975c31
 --- /dev/null
-+++ b/experimental/cachefile/fakeip_test.go
-@@ -0,0 +1,123 @@
++++ b/experimental/cachefile/fakeip_table_test.go
+@@ -0,0 +1,223 @@
 +package cachefile
 +
 +import (
 +	"context"
++	"fmt"
 +	"net/netip"
++	"os"
 +	"path/filepath"
 +	"testing"
++	"time"
 +
 +	"github.com/sagernet/bbolt"
 +	"github.com/sagernet/sing-box/adapter"
++	"github.com/sagernet/sing-box/dns/transport/fakeip"
 +	"github.com/sagernet/sing-box/option"
 +	"github.com/sagernet/sing/common/logger"
++	"github.com/sagernet/sing/service"
 +
 +	"github.com/stretchr/testify/require"
 +)
@@ -2907,38 +3091,263 @@ index 000000000..a18c89050
 +	require.False(t, clean)
 +	require.NoError(t, cacheFile.Close())
 +}
-diff --git a/experimental/clashapi/cache.go b/experimental/clashapi/cache.go
-index 4df1f8908..e21ef3280 100644
---- a/experimental/clashapi/cache.go
-+++ b/experimental/clashapi/cache.go
-@@ -20,14 +20,19 @@ func cacheRouter(ctx context.Context) http.Handler {
- 
- func flushFakeip(ctx context.Context) func(w http.ResponseWriter, r *http.Request) {
- 	return func(w http.ResponseWriter, r *http.Request) {
--		cacheFile := service.FromContext[adapter.CacheFile](ctx)
--		if cacheFile != nil {
--			err := cacheFile.FakeIPReset()
--			if err != nil {
--				render.Status(r, http.StatusInternalServerError)
--				render.JSON(w, r, newError(err.Error()))
--				return
--			}
-+		var err error
-+		// the store keeps the map in memory: resetting the cache file alone would leave
-+		// it answering
-+		transportManager := service.FromContext[adapter.DNSTransportManager](ctx)
-+		if transportManager != nil && transportManager.FakeIP() != nil {
-+			err = transportManager.FakeIP().Store().Reset()
-+		} else if cacheFile := service.FromContext[adapter.CacheFile](ctx); cacheFile != nil {
-+			err = cacheFile.FakeIPReset()
++
++// breakReset makes the next resetDB fail: the file cannot be removed (a directory that is
++// not empty stands at its path; root cannot remove it either).
++func breakReset(t *testing.T, path string) {
++	t.Helper()
++	require.NoError(t, os.Rename(path, path+".moved"))
++	require.NoError(t, os.MkdirAll(filepath.Join(path, "kept"), 0o755))
++}
++
++// The generation is the database: writes keep it, and every reset of a damaged file
++// changes it, to a new database or, when the file cannot be recreated, to none.
++func TestFakeIPGeneration(t *testing.T) {
++	t.Parallel()
++	path := filepath.Join(t.TempDir(), "cache.db")
++	cacheFile := openTestCacheFile(t, path)
++	position := &adapter.FakeIPMetadata{Inet4Range: netip.MustParsePrefix("198.18.0.0/15"), Inet4Current: netip.MustParseAddr("198.18.4.1")}
++	first := cacheFile.FakeIPGeneration()
++	require.NotNil(t, first)
++	require.NoError(t, cacheFile.FakeIPSaveChanges(map[netip.Addr]string{netip.MustParseAddr("198.18.0.2"): "a.test"}, nil, position, false))
++	require.NoError(t, cacheFile.StoreMode("rule"))
++	require.True(t, first == cacheFile.FakeIPGeneration(), "writes keep it")
++
++	// compared with ==, as the store compares them
++	seen := []any{first}
++	for range 3 {
++		cacheFile.resetDB(cacheFile.database(), "test")
++		generation := cacheFile.FakeIPGeneration()
++		for _, earlier := range seen {
++			require.False(t, earlier == generation, "a reset changes it")
 +		}
-+		if err != nil {
-+			render.Status(r, http.StatusInternalServerError)
-+			render.JSON(w, r, newError(err.Error()))
-+			return
- 		}
- 		render.NoContent(w, r)
- 	}
++		seen = append(seen, generation)
++	}
++	table, metadata, _ := loadTable(t, cacheFile)
++	require.Empty(t, table, "what was saved before is gone")
++	require.Nil(t, metadata)
++	require.NoError(t, cacheFile.FakeIPSaveChanges(nil, nil, position, false))
++
++	breakReset(t, path)
++	cacheFile.resetDB(cacheFile.database(), "test")
++	gone := cacheFile.FakeIPGeneration()
++	for _, earlier := range seen {
++		require.False(t, earlier == gone, "a reset that fails changes it too")
++	}
++	require.Error(t, cacheFile.FakeIPSaveChanges(nil, nil, position, false))
++	require.True(t, gone == cacheFile.FakeIPGeneration())
++	require.NoError(t, cacheFile.Close())
++}
++
++// A store on a cache file that is damaged and recreated saves its table and a reserve in
++// the new file before it gives out the next address. When the file cannot be recreated it
++// answers from memory.
++func TestFakeIPStoreAcrossReset(t *testing.T) {
++	t.Parallel()
++	path := filepath.Join(t.TempDir(), "cache.db")
++	cacheFile := openTestCacheFile(t, path)
++	ctx := service.ContextWithDefaultRegistry(context.Background())
++	service.MustRegister[adapter.CacheFile](ctx, cacheFile.CacheFile)
++	store := fakeip.NewTableStore(ctx, logger.NOP(), netip.MustParsePrefix("198.18.0.0/15"), netip.Prefix{})
++	require.NoError(t, store.Start())
++	saved := func(address netip.Addr, domain string) bool {
++		loaded, _ := cacheFile.FakeIPLoad(address)
++		return loaded == domain
++	}
++	first, err := store.Create("a.test", false)
++	require.NoError(t, err)
++	require.Eventually(t, func() bool { return saved(first, "a.test") }, 5*time.Second, 5*time.Millisecond)
++
++	cacheFile.resetDB(cacheFile.database(), "test")
++	second, err := store.Create("b.test", false)
++	require.NoError(t, err)
++	require.True(t, saved(first, "a.test"), "the table is in the new file before an address is given out")
++	require.NoError(t, cacheFile.view(func(tx *bbolt.Tx) error {
++		cursor := tx.Bucket(bucketFakeIPCursor)
++		require.NotNil(t, cursor, "and the reserve")
++		require.NotEmpty(t, cursor.Get(keyMetadata))
++		return nil
++	}))
++	require.Eventually(t, func() bool { return saved(second, "b.test") }, 5*time.Second, 5*time.Millisecond)
++
++	breakReset(t, path)
++	cacheFile.resetDB(cacheFile.database(), "test")
++	for i := range 2100 { // past the reserve
++		domain := fmt.Sprint("name-", i, ".test")
++		address, err := store.Create(domain, false)
++		require.NoError(t, err)
++		loaded, found := store.Lookup(address)
++		require.True(t, found)
++		require.Equal(t, domain, loaded)
++	}
++	loaded, found := store.Lookup(first)
++	require.True(t, found)
++	require.Equal(t, "a.test", loaded)
++	require.Error(t, store.Close(), "nothing can be saved")
++	require.NoError(t, cacheFile.Close())
++}
+diff --git a/experimental/clashapi/cache_fakeip_test.go b/experimental/clashapi/cache_fakeip_test.go
+new file mode 100644
+index 000000000..7ab52ce0a
+--- /dev/null
++++ b/experimental/clashapi/cache_fakeip_test.go
+@@ -0,0 +1,70 @@
++package clashapi
++
++import (
++	"context"
++	"net/http"
++	"net/http/httptest"
++	"net/netip"
++	"path/filepath"
++	"testing"
++	"time"
++
++	"github.com/sagernet/sing-box/adapter"
++	"github.com/sagernet/sing-box/dns/transport/fakeip"
++	"github.com/sagernet/sing-box/experimental/cachefile"
++	"github.com/sagernet/sing-box/log"
++	"github.com/sagernet/sing-box/option"
++	"github.com/sagernet/sing/common/json/badoption"
++	"github.com/sagernet/sing/service"
++
++	"github.com/stretchr/testify/require"
++)
++
++type fakeIPTransportManager struct {
++	adapter.DNSTransportManager
++	transports []adapter.DNSTransport
++}
++
++func (m fakeIPTransportManager) Transports() []adapter.DNSTransport {
++	return m.transports
++}
++
++// The FakeIP flush resets the store of the FakeIP server, its memory with the cache file:
++// the store of this fork answers from memory, a reset of the cache file alone would leave
++// the addresses answered.
++func TestFlushFakeIPResetsTheStoreInMemory(t *testing.T) {
++	t.Parallel()
++	ctx := service.ContextWithDefaultRegistry(context.Background())
++	logger := log.NewNOPFactory().NewLogger("test")
++	cacheFile := cachefile.New(ctx, logger, option.CacheFileOptions{Enabled: true, Path: filepath.Join(t.TempDir(), "cache.db"), StoreFakeIP: true})
++	scope := adapter.NewScope(ctx, logger)
++	require.NoError(t, cacheFile.Start(adapter.StartStateInitialize, scope))
++	service.MustRegister[adapter.CacheFile](ctx, cacheFile)
++	inet4Range := badoption.Prefix(netip.MustParsePrefix("198.18.0.0/15"))
++	transport, err := fakeip.NewTableTransport(ctx, logger, "fakeip", option.FakeIPDNSServerOptions{Inet4Range: &inet4Range})
++	require.NoError(t, err)
++	require.NoError(t, transport.Start(adapter.StartStateStart, scope))
++	service.MustRegister[adapter.DNSTransportManager](ctx, fakeIPTransportManager{transports: []adapter.DNSTransport{transport}})
++	store := transport.(adapter.FakeIPTransport).Store()
++	_, isTable := store.(*fakeip.TableStore)
++	require.True(t, isTable)
++
++	address, err := store.Create("example.com", false)
++	require.NoError(t, err)
++	require.Eventually(t, func() bool {
++		domain, _ := cacheFile.FakeIPLoad(address)
++		return domain == "example.com"
++	}, 5*time.Second, 5*time.Millisecond)
++
++	recorder := httptest.NewRecorder()
++	cacheRouter(ctx).ServeHTTP(recorder, httptest.NewRequest(http.MethodPost, "/fakeip/flush", nil))
++	require.Equal(t, http.StatusNoContent, recorder.Code, recorder.Body.String())
++	_, loaded := store.Lookup(address)
++	require.False(t, loaded, "the memory is reset")
++	_, loaded = cacheFile.FakeIPLoad(address)
++	require.False(t, loaded, "and the cache file")
++	again, err := store.Create("example.com", false)
++	require.NoError(t, err)
++	require.NotEqual(t, address, again, "clients may still hold the old address")
++	require.NoError(t, scope.Close())
++}
+diff --git a/include/fakeip_table_test.go b/include/fakeip_table_test.go
+new file mode 100644
+index 000000000..508538db7
+--- /dev/null
++++ b/include/fakeip_table_test.go
+@@ -0,0 +1,68 @@
++package include
++
++import (
++	"context"
++	"path/filepath"
++	"testing"
++
++	"github.com/sagernet/sing-box"
++	"github.com/sagernet/sing-box/adapter"
++	"github.com/sagernet/sing-box/dns/transport/fakeip"
++	"github.com/sagernet/sing-box/experimental/deprecated"
++	"github.com/sagernet/sing-box/log"
++	"github.com/sagernet/sing-box/option"
++	"github.com/sagernet/sing/common/json"
++	"github.com/sagernet/sing/service"
++
++	mDNS "github.com/miekg/dns"
++	"github.com/stretchr/testify/require"
++)
++
++func newFakeIPBox(t *testing.T, server string, cachePath string) (context.Context, *box.Box, error) {
++	t.Helper()
++	ctx := Context(service.ContextWith(context.Background(), deprecated.NewStderrManager(log.StdLogger())))
++	options, err := json.UnmarshalExtendedContext[option.Options](ctx, []byte(`{
++		"log": {"level": "error"},
++		"dns": {"servers": [{"type": "udp", "tag": "udp", "server": "127.0.0.1"}, `+server+`]},
++		"experimental": {"cache_file": {"enabled": true, "path": "`+cachePath+`", "store_fakeip": true}}
++	}`))
++	require.NoError(t, err)
++	instance, err := box.New(box.Options{Context: ctx, Options: options})
++	return ctx, instance, err
++}
++
++// The FakeIP server of a box is upstream's with the store of this fork: the registry has
++// RegisterTableTransport after upstream's RegisterTransport. Upstream's checks of the
++// options stay.
++func TestFakeIPServerHasTableStore(t *testing.T) {
++	cachePath := filepath.Join(t.TempDir(), "cache.db")
++	ctx, instance, err := newFakeIPBox(t, `{"type": "fakeip", "tag": "fakeip", "inet4_range": "198.18.0.0/15"}`, cachePath)
++	require.NoError(t, err)
++	require.NoError(t, instance.Start())
++	transport := service.FromContext[adapter.DNSTransportManager](ctx).FakeIP()
++	require.NotNil(t, transport)
++	store, isTable := transport.Store().(*fakeip.TableStore)
++	require.True(t, isTable, "%T", transport.Store())
++
++	message := new(mDNS.Msg)
++	message.SetQuestion("example.com.", mDNS.TypeA)
++	response, err := transport.Exchange(ctx, message)
++	require.NoError(t, err)
++	require.Len(t, response.Answer, 1)
++	address, found := store.Peek("example.com", false)
++	require.True(t, found)
++	require.Equal(t, response.Answer[0].(*mDNS.A).A.String(), address.String())
++	require.NoError(t, instance.Close())
++
++	// the next start reads the table the stop saved
++	ctx, instance, err = newFakeIPBox(t, `{"type": "fakeip", "tag": "fakeip", "inet4_range": "198.18.0.0/15"}`, cachePath)
++	require.NoError(t, err)
++	require.NoError(t, instance.Start())
++	domain, loaded := service.FromContext[adapter.DNSTransportManager](ctx).FakeIP().Store().Lookup(address)
++	require.True(t, loaded)
++	require.Equal(t, "example.com", domain)
++	require.NoError(t, instance.Close())
++
++	_, _, err = newFakeIPBox(t, `{"type": "fakeip", "tag": "fakeip", "inet4_range": "198.18.0.0/31"}`, cachePath)
++	require.ErrorContains(t, err, "inet4_range must have at least 2 host bits")
++}
+diff --git a/include/registry.go b/include/registry.go
+index 201eb4c2e..6ecebcea1 100644
+--- a/include/registry.go
++++ b/include/registry.go
+@@ -95,6 +95,7 @@ func DNSTransportRegistry() *dns.TransportRegistry {
+ 	local.RegisterTransport(registry)
+ 	mdns.RegisterTransport(registry)
+ 	fakeip.RegisterTransport(registry)
++	fakeip.RegisterTableTransport(registry) // podkop-engine: the FakeIP store in memory; replaces the line above
+ 	// podkop-engine: a list of servers, and the provider's servers that netifd knows
+ 	dns.RegisterGroupTransport(registry)
+ 	dns.RegisterProviderTransport(registry)
 -- 
 2.53.0
 

@@ -1,4 +1,4 @@
-From 30fc67db67d5cd29fdb296614f000ef90ed5280c Mon Sep 17 00:00:00 2001
+From 17dec5e4f8f67cc28cb80234c2dc081330efa9ba Mon Sep 17 00:00:00 2001
 From: FiyeroT <me@fiyero.xyz>
 Date: Thu, 12 Nov 2026 21:41:19 +0300
 Subject: [PATCH 09/71] box, hooks in upstream files: the Go memory limit
@@ -15,10 +15,10 @@ Pdk-Layer: 02
  1 file changed, 5 insertions(+), 1 deletion(-)
 
 diff --git a/box.go b/box.go
-index 3654fb65d..b409d3ab8 100644
+index 7d77557c2..52a445c38 100644
 --- a/box.go
 +++ b/box.go
-@@ -501,7 +501,6 @@ func (s *Box) PreStart() error {
+@@ -511,7 +511,6 @@ func (s *Box) PreStart() error {
  func (s *Box) Start() error {
  	err := s.start()
  	if err != nil {
@@ -26,7 +26,7 @@ index 3654fb65d..b409d3ab8 100644
  		return err
  	}
  	s.logger.Info("sing-box started (", F.Seconds(time.Since(s.createdAt).Seconds()), "s)")
-@@ -543,6 +542,11 @@ func (s *Box) preStart() error {
+@@ -553,6 +552,11 @@ func (s *Box) preStart() error {
  	}
  	s.scope.Add(s.logFactory.Close)
  	applyDebugOptions(s.debugOptions)

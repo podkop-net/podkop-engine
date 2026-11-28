@@ -1,4 +1,4 @@
-From 863982812541f2ed7e55f5667e6e95b86485c921 Mon Sep 17 00:00:00 2001
+From cea2dca42b3ab5a451bf38b7ce970824f3e7ea30 Mon Sep 17 00:00:00 2001
 From: FiyeroT <me@fiyero.xyz>
 Date: Thu, 12 Nov 2026 21:41:21 +0300
 Subject: [PATCH 55/71] cidrset: the CIDR lists of rule-sets as ranges

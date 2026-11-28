@@ -1,4 +1,4 @@
-From dd9c47b767d47bb5987429047ddac4c7d9a9df9e Mon Sep 17 00:00:00 2001
+From 4e8f07cb707ea485bea2dc0f351423b5f759445d Mon Sep 17 00:00:00 2001
 From: FiyeroT <me@fiyero.xyz>
 Date: Thu, 12 Nov 2026 21:41:20 +0300
 Subject: [PATCH 32/71] route: a chain with a URL test is dialed through the
@@ -13,23 +13,26 @@ Pdk-Feature: route-chain
 Pdk-Zone: core
 Pdk-Layer: 03
 ---
- route/route_dial_target_test.go | 39 +++++++++++++++++++++++++++++++++
- 1 file changed, 39 insertions(+)
+ route/route_dial_target_test.go | 66 +++++++++++++++++++++++++++++++++
+ 1 file changed, 66 insertions(+)
  create mode 100644 route/route_dial_target_test.go
 
 diff --git a/route/route_dial_target_test.go b/route/route_dial_target_test.go
 new file mode 100644
-index 000000000..9ea502877
+index 000000000..2d94585bc
 --- /dev/null
 +++ b/route/route_dial_target_test.go
-@@ -0,0 +1,39 @@
+@@ -0,0 +1,66 @@
 +package route
 +
 +import (
 +	"context"
 +	"testing"
++	"time"
 +
 +	"github.com/sagernet/sing-box/adapter"
++	"github.com/sagernet/sing-box/common/urltest"
++	E "github.com/sagernet/sing/common/exceptions"
 +	N "github.com/sagernet/sing/common/network"
 +
 +	"github.com/stretchr/testify/require"
@@ -61,6 +64,30 @@ index 000000000..9ea502877
 +	require.NoError(t, err)
 +	require.Equal(t, adapter.Outbound(member), dialTarget(chain))
 +	require.Equal(t, adapter.Outbound(member), dialTarget([]adapter.Outbound{member}))
++}
++
++type countingURLTest struct {
++	fakeGroup
++	checks *int
++}
++
++func (countingURLTest) URLTest(context.Context) (map[string]uint16, error) { return nil, nil }
++func (g countingURLTest) PerformUpdateCheck()                              { *g.checks++ }
++
++// A failed dial of a chain with a URL test is the group's to judge (it was dialed through it):
++// sing-box 1.14.5 takes the result of the last outbound of the chain away and asks each URL test of
++// the chain to select again, here the history stays as it is and no group is asked.
++func TestFailedDialLeftToTheURLTest(t *testing.T) {
++	history := urltest.NewHistoryStorage()
++	history.StoreURLTestHistory("vless", &adapter.URLTestHistory{Time: time.Now(), Delay: 100})
++	checks := 0
++	member := fakeOutbound{typ: "vless"}
++	group := countingURLTest{fakeGroup{fakeOutbound{typ: "urltest"}, member}, &checks}
++	var _ adapter.URLTestGroup = group
++	manager := &ConnectionManager{urlTestHistory: history}
++	manager.deleteURLTestHistory([]adapter.Outbound{group, member}, E.New("connection refused"))
++	require.NotNil(t, history.LoadURLTestHistory("vless"))
++	require.Zero(t, checks)
 +}
 -- 
 2.53.0

@@ -1,4 +1,4 @@
-From ddef9c12ba3a67fd8da95b8eea95451cc7e56e80 Mon Sep 17 00:00:00 2001
+From 516baa009ac12ebb19c8a3319a3235a31ddab6a9 Mon Sep 17 00:00:00 2001
 From: FiyeroT <me@fiyero.xyz>
 Date: Thu, 12 Nov 2026 21:41:20 +0300
 Subject: [PATCH 35/71] dns: the transports group and provider
@@ -19,9 +19,9 @@ Pdk-Layer: 03
  dns/transport_group_test.go      | 1027 ++++++++++++++++++++++++++++++
  dns/transport_provider.go        |  106 +++
  dns/transport_provider_test.go   |  215 +++++++
- include/podkop_dns_group_test.go |  131 ++++
+ include/podkop_dns_group_test.go |  132 ++++
  option/dns_group.go              |   16 +
- 7 files changed, 2389 insertions(+)
+ 7 files changed, 2390 insertions(+)
  create mode 100644 adapter/dns_podkop.go
  create mode 100644 dns/transport_group.go
  create mode 100644 dns/transport_group_test.go
@@ -2304,10 +2304,10 @@ index 000000000..20ad17bcb
 +}
 diff --git a/include/podkop_dns_group_test.go b/include/podkop_dns_group_test.go
 new file mode 100644
-index 000000000..65917dab2
+index 000000000..3fe150e33
 --- /dev/null
 +++ b/include/podkop_dns_group_test.go
-@@ -0,0 +1,131 @@
+@@ -0,0 +1,132 @@
 +//go:build podkop_slim
 +
 +package include
@@ -2350,7 +2350,8 @@ index 000000000..65917dab2
 +		message string
 +	}{
 +		{`{"type": "udp", "tag": "a", "server": "1.1.1.1"}, {"type": "group", "tag": "dns-server", "servers": ["a", "missing"]}`,
-+			"server missing of group dns-server not found"},
++			// since 1.14.5 the box checks the references of DNS servers itself, before the group does
++			"dependency[missing] not found for server[dns-server]"},
 +		{`{"type": "udp", "tag": "a", "server": "1.1.1.1"}, {"type": "fakeip", "tag": "f", "inet4_range": "198.18.0.0/15"}, {"type": "group", "tag": "dns-server", "servers": ["a", "f"]}`,
 +			"server f of group dns-server is of the type fakeip"},
 +		{`{"type": "udp", "tag": "a", "server": "1.1.1.1"}, {"type": "group", "tag": "inner", "servers": ["a"]}, {"type": "group", "tag": "dns-server", "servers": ["a", "inner"]}`,

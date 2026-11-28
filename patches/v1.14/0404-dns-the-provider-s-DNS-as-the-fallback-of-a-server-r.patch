@@ -1,4 +1,4 @@
-From 54dd0ed728fb9f361422cd5889969fa9103efe50 Mon Sep 17 00:00:00 2001
+From e2700bdb600df2e66966a717a8806a0393ddefd3 Mon Sep 17 00:00:00 2001
 From: FiyeroT <me@fiyero.xyz>
 Date: Thu, 12 Nov 2026 21:41:20 +0300
 Subject: [PATCH 40/71] dns: the provider's DNS as the fallback of a server
@@ -42,10 +42,10 @@ Pdk-Layer: 04
  create mode 100644 dns/client_fallback_test.go
 
 diff --git a/dns/client.go b/dns/client.go
-index 234b55eae..a56f19270 100644
+index f21003475..e94bdae03 100644
 --- a/dns/client.go
 +++ b/dns/client.go
-@@ -781,7 +781,7 @@ func stripDNSPadding(response *dns.Msg) {
+@@ -765,7 +765,7 @@ func stripDNSPadding(response *dns.Msg) {
  }
  
  func (c *Client) exchangeToTransport(ctx context.Context, transport adapter.DNSTransport, message *dns.Msg) (*dns.Msg, error) {
@@ -54,7 +54,7 @@ index 234b55eae..a56f19270 100644
  	if err == nil {
  		stripDNSPadding(response)
  		return response, nil
-@@ -790,11 +790,11 @@ func (c *Client) exchangeToTransport(ctx context.Context, transport adapter.DNST
+@@ -774,11 +774,11 @@ func (c *Client) exchangeToTransport(ctx context.Context, transport adapter.DNST
  	if errors.As(err, &rcodeError) {
  		return FixedResponseStatus(message, int(rcodeError)), nil
  	}
@@ -68,7 +68,7 @@ index 234b55eae..a56f19270 100644
  		if err == nil {
  			stripDNSPadding(response)
  			callback(response, nil)
-@@ -805,7 +805,7 @@ func (c *Client) exchangeToTransportAsync(ctx context.Context, transport adapter
+@@ -789,7 +789,7 @@ func (c *Client) exchangeToTransportAsync(ctx context.Context, transport adapter
  			callback(FixedResponseStatus(message, int(rcodeError)), nil)
  			return
  		}
@@ -2317,10 +2317,10 @@ index 000000000..311ca7e16
 +	}
 +}
 diff --git a/dns/router.go b/dns/router.go
-index f5e5aa56f..cd85090c0 100644
+index fbb3be4ee..d5ddff909 100644
 --- a/dns/router.go
 +++ b/dns/router.go
-@@ -51,6 +51,10 @@ type Router struct {
+@@ -54,6 +54,10 @@ type Router struct {
  	rulesAccess           sync.RWMutex
  	started               bool
  	closing               bool
@@ -2331,7 +2331,7 @@ index f5e5aa56f..cd85090c0 100644
  }
  
  func NewRouter(ctx context.Context, logFactory log.Factory, options option.DNSOptions) (*Router, error) {
-@@ -63,7 +67,13 @@ func NewRouter(ctx context.Context, logFactory log.Factory, options option.DNSOp
+@@ -66,7 +70,13 @@ func NewRouter(ctx context.Context, logFactory log.Factory, options option.DNSOp
  		rawRules:              make([]option.DNSRule, 0, len(options.Rules)),
  		rules:                 make([]adapter.DNSRule, 0, len(options.Rules)),
  		defaultDomainStrategy: C.DomainStrategy(options.Strategy),
@@ -2345,7 +2345,7 @@ index f5e5aa56f..cd85090c0 100644
  	if options.DNSClientOptions.IndependentCache {
  		deprecated.Report(ctx, deprecated.OptionIndependentDNSCache)
  	}
-@@ -535,7 +545,7 @@ func (r *Router) settleDNSFutures(ctx context.Context, message *mDNS.Msg, state
+@@ -543,7 +553,7 @@ func (r *Router) settleDNSFutures(ctx context.Context, message *mDNS.Msg, state
  			continue
  		}
  		future.settled = true
@@ -2354,7 +2354,7 @@ index f5e5aa56f..cd85090c0 100644
  			r.logger.ErrorContext(ctx, E.Cause(future.err, "exchange failed for ", FormatQuestion(message.Question[0].String())))
  		}
  		if future.tag == "" {
-@@ -1283,7 +1293,7 @@ func (r *Router) Lookup(ctx context.Context, domain string, options adapter.DNSQ
+@@ -1366,7 +1376,7 @@ func (r *Router) Lookup(ctx context.Context, domain string, options adapter.DNSQ
  				r.logger.DebugContext(ctx, "lookup rejected for ", domain)
  			} else if errors.Is(err, ErrNotCached) {
  				r.logger.DebugContext(ctx, "cache-only lookup missed for ", domain)
@@ -2363,7 +2363,7 @@ index f5e5aa56f..cd85090c0 100644
  				r.logger.ErrorContext(ctx, E.Cause(err, "lookup failed for ", domain))
  			}
  		}
-@@ -1404,6 +1414,12 @@ func (r *Router) LookupReverseMapping(ip netip.Addr) (string, bool) {
+@@ -1498,6 +1508,12 @@ func (r *Router) LookupECHPublicName(domain string) string {
  func (r *Router) ResetNetwork() {
  	for _, transport := range r.transport.Transports() {
  		transport.Reset()
@@ -2377,7 +2377,7 @@ index f5e5aa56f..cd85090c0 100644
  }
  
 diff --git a/dns/transport_adapter.go b/dns/transport_adapter.go
-index 7d2ebfa7e..252bfc6eb 100644
+index 377c1250a..057150483 100644
 --- a/dns/transport_adapter.go
 +++ b/dns/transport_adapter.go
 @@ -9,6 +9,7 @@ type TransportAdapter struct {
@@ -2397,26 +2397,26 @@ index 7d2ebfa7e..252bfc6eb 100644
  }
  
 @@ -68,3 +70,7 @@ func (a *TransportAdapter) Dependencies() []string {
- func (a *TransportAdapter) References() []string {
- 	return a.references
+ func (a *TransportAdapter) References() ([]string, []string) {
+ 	return a.references, nil
  }
 +
 +func (a *TransportAdapter) fallbackState() *fallbackServer {
 +	return a.fallback
 +}
 diff --git a/protocol/direct/outbound.go b/protocol/direct/outbound.go
-index 78fee262e..144b74272 100644
+index 1c50dd689..843b29112 100644
 --- a/protocol/direct/outbound.go
 +++ b/protocol/direct/outbound.go
-@@ -45,6 +45,7 @@ type Outbound struct {
+@@ -52,6 +52,7 @@ type Outbound struct {
+ 	dialer         parallelResolveDialer
  	domainStrategy C.DomainStrategy
- 	fallbackDelay  time.Duration
  	isEmpty        bool
 +	dialerOptions  option.DialerOptions
  	myAddresses    common.TypedValue[[]netip.Prefix]
  	icmpPort       *ping.Port
  }
-@@ -75,6 +76,7 @@ func NewOutbound(ctx context.Context, router adapter.Router, logger log.ContextL
+@@ -81,6 +82,7 @@ func NewOutbound(ctx context.Context, router adapter.Router, logger log.ContextL
  		isEmpty: reflect.DeepEqual(options.DialerOptions, option.DialerOptions{
  			AbstractDialerOptions: option.AbstractDialerOptions{UDPFragmentDefault: true},
  		}),
@@ -2424,7 +2424,7 @@ index 78fee262e..144b74272 100644
  	}
  	//nolint:staticcheck
  	if options.ProxyProtocol != 0 {
-@@ -269,3 +271,8 @@ func (h *Outbound) ListenSerialNetworkPacket(ctx context.Context, destination M.
+@@ -296,3 +298,8 @@ func (h *Outbound) ListenSerialNetworkPacket(ctx context.Context, destination M.
  func (h *Outbound) IsEmpty() bool {
  	return h.isEmpty
  }

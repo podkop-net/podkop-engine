@@ -1,4 +1,4 @@
-From 22e57864af3e62d8b971d6e8ba23f0ad719fc840 Mon Sep 17 00:00:00 2001
+From c20e2920e0f5eb0c65ff0afadfef47e9330965a1 Mon Sep 17 00:00:00 2001
 From: FiyeroT <me@fiyero.xyz>
 Date: Thu, 12 Nov 2026 21:41:21 +0300
 Subject: [PATCH 49/71] tlsspoof: the forged ClientHello the way the connection
@@ -21,8 +21,8 @@ Pdk-Layer: 04
  common/tlsspoof/integration_unix_test.go |  10 +
  common/tlsspoof/packet_vectors_test.go   |  46 +++++
  common/tlsspoof/raw_linux.go             | 206 ++++++++++++++------
- common/tlsspoof/raw_linux_test.go        | 230 +++++++++++++++++++++++
- 6 files changed, 476 insertions(+), 57 deletions(-)
+ common/tlsspoof/raw_linux_test.go        | 236 +++++++++++++++++++++++
+ 6 files changed, 482 insertions(+), 57 deletions(-)
  create mode 100644 common/tls/reality_spoof_test.go
  create mode 100644 common/tlsspoof/packet_vectors_test.go
  create mode 100644 common/tlsspoof/raw_linux_test.go
@@ -459,10 +459,10 @@ index bca7b5920..65747419f 100644
  	}
 diff --git a/common/tlsspoof/raw_linux_test.go b/common/tlsspoof/raw_linux_test.go
 new file mode 100644
-index 000000000..d9aa3181a
+index 000000000..5af56bcc4
 --- /dev/null
 +++ b/common/tlsspoof/raw_linux_test.go
-@@ -0,0 +1,230 @@
+@@ -0,0 +1,236 @@
 +package tlsspoof
 +
 +import (
@@ -486,9 +486,11 @@ index 000000000..d9aa3181a
 +	require.NoError(t, err)
 +	received := make(chan []byte, 1)
 +	served := make(chan struct{})
++	accepted := make(chan struct{})
 +	go func() {
 +		defer close(served)
 +		conn, err := listener.Accept()
++		close(accepted)
 +		if err != nil {
 +			return
 +		}
@@ -506,6 +508,10 @@ index 000000000..d9aa3181a
 +	}}
 +	client, err := dialer.DialContext(context.Background(), "tcp4", listener.Addr().String())
 +	require.NoError(t, err)
++	// the server's side is open before the caller counts descriptors: Accept runs on its own
++	// goroutine, and a socket it opened after the first count was the flake of
++	// TestIntegrationSpooferHoldsNoSocket (9 descriptors, then 10)
++	<-accepted
 +	// the server's side is closed before the next test counts descriptors
 +	t.Cleanup(func() {
 +		client.Close()

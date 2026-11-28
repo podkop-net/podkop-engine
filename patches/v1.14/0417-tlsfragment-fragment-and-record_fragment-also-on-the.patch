@@ -1,4 +1,4 @@
-From 0081b4303c2bf2f467bb201c53db3c4f8107a326 Mon Sep 17 00:00:00 2001
+From 08e168e3a1d0c403d0cc8339722a1957e1d76465 Mon Sep 17 00:00:00 2001
 From: FiyeroT <me@fiyero.xyz>
 Date: Thu, 12 Nov 2026 21:41:21 +0300
 Subject: [PATCH 53/71] tlsfragment: fragment and record_fragment, also on the
@@ -17,30 +17,31 @@ Pdk-Feature: record-fragment
 Pdk-Zone: protocols
 Pdk-Layer: 04
 ---
- common/tls/reality_client.go               |  14 ++-
+ common/tls/reality_client.go               |  15 ++-
  common/tls/reality_record_fragment_test.go |  77 ++++++++++++++
  common/tlsfragment/conn.go                 |  13 ++-
  common/tlsfragment/conn_label_test.go      | 113 +++++++++++++++++++++
  common/tlsfragment/wait_linux.go           |  43 +++++---
  common/tlsfragment/wait_linux_test.go      |  79 ++++++++++++++
- 6 files changed, 319 insertions(+), 20 deletions(-)
+ 6 files changed, 320 insertions(+), 20 deletions(-)
  create mode 100644 common/tls/reality_record_fragment_test.go
  create mode 100644 common/tlsfragment/conn_label_test.go
  create mode 100644 common/tlsfragment/wait_linux_test.go
 
 diff --git a/common/tls/reality_client.go b/common/tls/reality_client.go
-index 011256ea0..423179b12 100644
+index 0e8170ac9..e7ae4c593 100644
 --- a/common/tls/reality_client.go
 +++ b/common/tls/reality_client.go
-@@ -28,6 +28,7 @@ import (
+@@ -27,6 +27,8 @@ import (
+ 	"time"
  	"unsafe"
  
- 	"github.com/sagernet/sing-box/adapter"
++	"github.com/sagernet/sing-box/adapter"
 +	tf "github.com/sagernet/sing-box/common/tlsfragment"
  	C "github.com/sagernet/sing-box/constant"
  	"github.com/sagernet/sing-box/option"
  	"github.com/sagernet/sing/common/debug"
-@@ -217,9 +218,16 @@ func (e *RealityClientConfig) ClientHandshake(ctx context.Context, conn net.Conn
+@@ -231,9 +233,16 @@ func (e *RealityClientConfig) ClientHandshake(ctx context.Context, conn net.Conn
  	uConfig.InsecureSkipVerify = true
  	uConfig.SessionTicketsDisabled = true
  	uConfig.VerifyPeerCertificate = verifier.VerifyPeerCertificate

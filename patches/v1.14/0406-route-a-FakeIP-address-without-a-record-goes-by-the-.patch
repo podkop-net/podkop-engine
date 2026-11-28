@@ -1,4 +1,4 @@
-From cf0923d81fb9d33a6a65a78e1586a55affc61715 Mon Sep 17 00:00:00 2001
+From a2766de7413adba297370135545f3ca67ccbc388 Mon Sep 17 00:00:00 2001
 From: FiyeroT <me@fiyero.xyz>
 Date: Thu, 12 Nov 2026 21:41:21 +0300
 Subject: [PATCH 42/71] route: a FakeIP address without a record goes by the
@@ -15,16 +15,16 @@ Pdk-Feature: fakeip-route
 Pdk-Zone: core
 Pdk-Layer: 04
 ---
- route/route.go          |  60 +++++++-
+ route/route.go          |  58 +++++++-
  route/route_log_test.go | 299 ++++++++++++++++++++++++++++++++++++++++
- 2 files changed, 353 insertions(+), 6 deletions(-)
+ 2 files changed, 352 insertions(+), 5 deletions(-)
  create mode 100644 route/route_log_test.go
 
 diff --git a/route/route.go b/route/route.go
-index 416e6833e..389339a83 100644
+index f199451cf..b7874ac1e 100644
 --- a/route/route.go
 +++ b/route/route.go
-@@ -63,7 +63,7 @@ func (r *Router) RouteConnectionEx(ctx context.Context, conn net.Conn, metadata
+@@ -59,7 +59,7 @@ func (r *Router) RouteConnectionEx(ctx context.Context, conn net.Conn, metadata
  		N.CloseOnHandshakeFailure(conn, onClose, err)
  		if E.IsClosedOrCanceled(err) || R.IsRejected(err) {
  			r.logger.DebugContext(ctx, "connection closed: ", err)
@@ -33,7 +33,7 @@ index 416e6833e..389339a83 100644
  			r.logger.ErrorContext(ctx, err)
  		}
  	}
-@@ -166,7 +166,7 @@ func (r *Router) routeConnection(ctx context.Context, conn net.Conn, metadata ad
+@@ -163,7 +163,7 @@ func (r *Router) routeConnection(ctx context.Context, conn net.Conn, metadata ad
  	}
  	ctx = interrupt.ContextWithIsExternalConnection(ctx, true)
  	onClose = registerInterrupt(chain, conn, onClose)
@@ -42,16 +42,7 @@ index 416e6833e..389339a83 100644
  	if outboundHandler, isHandler := outbound.(adapter.ConnectionHandler); isHandler {
  		outboundHandler.NewConnection(ctx, conn, metadata, onClose)
  	} else {
-@@ -236,7 +236,7 @@ func (r *Router) RoutePacketConnection(ctx context.Context, conn N.PacketConn, m
- 		conn.Close()
- 		if E.IsClosedOrCanceled(err) || R.IsRejected(err) {
- 			r.logger.DebugContext(ctx, "connection closed: ", err)
--		} else {
-+		} else if !r.logRefused(ctx, metadata.Destination, err) {
- 			r.logger.ErrorContext(ctx, err)
- 		}
- 	}
-@@ -253,7 +253,7 @@ func (r *Router) RoutePacketConnectionEx(ctx context.Context, conn N.PacketConn,
+@@ -242,7 +242,7 @@ func (r *Router) RoutePacketConnectionEx(ctx context.Context, conn N.PacketConn,
  		N.CloseOnHandshakeFailure(conn, onClose, err)
  		if E.IsClosedOrCanceled(err) || R.IsRejected(err) {
  			r.logger.DebugContext(ctx, "connection closed: ", err)
@@ -60,7 +51,7 @@ index 416e6833e..389339a83 100644
  			r.logger.ErrorContext(ctx, err)
  		}
  	}
-@@ -349,7 +349,7 @@ func (r *Router) routePacketConnection(ctx context.Context, conn N.PacketConn, m
+@@ -339,7 +339,7 @@ func (r *Router) routePacketConnection(ctx context.Context, conn N.PacketConn, m
  	}
  	ctx = interrupt.ContextWithIsExternalConnection(ctx, true)
  	onClose = registerInterrupt(chain, conn, onClose)
@@ -69,7 +60,7 @@ index 416e6833e..389339a83 100644
  	if outboundHandler, isHandler := outbound.(adapter.PacketConnectionHandler); isHandler {
  		outboundHandler.NewPacketConnection(ctx, conn, metadata, onClose)
  	} else {
-@@ -583,6 +583,27 @@ func (r *Router) preMatchFlow(ctx context.Context, metadata *adapter.InboundCont
+@@ -566,6 +566,27 @@ func (r *Router) preMatchFlow(ctx context.Context, metadata *adapter.InboundCont
  	return result
  }
  
@@ -97,7 +88,7 @@ index 416e6833e..389339a83 100644
  func (r *Router) prepareMatchMetadata(ctx context.Context, metadata *adapter.InboundContext) error {
  	r.searchProcessInfo(ctx, metadata)
  	if r.neighborResolver != nil && metadata.SourceMACAddress == nil && metadata.Source.Addr.IsValid() {
-@@ -605,7 +626,7 @@ func (r *Router) prepareMatchMetadata(ctx context.Context, metadata *adapter.Inb
+@@ -588,7 +609,7 @@ func (r *Router) prepareMatchMetadata(ctx context.Context, metadata *adapter.Inb
  	if metadata.Destination.Addr.IsValid() && r.dnsTransport.FakeIP() != nil && r.dnsTransport.FakeIP().Store().Contains(metadata.Destination.Addr) {
  		domain, loaded := r.dnsTransport.FakeIP().Store().Lookup(metadata.Destination.Addr)
  		if !loaded {
@@ -106,7 +97,7 @@ index 416e6833e..389339a83 100644
  		}
  		if domain != "" {
  			metadata.OriginDestination = metadata.Destination
-@@ -639,6 +660,23 @@ func (r *Router) matchRule(
+@@ -624,6 +645,23 @@ func (r *Router) matchRule(
  	buffers []*buf.Buffer, packetBuffers []*N.PacketBuffer, fatalErr error,
  ) {
  	fatalErr = r.prepareMatchMetadata(ctx, metadata)
@@ -130,7 +121,7 @@ index 416e6833e..389339a83 100644
  	if fatalErr != nil {
  		return
  	}
-@@ -720,6 +758,16 @@ match:
+@@ -699,6 +737,16 @@ match:
  				fatalErr = newErr
  				return
  			}

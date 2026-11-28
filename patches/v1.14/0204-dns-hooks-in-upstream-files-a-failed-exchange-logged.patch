@@ -1,4 +1,4 @@
-From d79e2c531dd823dd25576e6e0852e05d8ba7635f Mon Sep 17 00:00:00 2001
+From fc596e52864d8da728355885a5b612de7d8a31b5 Mon Sep 17 00:00:00 2001
 From: FiyeroT <me@fiyero.xyz>
 Date: Thu, 12 Nov 2026 21:41:19 +0300
 Subject: [PATCH 08/71] dns, hooks in upstream files: a failed exchange logged
@@ -16,7 +16,7 @@ Pdk-Layer: 02
  2 files changed, 8 insertions(+), 4 deletions(-)
 
 diff --git a/dns/client.go b/dns/client.go
-index 51cedd60c..61769494f 100644
+index c6930ac14..f51e989ba 100644
 --- a/dns/client.go
 +++ b/dns/client.go
 @@ -51,6 +51,8 @@ type Client struct {
@@ -29,10 +29,10 @@ index 51cedd60c..61769494f 100644
  
  type ClientOptions struct {
 diff --git a/dns/router.go b/dns/router.go
-index 40107d9e0..dec640141 100644
+index d45f23d2b..9ba7d1830 100644
 --- a/dns/router.go
 +++ b/dns/router.go
-@@ -1174,10 +1174,12 @@ func (r *Router) exchangeLegacy(ctx context.Context, exchangeCtx *dnsExchangeCon
+@@ -1253,10 +1253,12 @@ func (r *Router) exchangeLegacy(ctx context.Context, exchangeCtx *dnsExchangeCon
  			} else if errors.Is(err, ErrResponseRejected) {
  				rejected = true
  				r.logger.DebugContext(ctx, E.Cause(err, "response rejected for ", FormatQuestion(message.Question[0].String())))

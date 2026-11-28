@@ -1,4 +1,4 @@
-From af3a072354cdbbec6f3cb628ef001d2f5a3391fb Mon Sep 17 00:00:00 2001
+From 0d9af17d90f438d2047dbd89a22599d6d4deedbd Mon Sep 17 00:00:00 2001
 From: FiyeroT <me@fiyero.xyz>
 Date: Thu, 12 Nov 2026 21:41:21 +0300
 Subject: [PATCH 58/71] http client: fallback clients, through which a remote
@@ -228,20 +228,20 @@ index c51b26435..5b878421b 100644
  
  type (
 diff --git a/route/rule/rule_set_remote.go b/route/rule/rule_set_remote.go
-index c3eea334d..a741b66e0 100644
+index 42d5282a4..ace5e8882 100644
 --- a/route/rule/rule_set_remote.go
 +++ b/route/rule/rule_set_remote.go
-@@ -51,6 +51,9 @@ type RemoteRuleSet struct {
+@@ -50,6 +50,9 @@ type RemoteRuleSet struct {
  	options        option.RuleSet
  	updateInterval time.Duration
  	httpClient     *http.Client
 +	// the clients a fetch that failed through httpClient is repeated through, in order
 +	// (option.HTTPClientOptions.Fallback)
 +	fallbacks      []ruleSetFallback
- 	access         sync.RWMutex
- 	rules          []adapter.HeadlessRule
- 	metadata       adapter.RuleSetMetadata
-@@ -135,6 +138,11 @@ func (s *RemoteRuleSet) StartContext(ctx context.Context, startContext *adapter.
+ 	content        atomic.Pointer[ruleSetContent]
+ 	lastUpdated    time.Time
+ 	lastEtag       string
+@@ -120,6 +123,11 @@ func (s *RemoteRuleSet) StartContext(ctx context.Context, startContext *adapter.
  	if err != nil {
  		return E.Cause(err, "create rule-set http client")
  	}
@@ -253,7 +253,7 @@ index c3eea334d..a741b66e0 100644
  	var loadedFromInitialPath bool
  	if s.lastUpdated.IsZero() && s.initialPath != "" {
  		var content []byte
-@@ -514,6 +522,33 @@ func describeRuleSetBody(response *http.Response, size int64, sample []byte) str
+@@ -495,6 +503,33 @@ func describeRuleSetBody(response *http.Response, size int64, sample []byte) str
  // each of its fallback clients in turn. Each way has the whole stall timeout of its own; the start
  // deadline bounds them all. The error is that of every way.
  func (s *RemoteRuleSet) fetch(ctx context.Context, isStart bool) error {
@@ -325,7 +325,7 @@ index 000000000..8f865ce60
 +}
 diff --git a/route/rule/rule_set_remote_fallback_test.go b/route/rule/rule_set_remote_fallback_test.go
 new file mode 100644
-index 000000000..12100a9be
+index 000000000..345db9da0
 --- /dev/null
 +++ b/route/rule/rule_set_remote_fallback_test.go
 @@ -0,0 +1,99 @@
@@ -381,7 +381,7 @@ index 000000000..12100a9be
 +		{tag: "via-b", client: last},
 +	}
 +	require.NoError(t, set.fetch(context.Background(), false))
-+	require.Len(t, set.currentRules(), 1)
++	require.Len(t, set.content.Load().rules, 1)
 +	require.EqualValues(t, 1, asked.Load())
 +	require.False(t, lastAsked.Load())
 +}
@@ -409,7 +409,7 @@ index 000000000..12100a9be
 +	set.httpClient = &http.Client{Transport: &http.Transport{}}
 +	set.fallbacks = []ruleSetFallback{{tag: "via-a", client: &http.Client{Transport: &http.Transport{}}}}
 +	require.NoError(t, set.fetch(context.Background(), false))
-+	require.Len(t, set.currentRules(), 1)
++	require.Len(t, set.content.Load().rules, 1)
 +}
 +
 +// When no way brings the list, the error tells what each of them met.
@@ -426,7 +426,7 @@ index 000000000..12100a9be
 +	for _, text := range []string{"direct refused", "http_client[via-a]", "a refused", "http_client[via-b]", "b refused"} {
 +		require.Contains(t, err.Error(), text)
 +	}
-+	require.Empty(t, set.currentRules())
++	require.Empty(t, set.content.Load().rules)
 +}
 -- 
 2.53.0

@@ -1,4 +1,4 @@
-From 18c0cf3f587440237b7d16b0a08e357dd6d41ccd Mon Sep 17 00:00:00 2001
+From fb69d5a82c71dc57908950ad3ed4702249ed46c1 Mon Sep 17 00:00:00 2001
 From: FiyeroT <me@fiyero.xyz>
 Date: Thu, 12 Nov 2026 21:41:21 +0300
 Subject: [PATCH 48/71] clashapi, trafficcontrol: a failed listen, a failed UI,

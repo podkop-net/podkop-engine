@@ -1,4 +1,4 @@
-From a78d3c00b12e20061872446f3d05cb05f1c654c7 Mon Sep 17 00:00:00 2001
+From 8388c240e45e540a00c5b05673687eefa3189f4d Mon Sep 17 00:00:00 2001
 From: FiyeroT <me@fiyero.xyz>
 Date: Thu, 12 Nov 2026 21:41:20 +0300
 Subject: [PATCH 38/71] rule-set: the download, the start and the update of
@@ -35,36 +35,40 @@ Pdk-Layer: 04
  common/domainset/stop_test.go                 |  52 +++
  common/httpclient/dial_context_test.go        | 103 +++++
  common/ruletext/stop_test.go                  |  25 ++
- experimental/cachefile/cache.go               |  32 +-
+ experimental/cachefile/cache.go               |  38 +-
  .../cachefile/rule_set_checked_test.go        |  30 ++
  route/router.go                               |   9 +
  route/rule/export_test.go                     |   8 +
+ route/rule/rule_set_content_test.go           | 156 +++++++
  route/rule/rule_set_hook.go                   |  65 +++
  route/rule/rule_set_hook_test.go              |  74 ++++
- route/rule/rule_set_local.go                  |  38 +-
- route/rule/rule_set_local_race_test.go        |  61 +++
- route/rule/rule_set_remote.go                 | 404 ++++++++++++++++--
+ route/rule/rule_set_local.go                  |  20 +-
+ route/rule/rule_set_local_race_test.go        |  63 +++
+ route/rule/rule_set_process_test.go           |  24 ++
+ route/rule/rule_set_remote.go                 | 384 ++++++++++++++++--
  route/rule/rule_set_remote_body_test.go       | 172 ++++++++
- route/rule/rule_set_remote_checked_test.go    |  69 +++
- route/rule/rule_set_remote_race_test.go       |  47 ++
+ route/rule/rule_set_remote_checked_test.go    |  69 ++++
+ route/rule/rule_set_remote_race_test.go       |  54 +++
  route/rule/rule_set_remote_start_test.go      | 100 +++++
  route/rule/rule_set_remote_stop_test.go       |  48 +++
- route/rule/rule_set_remote_timeout_test.go    | 107 +++++
- route/rule/rule_set_start.go                  |  34 ++
- route/rule/rule_set_start_empty_test.go       | 139 ++++++
+ route/rule/rule_set_remote_timeout_test.go    | 110 +++++
+ route/rule/rule_set_start.go                  |  52 +++
+ route/rule/rule_set_start_empty_test.go       | 139 +++++++
  route/rule/rule_set_start_test.go             |  52 +++
  route/rule/rule_set_update_log_test.go        | 101 +++++
  route/rule/rule_set_updater.go                | 146 ++++++-
- route/rule/rule_set_updater_test.go           | 161 +++++++
- 24 files changed, 2021 insertions(+), 56 deletions(-)
+ route/rule/rule_set_updater_test.go           | 161 ++++++++
+ 26 files changed, 2200 insertions(+), 55 deletions(-)
  create mode 100644 common/domainset/stop_test.go
  create mode 100644 common/httpclient/dial_context_test.go
  create mode 100644 common/ruletext/stop_test.go
  create mode 100644 experimental/cachefile/rule_set_checked_test.go
  create mode 100644 route/rule/export_test.go
+ create mode 100644 route/rule/rule_set_content_test.go
  create mode 100644 route/rule/rule_set_hook.go
  create mode 100644 route/rule/rule_set_hook_test.go
  create mode 100644 route/rule/rule_set_local_race_test.go
+ create mode 100644 route/rule/rule_set_process_test.go
  create mode 100644 route/rule/rule_set_remote_body_test.go
  create mode 100644 route/rule/rule_set_remote_checked_test.go
  create mode 100644 route/rule/rule_set_remote_race_test.go
@@ -276,7 +280,7 @@ index 000000000..e6e925255
 +	require.Len(t, compat.Options.Rules, 1)
 +}
 diff --git a/experimental/cachefile/cache.go b/experimental/cachefile/cache.go
-index b4f97d110..daf94ba61 100644
+index e7fb08e99..d641d6fa5 100644
 --- a/experimental/cachefile/cache.go
 +++ b/experimental/cachefile/cache.go
 @@ -2,6 +2,7 @@ package cachefile
@@ -306,11 +310,15 @@ index b4f97d110..daf94ba61 100644
  		string(bucketRDRC),
  		string(bucketDNSCache),
  	}
-@@ -466,9 +473,30 @@ func (c *CacheFile) LoadRuleSet(tag string) *adapter.SavedBinary {
+@@ -478,17 +485,34 @@ func (c *CacheFile) LoadRuleSet(tag string) *adapter.SavedBinary {
  	return &savedSet
  }
  
 -func (c *CacheFile) SaveRuleSet(tag string, set *adapter.SavedBinary) error {
+-	return c.batch(func(t *bbolt.Tx) error {
+-		bucket, err := c.createBucket(t, bucketRuleSet)
+-		if err != nil {
+-			return err
 +var _ adapter.RuleSetCheckCache = (*CacheFile)(nil)
 +
 +// LoadRuleSetChecked is when the rule set was last found up to date, the zero time when
@@ -321,7 +329,8 @@ index b4f97d110..daf94ba61 100644
 +		bucket := c.bucket(t, bucketRuleSetChecked)
 +		if bucket == nil {
 +			return nil
-+		}
+ 		}
+-		setBinary, err := set.MarshalBinary()
 +		if value := bucket.Get([]byte(tag)); len(value) == 8 {
 +			at = time.Unix(0, int64(binary.BigEndian.Uint64(value)))
 +		}
@@ -333,12 +342,16 @@ index b4f97d110..daf94ba61 100644
 +// StoreRuleSetChecked keeps when the rule set was found up to date: eight bytes, where a
 +// save of the rule set writes its whole content again.
 +func (c *CacheFile) StoreRuleSetChecked(tag string, at time.Time) error {
- 	return c.batch(func(t *bbolt.Tx) error {
--		bucket, err := c.createBucket(t, bucketRuleSet)
++	return c.batch(func(t *bbolt.Tx) error {
 +		bucket, err := c.createBucket(t, bucketRuleSetChecked)
  		if err != nil {
  			return err
  		}
+-		return bucket.Put([]byte(tag), setBinary)
++		return bucket.Put([]byte(tag), binary.BigEndian.AppendUint64(nil, uint64(at.UnixNano())))
+ 	})
+ }
+ 
 diff --git a/experimental/cachefile/rule_set_checked_test.go b/experimental/cachefile/rule_set_checked_test.go
 new file mode 100644
 index 000000000..90c260238
@@ -376,10 +389,10 @@ index 000000000..90c260238
 +	require.True(t, time.Unix(100, 0).Equal(saved.LastUpdated), "the content is not written again")
 +}
 diff --git a/route/router.go b/route/router.go
-index 0673ddef8..9e129c490 100644
+index c10f12109..776c4d6a7 100644
 --- a/route/router.go
 +++ b/route/router.go
-@@ -232,6 +232,15 @@ func (r *Router) RuleSet(tag string) (adapter.RuleSet, bool) {
+@@ -262,6 +262,15 @@ func (r *Router) RuleSet(tag string) (adapter.RuleSet, bool) {
  	return ruleSet, loaded
  }
  
@@ -408,6 +421,168 @@ index 000000000..5507de93c
 +// SwapTimeoutsForTest exposes the fetch bounds to the tests outside the package.
 +func SwapTimeoutsForTest(stall, startDeadline time.Duration) func() {
 +	return swapTimeouts(stall, startDeadline)
++}
+diff --git a/route/rule/rule_set_content_test.go b/route/rule/rule_set_content_test.go
+new file mode 100644
+index 000000000..8ccd99a47
+--- /dev/null
++++ b/route/rule/rule_set_content_test.go
+@@ -0,0 +1,156 @@
++package rule
++
++import (
++	"context"
++	"fmt"
++	"strings"
++	"sync"
++	"testing"
++
++	"github.com/sagernet/sing-box/adapter"
++	C "github.com/sagernet/sing-box/constant"
++	"github.com/sagernet/sing-box/option"
++	"github.com/sagernet/sing/common/json"
++	"github.com/sagernet/sing/service"
++
++	"github.com/stretchr/testify/require"
++)
++
++// The content of a set is read through upstream's atomic pointer: a match, the metadata and
++// the content for the matcher of rule-set items cost no allocation and no lock.
++func TestRuleSetContentReadWithoutAllocation(t *testing.T) {
++	remote := newTestRuleSet("")
++	remote.options.Format = C.RuleSetFormatSource
++	require.NoError(t, remote.loadBytes([]byte(`{"version":3,"rules":[{"domain_suffix":["example.com"]}]}`)))
++	local := &LocalRuleSet{ctx: context.Background(), tag: "test"}
++	require.NoError(t, local.reloadRules(testHeadlessRules(t, `{"version":3,"rules":[{"domain_suffix":["example.com"]}]}`)))
++	for name, set := range map[string]interface {
++		adapter.RuleSet
++		loadContent() *ruleSetContent
++	}{"remote": remote, "local": local} {
++		require.Zero(t, testing.AllocsPerRun(100, func() {
++			_ = set.loadContent()
++			_ = set.Metadata()
++		}), name)
++		require.NotNil(t, set.loadContent().mergeableRule(), name)
++	}
++}
++
++// A set started empty reports its content as mixed until a list comes, then the metadata
++// of the list; a cleanup of an unreferenced set leaves it with nothing to match and keeps its
++// metadata (a program that embeds the box reads it of the lists of a rule that is off).
++func TestRemoteRuleSetContentUnknownUntilLoaded(t *testing.T) {
++	set := newTestRuleSet("")
++	set.options.Format = C.RuleSetFormatSource
++	set.startEmpty()
++	require.Equal(t, adapter.RuleSetMetadata{ContainsIPCIDRRule: true, ContainsNonIPCIDRRule: true}, set.Metadata())
++	require.False(t, set.Match(&adapter.InboundContext{Domain: "www.example.com"}))
++	require.NoError(t, set.loadBytes([]byte(`{"version":3,"rules":[{"domain_suffix":["example.com"]}]}`)))
++	require.True(t, set.Metadata().ContainsNonIPCIDRRule)
++	require.False(t, set.Metadata().ContainsIPCIDRRule)
++	require.True(t, set.Match(&adapter.InboundContext{Domain: "www.example.com"}))
++	set.Cleanup()
++	require.False(t, set.Match(&adapter.InboundContext{Domain: "www.example.com"}))
++	require.True(t, set.Metadata().ContainsNonIPCIDRRule, "the metadata of an unreferenced set went with its rules")
++	require.False(t, set.Metadata().ContainsIPCIDRRule)
++}
++
++// The same for a local set.
++func TestLocalRuleSetCleanupKeepsMetadata(t *testing.T) {
++	set := &LocalRuleSet{ctx: context.Background(), tag: "test"}
++	require.NoError(t, set.reloadRules(testHeadlessRules(t, `{"version":3,"rules":[{"ip_cidr":["192.0.2.0/24"]}]}`)))
++	require.True(t, set.Metadata().ContainsIPCIDRRule)
++	set.Cleanup()
++	require.Nil(t, set.loadContent().rules)
++	require.True(t, set.Metadata().ContainsIPCIDRRule, "the metadata of an unreferenced set went with its rules")
++}
++
++// A set closed after the parse of a list and before the list is stored holds no rules: the
++// update validator runs in exactly that gap, and here it closes the set.
++func TestRemoteRuleSetClosedBeforeStore(t *testing.T) {
++	ctx, cancel := context.WithCancel(context.Background())
++	set := newTestRuleSet("")
++	set.ctx = service.ContextWith[adapter.DNSRuleSetUpdateValidator](ctx, &fakeDNSRuleSetUpdateValidator{
++		validate: func(string, adapter.RuleSetMetadata) error {
++			require.NoError(t, set.Close())
++			return nil
++		},
++	})
++	set.cancel = cancel
++	set.options.Format = C.RuleSetFormatSource
++	require.ErrorIs(t, set.commitBytes([]byte(`{"version":3,"rules":[{"domain_suffix":["example.com"]}]}`)), context.Canceled)
++	require.Empty(t, set.content.Load().rules)
++	require.False(t, set.Match(&adapter.InboundContext{Domain: "www.example.com"}))
++}
++
++// The same for a local set: a reload the watcher started that ends after Close stores nothing.
++func TestLocalRuleSetClosedBeforeStore(t *testing.T) {
++	var set *LocalRuleSet
++	set = &LocalRuleSet{ctx: service.ContextWith[adapter.DNSRuleSetUpdateValidator](context.Background(), &fakeDNSRuleSetUpdateValidator{
++		validate: func(string, adapter.RuleSetMetadata) error {
++			require.NoError(t, set.Close())
++			return nil
++		},
++	}), tag: "test"}
++	var callbacks int
++	set.RegisterCallback(func(adapter.RuleSet) { callbacks++ })
++	require.NoError(t, set.reloadRules(testHeadlessRules(t, `{"version":3,"rules":[{"domain_suffix":["example.com"]}]}`)))
++	require.Zero(t, callbacks)
++	require.False(t, set.Match(&adapter.InboundContext{Domain: "www.example.com"}))
++}
++
++// A set closed while it parses a list holds no rules once both are done, whichever comes
++// first. Run with -race.
++func TestRemoteRuleSetCloseDuringParse(t *testing.T) {
++	var source strings.Builder
++	source.WriteString(`{"version":3,"rules":[{"domain_suffix":[`)
++	for index := range 20000 {
++		if index > 0 {
++			source.WriteByte(',')
++		}
++		fmt.Fprintf(&source, `"host%d.example.com"`, index)
++	}
++	source.WriteString(`]}]}`)
++	content := []byte(source.String())
++	for range 5 {
++		ctx, cancel := context.WithCancel(context.Background())
++		set := newTestRuleSet("")
++		set.ctx, set.cancel = ctx, cancel
++		set.options.Format = C.RuleSetFormatSource
++		var wg sync.WaitGroup
++		wg.Add(1)
++		go func() {
++			defer wg.Done()
++			_ = set.commitBytes(content)
++		}()
++		require.NoError(t, set.Close())
++		wg.Wait()
++		require.Empty(t, set.content.Load().rules)
++		require.False(t, set.Match(&adapter.InboundContext{Domain: "host1.example.com"}))
++	}
++}
++
++// A reload the file watcher started does not give a closed local set its rules back, nor
++// run the callbacks.
++func TestLocalRuleSetReloadAfterClose(t *testing.T) {
++	set := &LocalRuleSet{ctx: context.Background(), tag: "test"}
++	var callbacks int
++	set.RegisterCallback(func(adapter.RuleSet) { callbacks++ })
++	require.NoError(t, set.reloadRules(testHeadlessRules(t, `{"version":3,"rules":[{"domain_suffix":["example.com"]}]}`)))
++	require.Equal(t, 1, callbacks)
++	require.True(t, set.Match(&adapter.InboundContext{Domain: "www.example.com"}))
++	require.NoError(t, set.Close())
++	require.NoError(t, set.reloadRules(testHeadlessRules(t, `{"version":3,"rules":[{"domain_suffix":["example.org"]}]}`)))
++	require.Equal(t, 1, callbacks)
++	require.False(t, set.Match(&adapter.InboundContext{Domain: "www.example.com"}))
++	require.False(t, set.Match(&adapter.InboundContext{Domain: "www.example.org"}))
++}
++
++func testHeadlessRules(t *testing.T, content string) []option.HeadlessRule {
++	t.Helper()
++	plain, err := json.UnmarshalExtended[option.PlainRuleSetCompat]([]byte(content))
++	require.NoError(t, err)
++	upgraded, err := plain.Upgrade()
++	require.NoError(t, err)
++	return upgraded.Rules
 +}
 diff --git a/route/rule/rule_set_hook.go b/route/rule/rule_set_hook.go
 new file mode 100644
@@ -561,50 +736,26 @@ index 000000000..442d6f697
 +	require.Contains(t, lines[1], "exit status 127")
 +}
 diff --git a/route/rule/rule_set_local.go b/route/rule/rule_set_local.go
-index 4314c3271..183e1d6cf 100644
+index a5777bf77..e304c2625 100644
 --- a/route/rule/rule_set_local.go
 +++ b/route/rule/rule_set_local.go
-@@ -15,7 +15,6 @@ import (
+@@ -14,7 +14,6 @@ import (
+ 	"github.com/sagernet/sing-box/option"
  	"github.com/sagernet/sing/common"
  	E "github.com/sagernet/sing/common/exceptions"
- 	F "github.com/sagernet/sing/common/format"
 -	"github.com/sagernet/sing/common/json"
  	"github.com/sagernet/sing/common/logger"
  	"github.com/sagernet/sing/common/x/list"
  	"github.com/sagernet/sing/service/filemanager"
-@@ -31,6 +30,7 @@ type LocalRuleSet struct {
- 	tag        string
- 	access     sync.RWMutex
- 	rules      []adapter.HeadlessRule
-+	closed     bool
- 	metadata   adapter.RuleSetMetadata
+@@ -32,6 +31,7 @@ type LocalRuleSet struct {
  	fileFormat string
  	watcher    *fswatch.Watcher
-@@ -82,7 +82,22 @@ func (s *LocalRuleSet) Name() string {
+ 	access     sync.Mutex
++	closed     bool
+ 	callbacks  list.List[adapter.RuleSetUpdateCallback]
+ 	refs       atomic.Int32
  }
- 
- func (s *LocalRuleSet) String() string {
--	return strings.Join(F.MapToString(s.rules), " ")
-+	return strings.Join(F.MapToString(s.currentRules()), " ")
-+}
-+
-+// currentRules reads the rules under the lock that reloadRules swaps them under: the file
-+// watcher reloads a local set while connections match it.
-+func (s *LocalRuleSet) currentRules() []adapter.HeadlessRule {
-+	s.access.RLock()
-+	defer s.access.RUnlock()
-+	return s.rules
-+}
-+
-+// dropRules forgets the rules, under the same lock.
-+func (s *LocalRuleSet) dropRules() {
-+	s.access.Lock()
-+	s.rules = nil
-+	s.access.Unlock()
- }
- 
- func (s *LocalRuleSet) StartContext(ctx context.Context, startContext *adapter.HTTPStartContext) error {
-@@ -103,7 +118,7 @@ func (s *LocalRuleSet) reloadFile(path string) error {
+@@ -101,7 +101,7 @@ func (s *LocalRuleSet) reloadFile(path string) error {
  		if err != nil {
  			return err
  		}
@@ -613,55 +764,51 @@ index 4314c3271..183e1d6cf 100644
  		if err != nil {
  			return err
  		}
-@@ -152,6 +167,11 @@ func (s *LocalRuleSet) reloadRules(headlessRules []option.HeadlessRule) error {
+@@ -149,8 +149,14 @@ func (s *LocalRuleSet) reloadRules(headlessRules []option.HeadlessRule) error {
+ 	if err != nil {
  		return err
  	}
+-	s.content.Store(&ruleSetContent{rules: rules, metadata: metadata})
++	// under the lock Close takes: a reload does not give a closed set its rules back
  	s.access.Lock()
 +	if s.closed {
 +		// a reload the watcher had already started when the set was closed
 +		s.access.Unlock()
 +		return nil
 +	}
- 	s.rules = rules
- 	s.metadata = metadata
++	s.content.Store(&ruleSetContent{rules: rules, metadata: metadata})
  	callbacks := s.callbacks.Array()
-@@ -186,7 +206,7 @@ func (s *LocalRuleSet) DecRef() {
+ 	s.access.Unlock()
+ 	for _, callback := range callbacks {
+@@ -179,7 +185,7 @@ func (s *LocalRuleSet) DecRef() {
  
  func (s *LocalRuleSet) Cleanup() {
  	if s.refs.Load() == 0 {
--		s.rules = nil
-+		s.dropRules()
+-		s.content.Store(&ruleSetContent{})
++		dropRules(&s.content)
  	}
  }
  
-@@ -203,14 +223,18 @@ func (s *LocalRuleSet) UnregisterCallback(element *list.Element[adapter.RuleSetU
+@@ -196,8 +202,12 @@ func (s *LocalRuleSet) UnregisterCallback(element *list.Element[adapter.RuleSetU
  }
  
  func (s *LocalRuleSet) Close() error {
 +	err := common.Close(common.PtrOrNil(s.watcher))
 +	s.access.Lock()
 +	s.closed = true
- 	s.rules = nil
+ 	s.content.Store(&ruleSetContent{})
 -	return common.Close(common.PtrOrNil(s.watcher))
 +	s.access.Unlock()
 +	return err
  }
  
  func (s *LocalRuleSet) Match(metadata *adapter.InboundContext) bool {
--	return matchAnyHeadlessRule(s.rules, metadata)
-+	return matchAnyHeadlessRule(s.currentRules(), metadata)
- }
- 
- func (s *LocalRuleSet) mergeableRule() *DefaultHeadlessRule {
--	return mergeableRuleIn(s.rules)
-+	return mergeableRuleIn(s.currentRules())
- }
 diff --git a/route/rule/rule_set_local_race_test.go b/route/rule/rule_set_local_race_test.go
 new file mode 100644
-index 000000000..21f95d2b9
+index 000000000..3d1e21697
 --- /dev/null
 +++ b/route/rule/rule_set_local_race_test.go
-@@ -0,0 +1,61 @@
+@@ -0,0 +1,63 @@
 +package rule
 +
 +import (
@@ -707,7 +854,9 @@ index 000000000..21f95d2b9
 +				metadata := adapter.InboundContext{Domain: "www.example.com", Destination: M.ParseSocksaddr("1.2.3.4:443")}
 +				s.Match(&metadata)
 +				_ = s.String()
-+				_ = s.mergeableRule()
++				_ = s.Metadata()
++				_ = s.ExtractIPSet()
++				_ = s.loadContent().mergeableRule()
 +			}
 +		}()
 +	}
@@ -723,11 +872,41 @@ index 000000000..21f95d2b9
 +	close(stop)
 +	wg.Wait()
 +}
+diff --git a/route/rule/rule_set_process_test.go b/route/rule/rule_set_process_test.go
+new file mode 100644
+index 000000000..d05e7daf6
+--- /dev/null
++++ b/route/rule/rule_set_process_test.go
+@@ -0,0 +1,24 @@
++package rule_test
++
++import (
++	"testing"
++	"time"
++
++	"github.com/sagernet/sing-box/route/rule"
++
++	"github.com/stretchr/testify/require"
++)
++
++// A set that started empty and loads a list with process rules later makes the router look
++// up the processes of connections: the callbacks a download runs (podkop-engine) reach the
++// router's tracking of process rules in updated sets (upstream).
++func TestRuleSetStartedEmptyLoadsProcessRules(t *testing.T) {
++	defer rule.SwapTimeoutsForTest(10*time.Second, 300*time.Millisecond)()
++	server, requests := slowFirstListServer(t, `{"version":3,"rules":[{"process_name":["curl"]}]}`)
++	logs := &memLog{}
++	instance := startBox(t, startEmptyConfig(server.URL, ``), logs)
++	require.Equal(t, 1, logs.count("starting empty and retrying"), logs.dump())
++	require.False(t, instance.Router().NeedFindProcess(), "an empty set has no process rules")
++	require.Eventually(t, func() bool { return instance.Router().NeedFindProcess() }, 10*time.Second, 100*time.Millisecond, "the loaded list did not reach the router:\n%s", logs.dump())
++	require.Equal(t, int32(2), requests.Load(), "the start fetch and one load")
++}
 diff --git a/route/rule/rule_set_remote.go b/route/rule/rule_set_remote.go
-index e673b74ae..c3eea334d 100644
+index f442cc6b9..42d5282a4 100644
 --- a/route/rule/rule_set_remote.go
 +++ b/route/rule/rule_set_remote.go
-@@ -1,18 +1,26 @@
+@@ -1,25 +1,32 @@
  package rule
  
  import (
@@ -754,22 +933,22 @@ index e673b74ae..c3eea334d 100644
  	"github.com/sagernet/sing-box/common/srs"
  	C "github.com/sagernet/sing-box/constant"
  	"github.com/sagernet/sing-box/experimental/deprecated"
-@@ -20,7 +28,6 @@ import (
+ 	"github.com/sagernet/sing-box/option"
  	"github.com/sagernet/sing/common"
  	E "github.com/sagernet/sing/common/exceptions"
- 	F "github.com/sagernet/sing/common/format"
 -	"github.com/sagernet/sing/common/json"
  	"github.com/sagernet/sing/common/logger"
  	"github.com/sagernet/sing/common/x/list"
  	"github.com/sagernet/sing/service"
-@@ -49,10 +56,19 @@ type RemoteRuleSet struct {
- 	metadata       adapter.RuleSetMetadata
+@@ -46,11 +53,20 @@ type RemoteRuleSet struct {
+ 	content        atomic.Pointer[ruleSetContent]
  	lastUpdated    time.Time
  	lastEtag       string
 +	startedEmpty   bool
-+	contentUnknown bool
++	contentUnknown atomic.Bool
  	cacheFile      adapter.CacheFile
  	pauseManager   pause.Manager
+ 	access         sync.Mutex
  	callbacks      list.List[adapter.RuleSetUpdateCallback]
  	refs           atomic.Int32
 +	// the updater's own: whether the last fetch loaded a list, and the failed updates
@@ -782,31 +961,7 @@ index e673b74ae..c3eea334d 100644
  }
  
  func NewRemoteRuleSet(ctx context.Context, logger logger.ContextLogger, tag string, options option.RuleSet) (*RemoteRuleSet, error) {
-@@ -89,7 +105,22 @@ func (s *RemoteRuleSet) Name() string {
- }
- 
- func (s *RemoteRuleSet) String() string {
--	return strings.Join(F.MapToString(s.rules), " ")
-+	return strings.Join(F.MapToString(s.currentRules()), " ")
-+}
-+
-+// currentRules reads the rules under the lock that loadBytes swaps them under: since the
-+// start deadline (podkop-engine) a set routinely gets its rules while connections match it.
-+func (s *RemoteRuleSet) currentRules() []adapter.HeadlessRule {
-+	s.access.RLock()
-+	defer s.access.RUnlock()
-+	return s.rules
-+}
-+
-+// dropRules forgets the rules, under the same lock.
-+func (s *RemoteRuleSet) dropRules() {
-+	s.access.Lock()
-+	s.rules = nil
-+	s.access.Unlock()
- }
- 
- func (s *RemoteRuleSet) StartContext(ctx context.Context, startContext *adapter.HTTPStartContext) error {
-@@ -100,21 +131,9 @@ func (s *RemoteRuleSet) StartContext(ctx context.Context, startContext *adapter.
+@@ -100,21 +116,9 @@ func (s *RemoteRuleSet) StartContext(ctx context.Context, startContext *adapter.
  	}
  	startContext.Register(transport)
  	s.httpClient = &http.Client{Transport: transport}
@@ -831,7 +986,7 @@ index e673b74ae..c3eea334d 100644
  	}
  	var loadedFromInitialPath bool
  	if s.lastUpdated.IsZero() && s.initialPath != "" {
-@@ -130,17 +149,76 @@ func (s *RemoteRuleSet) StartContext(ctx context.Context, startContext *adapter.
+@@ -130,15 +134,73 @@ func (s *RemoteRuleSet) StartContext(ctx context.Context, startContext *adapter.
  		}
  	}
  	if s.lastUpdated.IsZero() && !loadedFromInitialPath {
@@ -891,37 +1046,34 @@ index e673b74ae..c3eea334d 100644
 +}
 +
 +// startEmpty marks a set that starts without content; the updater fetches it at once
-+// and then retries with a backoff until the first download succeeds.
++// and then retries with a backoff until the first download succeeds. contentUnknown stays set
++// until a list is in the content (commitBytes).
 +func (s *RemoteRuleSet) startEmpty() {
 +	s.startedEmpty = true
 +	// The DNS router decides its rule mode from the metadata of the referenced sets
 +	// when it starts, right after this. Until the content is known, report it as
 +	// mixed (domains and IP CIDRs): that is the only answer every later content is
 +	// compatible with under the DNS router's update validator.
-+	s.access.Lock()
-+	s.contentUnknown = true
-+	s.access.Unlock()
++	s.contentUnknown.Store(true)
 +}
 +
  func (s *RemoteRuleSet) Metadata() adapter.RuleSetMetadata {
- 	s.access.RLock()
- 	defer s.access.RUnlock()
-+	if s.contentUnknown {
++	if s.contentUnknown.Load() {
 +		return adapter.RuleSetMetadata{ContainsIPCIDRRule: true, ContainsNonIPCIDRRule: true}
 +	}
- 	return s.metadata
+ 	return s.content.Load().metadata
  }
  
-@@ -162,7 +240,7 @@ func (s *RemoteRuleSet) DecRef() {
+@@ -158,7 +220,7 @@ func (s *RemoteRuleSet) DecRef() {
  
  func (s *RemoteRuleSet) Cleanup() {
  	if s.refs.Load() == 0 {
--		s.rules = nil
-+		s.dropRules()
+-		s.content.Store(&ruleSetContent{})
++		dropRules(&s.content)
  	}
  }
  
-@@ -178,19 +256,33 @@ func (s *RemoteRuleSet) UnregisterCallback(element *list.Element[adapter.RuleSet
+@@ -174,19 +236,33 @@ func (s *RemoteRuleSet) UnregisterCallback(element *list.Element[adapter.RuleSet
  	s.callbacks.Remove(element)
  }
  
@@ -957,7 +1109,7 @@ index e673b74ae..c3eea334d 100644
  		if err != nil {
  			return err
  		}
-@@ -212,6 +304,9 @@ func (s *RemoteRuleSet) loadBytes(content []byte) error {
+@@ -208,6 +284,9 @@ func (s *RemoteRuleSet) loadBytes(content []byte) error {
  	}
  	rules := make([]adapter.HeadlessRule, len(plainRuleSet.Rules))
  	for i, ruleOptions := range plainRuleSet.Rules {
@@ -967,14 +1119,18 @@ index e673b74ae..c3eea334d 100644
  		rules[i], err = NewHeadlessRule(s.ctx, ruleOptions)
  		if err != nil {
  			return E.Cause(err, "parse rule_set.rules.[", i, "]")
-@@ -225,25 +320,224 @@ func (s *RemoteRuleSet) loadBytes(content []byte) error {
- 	s.access.Lock()
- 	s.metadata = metadata
- 	s.rules = rules
--	callbacks := s.callbacks.Array()
-+	s.contentUnknown = false
- 	s.access.Unlock()
+@@ -219,26 +298,227 @@ func (s *RemoteRuleSet) loadBytes(content []byte) error {
+ 		return err
+ 	}
+ 	s.content.Store(&ruleSetContent{rules: rules, metadata: metadata})
++	// after the content: Metadata must not report the empty content in between
++	s.contentUnknown.Store(false)
 +	s.contentSize.Store(int64(len(content)))
++	if s.ctx.Err() != nil {
++		// closed while it parsed: Close may have dropped the content before this stored it
++		s.content.Store(&ruleSetContent{})
++		return s.ctx.Err()
++	}
 +	return nil
 +}
 +
@@ -995,9 +1151,9 @@ index e673b74ae..c3eea334d 100644
 +// notifyUpdated runs the callbacks of a new content. A download calls it once the content
 +// is saved to the cache file as well: a callback may read the set from there.
 +func (s *RemoteRuleSet) notifyUpdated() {
-+	s.access.RLock()
-+	callbacks := s.callbacks.Array()
-+	s.access.RUnlock()
+ 	s.access.Lock()
+ 	callbacks := s.callbacks.Array()
+ 	s.access.Unlock()
  	for _, callback := range callbacks {
  		callback(s)
  	}
@@ -1011,8 +1167,8 @@ index e673b74ae..c3eea334d 100644
  	err := s.fetch(s.ctx, false)
  	if err != nil {
 -		s.logger.Error("fetch rule-set ", s.tag, ": ", err)
--	} else if s.refs.Load() == 0 {
--		s.rules = nil
+-	} else {
+-		s.Cleanup()
 +		if s.ctx.Err() != nil {
 +			// cut by the shutdown, not a failed update
 +			return false
@@ -1023,13 +1179,11 @@ index e673b74ae..c3eea334d 100644
 +	if s.failures > 0 {
 +		s.logger.Info("fetch rule-set ", s.tag, ": succeeded after ", s.failures, " failed attempts")
 +		s.failures = 0
-+	}
-+	if s.refs.Load() == 0 {
-+		s.dropRules()
-+	}
+ 	}
++	s.Cleanup()
 +	return s.fetchLoaded
-+}
-+
+ }
+ 
 +// ruleSetFailureLogInterval is how often a rule-set that keeps failing to update logs its
 +// failures as an error.
 +const ruleSetFailureLogInterval = 10 * time.Minute
@@ -1161,12 +1315,12 @@ index e673b74ae..c3eea334d 100644
 +	description.WriteString(strconv.Quote(contentType))
 +	if len(sample) > ruleSetSampleSize {
 +		sample = sample[:ruleSetSampleSize]
- 	}
++	}
 +	description.WriteString(", starts with ")
 +	description.WriteString(strconv.Quote(string(sample)))
 +	return description.String()
- }
- 
++}
++
 +// fetch downloads the list through the http client of the rule-set and, while that fails, through
 +// each of its fallback clients in turn. Each way has the whole stall timeout of its own; the start
 +// deadline bounds them all. The error is that of every way.
@@ -1198,7 +1352,7 @@ index e673b74ae..c3eea334d 100644
  	request, err := http.NewRequest("GET", s.url, nil)
  	if err != nil {
  		return err
-@@ -252,18 +546,32 @@ func (s *RemoteRuleSet) fetch(ctx context.Context, isStart bool) error {
+@@ -247,18 +527,32 @@ func (s *RemoteRuleSet) fetch(ctx context.Context, isStart bool) error {
  		request.Header.Set("If-None-Match", s.lastEtag)
  	}
  	if !isStart {
@@ -1235,7 +1389,7 @@ index e673b74ae..c3eea334d 100644
  			savedRuleSet := s.cacheFile.LoadRuleSet(s.tag)
  			if savedRuleSet != nil {
  				savedRuleSet.LastUpdated = s.lastUpdated
-@@ -280,14 +588,27 @@ func (s *RemoteRuleSet) fetch(ctx context.Context, isStart bool) error {
+@@ -275,14 +569,27 @@ func (s *RemoteRuleSet) fetch(ctx context.Context, isStart bool) error {
  	default:
  		return E.New("unexpected status: ", response.Status)
  	}
@@ -1258,16 +1412,16 @@ index e673b74ae..c3eea334d 100644
  	if err != nil {
 -		return err
 +		return E.Cause(err, "read rule-set (", describeRuleSetBody(response, int64(len(content)), content), ")")
-+	}
+ 	}
 +	if s.ctx.Err() != nil {
 +		// closed during the parse: its cache file and the callbacks are closed too
 +		return s.ctx.Err()
- 	}
++	}
 +	s.fetchLoaded = true
  	eTagHeader := response.Header.Get("Etag")
  	if eTagHeader != "" {
  		s.lastEtag = eTagHeader
-@@ -305,6 +626,7 @@ func (s *RemoteRuleSet) fetch(ctx context.Context, isStart bool) error {
+@@ -300,6 +607,7 @@ func (s *RemoteRuleSet) fetch(ctx context.Context, isStart bool) error {
  		}
  	}
  	s.logger.Info("updated rule-set ", s.tag)
@@ -1275,28 +1429,21 @@ index e673b74ae..c3eea334d 100644
  	return nil
  }
  
-@@ -333,15 +655,15 @@ func (s *RemoteRuleSet) resolveTransport() (adapter.HTTPTransport, error) {
+@@ -328,8 +636,10 @@ func (s *RemoteRuleSet) resolveTransport() (adapter.HTTPTransport, error) {
  }
  
  func (s *RemoteRuleSet) Close() error {
--	s.rules = nil
-+	s.dropRules()
+-	s.content.Store(&ruleSetContent{})
++	// cancel first: a parse that stores its content after this sees the end of ctx and drops
++	// it again (commitBytes)
  	s.cancel()
++	s.content.Store(&ruleSetContent{})
  	return nil
  }
  
- func (s *RemoteRuleSet) Match(metadata *adapter.InboundContext) bool {
--	return matchAnyHeadlessRule(s.rules, metadata)
-+	return matchAnyHeadlessRule(s.currentRules(), metadata)
- }
- 
- func (s *RemoteRuleSet) mergeableRule() *DefaultHeadlessRule {
--	return mergeableRuleIn(s.rules)
-+	return mergeableRuleIn(s.currentRules())
- }
 diff --git a/route/rule/rule_set_remote_body_test.go b/route/rule/rule_set_remote_body_test.go
 new file mode 100644
-index 000000000..e4a1ad995
+index 000000000..a62763a87
 --- /dev/null
 +++ b/route/rule/rule_set_remote_body_test.go
 @@ -0,0 +1,172 @@
@@ -1410,7 +1557,7 @@ index 000000000..e4a1ad995
 +		set.ctx = context.Background()
 +		set.options.Format = C.RuleSetFormatSource
 +		require.NoError(t, set.fetch(context.Background(), false), "chunked=%v", chunked)
-+		require.Len(t, set.currentRules(), 1)
++		require.Len(t, set.content.Load().rules, 1)
 +		server.Close()
 +	}
 +}
@@ -1474,7 +1621,7 @@ index 000000000..e4a1ad995
 +}
 diff --git a/route/rule/rule_set_remote_checked_test.go b/route/rule/rule_set_remote_checked_test.go
 new file mode 100644
-index 000000000..59807cef7
+index 000000000..5c0aaa25f
 --- /dev/null
 +++ b/route/rule/rule_set_remote_checked_test.go
 @@ -0,0 +1,69 @@
@@ -1545,14 +1692,14 @@ index 000000000..59807cef7
 +	next.loadCached()
 +	require.True(t, next.lastUpdated.Equal(cache.checked["test"]))
 +	require.Equal(t, `"v1"`, next.lastEtag)
-+	require.NotNil(t, next.rules)
++	require.NotEmpty(t, next.content.Load().rules)
 +}
 diff --git a/route/rule/rule_set_remote_race_test.go b/route/rule/rule_set_remote_race_test.go
 new file mode 100644
-index 000000000..a424f91b2
+index 000000000..2538d031b
 --- /dev/null
 +++ b/route/rule/rule_set_remote_race_test.go
-@@ -0,0 +1,47 @@
+@@ -0,0 +1,54 @@
 +package rule
 +
 +import (
@@ -1590,10 +1737,17 @@ index 000000000..a424f91b2
 +				metadata := adapter.InboundContext{Domain: "www.example.com", Destination: M.ParseSocksaddr("1.2.3.4:443")}
 +				s.Match(&metadata)
 +				_ = s.String()
++				_ = s.Metadata()
++				_ = s.ExtractIPSet()
++				_ = s.loadContent().mergeableRule()
 +			}
 +		}()
 +	}
-+	for range 50 {
++	for i := range 50 {
++		if i%10 == 0 {
++			// a set that started empty reports its content as unknown until a list comes
++			s.startEmpty()
++		}
 +		require.NoError(t, s.loadBytes(content))
 +	}
 +	s.Cleanup()
@@ -1708,7 +1862,7 @@ index 000000000..08fbe9cec
 +}
 diff --git a/route/rule/rule_set_remote_stop_test.go b/route/rule/rule_set_remote_stop_test.go
 new file mode 100644
-index 000000000..62c61a447
+index 000000000..e5ca7eec0
 --- /dev/null
 +++ b/route/rule/rule_set_remote_stop_test.go
 @@ -0,0 +1,48 @@
@@ -1745,7 +1899,7 @@ index 000000000..62c61a447
 +		ruleSet := &RemoteRuleSet{ctx: ctx, tag: "big", options: option.RuleSet{Format: format}}
 +		cancel()
 +		require.ErrorIs(t, ruleSet.commitBytes([]byte(content)), context.Canceled, format)
-+		require.Nil(t, ruleSet.rules, format)
++		require.Nil(t, ruleSet.content.Load(), format)
 +	}
 +}
 +
@@ -1762,10 +1916,10 @@ index 000000000..62c61a447
 +}
 diff --git a/route/rule/rule_set_remote_timeout_test.go b/route/rule/rule_set_remote_timeout_test.go
 new file mode 100644
-index 000000000..a86ced09a
+index 000000000..995483c22
 --- /dev/null
 +++ b/route/rule/rule_set_remote_timeout_test.go
-@@ -0,0 +1,107 @@
+@@ -0,0 +1,110 @@
 +package rule
 +
 +import (
@@ -1782,13 +1936,16 @@ index 000000000..a86ced09a
 +)
 +
 +func newTestRuleSet(url string) *RemoteRuleSet {
-+	return &RemoteRuleSet{
++	set := &RemoteRuleSet{
 +		ctx:        context.Background(),
 +		logger:     log.NewNOPFactory().NewLogger("test"),
 +		tag:        "test",
 +		url:        url,
 +		httpClient: &http.Client{},
 +	}
++	// as NewRemoteRuleSet: an empty content until a list loads
++	set.content.Store(&ruleSetContent{})
++	return set
 +}
 +
 +// A download that sends its headers and then goes silent must not hold the caller: the stall
@@ -1875,15 +2032,16 @@ index 000000000..a86ced09a
 +}
 diff --git a/route/rule/rule_set_start.go b/route/rule/rule_set_start.go
 new file mode 100644
-index 000000000..749c61884
+index 000000000..c8d708d52
 --- /dev/null
 +++ b/route/rule/rule_set_start.go
-@@ -0,0 +1,34 @@
+@@ -0,0 +1,52 @@
 +package rule
 +
 +import (
 +	"context"
 +	"os"
++	"sync/atomic"
 +
 +	"github.com/sagernet/sing/service"
 +)
@@ -1912,6 +2070,23 @@ index 000000000..749c61884
 +// ruleSetStartEmpty is what the environment tells. A variable for the tests.
 +var ruleSetStartEmpty = func() bool {
 +	return os.Getenv("SING_BOX_RULE_SET_START_EMPTY") != ""
++}
++
++// dropRules lets the rules of a set no rule uses go (memory), as upstream's Cleanup does, but keeps
++// its metadata: a program that embeds the box reads what a list holds also of a list no rule uses
++// (podkop-exp: whether it has addresses for the firewall, of the lists of a rule that is off), as
++// it could before upstream kept the rules and the metadata together (f0fbf236f). A content stored
++// meanwhile is not overwritten with an older metadata.
++func dropRules(content *atomic.Pointer[ruleSetContent]) {
++	for {
++		current := content.Load()
++		if current.rules == nil {
++			return
++		}
++		if content.CompareAndSwap(current, &ruleSetContent{metadata: current.metadata}) {
++			return
++		}
++	}
 +}
 diff --git a/route/rule/rule_set_start_empty_test.go b/route/rule/rule_set_start_empty_test.go
 new file mode 100644

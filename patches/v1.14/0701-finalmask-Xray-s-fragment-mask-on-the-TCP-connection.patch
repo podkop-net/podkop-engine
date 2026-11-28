@@ -1,4 +1,4 @@
-From 173d7d011ffc9e655cfb8093df92c1868b9e4501 Mon Sep 17 00:00:00 2001
+From 3312bec45ba30b14c217e4fde4f8c95b9be47092 Mon Sep 17 00:00:00 2001
 From: FiyeroT <me@fiyero.xyz>
 Date: Sat, 21 Nov 2026 14:16:35 +0300
 Subject: [PATCH 68/71] finalmask: Xray's fragment mask on the TCP connections
@@ -13,8 +13,11 @@ dialer opens for the outbound, beneath TLS, REALITY and every transport:
   in a write of its own with its delay;
 - packets "N-M" (from 1): writes N to M are cut into pieces, each a write; "": every write;
 - max_split bounds the pieces, the last one taking the rest;
-- masks in a list are chained as in Xray, the first next to the socket: a "1-1" mask under a
-  "tlshello" one writes the cut ClientHello in two TCP pieces.
+- masks in a list are chained as in Xray, whose NewFinalMask reverses the list: the first one
+  takes the writes first, the last one is next to the socket; with [tlshello, 1-1] the "1-1"
+  mask under the "tlshello" one writes the cut ClientHello in two TCP pieces. Checked on the
+  wire against Xray 26.9.9 and 26.11.9 (podkop-exp lab/runs/2026-11-28-fmorder): the same
+  records with both lists; r28 and r29 chained the list the other way round.
 
 The cutting is Xray's, piece for piece, its ranges drawn as Xray draws them (from included, to
 left out: "11-24" gives 11 to 23). A ClientHello is cut only when the first write is a whole
@@ -54,21 +57,21 @@ Pdk-Layer: 07
  cmd/sing-box/version_features.go           |   2 +
  common/dialer/default.go                   |  10 +
  common/dialer/default_finalmask_test.go    |  71 +++++
- common/finalmask/conn.go                   | 199 ++++++++++++++
- common/finalmask/finalmask.go              | 149 +++++++++++
- common/finalmask/finalmask_test.go         | 292 +++++++++++++++++++++
+ common/finalmask/conn.go                   | 199 +++++++++++++
+ common/finalmask/finalmask.go              | 153 ++++++++++
+ common/finalmask/finalmask_test.go         | 322 +++++++++++++++++++++
  common/sharelink/link.go                   |  14 +
  common/sharelink/link_test.go              |  57 ++--
  common/sharelink/policy.go                 |   3 +-
- common/sharelink/policy_test.go            |  62 ++++-
- common/sharelink/quic.go                   | 161 ++++++++++--
+ common/sharelink/policy_test.go            |  62 +++-
+ common/sharelink/quic.go                   | 161 ++++++++++-
  common/sharelink/schemes_test.go           |  29 +-
  common/sharelink/testdata/options-1.14.txt |  23 ++
  common/sharelink/tls.go                    |  51 +++-
- common/sharelink/transport.go              |  93 ++++++-
- option/finalmask.go                        |  32 +++
+ common/sharelink/transport.go              |  93 +++++-
+ option/finalmask.go                        |  34 +++
  option/outbound.go                         |   2 +
- 17 files changed, 1182 insertions(+), 68 deletions(-)
+ 17 files changed, 1218 insertions(+), 68 deletions(-)
  create mode 100644 common/dialer/default_finalmask_test.go
  create mode 100644 common/finalmask/conn.go
  create mode 100644 common/finalmask/finalmask.go
@@ -87,10 +90,10 @@ index c5b410ff5..50cf01695 100644
 +	"dialer.finalmask",
  }
 diff --git a/common/dialer/default.go b/common/dialer/default.go
-index 88d6566fa..f38be80af 100644
+index 23d8b168c..54e87a1ed 100644
 --- a/common/dialer/default.go
 +++ b/common/dialer/default.go
-@@ -10,6 +10,7 @@ import (
+@@ -12,6 +12,7 @@ import (
  	"time"
  
  	"github.com/sagernet/sing-box/adapter"
@@ -98,7 +101,7 @@ index 88d6566fa..f38be80af 100644
  	"github.com/sagernet/sing-box/common/listener"
  	"github.com/sagernet/sing-box/common/probesock"
  	C "github.com/sagernet/sing-box/constant"
-@@ -52,6 +53,8 @@ type DefaultDialer struct {
+@@ -57,6 +58,8 @@ type DefaultDialer struct {
  	fallbackNetworkType    []C.InterfaceType
  	networkFallbackDelay   time.Duration
  	networkLastFallback    common.TypedValue[time.Time]
@@ -107,7 +110,7 @@ index 88d6566fa..f38be80af 100644
  }
  
  func NewDefault(ctx context.Context, options option.DialerOptions) (*DefaultDialer, error) {
-@@ -229,7 +232,12 @@ func NewDefault(ctx context.Context, options option.DialerOptions) (*DefaultDial
+@@ -242,7 +245,12 @@ func NewDefault(ctx context.Context, options option.DialerOptions) (*DefaultDial
  	}
  	tcpDialer4 := tfo.Dialer{Dialer: dialer4, DisableTFO: !options.TCPFastOpen}
  	tcpDialer6 := tfo.Dialer{Dialer: dialer6, DisableTFO: !options.TCPFastOpen}
@@ -115,12 +118,12 @@ index 88d6566fa..f38be80af 100644
 +	if err != nil {
 +		return nil, err
 +	}
- 	return &DefaultDialer{
+ 	defaultDialer := &DefaultDialer{
 +		finalMask:              finalMask,
  		dialer4:                tcpDialer4,
  		dialer6:                tcpDialer6,
  		udpDialer4:             udpDialer4,
-@@ -450,6 +458,8 @@ func (d *DefaultDialer) trackConn(ctx context.Context, destination M.Socksaddr,
+@@ -509,6 +517,8 @@ func (d *DefaultDialer) trackConn(ctx context.Context, destination M.Socksaddr,
  			return nil, err
  		}
  		conn = &udpConn{Conn: conn, rawConn: rawConn}
@@ -413,10 +416,10 @@ index 000000000..83691caec
 +}
 diff --git a/common/finalmask/finalmask.go b/common/finalmask/finalmask.go
 new file mode 100644
-index 000000000..e235a951d
+index 000000000..0078a0c11
 --- /dev/null
 +++ b/common/finalmask/finalmask.go
-@@ -0,0 +1,149 @@
+@@ -0,0 +1,153 @@
 +// Package finalmask puts Xray's finalmask masks on the TCP connections of an outbound: what
 +// goes over the wire is reshaped, what it carries is not. Only "fragment" is here, the one
 +// mask a server does not see (transport/internet/finalmask/fragment of Xray-core, 26.x): it
@@ -433,7 +436,7 @@ index 000000000..e235a951d
 +	E "github.com/sagernet/sing/common/exceptions"
 +)
 +
-+// Masks are the masks of one outbound, in the order of its options.
++// Masks are the masks of one outbound, in the order of its options (the first one outermost).
 +type Masks struct {
 +	fragments []*fragment
 +}
@@ -459,14 +462,18 @@ index 000000000..e235a951d
 +	return masks, nil
 +}
 +
-+// Client puts the masks on a TCP connection the outbound opened: the first mask of the list
-+// is the one nearest to the socket, as in Xray.
++// Client puts the masks on a TCP connection the outbound opened. As in Xray (NewFinalMask
++// reverses the list before it wraps the connection), the last mask of the list is the one
++// nearest to the socket and the first one takes the writes first: [tlshello, 1-1] cuts the
++// ClientHello into records and then the first write, those records, into pieces, while
++// [1-1, tlshello] cuts the hello into pieces that tlshello then leaves alone (no piece is a
++// whole record).
 +func (m *Masks) Client(conn net.Conn) net.Conn {
 +	if m == nil {
 +		return conn
 +	}
-+	for _, mask := range m.fragments {
-+		conn = newFragmentConn(conn, mask)
++	for index := len(m.fragments) - 1; index >= 0; index-- {
++		conn = newFragmentConn(conn, m.fragments[index])
 +	}
 +	return conn
 +}
@@ -568,10 +575,10 @@ index 000000000..e235a951d
 +}
 diff --git a/common/finalmask/finalmask_test.go b/common/finalmask/finalmask_test.go
 new file mode 100644
-index 000000000..099235cd9
+index 000000000..d8449dfee
 --- /dev/null
 +++ b/common/finalmask/finalmask_test.go
-@@ -0,0 +1,292 @@
+@@ -0,0 +1,322 @@
 +package finalmask
 +
 +import (
@@ -711,6 +718,36 @@ index 000000000..099235cd9
 +	require.Equal(t, message[5:], payload)
 +	require.Equal(t, []int{50, 50, 20}, sizes)
 +	require.Equal(t, extra, under.writes[1])
++}
++
++// Two masks go as Xray chains them, the last next to the socket (Xray-core
++// transport/internet/finalmask/finalmask.go: NewFinalMask reverses the list). On the wire, with
++// Xray 26.9.9 and 26.10.31 (podkop-exp lab/runs/2026-11-25-selcheck): [tlshello, 1-1] sends the
++// hello in records, [1-1, tlshello] sends it as one record.
++func TestMasksInXrayOrder(t *testing.T) {
++	t.Parallel()
++	const (
++		hellos = `{"type":"fragment","packets":"tlshello","length":"11-24","delay":"0"}`
++		pieces = `{"type":"fragment","packets":"1-1","length":"100-200","max_split":"2"}`
++	)
++	for range 20 {
++		conn, under := masked(t, `{"tcp":[`+hellos+`,`+pieces+`]}`)
++		message := hello(1521)
++		n, err := conn.Write(message)
++		require.NoError(t, err)
++		require.Equal(t, len(message), n)
++		require.Len(t, under.writes, 2, "the records in two TCP pieces")
++		require.True(t, len(under.writes[0]) >= 100 && len(under.writes[0]) <= 199, "a first piece of %d bytes", len(under.writes[0]))
++		payload, sizes := records(t, bytes.Join(under.writes, nil))
++		require.Equal(t, message[5:], payload)
++		require.Greater(t, len(sizes), 1521/24, "the hello in records of 11 to 23 bytes")
++
++		conn, under = masked(t, `{"tcp":[`+pieces+`,`+hellos+`]}`)
++		_, err = conn.Write(message)
++		require.NoError(t, err)
++		require.Len(t, under.writes, 2)
++		require.Equal(t, message, bytes.Join(under.writes, nil), "the pieces are no whole record: the hello is not cut into records")
++	}
 +}
 +
 +func TestPacketsRange(t *testing.T) {
@@ -1773,16 +1810,18 @@ index a59c307ba..2bf7dbe4c 100644
  
 diff --git a/option/finalmask.go b/option/finalmask.go
 new file mode 100644
-index 000000000..9bab76d98
+index 000000000..1d8f47d05
 --- /dev/null
 +++ b/option/finalmask.go
-@@ -0,0 +1,32 @@
+@@ -0,0 +1,34 @@
 +package option
 +
 +// FinalMaskOptions are the masks put on the TCP connections an outbound opens itself, as
 +// Xray's finalmask (streamSettings.finalmask) puts them: they change how the bytes go over
 +// the wire, not the bytes. Only the masks the server does not see are taken: "fragment".
 +// Through a detour an outbound opens no connection of its own, and the masks do nothing.
++// The list is chained as Xray chains it: the first mask takes the writes first, the last
++// one is nearest to the socket.
 +type FinalMaskOptions struct {
 +	TCP []FinalMaskTCPOptions `json:"tcp,omitempty"`
 +}

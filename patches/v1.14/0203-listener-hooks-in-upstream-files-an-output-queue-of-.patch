@@ -1,4 +1,4 @@
-From dacb26e650a4f4e243fabe7aa503800d9e09496c Mon Sep 17 00:00:00 2001
+From 3ca7f82bb93e03fb764d788ca2654c054338f1f6 Mon Sep 17 00:00:00 2001
 From: FiyeroT <me@fiyero.xyz>
 Date: Thu, 12 Nov 2026 21:41:19 +0300
 Subject: [PATCH 07/71] listener, hooks in upstream files: an output queue of
@@ -16,10 +16,10 @@ Pdk-Layer: 02
  2 files changed, 12 insertions(+), 1 deletion(-)
 
 diff --git a/common/listener/listener.go b/common/listener/listener.go
-index 2cbbbab51..40d9d0271 100644
+index 1e47610ba..c584ad37d 100644
 --- a/common/listener/listener.go
 +++ b/common/listener/listener.go
-@@ -92,7 +92,7 @@ func (l *Listener) Start() error {
+@@ -98,7 +98,7 @@ func (l *Listener) Start() error {
  			return E.Errors(err, l.Close())
  		}
  		l.packetOutboundClosed = make(chan struct{})
@@ -29,10 +29,10 @@ index 2cbbbab51..40d9d0271 100644
  		if !l.disablePacketOutput {
  			go l.loopUDPOut()
 diff --git a/common/listener/listener_udp.go b/common/listener/listener_udp.go
-index 697ef34d1..b3d5c35a5 100644
+index d28a50136..bc7614bd4 100644
 --- a/common/listener/listener_udp.go
 +++ b/common/listener/listener_udp.go
-@@ -21,6 +21,17 @@ import (
+@@ -20,6 +20,17 @@ import (
  
  const udpOutputBatchSize = 128
  

@@ -1,4 +1,4 @@
-From 983934b85eccfbf8377c91b65e64314a2f87bd44 Mon Sep 17 00:00:00 2001
+From b18005166c228076147d1d0cecca8d62c915c372 Mon Sep 17 00:00:00 2001
 From: FiyeroT <me@fiyero.xyz>
 Date: Thu, 12 Nov 2026 21:41:20 +0300
 Subject: [PATCH 18/71] dns, hooks in upstream files: the transports group and
@@ -38,10 +38,10 @@ index d02688064..ebe36fb0f 100644
  
  const (
 diff --git a/dns/router.go b/dns/router.go
-index aa673b7ef..f5e5aa56f 100644
+index 68dd905b9..fbb3be4ee 100644
 --- a/dns/router.go
 +++ b/dns/router.go
-@@ -128,7 +128,9 @@ func (r *Router) Initialize(rules []option.DNSRule) error {
+@@ -136,7 +136,9 @@ func (r *Router) Initialize(rules []option.DNSRule) error {
  		return err
  	}
  	closeRules(newRules)

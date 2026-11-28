@@ -1,4 +1,4 @@
-From 5a26828e081193f65a92bc878351f27a6862d227 Mon Sep 17 00:00:00 2001
+From 28ca5621f34804dcfcf3368bb778e33cfc7c6713 Mon Sep 17 00:00:00 2001
 From: FiyeroT <me@fiyero.xyz>
 Date: Thu, 12 Nov 2026 21:41:21 +0300
 Subject: [PATCH 45/71] transports: the dial and the close of v2ray transports
@@ -26,16 +26,14 @@ Pdk-Layer: 04
  transport/v2ray/transport_quic_test.go    |  16 +++
  transport/v2ray/transport_test.go         | 131 +++++++++++++++++++
  transport/v2raygrpclite/client.go         |   8 +-
- transport/v2raygrpclite/conn.go           |  32 +++++
+ transport/v2raygrpclite/conn.go           |  30 +++++
  transport/v2raygrpclite/conn_test.go      |  61 +++++++++
  transport/v2rayhttp/client.go             |   8 +-
  transport/v2rayhttp/conn_test.go          |  61 +++++++++
- transport/v2rayhttpupgrade/client.go      |   5 +
  transport/v2rayhttpupgrade/client_test.go | 101 +++++++++++++++
  transport/v2rayquic/stream.go             |  12 ++
- transport/v2raywebsocket/client.go        |   4 +
  transport/v2raywebsocket/client_test.go   | 107 ++++++++++++++++
- 18 files changed, 838 insertions(+), 6 deletions(-)
+ 16 files changed, 827 insertions(+), 6 deletions(-)
  create mode 100644 common/readwait/peek.go
  create mode 100644 common/readwait/peek_test.go
  create mode 100644 transport/v2ray/transport_grpc_test.go
@@ -325,7 +323,7 @@ index 000000000..9a56976d5
 +	require.Positive(t, stream.earlyReads.Load())
 +}
 diff --git a/protocol/hysteria2/outbound.go b/protocol/hysteria2/outbound.go
-index 14e761fba..316e81667 100644
+index 83768102a..ad1350437 100644
 --- a/protocol/hysteria2/outbound.go
 +++ b/protocol/hysteria2/outbound.go
 @@ -12,6 +12,7 @@ import (
@@ -336,16 +334,16 @@ index 14e761fba..316e81667 100644
  	"github.com/sagernet/sing-box/common/tls"
  	C "github.com/sagernet/sing-box/constant"
  	"github.com/sagernet/sing-box/log"
-@@ -54,7 +55,7 @@ func NewOutbound(ctx context.Context, router adapter.Router, logger log.ContextL
+@@ -58,7 +59,7 @@ func NewOutbound(ctx context.Context, router adapter.Router, logger log.ContextL
+ 		Context:        ctx,
+ 		Logger:         logger,
+ 		ServerAddress:  tlsServerAddress,
+-		Options:        tlsOptions,
++		Options:        tls.QUICClientOptions(logger, tlsOptions),
+ 		DomainResolver: options.DomainResolver,
+ 	})
  	if err != nil {
- 		return nil, err
- 	}
--	tlsConfig, err := tls.NewClient(ctx, logger, tlsServerAddress, tlsOptions)
-+	tlsConfig, err := tls.NewClient(ctx, logger, tlsServerAddress, tls.QUICClientOptions(logger, tlsOptions))
- 	if err != nil {
- 		return nil, err
- 	}
-@@ -190,7 +191,11 @@ func (h *Outbound) DialContext(ctx context.Context, network string, destination
+@@ -196,7 +197,11 @@ func (h *Outbound) DialContext(ctx context.Context, network string, destination
  	switch N.NetworkName(network) {
  	case N.NetworkTCP:
  		h.logger.InfoContext(ctx, "outbound connection to ", destination)
@@ -359,7 +357,7 @@ index 14e761fba..316e81667 100644
  		conn, err := h.ListenPacket(ctx, destination)
  		if err != nil {
 diff --git a/protocol/tuic/outbound.go b/protocol/tuic/outbound.go
-index 988f0065c..0c499c395 100644
+index 4d81a620c..c7aabdbfc 100644
 --- a/protocol/tuic/outbound.go
 +++ b/protocol/tuic/outbound.go
 @@ -9,6 +9,7 @@ import (
@@ -370,16 +368,16 @@ index 988f0065c..0c499c395 100644
  	"github.com/sagernet/sing-box/common/tls"
  	C "github.com/sagernet/sing-box/constant"
  	"github.com/sagernet/sing-box/log"
-@@ -47,7 +48,7 @@ func NewOutbound(ctx context.Context, router adapter.Router, logger log.ContextL
- 	if options.TLS == nil || !options.TLS.Enabled {
- 		return nil, C.ErrTLSRequired
- 	}
--	tlsConfig, err := tls.NewClient(ctx, logger, options.Server, common.PtrValueOrDefault(options.TLS))
-+	tlsConfig, err := tls.NewClient(ctx, logger, options.Server, tls.QUICClientOptions(logger, common.PtrValueOrDefault(options.TLS)))
+@@ -51,7 +52,7 @@ func NewOutbound(ctx context.Context, router adapter.Router, logger log.ContextL
+ 		Context:        ctx,
+ 		Logger:         logger,
+ 		ServerAddress:  options.Server,
+-		Options:        common.PtrValueOrDefault(options.TLS),
++		Options:        tls.QUICClientOptions(logger, common.PtrValueOrDefault(options.TLS)),
+ 		DomainResolver: options.DomainResolver,
+ 	})
  	if err != nil {
- 		return nil, err
- 	}
-@@ -104,7 +105,11 @@ func (h *Outbound) DialContext(ctx context.Context, network string, destination
+@@ -110,7 +111,11 @@ func (h *Outbound) DialContext(ctx context.Context, network string, destination
  	switch N.NetworkName(network) {
  	case N.NetworkTCP:
  		h.logger.InfoContext(ctx, "outbound connection to ", destination)
@@ -605,11 +603,11 @@ index 3ac0404cc..67a961583 100644
  			conn.setup(response.Body, nil)
  		}
 diff --git a/transport/v2raygrpclite/conn.go b/transport/v2raygrpclite/conn.go
-index 7080d63c2..22750e042 100644
+index f406941e7..2fd3d4a1e 100644
 --- a/transport/v2raygrpclite/conn.go
 +++ b/transport/v2raygrpclite/conn.go
-@@ -10,10 +10,12 @@ import (
- 	"os"
+@@ -11,10 +11,12 @@ import (
+ 	"sync"
  	"time"
  
 +	"github.com/sagernet/sing-box/common/readwait"
@@ -621,21 +619,19 @@ index 7080d63c2..22750e042 100644
  	"github.com/sagernet/sing/common/varbin"
  )
  
-@@ -56,6 +58,13 @@ func (c *GunConn) setup(reader io.Reader, err error) {
- 		c.reader = std_bufio.NewReader(reader)
- 	}
- 	c.err = err
-+	if err != nil {
-+		// the client has closed the request-body pipe with the error; cancel the request
-+		// too, so that the transport lets its goroutine go
-+		if c.cancel != nil {
+@@ -64,6 +66,11 @@ func (c *GunConn) setup(reader io.Reader, err error) {
+ 			c.reader = std_bufio.NewReader(reader)
+ 		}
+ 		c.err = err
++		if err != nil && c.cancel != nil {
++			// the client has closed the request-body pipe with the error; cancel the request
++			// too, so that the transport lets its goroutine go
 +			c.cancel()
 +		}
-+	}
+ 	}
  	close(c.create)
- }
- 
-@@ -101,6 +110,29 @@ func (c *GunConn) read(b []byte) (n int, err error) {
+ 	c.access.Unlock()
+@@ -114,6 +121,29 @@ func (c *GunConn) read(b []byte) (n int, err error) {
  	return
  }
  
@@ -821,22 +817,6 @@ index 000000000..518740c6c
 +		t.Fatal("a write after the failure blocked")
 +	}
 +}
-diff --git a/transport/v2rayhttpupgrade/client.go b/transport/v2rayhttpupgrade/client.go
-index 207c4ebe6..9d243bdfb 100644
---- a/transport/v2rayhttpupgrade/client.go
-+++ b/transport/v2rayhttpupgrade/client.go
-@@ -82,6 +82,11 @@ func (c *Client) DialContext(ctx context.Context) (net.Conn, error) {
- 	if err != nil {
- 		return nil, err
- 	}
-+	// the upgrade reads with no deadline: the end of ctx has to reach it (podkop-engine). The
-+	// watcher ends with the dial, so an upgraded connection does not die with ctx
-+	handshakeConn := conn
-+	stop := context.AfterFunc(ctx, func() { handshakeConn.Close() })
-+	defer stop()
- 	request := &http.Request{
- 		Method: http.MethodGet,
- 		URL:    &c.requestURL,
 diff --git a/transport/v2rayhttpupgrade/client_test.go b/transport/v2rayhttpupgrade/client_test.go
 new file mode 100644
 index 000000000..622808db4
@@ -975,21 +955,6 @@ index 7be6e2a92..5015bbf71 100644
  func (s *StreamWrapper) Write(p []byte) (n int, err error) {
  	n, err = s.Stream.Write(p)
  	return n, qtls.WrapError(err)
-diff --git a/transport/v2raywebsocket/client.go b/transport/v2raywebsocket/client.go
-index 54d748f1b..b18a0c67e 100644
---- a/transport/v2raywebsocket/client.go
-+++ b/transport/v2raywebsocket/client.go
-@@ -81,6 +81,10 @@ func (c *Client) DialContext(ctx context.Context) (net.Conn, error) {
- 	if c.maxEarlyData > 0 {
- 		return &EarlyWebsocketConn{Client: c, rawConn: conn, create: make(chan struct{})}, nil
- 	}
-+	// the upgrade knows only its own deadline: the end of ctx has to reach it (podkop-engine). The
-+	// watcher ends with the dial, so an upgraded connection does not die with ctx
-+	stop := context.AfterFunc(ctx, func() { conn.Close() })
-+	defer stop()
- 	websocketConn, err := c.upgrade(conn, &c.requestURL, c.headers)
- 	if err != nil {
- 		return nil, err
 diff --git a/transport/v2raywebsocket/client_test.go b/transport/v2raywebsocket/client_test.go
 new file mode 100644
 index 000000000..844d88062

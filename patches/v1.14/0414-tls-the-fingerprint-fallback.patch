@@ -1,4 +1,4 @@
-From 6a80a48e98ef529d5c98dc2de99eadbe47d5719d Mon Sep 17 00:00:00 2001
+From 8e619f0c2fc9b21de85555e25e24e948be53955e Mon Sep 17 00:00:00 2001
 From: FiyeroT <me@fiyero.xyz>
 Date: Thu, 12 Nov 2026 21:41:21 +0300
 Subject: [PATCH 50/71] tls: the fingerprint fallback
@@ -20,15 +20,16 @@ Pdk-Zone: protocols
 Pdk-Layer: 04
 ---
  box.go                                 |    4 +
- common/tls/client.go                   |   76 +-
+ common/tls/client.go                   |   86 +-
  common/tls/detour_test.go              |  165 ++++
  common/tls/ech.go                      |    6 +
+ common/tls/ech_fallback_test.go        |  106 +++
  common/tls/hello_watch.go              |  116 +++
  common/tls/hello_watch_linux.go        |  100 +++
  common/tls/hello_watch_linux_test.go   |  336 ++++++++
  common/tls/hello_watch_stub.go         |    9 +
  common/tls/ktls.go                     |    6 +
- common/tls/reality_client.go           |   65 ++
+ common/tls/reality_client.go           |   79 +-
  common/tls/reality_error.go            |   33 +
  common/tls/reality_error_test.go       |   55 ++
  common/tls/reality_fingerprint_test.go |    3 +
@@ -38,8 +39,9 @@ Pdk-Layer: 04
  common/tls/utls_mlkem.go               |   27 +
  experimental/cachefile/utls_choice.go  |   43 +
  option/experimental.go                 |   15 +
- 19 files changed, 2892 insertions(+), 5 deletions(-)
+ 20 files changed, 3020 insertions(+), 7 deletions(-)
  create mode 100644 common/tls/detour_test.go
+ create mode 100644 common/tls/ech_fallback_test.go
  create mode 100644 common/tls/hello_watch.go
  create mode 100644 common/tls/hello_watch_linux.go
  create mode 100644 common/tls/hello_watch_linux_test.go
@@ -52,7 +54,7 @@ Pdk-Layer: 04
  create mode 100644 experimental/cachefile/utls_choice.go
 
 diff --git a/box.go b/box.go
-index 3ebc8eb7b..d9d90b90f 100644
+index a851a313c..329a8e31d 100644
 --- a/box.go
 +++ b/box.go
 @@ -144,6 +144,10 @@ func New(options Options) (*Box, error) {
@@ -67,7 +69,7 @@ index 3ebc8eb7b..d9d90b90f 100644
  	err := checkDebugOptions(debugOptions)
  	if err != nil {
 diff --git a/common/tls/client.go b/common/tls/client.go
-index ae6b23198..c9116634d 100644
+index 6e1a63ddb..fd45fba8c 100644
 --- a/common/tls/client.go
 +++ b/common/tls/client.go
 @@ -40,6 +40,16 @@ func parseTLSSpoofOptions(serverName string, options option.OutboundTLSOptions)
@@ -87,22 +89,26 @@ index ae6b23198..c9116634d 100644
  func applyTLSSpoof(conn net.Conn, spoof string, method tlsspoof.Method) (net.Conn, error) {
  	if spoof == "" {
  		return conn, nil
-@@ -176,13 +186,66 @@ func (d *defaultDialer) DialTLSContext(ctx context.Context, destination M.Socksa
+@@ -190,14 +200,78 @@ func (d *defaultDialer) DialTLSContext(ctx context.Context, destination M.Socksa
+ 	return d.dialContext(ctx, destination, retryConfig)
  }
  
- func (d *defaultDialer) dialContext(ctx context.Context, destination M.Socksaddr, echRetry bool) (Conn, error) {
+-func (d *defaultDialer) dialContext(ctx context.Context, destination M.Socksaddr, config Config) (Conn, error) {
 -	conn, err := d.dialer.DialContext(ctx, N.NetworkTCP, destination)
 -	if err != nil {
 -		return nil, err
++func (d *defaultDialer) dialContext(ctx context.Context, destination M.Socksaddr, baseConfig Config) (Conn, error) {
 +	// Inside the connection of another outbound the socket is not the server's: there is
 +	// no ClientHello of this client to watch on it, and a forged one would be sent to the
 +	// server of the tunnel, into its connection (podkop-engine).
 +	tunnel := throughTunnel(d.dialer)
 +	var fallback fingerprintDial
-+	if fallbackConfig, hasFallback := d.config.(fingerprintFallbackConfig); hasFallback && !tunnel {
++	// the configuration of this dial: DialTLSContext retries an ECH rejection with a clone that
++	// carries the server's ECH configuration, and the candidates are made of it
++	if fallbackConfig, hasFallback := baseConfig.(fingerprintFallbackConfig); hasFallback && !tunnel {
 +		fallback = fallbackConfig.fingerprintDial()
  	}
--	tlsConn, err := aTLS.ClientHandshake(ctx, conn, d.config)
+-	tlsConn, err := aTLS.ClientHandshake(ctx, conn, config)
 -	if err != nil {
 +	if tunnel {
 +		if spoofing, canSpoof := d.config.(spoofingConfig); canSpoof && spoofing.spoofs() {
@@ -121,7 +127,7 @@ index ae6b23198..c9116634d 100644
 +		if err != nil {
 +			return nil, err
 +		}
-+		config := d.config
++		config := baseConfig
 +		var watch *helloWatch
 +		if fallback != nil {
 +			var watched bool
@@ -156,13 +162,12 @@ index ae6b23198..c9116634d 100644
 +			}
 +			return nil, fallbackErr
 +		}
- 		var echErr *tls.ECHRejectionError
- 		if echRetry && errors.As(err, &echErr) && len(echErr.RetryConfigList) > 0 {
- 			if echConfig, isECH := d.config.(ECHCapableConfig); isECH {
-@@ -190,6 +253,9 @@ func (d *defaultDialer) dialContext(ctx context.Context, destination M.Socksaddr
- 				return d.dialContext(ctx, destination, false)
- 			}
- 		}
++		// an ECH rejection is no matter of the fingerprint: DialTLSContext retries it with a
++		// clone of the configuration that carries the server's ECH configuration
++		var echErr *tls.ECHRejectionError
++		if errors.As(err, &echErr) && len(echErr.RetryConfigList) > 0 {
++			return nil, err
++		}
 +		if fallback != nil && fallback.failed(ctx, destination, err) {
 +			continue
 +		}
@@ -341,10 +346,10 @@ index 000000000..67e833fab
 +	require.EqualValues(t, 2, config.asked.Load())
 +}
 diff --git a/common/tls/ech.go b/common/tls/ech.go
-index 46ab50a23..8322dfb74 100644
+index 97b7d7c81..187b40f57 100644
 --- a/common/tls/ech.go
 +++ b/common/tls/ech.go
-@@ -188,6 +188,12 @@ func (s *ECHClientConfig) Clone() Config {
+@@ -263,6 +263,12 @@ func (s *ECHClientConfig) Clone() Config {
  	}
  }
  
@@ -357,9 +362,121 @@ index 46ab50a23..8322dfb74 100644
  func UnmarshalECHKeys(raw []byte) ([]tls.EncryptedClientHelloKey, error) {
  	var keys []tls.EncryptedClientHelloKey
  	rawString := cryptobyte.String(raw)
+diff --git a/common/tls/ech_fallback_test.go b/common/tls/ech_fallback_test.go
+new file mode 100644
+index 000000000..a6bfdb273
+--- /dev/null
++++ b/common/tls/ech_fallback_test.go
+@@ -0,0 +1,106 @@
++package tls
++
++import (
++	"context"
++	"crypto/tls"
++	"errors"
++	"net"
++	"testing"
++	"time"
++
++	M "github.com/sagernet/sing/common/metadata"
++
++	"github.com/stretchr/testify/require"
++)
++
++// pipeDialer gives each dial one end of a pipe.
++type pipeDialer struct{}
++
++func (pipeDialer) DialContext(ctx context.Context, network string, destination M.Socksaddr) (net.Conn, error) {
++	client, server := net.Pipe()
++	_ = server.Close()
++	return client, nil
++}
++
++func (pipeDialer) ListenPacket(ctx context.Context, destination M.Socksaddr) (net.PacketConn, error) {
++	return nil, errors.New("no packets")
++}
++
++// echRejectedConn ends every handshake with the server's rejection of ECH, with a list to retry.
++type echRejectedConn struct {
++	Conn
++}
++
++func (echRejectedConn) HandshakeContext(ctx context.Context) error {
++	return &tls.ECHRejectionError{RetryConfigList: []byte{1}}
++}
++
++func (echRejectedConn) Close() error {
++	return nil
++}
++
++// echRejectedConfig is a client configuration whose handshakes the server's ECH rejects; it tells
++// which configuration the fingerprint fallback of a dial was asked of.
++type echRejectedConfig struct {
++	Config
++	name     string
++	asked    *[]string
++	fallback fingerprintDial
++}
++
++func (c echRejectedConfig) HandshakeTimeout() time.Duration {
++	return 0
++}
++
++func (c echRejectedConfig) Client(conn net.Conn) (Conn, error) {
++	return echRejectedConn{}, nil
++}
++
++func (c echRejectedConfig) fingerprintDial() fingerprintDial {
++	*c.asked = append(*c.asked, c.name)
++	return c.fallback
++}
++
++// iteratingFallback would dial again after any failure it is told of.
++type iteratingFallback struct {
++	config   Config
++	attempts int
++	failures int
++}
++
++func (f *iteratingFallback) ready(ctx context.Context, destination M.Socksaddr) error { return nil }
++func (f *iteratingFallback) done()                                                    {}
++func (f *iteratingFallback) answered()                                                {}
++
++func (f *iteratingFallback) attempt(conn net.Conn) (Config, bool) {
++	f.attempts++
++	return f.config, false
++}
++
++func (f *iteratingFallback) unanswered(destination M.Socksaddr) (bool, error) {
++	return false, nil
++}
++
++func (f *iteratingFallback) failed(ctx context.Context, destination M.Socksaddr, err error) bool {
++	f.failures++
++	return f.failures < 4
++}
++
++// An ECH rejection is no matter of the fingerprint: the dial returns it at once for
++// DialTLSContext to retry with the server's ECH configuration, without trying the next
++// fingerprint, and the candidates of the dial are made of the configuration it was given (the
++// retry's clone carries the server's ECH list) (podkop-engine, tls-fp-fallback).
++func TestECHRejectionLeavesTheFingerprintFallback(t *testing.T) {
++	var asked []string
++	fallback := &iteratingFallback{}
++	original := echRejectedConfig{name: "original", asked: &asked, fallback: fallback}
++	retry := echRejectedConfig{name: "retry", asked: &asked, fallback: fallback}
++	fallback.config = retry
++	dialer := NewDialer(pipeDialer{}, original).(*defaultDialer)
++	_, err := dialer.dialContext(context.Background(), M.ParseSocksaddrHostPort("192.0.2.1", 443), retry)
++	var echErr *tls.ECHRejectionError
++	require.ErrorAs(t, err, &echErr)
++	require.Equal(t, 1, fallback.attempts, "an ECH rejection tried the next fingerprint")
++	require.Zero(t, fallback.failures, "the fallback was told of an ECH rejection")
++	require.Equal(t, []string{"retry"}, asked, "the candidates were not made of the configuration of the dial")
++}
 diff --git a/common/tls/hello_watch.go b/common/tls/hello_watch.go
 new file mode 100644
-index 000000000..c9753980a
+index 000000000..593b171de
 --- /dev/null
 +++ b/common/tls/hello_watch.go
 @@ -0,0 +1,116 @@
@@ -388,7 +505,7 @@ index 000000000..c9753980a
 +// and keeps the first that a server takes and the path lets through:
 +//
 +//  1. the configured fingerprint without its X25519MLKEM768 key share, as stock sing-box
-+//     sends it under REALITY;
++//     sent it under REALITY up to 1.14.4;
 +//  2. firefox, with the key share: REALITY servers since Xray-core v26.9.8 refuse a
 +//     ClientHello without it (they answer it as a stranger's);
 +//  3. the configured fingerprint as it is.
@@ -960,10 +1077,10 @@ index dd564f534..8f8a24a96 100644
  	ServerConfig
  	logger             logger.ContextLogger
 diff --git a/common/tls/reality_client.go b/common/tls/reality_client.go
-index 20597bda7..011256ea0 100644
+index 77aa9d43b..0e8170ac9 100644
 --- a/common/tls/reality_client.go
 +++ b/common/tls/reality_client.go
-@@ -49,6 +49,67 @@ type RealityClientConfig struct {
+@@ -47,6 +47,75 @@ type RealityClientConfig struct {
  	uClient   *UTLSClientConfig
  	publicKey []byte
  	shortID   [8]byte
@@ -988,6 +1105,14 @@ index 20597bda7..011256ea0 100644
 +	// what to configure in place of such a fingerprint
 +	realityHybridKeyShareAdvice = ", use chrome, firefox, safari, random or randomized"
 +)
++
++// realityFallbackRequestWait bounds the request a client that failed the verification sends
++// to the target, as a browser would, before the error returns: the fingerprint fallback tries
++// its next candidate only after it. The common targets of REALITY answer their whole first page
++// within 1.34 s of the handshake from a datacenter, and www.microsoft.com did not answer at all
++// (lab/runs/2026-11-28-reality-fallback); without a bound such a target holds every candidate
++// for the whole handshake timeout.
++const realityFallbackRequestWait = 2 * time.Second
 +
 +// realityStrangerError is the failure of a handshake with a fingerprint without the
 +// X25519MLKEM768 key share that the server answered as it answers a stranger, with the
@@ -1031,7 +1156,20 @@ index 20597bda7..011256ea0 100644
  }
  
  func NewRealityClient(ctx context.Context, logger logger.ContextLogger, serverAddress string, options option.OutboundTLSOptions) (Config, error) {
-@@ -386,3 +447,7 @@ func (c *realityClientConnWrapper) ReaderReplaceable() bool {
+@@ -261,7 +330,11 @@ func (e *RealityClientConfig) ClientHandshake(ctx context.Context, conn net.Conn
+ 	}
+ 
+ 	if !verifier.verified {
+-		realityClientFallback(ctx, uConn, e.uClient.ServerName(), e.uClient.id)
++		// the request a browser would make goes out before the error returns (the caller closes
++		// the connection then), within realityFallbackRequestWait (podkop-engine)
++		fallbackCtx, cancel := context.WithTimeout(ctx, realityFallbackRequestWait)
++		realityClientFallback(fallbackCtx, uConn, e.uClient.ServerName(), e.uClient.id)
++		cancel()
+ 		return nil, e.verificationFailed(nil)
+ 	}
+ 
+@@ -384,3 +457,7 @@ func (c *realityClientConnWrapper) ReaderReplaceable() bool {
  func (c *realityClientConnWrapper) WriterReplaceable() bool {
  	return false
  }
@@ -1163,10 +1301,10 @@ index 81878772d..9903f67dd 100644
  			require.Contains(t, err.Error(), "uTLS fingerprint "+testCase.fingerprint+":")
  			require.Contains(t, err.Error(), "Xray-core v26.9.8")
 diff --git a/common/tls/utls_client.go b/common/tls/utls_client.go
-index ce7493a8c..154df09a7 100644
+index 8a8da68b9..7001b9650 100644
 --- a/common/tls/utls_client.go
 +++ b/common/tls/utls_client.go
-@@ -39,6 +39,10 @@ type UTLSClientConfig struct {
+@@ -40,6 +40,10 @@ type UTLSClientConfig struct {
  	recordFragment        bool
  	spoof                 string
  	spoofMethod           tlsspoof.Method
@@ -1177,7 +1315,7 @@ index ce7493a8c..154df09a7 100644
  }
  
  func (c *UTLSClientConfig) ServerName() string {
-@@ -115,6 +119,8 @@ func (c *UTLSClientConfig) Clone() Config {
+@@ -116,6 +120,8 @@ func (c *UTLSClientConfig) Clone() Config {
  		recordFragment:        c.recordFragment,
  		spoof:                 c.spoof,
  		spoofMethod:           c.spoofMethod,
@@ -1186,7 +1324,7 @@ index ce7493a8c..154df09a7 100644
  	}
  	cloned.SetServerName(cloned.serverName)
  	return cloned
-@@ -166,6 +172,8 @@ func (c *utlsConnWrapper) WriterReplaceable() bool {
+@@ -176,6 +182,8 @@ func (c *utlsConnWrapper) WriterReplaceable() bool {
  type utlsALPNWrapper struct {
  	utlsConnWrapper
  	nextProtocols []string
@@ -1195,7 +1333,7 @@ index ce7493a8c..154df09a7 100644
  }
  
  func (c *utlsALPNWrapper) HandshakeContext(ctx context.Context) error {
-@@ -356,6 +364,7 @@ func newUTLSClient(ctx context.Context, logger logger.ContextLogger, serverAddre
+@@ -366,6 +374,7 @@ func newUTLSClient(ctx context.Context, logger logger.ContextLogger, serverAddre
  		recordFragment:        options.RecordFragment,
  		spoof:                 spoof,
  		spoofMethod:           spoofMethod,
@@ -1203,7 +1341,7 @@ index ce7493a8c..154df09a7 100644
  	}
  	config.SetServerName(serverName)
  	if options.ECH != nil && options.ECH.Enabled {
-@@ -435,3 +444,7 @@ func uTLSClientHelloID(name string) (utls.ClientHelloID, error) {
+@@ -445,3 +454,7 @@ func uTLSClientHelloID(name string) (utls.ClientHelloID, error) {
  		return utls.ClientHelloID{}, E.New("unknown uTLS fingerprint: ", name)
  	}
  }
@@ -1213,7 +1351,7 @@ index ce7493a8c..154df09a7 100644
 +}
 diff --git a/common/tls/utls_fallback.go b/common/tls/utls_fallback.go
 new file mode 100644
-index 000000000..fa043455b
+index 000000000..bc6b09439
 --- /dev/null
 +++ b/common/tls/utls_fallback.go
 @@ -0,0 +1,806 @@
@@ -1436,8 +1574,8 @@ index 000000000..fa043455b
 +// newUTLSFallback makes the fallback of a client with the fingerprint configured (of the ID
 +// configuredID), nil when it is off. Its candidates, each once:
 +//
-+//  1. the configured fingerprint without its X25519MLKEM768 key share, as stock sing-box sends
-+//     it under REALITY (a fingerprint without the key share as it is): a small ClientHello
++//  1. the configured fingerprint without its X25519MLKEM768 key share, as stock sing-box sent
++//     it under REALITY up to 1.14.4 (a fingerprint without the key share as it is): a small ClientHello
 +//     that the DPI freezing chrome under bursts of connections lets through, and that every
 +//     server takes but a REALITY server since Xray-core v26.9.8;
 +//  2. firefox with the key share, which such a server takes and that DPI lets through;

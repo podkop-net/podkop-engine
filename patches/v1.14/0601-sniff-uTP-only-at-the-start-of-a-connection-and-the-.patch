@@ -1,4 +1,4 @@
-From 68cf8fc7a9f6ad6e3b74c29445996bc447be4864 Mon Sep 17 00:00:00 2001
+From 0b00cc7ba79d83c1ff591701f8b4d7616a32752a Mon Sep 17 00:00:00 2001
 From: FiyeroT <me@fiyero.xyz>
 Date: Sun, 15 Nov 2026 09:08:53 +0300
 Subject: [PATCH 65/71] sniff: uTP only at the start of a connection, and the
@@ -486,10 +486,10 @@ index 00466bb2c..734b7bd23 100644
  	require.Empty(t, metadata.Protocol)
  }
 diff --git a/route/route.go b/route/route.go
-index 9610e2763..6347dac46 100644
+index 048b79a9f..5021e4ece 100644
 --- a/route/route.go
 +++ b/route/route.go
-@@ -36,6 +36,7 @@ var defaultPacketSniffers = []sniff.PacketSniffer{
+@@ -35,6 +35,7 @@ var defaultPacketSniffers = []sniff.PacketSniffer{
  	sniff.DomainNameQuery,
  	sniff.QUICClientHello,
  	sniff.STUNMessage,
@@ -498,10 +498,10 @@ index 9610e2763..6347dac46 100644
  	sniff.UDPTracker,
  	sniff.DTLSRecord,
 diff --git a/route/rule/rule_action.go b/route/rule/rule_action.go
-index 6fd1707ac..4ceba1614 100644
+index 9a55d2ad9..5f943fd62 100644
 --- a/route/rule/rule_action.go
 +++ b/route/rule/rule_action.go
-@@ -499,6 +499,7 @@ func (r *RuleActionSniff) build() error {
+@@ -497,6 +497,7 @@ func (r *RuleActionSniff) build() error {
  			r.PacketSniffers = append(r.PacketSniffers, sniff.STUNMessage)
  		case C.ProtocolBitTorrent:
  			r.StreamSniffers = append(r.StreamSniffers, sniff.BitTorrent)

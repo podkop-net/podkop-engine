@@ -1,4 +1,4 @@
-From 127919c70a85aaa267e8bee4613915fd20310fc1 Mon Sep 17 00:00:00 2001
+From 455fb135a020d2b130962c4e65b954bfe984c3ab Mon Sep 17 00:00:00 2001
 From: FiyeroT <me@fiyero.xyz>
 Date: Thu, 12 Nov 2026 21:41:21 +0300
 Subject: [PATCH 52/71] vmess: the security auto is not zero under TLS
@@ -16,10 +16,10 @@ Pdk-Layer: 04
  1 file changed, 3 insertions(+), 3 deletions(-)
 
 diff --git a/protocol/vmess/outbound.go b/protocol/vmess/outbound.go
-index 2d8676762..9b7d9c0e2 100644
+index f1048676b..e44fc4e73 100644
 --- a/protocol/vmess/outbound.go
 +++ b/protocol/vmess/outbound.go
-@@ -100,9 +100,9 @@ func NewOutbound(ctx context.Context, router adapter.Router, logger log.ContextL
+@@ -106,9 +106,9 @@ func NewOutbound(ctx context.Context, router adapter.Router, logger log.ContextL
  	if security == "" {
  		security = "auto"
  	}

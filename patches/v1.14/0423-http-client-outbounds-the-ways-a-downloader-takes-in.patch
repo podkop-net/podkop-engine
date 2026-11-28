@@ -1,4 +1,4 @@
-From 36d86d9cfe64b6b5dfe02bb795aeabfc187a8c37 Mon Sep 17 00:00:00 2001
+From 5219dfa0ead0549516edb5f6cee3a3e86b7cc72c Mon Sep 17 00:00:00 2001
 From: FiyeroT <me@fiyero.xyz>
 Date: Fri, 13 Nov 2026 14:38:32 +0300
 Subject: [PATCH 59/71] http client: outbounds, the ways a downloader takes in
@@ -1082,7 +1082,7 @@ index 000000000..62e1b677c
 +	require.Equal(t, int32(2), transport.closes.Load(), "closed once the hold is released, once")
 +}
 diff --git a/common/httpclient/manager.go b/common/httpclient/manager.go
-index 820cbeabb..1dbd9ed32 100644
+index 3981e53b9..1f40f8717 100644
 --- a/common/httpclient/manager.go
 +++ b/common/httpclient/manager.go
 @@ -28,6 +28,9 @@ type Manager struct {
@@ -1206,7 +1206,7 @@ index 5b878421b..77844b4c5 100644
  
  type (
 diff --git a/route/rule/export_test.go b/route/rule/export_test.go
-index 5507de93c..96295d073 100644
+index 5507de93c..4b2635d7f 100644
 --- a/route/rule/export_test.go
 +++ b/route/rule/export_test.go
 @@ -1,8 +1,41 @@
@@ -1250,13 +1250,13 @@ index 5507de93c..96295d073 100644
 +
 +// RulesForTest is the number of the rules the set has.
 +func (s *RemoteRuleSet) RulesForTest() int {
-+	return len(s.currentRules())
++	return len(s.content.Load().rules)
 +}
 diff --git a/route/rule/rule_set_remote.go b/route/rule/rule_set_remote.go
-index a741b66e0..31cd7601b 100644
+index ace5e8882..d7cc7e6a8 100644
 --- a/route/rule/rule_set_remote.go
 +++ b/route/rule/rule_set_remote.go
-@@ -52,8 +52,10 @@ type RemoteRuleSet struct {
+@@ -51,8 +51,10 @@ type RemoteRuleSet struct {
  	updateInterval time.Duration
  	httpClient     *http.Client
  	// the clients a fetch that failed through httpClient is repeated through, in order
@@ -1265,10 +1265,10 @@ index a741b66e0..31cd7601b 100644
 +	// outbounds (adapter.HTTPDownloaders)
  	fallbacks      []ruleSetFallback
 +	downloader     adapter.HTTPDownloader
- 	access         sync.RWMutex
- 	rules          []adapter.HeadlessRule
- 	metadata       adapter.RuleSetMetadata
-@@ -142,6 +144,14 @@ func (s *RemoteRuleSet) StartContext(ctx context.Context, startContext *adapter.
+ 	content        atomic.Pointer[ruleSetContent]
+ 	lastUpdated    time.Time
+ 	lastEtag       string
+@@ -127,6 +129,14 @@ func (s *RemoteRuleSet) StartContext(ctx context.Context, startContext *adapter.
  		startContext.Register(fallback.Transport)
  		s.fallbacks = append(s.fallbacks, ruleSetFallback{tag: fallback.Tag, client: &http.Client{Transport: fallback.Transport}})
  	}
@@ -1283,7 +1283,7 @@ index a741b66e0..31cd7601b 100644
  	s.loadCached()
  	var loadedFromInitialPath bool
  	if s.lastUpdated.IsZero() && s.initialPath != "" {
-@@ -437,12 +447,17 @@ var (
+@@ -418,12 +428,17 @@ var (
  type stallResetReader struct {
  	reader io.Reader
  	reset  func()
@@ -1301,7 +1301,7 @@ index a741b66e0..31cd7601b 100644
  	}
  	return n, err
  }
-@@ -518,8 +533,9 @@ func describeRuleSetBody(response *http.Response, size int64, sample []byte) str
+@@ -499,8 +514,9 @@ func describeRuleSetBody(response *http.Response, size int64, sample []byte) str
  	return description.String()
  }
  
@@ -1313,7 +1313,7 @@ index a741b66e0..31cd7601b 100644
  // deadline bounds them all. The error is that of every way.
  func (s *RemoteRuleSet) fetch(ctx context.Context, isStart bool) error {
  	if isStart {
-@@ -527,6 +543,9 @@ func (s *RemoteRuleSet) fetch(ctx context.Context, isStart bool) error {
+@@ -508,6 +524,9 @@ func (s *RemoteRuleSet) fetch(ctx context.Context, isStart bool) error {
  		ctx, stop = context.WithTimeout(ctx, ruleSetStartDeadline)
  		defer stop()
  	}
@@ -1323,7 +1323,7 @@ index a741b66e0..31cd7601b 100644
  	err := s.fetchThrough(ctx, s.httpClient, isStart)
  	if err == nil || len(s.fallbacks) == 0 {
  		return err
-@@ -547,8 +566,26 @@ func (s *RemoteRuleSet) fetch(ctx context.Context, isStart bool) error {
+@@ -528,8 +547,26 @@ func (s *RemoteRuleSet) fetch(ctx context.Context, isStart bool) error {
  	return E.Errors(errs...)
  }
  
@@ -1351,7 +1351,7 @@ index a741b66e0..31cd7601b 100644
  	s.logger.Debug("updating rule-set ", s.tag, " from URL: ", s.url)
  	// a group that switches members closes the connections it does not know as routed
  	// ones: a list half downloaded through it would wait for the next update_interval
-@@ -575,10 +612,10 @@ func (s *RemoteRuleSet) fetchThrough(ctx context.Context, client *http.Client, i
+@@ -556,10 +593,10 @@ func (s *RemoteRuleSet) fetchThrough(ctx context.Context, client *http.Client, i
  	}
  	request, err := http.NewRequest("GET", s.url, nil)
  	if err != nil {
@@ -1365,7 +1365,7 @@ index a741b66e0..31cd7601b 100644
  	}
  	if !isStart {
  		defer client.CloseIdleConnections()
-@@ -590,18 +627,38 @@ func (s *RemoteRuleSet) fetchThrough(ctx context.Context, client *http.Client, i
+@@ -571,18 +608,38 @@ func (s *RemoteRuleSet) fetchThrough(ctx context.Context, client *http.Client, i
  			// next batch of rule-sets into the same wait
  			client.Transport.(adapter.HTTPTransport).Reset()
  		}
@@ -1406,7 +1406,7 @@ index a741b66e0..31cd7601b 100644
  			if err != nil {
  				s.logger.Error("save rule-set updated time: ", err)
  				return nil
-@@ -611,7 +668,7 @@ func (s *RemoteRuleSet) fetchThrough(ctx context.Context, client *http.Client, i
+@@ -592,7 +649,7 @@ func (s *RemoteRuleSet) fetchThrough(ctx context.Context, client *http.Client, i
  			if savedRuleSet != nil {
  				savedRuleSet.LastUpdated = s.lastUpdated
  				savedRuleSet.URLHash = s.urlHash[:]
@@ -1415,7 +1415,7 @@ index a741b66e0..31cd7601b 100644
  				if err != nil {
  					s.logger.Error("save rule-set updated time: ", err)
  					return nil
-@@ -620,22 +677,14 @@ func (s *RemoteRuleSet) fetchThrough(ctx context.Context, client *http.Client, i
+@@ -601,22 +658,14 @@ func (s *RemoteRuleSet) fetchThrough(ctx context.Context, client *http.Client, i
  		}
  		s.logger.Info("update rule-set ", s.tag, ": not modified")
  		return nil

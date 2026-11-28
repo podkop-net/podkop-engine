@@ -1,4 +1,4 @@
-From 1abf49b0b699025fe438efe5579e7b61c73f1a33 Mon Sep 17 00:00:00 2001
+From 6cfe99150f3ca441ede4a8650d7baa67d4339c7f Mon Sep 17 00:00:00 2001
 From: FiyeroT <me@fiyero.xyz>
 Date: Fri, 13 Nov 2026 21:14:28 +0300
 Subject: [PATCH 61/71] dns: the question of the exchange debug line formatted
@@ -86,10 +86,10 @@ index 000000000..75a294992
 +	t.Logf("allocations a dropped debug line: lazy %v, eager %v", lazy, eager)
 +}
 diff --git a/dns/router.go b/dns/router.go
-index 10026873c..2d5f8b5db 100644
+index e76119cd3..91619bf83 100644
 --- a/dns/router.go
 +++ b/dns/router.go
-@@ -1084,7 +1084,7 @@ func (r *Router) prepareExchange(ctx context.Context, message *mDNS.Msg) (*dnsEx
+@@ -1092,7 +1092,7 @@ func (r *Router) prepareExchange(ctx context.Context, message *mDNS.Msg) (*dnsEx
  		}, nil
  	}
  	if isResolverDiscoveryQuery(message.Question[0]) {
@@ -98,7 +98,7 @@ index 10026873c..2d5f8b5db 100644
  		return nil, &mDNS.Msg{
  			MsgHdr: mDNS.MsgHdr{
  				Id:                 message.Id,
-@@ -1104,7 +1104,7 @@ func (r *Router) prepareExchange(ctx context.Context, message *mDNS.Msg) (*dnsEx
+@@ -1112,7 +1112,7 @@ func (r *Router) prepareExchange(ctx context.Context, message *mDNS.Msg) (*dnsEx
  	rules := r.rules
  	legacyDNSMode := r.legacyDNSMode
  	r.rulesAccess.RUnlock()

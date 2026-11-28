@@ -1,4 +1,4 @@
-From 4448266f3447a19de3d9b8f70b0ad99a19bd88ad Mon Sep 17 00:00:00 2001
+From d858cc2ab3de3ad2da12222f0f8470469b362258 Mon Sep 17 00:00:00 2001
 From: FiyeroT <me@fiyero.xyz>
 Date: Sat, 21 Nov 2026 18:34:03 +0300
 Subject: [PATCH 69/71] tls: the server's certificate verified as Xray verifies
@@ -784,10 +784,10 @@ index 000000000..f76cc1b4a
 +	require.ErrorContains(t, err, "certificate_server_name is unavailable in reality")
 +}
 diff --git a/common/tls/reality_client.go b/common/tls/reality_client.go
-index 8ca47b31e..4e40ccc34 100644
+index f8581a2c8..cafc262fc 100644
 --- a/common/tls/reality_client.go
 +++ b/common/tls/reality_client.go
-@@ -124,6 +124,10 @@ func newRealityClient(ctx context.Context, logger logger.ContextLogger, serverAd
+@@ -131,6 +131,10 @@ func newRealityClient(ctx context.Context, logger logger.ContextLogger, serverAd
  	if options.UTLS == nil || !options.UTLS.Enabled {
  		return nil, E.New("uTLS is required by reality client")
  	}
@@ -799,7 +799,7 @@ index 8ca47b31e..4e40ccc34 100644
  	classicFingerprint, err := checkRealityFingerprint(options.UTLS.Fingerprint)
  	if err != nil {
 diff --git a/common/tls/std_client.go b/common/tls/std_client.go
-index 2897d9688..3b1398ce9 100644
+index 2a67f4f72..cadfab01b 100644
 --- a/common/tls/std_client.go
 +++ b/common/tls/std_client.go
 @@ -35,6 +35,9 @@ type STDClientConfig struct {
@@ -879,10 +879,10 @@ index 559df943c..000841363 100644
  		return SystemTLSValidated{}, E.New("certificate_sha256 or certificate_public_key_sha256 is conflict with certificate or certificate_path")
  	}
 diff --git a/common/tls/utls_client.go b/common/tls/utls_client.go
-index 154df09a7..39144be68 100644
+index 7001b9650..868595504 100644
 --- a/common/tls/utls_client.go
 +++ b/common/tls/utls_client.go
-@@ -43,6 +43,9 @@ type UTLSClientConfig struct {
+@@ -44,6 +44,9 @@ type UTLSClientConfig struct {
  	fallback *utlsFallback
  	// the ClientHello without the X25519MLKEM768 key share: a candidate of the fallback
  	noMLKEM bool
@@ -892,7 +892,7 @@ index 154df09a7..39144be68 100644
  }
  
  func (c *UTLSClientConfig) ServerName() string {
-@@ -51,6 +54,9 @@ func (c *UTLSClientConfig) ServerName() string {
+@@ -52,6 +55,9 @@ func (c *UTLSClientConfig) ServerName() string {
  
  func (c *UTLSClientConfig) SetServerName(serverName string) {
  	c.serverName = serverName
@@ -902,7 +902,7 @@ index 154df09a7..39144be68 100644
  	if c.disableSNI {
  		c.config.ServerName = ""
  		if c.verifyServerName {
-@@ -121,6 +127,7 @@ func (c *UTLSClientConfig) Clone() Config {
+@@ -122,6 +128,7 @@ func (c *UTLSClientConfig) Clone() Config {
  		spoofMethod:           c.spoofMethod,
  		fallback:              c.fallback,
  		noMLKEM:               c.noMLKEM,
@@ -910,7 +910,7 @@ index 154df09a7..39144be68 100644
  	}
  	cloned.SetServerName(cloned.serverName)
  	return cloned
-@@ -242,6 +249,10 @@ func newUTLSClient(ctx context.Context, logger logger.ContextLogger, serverAddre
+@@ -252,6 +259,10 @@ func newUTLSClient(ctx context.Context, logger logger.ContextLogger, serverAddre
  	if serverName == "" && !options.Insecure && !allowEmptyServerName {
  		return nil, errMissingServerName
  	}
@@ -921,7 +921,7 @@ index 154df09a7..39144be68 100644
  
  	var tlsConfig utls.Config
  	tlsConfig.Time = ntp.TimeFuncFromContext(ctx)
-@@ -308,6 +319,12 @@ func newUTLSClient(ctx context.Context, logger logger.ContextLogger, serverAddre
+@@ -318,6 +329,12 @@ func newUTLSClient(ctx context.Context, logger logger.ContextLogger, serverAddre
  		}
  		tlsConfig.RootCAs = certPool
  	}
@@ -934,7 +934,7 @@ index 154df09a7..39144be68 100644
  	var clientCertificate []byte
  	if len(options.ClientCertificate) > 0 {
  		clientCertificate = []byte(strings.Join(options.ClientCertificate, "\n"))
-@@ -356,7 +373,8 @@ func newUTLSClient(ctx context.Context, logger logger.ContextLogger, serverAddre
+@@ -366,7 +383,8 @@ func newUTLSClient(ctx context.Context, logger logger.ContextLogger, serverAddre
  		config:                &tlsConfig,
  		serverName:            serverName,
  		disableSNI:            options.DisableSNI,
@@ -957,10 +957,10 @@ index 414253361..7ad978502 100644
  	ClientCertificatePath      string                              `json:"client_certificate_path,omitempty"`
  	ClientKey                  badoption.Listable[string]          `json:"client_key,omitempty"`
 diff --git a/protocol/naive/outbound.go b/protocol/naive/outbound.go
-index c89d4bc48..fb4ee0460 100644
+index d2ac0a626..6aeeb35a9 100644
 --- a/protocol/naive/outbound.go
 +++ b/protocol/naive/outbound.go
-@@ -86,6 +86,14 @@ func NewOutbound(ctx context.Context, router adapter.Router, logger log.ContextL
+@@ -94,6 +94,14 @@ func NewOutbound(ctx context.Context, router adapter.Router, logger log.ContextL
  	if options.TLS.Reality != nil && options.TLS.Reality.Enabled {
  		return nil, E.New("reality is not supported on naive outbound")
  	}

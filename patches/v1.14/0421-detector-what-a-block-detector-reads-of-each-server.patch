@@ -1,4 +1,4 @@
-From 989e7ec1dd70749dc6a536ba52a679675a2b5da4 Mon Sep 17 00:00:00 2001
+From 3fd5c3daf75bb0fad945573a629e6ab48fcac181 Mon Sep 17 00:00:00 2001
 From: FiyeroT <me@fiyero.xyz>
 Date: Thu, 12 Nov 2026 21:41:21 +0300
 Subject: [PATCH 57/71] detector: what a block detector reads of each server
@@ -149,11 +149,11 @@ index be6267419..f5a8d07ba 100644
  	RoutedConnection(ctx context.Context, conn net.Conn, metadata InboundContext, matchedRule Rule, matchOutbound Outbound) net.Conn
  	RoutedPacketConnection(ctx context.Context, conn N.PacketConn, metadata InboundContext, matchedRule Rule, matchOutbound Outbound) N.PacketConn
 diff --git a/common/tls/client.go b/common/tls/client.go
-index c9116634d..933d1e750 100644
+index fd45fba8c..56cae37dc 100644
 --- a/common/tls/client.go
 +++ b/common/tls/client.go
-@@ -185,6 +185,13 @@ func (d *defaultDialer) DialTLSContext(ctx context.Context, destination M.Socksa
- 	return d.dialContext(ctx, destination, true)
+@@ -200,6 +200,13 @@ func (d *defaultDialer) DialTLSContext(ctx context.Context, destination M.Socksa
+ 	return d.dialContext(ctx, destination, retryConfig)
  }
  
 +// detectRecorder is a TLS client that records for the block detector what a handshake met. It is
@@ -163,7 +163,7 @@ index c9116634d..933d1e750 100644
 +	recordDetectOutcome(ctx context.Context, destination M.Socksaddr, handshakeErr error)
 +}
 +
- func (d *defaultDialer) dialContext(ctx context.Context, destination M.Socksaddr, echRetry bool) (Conn, error) {
+ func (d *defaultDialer) dialContext(ctx context.Context, destination M.Socksaddr, baseConfig Config) (Conn, error) {
  	// Inside the connection of another outbound the socket is not the server's: there is
  	// no ClientHello of this client to watch on it, and a forged one would be sent to the
 diff --git a/common/tls/detect_outcome.go b/common/tls/detect_outcome.go
@@ -915,7 +915,7 @@ index 000000000..73f0f1cb4
 +	require.Nil(t, reality.outcome.cache)
 +}
 diff --git a/common/tls/reality_client.go b/common/tls/reality_client.go
-index 423179b12..8ca47b31e 100644
+index e7ae4c593..f8581a2c8 100644
 --- a/common/tls/reality_client.go
 +++ b/common/tls/reality_client.go
 @@ -17,11 +17,13 @@ import (
@@ -932,15 +932,15 @@ index 423179b12..8ca47b31e 100644
  	"reflect"
  	"strings"
  	"time"
-@@ -37,6 +39,7 @@ import (
+@@ -36,6 +38,7 @@ import (
+ 	"github.com/sagernet/sing/common/logger"
  	M "github.com/sagernet/sing/common/metadata"
- 	"github.com/sagernet/sing/common/ntp"
  	aTLS "github.com/sagernet/sing/common/tls"
 +	"github.com/sagernet/sing/service"
  
  	utls "github.com/metacubex/utls"
  	"golang.org/x/crypto/hkdf"
-@@ -186,6 +189,66 @@ func (e *RealityClientConfig) SetServerName(serverName string) {
+@@ -193,6 +196,66 @@ func (e *RealityClientConfig) SetServerName(serverName string) {
  	e.uClient.SetServerName(serverName)
  }
  
@@ -1007,7 +1007,7 @@ index 423179b12..8ca47b31e 100644
  func (e *RealityClientConfig) NextProtos() []string {
  	return e.uClient.NextProtos()
  }
-@@ -378,6 +441,10 @@ func (e *RealityClientConfig) Clone() Config {
+@@ -385,6 +448,10 @@ func (e *RealityClientConfig) Clone() Config {
  		e.uClient.Clone().(*UTLSClientConfig),
  		e.publicKey,
  		e.shortID,
@@ -2035,10 +2035,10 @@ index 000000000..041c2debb
 +	require.False(t, loaded, "the group was closed during the test")
 +}
 diff --git a/route/conn.go b/route/conn.go
-index e83116e82..89206c3d3 100644
+index cdddc73d9..169ce33ef 100644
 --- a/route/conn.go
 +++ b/route/conn.go
-@@ -291,6 +291,11 @@ func (m *ConnectionManager) connectionCopy(ctx context.Context, source net.Conn,
+@@ -301,6 +301,11 @@ func (m *ConnectionManager) finishConnectionCopy(ctx context.Context, source net
  	if err != nil {
  		common.Close(source, destination)
  	} else {

@@ -1,4 +1,4 @@
-From 62f2c7002cdb63979df0f5a523570268f1217a83 Mon Sep 17 00:00:00 2001
+From ae7ed57307f50b3fda6db92ef8771e0ec8cee7e7 Mon Sep 17 00:00:00 2001
 From: FiyeroT <me@fiyero.xyz>
 Date: Sun, 15 Nov 2026 12:55:34 +0300
 Subject: [PATCH 67/71] urltest: the loss of members over QUIC (hysteria2,
@@ -892,7 +892,7 @@ index 000000000..d157ee4e5
 +// more than its loss costs. TUIC was not measured and is priced as hysteria2.
 +var quicLossPrice = lossPrice{perRTT: 1, perLoss: -10.28, perLossRTT: 0.5438, minRTT: 20}
 diff --git a/protocol/group/urltestgroup/urltest_loss_test.go b/protocol/group/urltestgroup/urltest_loss_test.go
-index b82c6ac51..b43359688 100644
+index 5835513bf..464d7f2a2 100644
 --- a/protocol/group/urltestgroup/urltest_loss_test.go
 +++ b/protocol/group/urltestgroup/urltest_loss_test.go
 @@ -27,12 +27,82 @@ import (
@@ -981,10 +981,10 @@ index b82c6ac51..b43359688 100644
  
  func TestGroupModeOptions(t *testing.T) {
 diff --git a/protocol/hysteria2/outbound.go b/protocol/hysteria2/outbound.go
-index 316e81667..2c38e36d9 100644
+index ad1350437..eb22a2a5c 100644
 --- a/protocol/hysteria2/outbound.go
 +++ b/protocol/hysteria2/outbound.go
-@@ -237,3 +237,19 @@ func (h *Outbound) Start(stage adapter.StartStage, scope *adapter.Scope) error {
+@@ -243,3 +243,19 @@ func (h *Outbound) Start(stage adapter.StartStage, scope *adapter.Scope) error {
  	})
  	return nil
  }
@@ -1005,10 +1005,10 @@ index 316e81667..2c38e36d9 100644
 +	}, true
 +}
 diff --git a/protocol/tuic/outbound.go b/protocol/tuic/outbound.go
-index 0c499c395..f7b2cb9e6 100644
+index c7aabdbfc..b79186eb2 100644
 --- a/protocol/tuic/outbound.go
 +++ b/protocol/tuic/outbound.go
-@@ -175,3 +175,19 @@ func (h *Outbound) Start(stage adapter.StartStage, scope *adapter.Scope) error {
+@@ -181,3 +181,19 @@ func (h *Outbound) Start(stage adapter.StartStage, scope *adapter.Scope) error {
  	})
  	return nil
  }

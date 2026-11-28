@@ -1,4 +1,4 @@
-From f7d16bb107f2ef8e51af99e4f795f8e1d2000698 Mon Sep 17 00:00:00 2001
+From b74f70251ec0b115815a9bd6dddca0927e487743 Mon Sep 17 00:00:00 2001
 From: FiyeroT <me@fiyero.xyz>
 Date: Sat, 21 Nov 2026 14:00:56 +0300
 Subject: [PATCH 04/71] tls: certificate_sha256, a pin of the whole server
@@ -20,7 +20,7 @@ Pdk-Layer: 01
  .../httpclient/apple_transport_darwin_test.go |  98 +++++++---
  common/tls/apple_client_platform.go           |   4 +-
  common/tls/pinned_certificate_test.go         | 175 ++++++++++++++++++
- common/tls/std_client.go                      |  34 ++--
+ common/tls/std_client.go                      |  33 ++--
  common/tls/std_server.go                      |  11 +-
  common/tls/system_client.go                   |   4 +-
  common/tls/system_client_engine.go            |   5 +-
@@ -33,7 +33,7 @@ Pdk-Layer: 01
  docs/configuration/shared/tls.zh.md           |  40 +++-
  docs/schema.json                              |  74 ++++++++
  option/tls.go                                 |   2 +
- 19 files changed, 576 insertions(+), 96 deletions(-)
+ 19 files changed, 572 insertions(+), 99 deletions(-)
  create mode 100644 common/tls/pinned_certificate_test.go
 
 diff --git a/common/httpclient/apple_transport_darwin.go b/common/httpclient/apple_transport_darwin.go
@@ -638,7 +638,7 @@ index 000000000..b78a73e33
 +	}))
 +}
 diff --git a/common/tls/std_client.go b/common/tls/std_client.go
-index 80fa6cb28..2897d9688 100644
+index 64a6e3022..2a67f4f72 100644
 --- a/common/tls/std_client.go
 +++ b/common/tls/std_client.go
 @@ -8,6 +8,7 @@ import (
@@ -666,19 +666,20 @@ index 80fa6cb28..2897d9688 100644
  		}
  	}
  	if len(options.ALPN) > 0 {
-@@ -275,21 +276,26 @@ func verifyConnection(rootCAs *x509.CertPool, timeFunc func() time.Time, serverN
+@@ -275,24 +276,26 @@ func verifyConnection(rootCAs *x509.CertPool, timeFunc func() time.Time, serverN
  	}
  }
  
 -func VerifyPublicKeySHA256(knownHashValues [][]byte, rawCerts [][]byte) error {
 +func VerifyPinnedCertificate(certificateHashes [][]byte, publicKeyHashes [][]byte, rawCerts [][]byte) error {
-+	if len(rawCerts) == 0 {
+ 	if len(rawCerts) == 0 {
+-		return E.New("missing remote certificate")
 +		return E.New("missing peer certificate")
 +	}
 +	certificateHash := sha256.Sum256(rawCerts[0])
 +	if slices.ContainsFunc(certificateHashes, func(value []byte) bool { return bytes.Equal(value, certificateHash[:]) }) {
 +		return nil
-+	}
+ 	}
  	leafCertificate, err := x509.ParseCertificate(rawCerts[0])
  	if err != nil {
 -		return E.Cause(err, "failed to parse leaf certificate")
@@ -705,14 +706,15 @@ index 80fa6cb28..2897d9688 100644
 +		", public key sha256 ", base64.StdEncoding.EncodeToString(publicKeyHash[:]))
  }
 diff --git a/common/tls/std_server.go b/common/tls/std_server.go
-index 171cc4f29..bc156d278 100644
+index 10afe7094..46f6ea53b 100644
 --- a/common/tls/std_server.go
 +++ b/common/tls/std_server.go
-@@ -472,18 +472,23 @@ func NewSTDServer(ctx context.Context, logger log.ContextLogger, options option.
+@@ -423,22 +423,23 @@ func NewSTDServer(ctx context.Context, logger log.ContextLogger, options option.
  				}
  			}
  			tlsConfig.ClientCAs = clientCertificateCA
 -		} else if len(options.ClientCertificatePublicKeySHA256) > 0 {
+-			verifyIfGiven := tlsConfig.ClientAuth == tls.VerifyClientCertIfGiven
 +		} else if len(options.ClientCertificateSHA256) > 0 || len(options.ClientCertificatePublicKeySHA256) > 0 {
 +			var certificateOptional bool
  			switch tlsConfig.ClientAuth {
@@ -723,10 +725,11 @@ index 171cc4f29..bc156d278 100644
 +				certificateOptional = true
  			}
  			tlsConfig.VerifyPeerCertificate = func(rawCerts [][]byte, verifiedChains [][]*x509.Certificate) error {
--				return VerifyPublicKeySHA256(options.ClientCertificatePublicKeySHA256, rawCerts)
+-				if verifyIfGiven && len(rawCerts) == 0 {
 +				if certificateOptional && len(rawCerts) == 0 {
-+					return nil
-+				}
+ 					return nil
+ 				}
+-				return VerifyPublicKeySHA256(options.ClientCertificatePublicKeySHA256, rawCerts)
 +				return VerifyPinnedCertificate(options.ClientCertificateSHA256, options.ClientCertificatePublicKeySHA256, rawCerts)
  			}
  		} else {
@@ -782,10 +785,10 @@ index 5fc89959f..5b8682ce1 100644
  		timeFunc:                   ntp.TimeFuncFromContext(ctx),
  		store:                      validated.Store,
 diff --git a/common/tls/utls_client.go b/common/tls/utls_client.go
-index 16d0352d0..2b725d30d 100644
+index 9cc1dbbb6..54bc4778a 100644
 --- a/common/tls/utls_client.go
 +++ b/common/tls/utls_client.go
-@@ -209,13 +209,13 @@ func newUTLSClient(ctx context.Context, logger logger.ContextLogger, serverAddre
+@@ -219,13 +219,13 @@ func newUTLSClient(ctx context.Context, logger logger.ContextLogger, serverAddre
  			return nil, E.New("disable_sni is unsupported in reality")
  		}
  	}
@@ -1077,7 +1080,7 @@ index 0db72f43a..80712fe8d 100644
  
  !!! question "自 sing-box 1.13.0 起"
 diff --git a/docs/schema.json b/docs/schema.json
-index e028e4286..df9c68900 100644
+index 4d890786d..f13048790 100644
 --- a/docs/schema.json
 +++ b/docs/schema.json
 @@ -8442,6 +8442,43 @@

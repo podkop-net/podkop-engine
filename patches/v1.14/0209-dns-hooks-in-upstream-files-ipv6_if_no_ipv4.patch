@@ -1,4 +1,4 @@
-From 72f7743ff55179bdbbb452adef08153e081ee91d Mon Sep 17 00:00:00 2001
+From 38721df8719108ad29f2cf98a441bcc3e46c0072 Mon Sep 17 00:00:00 2001
 From: FiyeroT <me@fiyero.xyz>
 Date: Thu, 12 Nov 2026 21:41:19 +0300
 Subject: [PATCH 13/71] dns, hooks in upstream files: ipv6_if_no_ipv4
@@ -16,7 +16,7 @@ Pdk-Layer: 02
  3 files changed, 36 insertions(+), 2 deletions(-)
 
 diff --git a/dns/client.go b/dns/client.go
-index 61769494f..234b55eae 100644
+index f51e989ba..f21003475 100644
 --- a/dns/client.go
 +++ b/dns/client.go
 @@ -66,6 +66,7 @@ type ClientOptions struct {
@@ -80,10 +80,10 @@ index 61769494f..234b55eae 100644
  		return c.lookupToExchange(ctx, transport, dnsName, dns.TypeAAAA, lookupOptions, responseChecker)
  	}
 diff --git a/dns/router.go b/dns/router.go
-index dec640141..aa673b7ef 100644
+index 9ba7d1830..68dd905b9 100644
 --- a/dns/router.go
 +++ b/dns/router.go
-@@ -81,8 +81,10 @@ func NewRouter(ctx context.Context, logFactory log.Factory, options option.DNSOp
+@@ -84,8 +84,10 @@ func NewRouter(ctx context.Context, logFactory log.Factory, options option.DNSOp
  			optimisticTimeout = 3 * 24 * time.Hour
  		}
  	}
@@ -94,7 +94,7 @@ index dec640141..aa673b7ef 100644
  		Timeout:           time.Duration(options.DNSClientOptions.Timeout),
  		DisableCache:      options.DNSClientOptions.DisableCache,
  		DisableExpire:     options.DNSClientOptions.DisableExpire,
-@@ -992,7 +994,12 @@ func (r *Router) lookupWithRules(ctx context.Context, rules []adapter.DNSRule, d
+@@ -1000,7 +1002,12 @@ func (r *Router) lookupWithRules(ctx context.Context, rules []adapter.DNSRule, d
  		lookupOptions.Strategy = strategy
  	}
  	if strategy == C.DomainStrategyIPv4Only {

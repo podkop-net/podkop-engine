@@ -1,4 +1,4 @@
-From f866c9d898343fa0aa2a6d2e088ab1ac3bc3a8fe Mon Sep 17 00:00:00 2001
+From d9a9a9a216d731cf4fb0e267bee0b098a232ad1e Mon Sep 17 00:00:00 2001
 From: FiyeroT <me@fiyero.xyz>
 Date: Tue, 24 Nov 2026 23:26:55 +0300
 Subject: [PATCH 71/71] box: a test of what a program that embeds this sing-box
