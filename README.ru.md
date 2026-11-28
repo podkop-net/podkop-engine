@@ -62,7 +62,7 @@
 |---|---|---|
 | Входы | tproxy, direct, mixed | те же |
 | Выходы | direct, socks, shadowsocks, trojan, vless, hysteria2, tuic, http, selector, urltest, block | те же и ещё vmess, snell, tor (нужен пакет tor), ssh, shadowtls, anytls, hysteria, naive (NaiveProxy, [не на всех архитектурах](docs/INSTALL.ru.md#naiveproxy)) |
-| Пакет, r29: x86_64 / aarch64_cortex-a53 / mipsel_24kc | 9,8 / 8,8 / 8,8 МБ | 15,6 / 14,3 / 15,4 МБ |
+| Пакет, r30: x86_64 / aarch64_cortex-a53 / mipsel_24kc | 9,9 / 8,9 / 8,9 МБ | 15,9 / 14,6 / 15,7 МБ |
 
 Чего нет ни в одном пакете по сравнению с полным sing-box: других серверных входов, TUN, WireGuard и
 Tailscale внутри sing-box (WireGuard и AmneziaWG в podkop подключаются интерфейсом OpenWrt), DNS-серверов
