@@ -11,6 +11,8 @@
 #   FINALMASK      finalmask клиента sing-box: merged (ClientHello записями по 11–24 байта, одной
 #                  записью в сокет, как fm провайдеров) или s1 (то же двумя TCP-кусками, первый
 #                  100–200 байт); пусто = без маски. В строках результата клиент — <имя>+fm-<маска>
+#   UTLS_FALLBACK=1 клиент sing-box с SING_BOX_UTLS_FALLBACK=1 (перебор отпечатков, патч 0414);
+#                  в строках результата клиент — <имя>+fb
 #   SHOW=true      realitySettings.show (xray печатает, почему отверг клиента)
 #   VERBOSE=1      печатать хвосты логов на каждом FAIL
 set -u
@@ -109,7 +111,8 @@ for xv in $XRAY_VERSIONS; do
     for fp in $FINGERPRINTS; do
       case $sb in
         xrayc-*) xray_client_config "$fp" > $WORK/sb.json; CLIENT="$BIN/xray-${sb#xrayc-} run -c $WORK/sb.json";;
-        *)       singbox_config "$fp" > $WORK/sb.json;       CLIENT="$BIN/$sb run -c $WORK/sb.json";;
+        *)       singbox_config "$fp" > $WORK/sb.json;       CLIENT="$BIN/$sb run -c $WORK/sb.json"
+                 [ "${UTLS_FALLBACK:-}" = 1 ] && CLIENT="env SING_BOX_UTLS_FALLBACK=1 $CLIENT";;
       esac
       $BIN/xray-$xv run -c $WORK/xray.json > $WORK/xray.log 2>&1 & XP=$!
       wait_port 443
@@ -132,7 +135,7 @@ for xv in $XRAY_VERSIONS; do
         [ -n "$srv" ] && detail="$detail | xray: $srv"
       fi
       label=$sb
-      case $sb in xrayc-*) ;; *) [ -n "${FINALMASK:-}" ] && label="$sb+fm-$FINALMASK";; esac
+      case $sb in xrayc-*) ;; *) [ -n "${FINALMASK:-}" ] && label="$sb+fm-$FINALMASK"; [ "${UTLS_FALLBACK:-}" = 1 ] && label="$label+fb";; esac
       printf '%-10s %-28s %-11s %-6s %s\n' "$xv" "$label" "$fp" "$res" "$detail"
       if [ "$res" = FAIL ] && [ "${VERBOSE:-0}" = 1 ]; then
         echo "  --- xray.log (REALITY):"; grep -i reality $WORK/xray.log | tail -3 | sed 's/^/  /'
