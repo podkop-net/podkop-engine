@@ -8,6 +8,18 @@ previous release and what it means for a user; a line is named only where a chan
 line. What each patch does: [docs/PATCHES.md](docs/PATCHES.md); the options: [docs/FEATURES.md](docs/FEATURES.md);
 full notes and packages: [GitHub releases](https://github.com/podkop-net/podkop-engine/releases).
 
+## r30 — 2026-11-28
+
+sing-box 1.14.6
+
+- **upstream:** sing-box 1.14.6 (was 1.14.4): fixes of DNS, URL tests, rule sets, FakeIP, the v2ray transports, ECH and REALITY; REALITY now keeps the X25519MLKEM768 key share upstream too, which this engine had sent since Xray-core 26.9.8 required it. The forks of quic-go, sing-quic and sing-vmess moved to the versions 1.14.6 takes.
+- **reality:** a client that fails the verification sends the target the request a browser would before it gives up (upstream 1.14.5; before, it never reached the server); here it takes 2 s at most, so the fingerprint fallback tries its next ClientHello at most 2 s later (www.microsoft.com, a common target, answered nothing in 20 s). Tested against Xray-core 24.11.21–26.11.9: the same results as r29, and with the fallback on every fingerprint, edge and ios included, connects to every server from 25.5.16.
+- **finalmask:** two masks or more are chained as Xray chains them: the first one takes the writes first, the last one is next to the socket. r28 and r29 chained the list the other way round, so with a provider's list of two masks (tlshello, then 1-1) the ClientHello went out whole, and behind an ISP that drops whole hellos the server failed with "no TLS" where Xray connected. Checked on the wire against Xray-core 26.9.9 and 26.11.9: the same records with both orders of the list. A list of two masks written for r28 or r29 must be reversed.
+- **dns:** a DNS connection that carries queries one after another holds 16 at most again under a burst (1.14.5 starts each on a goroutine of its own, and a burst passed the limit).
+- **fakeip:** the store in memory sits on upstream's FakeIP server, put in by one line of the registry, so a new sing-box no longer conflicts with it; a name given out while the store is flushed keeps its record.
+- **urltest:** a group naming an outbound or a fallback that does not exist fails when the box is created, as upstream's; a data race of a group that starts fixed.
+- **embedding:** nothing removed; the metadata of a rule set no rule uses is kept when its rules are dropped (upstream drops both since 1.14.5); the masks of `finalmask` are chained in the other order (see finalmask).
+
 ## r29 — 2026-11-25
 
 sing-box 1.14.4
