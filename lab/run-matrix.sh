@@ -10,7 +10,8 @@
 #   KEY_SHARE      reality.key_share клиента (только sing-box-lx: hybrid|classical)
 #   FINALMASK      finalmask клиента sing-box: merged (ClientHello записями по 11–24 байта, одной
 #                  записью в сокет, как fm провайдеров) или s1 (то же двумя TCP-кусками, первый
-#                  100–200 байт); пусто = без маски. В строках результата клиент — <имя>+fm-<маска>
+#                  100–200 байт; маски в порядке Xray: tlshello, затем 1-1 у сокета, с r30);
+#                  пусто = без маски. В строках результата клиент — <имя>+fm-<маска>
 #   UTLS_FALLBACK=1 клиент sing-box с SING_BOX_UTLS_FALLBACK=1 (перебор отпечатков, патч 0414);
 #                  в строках результата клиент — <имя>+fb
 #   SHOW=true      realitySettings.show (xray печатает, почему отверг клиента)
@@ -62,7 +63,7 @@ EOF
 finalmask_json() {
   case ${FINALMASK:-} in
     merged) echo ', "finalmask": {"tcp": [{"type": "fragment", "packets": "tlshello", "length": "11-24", "delay": "0"}]}';;
-    s1) echo ', "finalmask": {"tcp": [{"type": "fragment", "packets": "1-1", "length": "100-200", "max_split": "2"}, {"type": "fragment", "packets": "tlshello", "length": "11-24", "delay": "0"}]}';;
+    s1) echo ', "finalmask": {"tcp": [{"type": "fragment", "packets": "tlshello", "length": "11-24", "delay": "0"}, {"type": "fragment", "packets": "1-1", "length": "100-200", "max_split": "2"}]}';;
   esac
 }
 
